@@ -1,0 +1,393 @@
+//! Live TV and DVR on a Plex Media Server: the guide (EPG providers, lineups, the time grid),
+//! recording rules and recording operations, and the live tune a channel plays from.
+//! `docs/pms-api.md` §10 is the contract this file follows; the bundled OpenAPI spec documents
+//! the paths but not the tune's real answer, which clients receive as a `MediaSubscription`.
+//!
+//! This file is the PROTOCOL half: one `impl Client` method per operation, each building its path
+//! through [`QueryBuilder`] and reading its answer through `live_tv/parse.rs` into the plain values
+//! of `live_tv/model.rs`. When to fetch, what to cache, and who owns a tune's release are the data
+//! and media layers' business.
+//!
+//! **Every write is gated** ([`guard`]). Creating, editing, deleting or re-prioritising a rule,
+//! cancelling a recording, and tuning a channel all change a household's server: a recording that
+//! does not happen, or a tuner taken from one that should. A `devtriggers` (debug) build refuses
+//! them unless the server is the synthetic mock (`tests/mock_pms.py --livetv`, which identifies as a
+//! `-synthetic` build) or the owner armed the live switch (`plxnative-livetv-live`). A release build
+//! always writes. Releasing a tune this process made ([`Client::live_release`]) is cleanup of a
+//! permitted write and is never refused.
+
+use super::client::{Client, QueryBuilder, ValueOutcome};
+use crate::http::Method;
+use serde_json::Value;
+
+mod model;
+mod parse;
+#[cfg(test)]
+mod fixtures;
+#[cfg(test)]
+mod tests;
+
+pub use model::*;
+
+/// The debug-build write gate. See the module doc.
+pub mod guard {
+    #[cfg(feature = "devtriggers")]
+    plx_base::devtrig::latched_flag!(
+        /// **The owner's live switch** (`plxnative-livetv-live` in the install's runtime root): a
+        /// `devtriggers` build sends Live TV and DVR writes to a REAL server while it exists. Off by
+        /// default, read once per process. **No agent creates this file unless the owner asks for it
+        /// in that session** (AGENTS.md; `.claude/hooks/livetv-live-guard.py` refuses a command that
+        /// would).
+        fn live_armed = "livetv-live";
+    );
+    #[cfg(not(feature = "devtriggers"))]
+    fn live_armed() -> bool {
+        false
+    }
+
+    /// The pure decision: a release build always writes; a debug build writes only to the mock or
+    /// under the owner's switch.
+    pub(super) fn permit(devtriggers_build: bool, mock_server: bool, live: bool) -> bool {
+        !devtriggers_build || mock_server || live
+    }
+
+    /// Is `version` (a server's self-reported build) the synthetic mock's? `tests/mock_pms.py`
+    /// answers `1.41.0.0000-synthetic`; no real PMS build carries the suffix.
+    pub(super) fn is_mock_version(version: &str) -> bool {
+        version.trim().ends_with("-synthetic")
+    }
+
+    /// Was the last Live TV write this process tried refused by the gate? Read by the debug cue.
+    static LAST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn last_write_refused() -> bool {
+        LAST_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// May this process write to the server that reports `version`? Logs a refusal by operation
+    /// name only.
+    pub(super) fn allow(op: &str, version: &str) -> bool {
+        let live = live_armed();
+        let ok = permit(cfg!(feature = "devtriggers"), is_mock_version(version), live);
+        LAST_REFUSED.store(!ok, std::sync::atomic::Ordering::Relaxed);
+        if !ok {
+            plx_base::eventlog::log(&format!(
+                "livetv: {op} refused (debug build: the server is not the mock and the live switch is off)"
+            ));
+        }
+        ok
+    }
+
+    /// BOOT: log once whether a debug build may write Live TV/DVR changes to a real server. Silent
+    /// in a release build; the trigger's name rides its own gate (`ci/check-package.py`).
+    pub fn announce_live_writes() {
+        #[cfg(feature = "devtriggers")]
+        if live_armed() {
+            plx_base::eventlog::log("livetv: LIVE writes enabled by trigger (plxnative-livetv-live)");
+        }
+    }
+}
+
+/// A path segment PMS hands out as an id (`12`, a uuid): letters, digits, `-`, `_`, `.`.
+fn is_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A provider identifier as it prefixes a path (`tv.plex.providers.epg.cloud:12`).
+fn is_provider(s: &str) -> bool {
+    s.starts_with("tv.plex.providers.epg")
+        && s.len() <= 128
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// `YYYY-MM-DD`.
+fn is_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// The UTC calendar date of an epoch second, `YYYY-MM-DD` — the grid's `date` parameter, which
+/// names a UTC day (`docs/pms-api.md` §10). Civil-from-days, Howard Hinnant's algorithm.
+pub fn utc_date(epoch_s: i64) -> String {
+    let days = epoch_s.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+// ---- pure request builders (tested without a server) ------------------------------------------
+
+pub(super) fn lineup_path(provider: &str) -> Option<String> {
+    is_provider(provider).then(|| format!("/{provider}/lineups/dvr/channels"))
+}
+
+pub(super) fn grid_path(provider: &str, grid_key: &str, date: &str) -> Option<String> {
+    (is_provider(provider) && !grid_key.is_empty() && is_date(date)).then(|| {
+        QueryBuilder::new(format!("/{provider}/grid"))
+            .str("channelGridKey", grid_key)
+            .str("date", date)
+            .build()
+    })
+}
+
+pub(super) fn subscription_path(id: &str) -> Option<String> {
+    is_id(id).then(|| format!("/media/subscriptions/{id}"))
+}
+
+pub(super) fn template_path(guid: &str) -> Option<String> {
+    (!guid.is_empty()).then(|| QueryBuilder::new("/media/subscriptions/template").str("guid", guid).build())
+}
+
+/// `POST /media/subscriptions?…` — the official clients' parameter order: `includeGrabs`, the
+/// target library and location, `type`, one `prefs[id]` per setting, then the template's
+/// `parameters` verbatim.
+pub(super) fn create_path(req: &CreateSubscription) -> Option<String> {
+    if req.target_section.is_empty() || req.parameters.is_empty() {
+        return None;
+    }
+    let mut q = QueryBuilder::new("/media/subscriptions")
+        .int("includeGrabs", 1)
+        .str("targetLibrarySectionID", &req.target_section)
+        .opt_str("targetSectionLocationID", &req.target_location)
+        .int("type", req.kind);
+    for (id, value) in &req.prefs {
+        q = q.encoded_key(&format!("prefs[{id}]"), value);
+    }
+    let path = q.verbatim(&req.parameters).build();
+    // `verbatim` drops a fragment that is not a plain query string; a rule created without its
+    // hints would record the wrong thing, so that is a refusal, not a smaller request.
+    path.contains(req.parameters.trim_start_matches(['&', '?'])).then_some(path)
+}
+
+/// `PUT /media/subscriptions/{id}?…` — the create parameters minus `type` and `parameters`.
+pub(super) fn edit_path(id: &str, req: &EditSubscription) -> Option<String> {
+    let base = subscription_path(id)?;
+    let mut q = QueryBuilder::new(base)
+        .int("includeGrabs", 1)
+        .opt_str("targetLibrarySectionID", &req.target_section)
+        .opt_str("targetSectionLocationID", &req.target_location);
+    for (sid, value) in &req.prefs {
+        q = q.encoded_key(&format!("prefs[{sid}]"), value);
+    }
+    Some(q.build())
+}
+
+/// `PUT /media/subscriptions/{id}/move[?after={other}]` — no `after` moves it to the top.
+pub(super) fn move_path(id: &str, after: Option<&str>) -> Option<String> {
+    let base = format!("{}/move", subscription_path(id)?);
+    match after {
+        None => Some(base),
+        Some(a) if is_id(a) => Some(QueryBuilder::new(base).str("after", a).build()),
+        Some(_) => None,
+    }
+}
+
+/// A grab's own key, which is what a cancel DELETEs. Only `/media/grabbers/operations/{id}` is
+/// accepted: the key comes from the server and must not be able to name anything else.
+pub(super) fn grab_path(grab_key: &str) -> Option<String> {
+    let id = grab_key.strip_prefix("/media/grabbers/operations/")?;
+    is_id(id).then(|| grab_key.to_string())
+}
+
+/// `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`. The channel identifier is percent-encoded as
+/// one path segment (it can carry `-`, `.`, and in some lineups `/`).
+pub(super) fn tune_path(dvr_key: &str, channel: &str) -> Option<String> {
+    (is_id(dvr_key) && !channel.is_empty())
+        .then(|| format!("/livetv/dvrs/{dvr_key}/channels/{}/tune", super::client::urlenc_str(channel)))
+}
+
+// ---- the operations ---------------------------------------------------------------------------
+
+/// A completed answer → its JSON, or the error a non-2xx / unreadable / in-band failure is.
+fn ok_body(outcome: ValueOutcome) -> Result<Value, LiveError> {
+    match outcome {
+        ValueOutcome::Transport => Err(LiveError::Transport),
+        ValueOutcome::Response { status, .. } if !(200..300).contains(&status) => Err(LiveError::Status(status)),
+        ValueOutcome::Response { body: Some(v), .. } => match parse::container(&v).and_then(parse::server_error) {
+            Some(e) => Err(e),
+            None => Ok(v),
+        },
+        ValueOutcome::Response { body: None, .. } => Err(LiveError::Unreadable),
+    }
+}
+
+/// A completed write whose body does not matter.
+fn ok_status(outcome: ValueOutcome) -> LiveResult<()> {
+    match outcome {
+        ValueOutcome::Transport => Err(LiveError::Transport),
+        ValueOutcome::Response { status, .. } if (200..300).contains(&status) => Ok(()),
+        ValueOutcome::Response { status, .. } => Err(LiveError::Status(status)),
+    }
+}
+
+impl Client {
+    /// The write gate for this server ([`guard`]).
+    fn live_write_allowed(&self, op: &str) -> bool {
+        guard::allow(op, &super::serverinfo::version_of(self.id))
+    }
+
+    /// `GET /media/providers` → this server's EPG providers (one per DVR). Empty when the server
+    /// has no DVR or the account may not use it.
+    pub fn live_tv_providers(&self) -> LiveResult<Vec<EpgProvider>> {
+        let body = ok_body(self.json_value(Method::Get, "/media/providers"))?;
+        Ok(parse::providers(&body))
+    }
+
+    /// A provider's channel lineup.
+    pub fn live_tv_channels(&self, provider: &str) -> LiveResult<Vec<Channel>> {
+        let path = lineup_path(provider).ok_or(LiveError::Invalid)?;
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        Ok(parse::channels(&body))
+    }
+
+    /// One channel's airings for one UTC day (`date` = [`utc_date`]).
+    pub fn live_tv_grid(&self, provider: &str, channel: &Channel, date: &str) -> LiveResult<Vec<Airing>> {
+        let path = grid_path(provider, &channel.grid_key, date).ok_or(LiveError::Invalid)?;
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        Ok(parse::grid(&body, Some(channel)))
+    }
+
+    /// The recording rules, in priority order.
+    pub fn dvr_subscriptions(&self) -> LiveResult<Vec<Subscription>> {
+        let body = ok_body(self.json_value(Method::Get, "/media/subscriptions"))?;
+        Ok(parse::subscriptions(&body))
+    }
+
+    /// One recording rule.
+    pub fn dvr_subscription(&self, id: &str) -> LiveResult<Subscription> {
+        let path = subscription_path(id).ok_or(LiveError::Invalid)?;
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        parse::subscriptions(&body).into_iter().next().ok_or(LiveError::Unreadable)
+    }
+
+    /// The recording operations (scheduled, recording now, finished, failed), soonest first.
+    pub fn dvr_scheduled(&self) -> LiveResult<Vec<Grab>> {
+        let body = ok_body(self.json_value(Method::Get, "/media/subscriptions/scheduled"))?;
+        Ok(parse::scheduled(&body))
+    }
+
+    /// The record choices for a program (`guid` = [`Airing::guid`]).
+    pub fn dvr_template(&self, guid: &str) -> LiveResult<Vec<TemplateChoice>> {
+        let path = template_path(guid).ok_or(LiveError::Invalid)?;
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        Ok(parse::template(&body))
+    }
+
+    /// Create a recording rule. The rule exists on the server even when the answer carries
+    /// conflicts; the caller then prefers it ([`Client::dvr_move`] with no `after`) or deletes it.
+    pub fn dvr_create(&self, req: &CreateSubscription) -> LiveResult<CreateResult> {
+        let path = create_path(req).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("record") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Post, &path);
+        log_write("record", &outcome);
+        parse::created(&ok_body(outcome)?)
+    }
+
+    /// Change a rule's library or preferences.
+    pub fn dvr_edit(&self, id: &str, req: &EditSubscription) -> LiveResult<()> {
+        let path = edit_path(id, req).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("edit recording") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Put, &path);
+        log_write("edit recording", &outcome);
+        ok_status(outcome)
+    }
+
+    /// Delete a rule and every grab it scheduled ("Cancel recording"). A 404 means it was already
+    /// gone, which is what the caller wanted.
+    pub fn dvr_delete(&self, id: &str) -> LiveResult<()> {
+        let path = subscription_path(id).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("cancel recording") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Delete, &path);
+        log_write("cancel recording", &outcome);
+        match ok_status(outcome) {
+            Err(LiveError::Status(404)) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Move a rule in the priority list: after `after`, or to the top when `None`. PMS allows it
+    /// to the server's admin only (403 for anyone else).
+    pub fn dvr_move(&self, id: &str, after: Option<&str>) -> LiveResult<()> {
+        let path = move_path(id, after).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("reprioritize recording") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Put, &path);
+        log_write("reprioritize recording", &outcome);
+        ok_status(outcome)
+    }
+
+    /// Cancel one recording operation — stop a recording in progress or skip one airing — by the
+    /// grab's own key. Its rule stays.
+    pub fn dvr_cancel_grab(&self, grab_key: &str) -> LiveResult<()> {
+        let path = grab_path(grab_key).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("stop recording") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Delete, &path);
+        log_write("stop recording", &outcome);
+        match ok_status(outcome) {
+            Err(LiveError::Status(404)) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Tune a channel to watch it live. On success the server holds a tuner for this client until
+    /// [`Client::live_release`] (or until it notices nobody is watching). A tune answered with
+    /// conflicts holds nothing playable but may still carry a subscription id, which the caller
+    /// releases too.
+    pub fn live_tune(&self, dvr_key: &str, channel: &str) -> LiveResult<TuneResult> {
+        let path = tune_path(dvr_key, channel).ok_or(LiveError::Invalid)?;
+        if !self.live_write_allowed("tune") {
+            return Err(LiveError::Refused);
+        }
+        let outcome = self.json_value(Method::Post, &path);
+        log_write("tune", &outcome);
+        parse::tune(&ok_body(outcome)?)
+    }
+
+    /// Re-read a live tune's subscription: the program list moves on as programs end.
+    pub fn live_refresh(&self, subscription_id: &str) -> LiveResult<TuneResult> {
+        let path = subscription_path(subscription_id).ok_or(LiveError::Invalid)?;
+        parse::tune(&ok_body(self.json_value(Method::Get, &path))?)
+    }
+
+    /// Release a live tune this process made: delete its subscription so the tuner is free. Not
+    /// gated (it undoes a permitted write) and idempotent (a 404 is done). `Err(Transport)` is
+    /// the one answer a caller retries.
+    pub fn live_release(&self, subscription_id: &str) -> LiveResult<()> {
+        let path = subscription_path(subscription_id).ok_or(LiveError::Invalid)?;
+        let outcome = self.json_value(Method::Delete, &path);
+        log_write("release tune", &outcome);
+        match ok_status(outcome) {
+            Err(LiveError::Status(404)) => Ok(()),
+            other => other,
+        }
+    }
+}
+
+/// One line per write that went out: the operation and its status, never a path, id or token.
+fn log_write(op: &str, outcome: &ValueOutcome) {
+    let what = match outcome {
+        ValueOutcome::Response { status, .. } => format!("HTTP {status}"),
+        ValueOutcome::Transport => "no answer".to_string(),
+    };
+    plx_base::eventlog::log(&format!("livetv: {op} -> {what}"));
+}

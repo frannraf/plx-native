@@ -69,7 +69,7 @@ CLIENT_DOORS = frozenset({
     'get_json', 'get_json_with_headers', 'get_json_with_headers_until', 'get_json_status',
     'get_bytes', 'get_sidecar_bytes', 'get_void', 'get_ok', 'get_status', 'get_status_until',
     'post_status', 'post_status_until', 'put', 'post_ok', 'post_json', 'fetch_built',
-    'fetch_built_outcome',
+    'fetch_built_outcome', 'delete_status', 'json_value',
 })
 # The server client's private transport. A call is a site only as `self.name(` inside `impl Client`,
 # and never from a door's own body (`get_json_status` reads through `send_bulk`).

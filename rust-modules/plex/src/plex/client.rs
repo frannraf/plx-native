@@ -53,6 +53,17 @@ pub(super) enum JsonStatusOutcome {
     Transport,
 }
 
+/// [`Client::json_value`]'s answer: a completed response (any status) with its body decoded as a
+/// generic JSON value when there was one, or no response at all.
+#[derive(Debug)]
+pub(super) enum ValueOutcome {
+    Response {
+        status: i32,
+        body: Option<serde_json::Value>,
+    },
+    Transport,
+}
+
 /// The headers shared by EVERY PMS operation, over either transport. `X-Plex-Language` belongs
 /// here rather than in [`Client::playback_identity`]: it selects server-returned metadata for
 /// browse/search reads too, not only playback protocol calls. Owned strings keep the optional
@@ -836,6 +847,53 @@ impl Client {
         self.body_2xx(path_no_token, Method::Post, &[]).is_some()
     }
 
+    /// DELETE (no body) whose HTTP status is the protocol result: removing a DVR subscription,
+    /// cancelling one recording, releasing a live tune (`docs/pms-api.md` §10). `None` when the
+    /// request never completed, so a caller that must retry a release can tell "the server said
+    /// no" from "nothing reached it"; PMS answers an already-absent subscription 404, which the
+    /// caller reads as done.
+    #[track_caller]
+    pub(super) fn delete_status(&self, path_no_token: &str) -> Option<i32> {
+        self.send(path_no_token, Method::Delete, &[])
+            .map(|reply| reply.status)
+    }
+
+    /// Any verb, `Accept: application/json`, answering the status and the body decoded as a
+    /// generic JSON value. The Live TV / DVR surface (`super::live_tv`) parses its answers from
+    /// a [`serde_json::Value`] rather than the flat [`MediaContainer`], because PMS nests the same
+    /// elements as an object on one endpoint and an array on the next (`MediaSubscription`,
+    /// `MediaGrabOperation`, `Video` vs `Metadata`), and that surface must not lose a tune's
+    /// subscription id to a shape the strict DTO did not expect. An empty or unparseable body is
+    /// `body: None` beside the status, never a transport failure.
+    #[track_caller]
+    pub(super) fn json_value(&self, method: Method, path_no_token: &str) -> ValueOutcome {
+        let reply = match method {
+            Method::Get => self.send_bulk(path_no_token, &[ACCEPT_JSON]),
+            _ => self.send(path_no_token, method, &[ACCEPT_JSON]),
+        };
+        let Some(reply) = reply else {
+            return ValueOutcome::Transport;
+        };
+        let body = if reply.body.iter().all(u8::is_ascii_whitespace) {
+            None
+        } else {
+            match serde_json::from_slice::<serde_json::Value>(&reply.body) {
+                Ok(v) => Some(v),
+                Err(error) => {
+                    // The ENDPOINT only, as `get_json` logs it — never the built path.
+                    plx_base::eventlog::log(&format!(
+                        "pms: {:?} {} answered {} bytes that will not parse — {error}",
+                        method,
+                        path_no_token.split('?').next().unwrap_or(path_no_token),
+                        reply.body.len()
+                    ));
+                    None
+                }
+            }
+        };
+        ValueOutcome::Response { status: reply.status, body }
+    }
+
     /// POST → parse the `{ "MediaContainer": … }` envelope — /playQueues (the returned ids).
     pub(super) fn post_json(&self, path_no_token: &str) -> Option<MediaContainer> {
         let body = self.body_2xx(path_no_token, Method::Post, &[ACCEPT_JSON])?;
@@ -919,6 +977,26 @@ impl QueryBuilder {
             self
         }
     }
+    /// A key that is not a plain identifier — PMS's deep-object parameters, `prefs[minVideoQuality]`
+    /// — with the KEY percent-encoded as well as the value (`prefs%5BminVideoQuality%5D=720`), the
+    /// spelling the official clients send (`docs/pms-api.md` §10). [`Self::str`] encodes only the
+    /// value, which is right for every fixed identifier key and wrong for a key that carries a
+    /// server-supplied setting id.
+    pub(super) fn encoded_key(mut self, k: &str, v: &str) -> Self {
+        self.parts.push(format!("{}={}", urlenc_str(k), urlenc_str(v)));
+        self
+    }
+    /// Append a query FRAGMENT the server already encoded — the DVR template's `parameters`
+    /// string (`hints[…]=…&params[…]=…`), which PMS hands out to be sent back verbatim and which
+    /// must not be decoded, re-encoded or re-ordered. A fragment that is not a plain query string
+    /// ([`is_query_fragment`]) is dropped rather than sent; a leading `&`/`?` is not part of it.
+    pub(super) fn verbatim(mut self, fragment: &str) -> Self {
+        let fragment = fragment.trim_start_matches(['&', '?']);
+        if !fragment.is_empty() && is_query_fragment(fragment) {
+            self.parts.push(fragment.to_string());
+        }
+        self
+    }
     pub(super) fn build(self) -> String {
         if self.parts.is_empty() {
             self.path
@@ -930,6 +1008,18 @@ impl QueryBuilder {
     pub(super) fn query(self) -> String {
         self.parts.join("&")
     }
+}
+
+/// Can `s` ride a query string as it is? Visible ASCII only — no space, no control byte (a CR or
+/// LF would end the request line on the plaintext arm), no `#` (it would end the URL) — and no
+/// key that names the token: the fragment is server-supplied, and [`Client::with_token`] is the
+/// one place a token is added.
+pub(super) fn is_query_fragment(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+        && !s.split('&').any(|pair| {
+            let key = pair.split('=').next().unwrap_or("");
+            key.eq_ignore_ascii_case("X-Plex-Token")
+        })
 }
 
 // ---- StreamUrl — the streaming return type ----

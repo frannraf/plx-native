@@ -37,6 +37,9 @@ pub mod subtitles;
 /// The PMS server-sent-event notification feed: the SSE parser, the lenient `playing` models and
 /// the one-connection client. `docs/pms-api.md` §9; the data layer decides when to connect.
 pub mod notify;
+/// Live TV and DVR: EPG providers, lineups, the guide grid, recording rules and operations, and
+/// the live tune. `docs/pms-api.md` §10; every write passes the debug-build gate in `live_tv::guard`.
+pub mod live_tv;
 /// The one client-side hub-title override rule (issue #12): shared by Home's whole-catalog merge
 /// (`crate::pms`) and a library's own `/hubs/sections/{id}` shelves (`crate::browse::section_hubs`)
 /// so neither reimplements or drifts from the other's id table.
