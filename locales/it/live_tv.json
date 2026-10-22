@@ -23,6 +23,7 @@
   "live_tv.badge.scheduled": "Programmata",
   "live_tv.badge.failed": "Non riuscita",
   "live_tv.badge.on_now": "In onda",
+  "live_tv.badge.new": "NUOVO",
   "live_tv.episode": "S{season} E{episode}",
   "live_tv.tuning": "Sintonizzazione di {channel}…",
   "live_tv.tune_failed": "Impossibile sintonizzare {channel}: {reason}",

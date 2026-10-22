@@ -23,6 +23,7 @@
   "live_tv.badge.scheduled": "Ütemezve",
   "live_tv.badge.failed": "Sikertelen",
   "live_tv.badge.on_now": "Most adásban",
+  "live_tv.badge.new": "ÚJ",
   "live_tv.episode": "{season}. évad {episode}. rész",
   "live_tv.tuning": "{channel} hangolása…",
   "live_tv.tune_failed": "{channel} nem hangolható: {reason}",

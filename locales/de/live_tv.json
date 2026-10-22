@@ -23,6 +23,7 @@
   "live_tv.badge.scheduled": "Geplant",
   "live_tv.badge.failed": "Fehlgeschlagen",
   "live_tv.badge.on_now": "Läuft gerade",
+  "live_tv.badge.new": "NEU",
   "live_tv.episode": "S{season} F{episode}",
   "live_tv.tuning": "{channel} wird eingestellt …",
   "live_tv.tune_failed": "{channel} konnte nicht eingestellt werden: {reason}",

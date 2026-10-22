@@ -95,6 +95,10 @@
     "value": "On Now",
     "description": "Badge on a program airing right now in the Live TV guide."
   },
+  "live_tv.badge.new": {
+    "value": "NEW",
+    "description": "Small badge in the corner of a Live TV guide cell whose airing is a premiere (a new episode or a first showing)."
+  },
   "live_tv.episode": {
     "value": "S{season} E{episode}",
     "args": {

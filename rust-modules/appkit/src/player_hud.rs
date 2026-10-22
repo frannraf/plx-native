@@ -652,9 +652,10 @@ impl TransportRow {
 /// its OK and its click, and a second literal `2` over there is exactly the drift `ControlSlot`
 /// was introduced to stop.
 pub const BTN_MORE: i32 = BTN_N - 1;
-/// On a live channel the FIRST disc (Subtitles elsewhere) records the program on now: what is
-/// playing can only be recorded from here, the guide's OK on it watches it.
-pub const BTN_RECORD: i32 = 0;
+/// On a live channel the MIDDLE disc (Audio elsewhere) records the program on now: what is
+/// playing can only be recorded from here, the guide's OK on it watches it. The captions disc
+/// stays (the owner wants it on a channel), and its panel still holds the Audio tab.
+pub const BTN_RECORD: i32 = 1;
 /// width the disc row occupies, the floor for anything replacing it
 pub fn ctrl_row_w() -> f32 {
     disc_row().width()

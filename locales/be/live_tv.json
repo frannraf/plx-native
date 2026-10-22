@@ -23,6 +23,7 @@
   "live_tv.badge.scheduled": "Запланавана",
   "live_tv.badge.failed": "Збой",
   "live_tv.badge.on_now": "Зараз у эфіры",
+  "live_tv.badge.new": "НОВАЕ",
   "live_tv.episode": "С{season} Э{episode}",
   "live_tv.tuning": "Наладжваецца {channel}…",
   "live_tv.tune_failed": "Не ўдалося наладзіць {channel}: {reason}",

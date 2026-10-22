@@ -872,7 +872,22 @@ impl LiveTvScreen {
             sub = format!("{sub} \u{b7} {}", a.title);
         }
         let dot = if rec { 24.0 } else { 0.0 };
-        let w = rect.x + rect.w - 14.0 - dot - tx;
+        // a premiere's NEW, outlined in the top-right corner (left of the record dot)
+        let mut badge_w = 0.0;
+        if a.premiere && rect.w >= NEW_MIN_CELL_W {
+            let words = msg::live_tv_badge_new();
+            let tw = f.measure.width_str(words, theme::size::MICRO, true);
+            let b = Rect::new(rect.x + rect.w - 12.0 - dot - tw - 16.0, rect.y + 10.0, tw + 16.0, 28.0);
+            p.rring(b, 6.0, 1.5, theme::with_a(ink2, 0.8));
+            TextView::new(words, theme::size::MICRO, ink2)
+                .bold()
+                .with_measure(f.measure)
+                .max_lines(1)
+                .h(HAlign::Center)
+                .draw(p, Rect::new(b.x, b.y + (b.h - f.measure.line_h(theme::size::MICRO)) * 0.5, b.w, 0.0));
+            badge_w = b.w + 10.0;
+        }
+        let w = rect.x + rect.w - 14.0 - dot - badge_w - tx;
         if w > 8.0 {
             TextView::new(title, theme::size::LABEL, ink)
                 .bold()
@@ -1123,6 +1138,8 @@ const ART_FADE_STEPS: usize = 48;
 /// A cell this wide shows its program's art; this wide, its episode title beside its times.
 const POSTER_MIN_CELL_W: f32 = 300.0;
 const EPISODE_MIN_CELL_W: f32 = 560.0;
+/// A cell this wide wears a premiere's NEW.
+const NEW_MIN_CELL_W: f32 = 240.0;
 
 /// An UltraBlur corner as the page's ground: held under [`TINT_LUMA`] (a scalar dim, so its hue
 /// survives), leaned [`TINT_W`] of the way from the plain ground, and darker at the foot.
