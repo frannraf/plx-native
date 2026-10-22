@@ -1646,6 +1646,10 @@ of plex.tv, not a server's) and `X-Plex-Provider-Version: 7.2` (`plex::live_tv::
   the bytes are a transport stream whatever the name.
 - **No port is written in these URLs.** A client whose URL parser defaults to PMS's 32400 dials
   a port the CDN never answers (a 15 s connect timeout): the scheme's own port (443) is meant.
+- Some channels the lineup does not mark `drm` tag every media playlist with
+  `#EXT-X-KEY:METHOD=NONE`, which says the segments are **not** encrypted; a reader that refuses
+  any key tag refuses those channels. Their target duration may differ (6 s seen beside 7 s).
+- An ad break's segments 301-redirect to the ad server's own `.ts` files on another host.
 
 ## Paging, observed
 
