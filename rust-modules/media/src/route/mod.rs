@@ -22,7 +22,8 @@ pub use flight::{
     take_ready_recovery_flight, ReadyFlight, RecoveryLanding, RecoveryVerdict, SeekVerdict,
 };
 pub use live::{
-    drain_live_releases, install_live, is_live, record_asked, release_live, set_record_asked, LiveInfo, LiveRoute, KEEPALIVE_S,
+    drain_live_releases, install_live, is_live, is_recordable_live, record_asked, release_live, set_record_asked, LiveInfo, LiveRoute,
+    KEEPALIVE_S,
 };
 pub use plan::*;
 pub use prefs::*;

@@ -20,6 +20,7 @@ use super::client::{Client, QueryBuilder, ValueOutcome};
 use crate::http::Method;
 use serde_json::Value;
 
+pub mod cloud;
 pub(super) mod debug;
 mod model;
 mod parse;

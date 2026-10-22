@@ -9,7 +9,7 @@
 //! without a battery clock can read 1970 until NTP has run; [`plausible_now`] says so, and the
 //! store waits rather than asking the server for a guide of 1970.
 
-use plx_plex::plex::live_tv::{Airing, Channel, EpgProvider, Grab, LiveStream, Subscription, TunedItem};
+use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, EpgProvider, Grab, LiveStream, Subscription, TunedItem};
 use plx_plex::plex::ServerId;
 use std::collections::HashMap;
 
@@ -66,6 +66,54 @@ impl Phase {
     }
     pub fn is_ready(&self) -> bool {
         matches!(self, Phase::Ready)
+    }
+}
+
+/// Which lineup the guide shows (a guide tab): the server's DVR, all of Plex's own channels, or
+/// one genre tab of them (its [`CloudTab::identifier`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Source {
+    #[default]
+    Dvr,
+    Plex,
+    PlexTab(String),
+}
+
+impl Source {
+    /// A lineup of Plex's own channels: played from the provider, never tuned.
+    pub fn is_cloud(&self) -> bool {
+        !matches!(self, Source::Dvr)
+    }
+    /// The `?genre=` its lineup is read with.
+    pub fn genre(&self) -> Option<&str> {
+        match self {
+            Source::PlexTab(g) => Some(g),
+            _ => None,
+        }
+    }
+}
+
+/// Who a read of Plex's own channels acts for: the seated profile's plex.tv identity, captured
+/// on the main thread (a worker never reads the session). Its `Debug` names no credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CloudAuth {
+    pub client_id: String,
+    pub credential: String,
+}
+
+impl std::fmt::Debug for CloudAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloudAuth(..)")
+    }
+}
+
+impl CloudAuth {
+    /// MAIN THREAD. `None` with no plex.tv identity (signed out, a managed profile with no token).
+    pub fn capture() -> Option<CloudAuth> {
+        crate::watchlist::WatchlistAuth::capture().map(|a| CloudAuth { client_id: a.client_id, credential: a.credential })
+    }
+    pub fn client(&self) -> plx_plex::plex::account::AccountClient {
+        plx_plex::plex::account::AccountClient::new(&self.client_id, Some(&self.credential))
     }
 }
 
@@ -279,6 +327,8 @@ pub struct Tuned {
     /// The channel row's label and the airing the page showed as on now (for the player's lines).
     pub channel: String,
     pub airing: Option<Airing>,
+    /// One of Plex's own channels: a provider's stream, no server tune behind it.
+    pub cloud: bool,
 }
 
 /// Where the page's last Watch press stands.
@@ -317,4 +367,16 @@ pub struct Snapshot {
     /// Guide art → its UltraBlur colours (corner-major: top-left, top-right, bottom-right,
     /// bottom-left), for the art that has them.
     pub blurs: HashMap<String, [[f32; 3]; 4]>,
+    /// Which lineup `channels` is (the guide tab shown).
+    pub source: Source,
+    /// The genre tabs of Plex's own channels (empty until read, or with no plex.tv identity).
+    pub cloud_tabs: Vec<CloudTab>,
+}
+
+impl Snapshot {
+    /// Can a channel of the lineup shown be watched? A DVR's only with a tuner behind it; Plex's
+    /// own channels always (they are streams).
+    pub fn can_watch(&self) -> bool {
+        self.source.is_cloud() || self.provider.as_ref().is_some_and(|p| p.tunable())
+    }
 }

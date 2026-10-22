@@ -3,6 +3,10 @@
     "value": "Live TV",
     "description": "Label of the Live TV tab in the top tab strip; the tab shows only when the server has Live TV & DVR."
   },
+  "live_tv.tab.plex_channels": {
+    "value": "Plex Channels",
+    "description": "Tab in the Live TV guide's tab row: Plex's own free streaming channels (as opposed to the server's DVR channels)."
+  },
   "live_tv.mode.guide": {
     "value": "Guide",
     "description": "Live TV page header pill: shows the channel guide (a grid of channels and programs over time)."

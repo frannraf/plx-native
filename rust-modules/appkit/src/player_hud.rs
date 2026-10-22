@@ -1991,7 +1991,8 @@ pub fn draw_hud(
                     crate::skip_pill::draw(row, pc, pr, focus == 1, measure);
                 }
                 ControlSlot::Discs => {
-                    let live = plx_media::route::is_live(ps);
+                    // a channel of the server's DVR (one of Plex's own has nothing to record it with)
+                    let live = plx_media::route::is_recordable_live(ps);
                     for i in 0..BTN_N {
                         let pop = row.scale(i);
                         let mut disc = TransportButton::new(i, Rect::new(btn_x(i), BTN_Y, BTN_S, BTN_S));

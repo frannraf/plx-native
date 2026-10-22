@@ -134,6 +134,7 @@ pub(super) fn providers(body: &Value) -> Vec<EpgProvider> {
             Some(EpgProvider {
                 dvr_key: text(p, "parentID"),
                 title: text(p, "title"),
+                server_name: text(p, "friendlyName"),
                 identifier,
                 recordable,
                 grid,
@@ -162,6 +163,8 @@ pub(super) fn channels(body: &Value) -> Vec<Channel> {
                 call_sign: { let cs = text(ch, "callSign"); if cs.is_empty() { text(ch, "shortTitle") } else { cs } },
                 thumb: text(ch, "thumb"),
                 hd: flag(ch, "isHd") || flag(ch, "hd"),
+                part_key: many(ch, "Media").into_iter().flat_map(|m| many(m, "Part")).map(|p| text(p, "key")).find(|k| !k.is_empty()).unwrap_or_default(),
+                drm: flag(ch, "drm") || many(ch, "Media").into_iter().any(|m| flag(m, "drm") || many(m, "Part").into_iter().any(|p| flag(p, "drm"))),
             })
         })
         .collect()
@@ -186,13 +189,39 @@ fn airing_meta(m: &Value) -> Airing {
             let cover = many(m, "Image").into_iter().find(|i| text(i, "type") == "coverPoster").map(|i| text(i, "url"));
             [cover.unwrap_or_default(), text(m, "grandparentThumb"), text(m, "thumb")].into_iter().find(|s| !s.is_empty()).unwrap_or_default()
         },
-        art: { let a = text(m, "art"); if a.is_empty() { text(m, "grandparentArt") } else { a } },
+        art: {
+            // a server's grid says art/grandparentArt; Plex's own channels say Image[type=background]
+            let image = |kind: &str| many(m, "Image").into_iter().find(|i| text(i, "type") == kind).map(|i| text(i, "url"));
+            [text(m, "art"), text(m, "grandparentArt"), image("background").unwrap_or_default(), image("coverArt").unwrap_or_default()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or_default()
+        },
         content_rating: text(m, "contentRating"),
         genres: many(m, "Genre").into_iter().map(|g| text(g, "tag")).filter(|t| !t.is_empty()).collect(),
         subscription_id: nonzero(text(m, "subscriptionID")),
         show_subscription_id: nonzero(text(m, "grandparentSubscriptionID")),
         ..Airing::default()
     }
+}
+
+/// The cloud provider's root → its genre tabs (`Feature type="grid"` → `GridChannelFilter[]`).
+pub(super) fn cloud_tabs(body: &Value) -> Vec<CloudTab> {
+    let Some(c) = container(body) else { return Vec::new() };
+    let mut providers = many(c, "MediaProvider");
+    if providers.is_empty() {
+        providers.push(c);
+    }
+    providers
+        .into_iter()
+        .flat_map(|p| many(p, "Feature"))
+        .filter(|f| text(f, "type") == "grid")
+        .flat_map(|f| many(f, "GridChannelFilter"))
+        .filter_map(|g| {
+            let (identifier, title) = (text(g, "identifier"), text(g, "title"));
+            (!identifier.is_empty() && !title.is_empty()).then_some(CloudTab { identifier, title })
+        })
+        .collect()
 }
 
 /// `GET /services/ultrablur/colors` → the four corners (object or array of one), corner-major:

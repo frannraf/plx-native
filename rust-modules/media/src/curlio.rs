@@ -1383,7 +1383,12 @@ impl CurlSource {
             }
             let why = plx_net::net::tls_failure_reason(self.easy, self.rc)
                 .unwrap_or_else(|| curl_why(self.rc).to_owned());
-            crate::player::log(&format!("curlio: transport failed rc={} — {why}", self.rc));
+            let [dns, tcp, tls, first, total] = plx_net::net::transfer_phases(self.easy);
+            let (errno, family) = plx_net::net::connect_failure(self.easy);
+            crate::player::log(&format!(
+                "curlio: transport failed rc={} — {why} (lookup {dns:.3}s connect {tcp:.3}s tls {tls:.3}s first byte {first:.3}s total {total:.2}s, status {}, dialled v{family} errno {errno})",
+                self.rc, self.xfer.status
+            ));
             return Err(OpenErr::Transport(self.rc));
         }
         if self.xfer.status == 0 {
@@ -1990,7 +1995,52 @@ fn resolve_entry_for(origin: &Origin) -> Result<Option<CString>, OpenErr> {
     if entry.is_none() && plx_net::net::refuse_name(origin.host(), plx_net::net::API.connect_s) {
         return Err(OpenErr::Local);
     }
+    let entry = entry.or_else(|| looked_up_entry(origin));
     entry.map(CString::new).transpose().map_err(|_| OpenErr::Local)
+}
+
+/// A cloud provider's stream is playing (Plex's own channels): names no pin covers are looked up
+/// here ([`looked_up_entry`]). Set with the provider's stream (`ff::set_provider_stream`).
+static RESOLVE_UNPINNED: AtomicBool = AtomicBool::new(false);
+
+/// See [`RESOLVE_UNPINNED`].
+pub(crate) fn set_resolve_unpinned(on: bool) {
+    RESOLVE_UNPINNED.store(on, Ordering::Release);
+}
+
+/// **For a cloud provider's stream only**: the `CURLOPT_RESOLVE` entry for a name no pin covers,
+/// from the system resolver, for THIS one easy handle (nothing is added to `net::resolve`, whose
+/// pins are plex.direct names that cannot become wrong). libcurl's own resolver, driven from this
+/// module's multi loop, never finished a lookup on the television: a provider's host, 2026-10-22,
+/// "lookup 0.00s … total 11.35s" — while the same name resolved in milliseconds through
+/// `getaddrinfo`. The hostname stays in the URL, so SNI and the certificate's name check are
+/// untouched. An IPv4 answer is preferred (the set's IPv6 is not known to route).
+fn looked_up_entry(origin: &Origin) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    if !RESOLVE_UNPINNED.load(Ordering::Acquire) || origin.host().parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let port = u16::try_from(origin.port()).ok()?;
+    let started = std::time::Instant::now();
+    let addrs: Vec<std::net::SocketAddr> = match (origin.host(), port).to_socket_addrs() {
+        Ok(a) => a.collect(),
+        Err(e) => {
+            crate::player::log(&format!("curlio: a provider host did not resolve ({:?}) in {} ms", e.kind(), started.elapsed().as_millis()));
+            return None;
+        }
+    };
+    crate::player::log(&format!(
+        "curlio: a provider host resolved to {} v4 / {} v6 in {} ms",
+        addrs.iter().filter(|a| a.is_ipv4()).count(),
+        addrs.iter().filter(|a| a.is_ipv6()).count(),
+        started.elapsed().as_millis()
+    ));
+    let addr = addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first())?;
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    Some(format!("{}:{}:{ip}", origin.host(), origin.port()))
 }
 
 /// One request of a redirect chain, and what is looked up by the host it dials. Built afresh for

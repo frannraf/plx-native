@@ -1,5 +1,6 @@
 {
   "live_tv.tab": "TV en direct",
+  "live_tv.tab.plex_channels": "Chaînes Plex",
   "live_tv.mode.guide": "Guide",
   "live_tv.mode.recordings": "Enregistrements",
   "live_tv.state.loading": "Chargement du guide…",

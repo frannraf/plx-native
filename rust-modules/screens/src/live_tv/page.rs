@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 use std::ffi::CString;
 
-use plx_data::live_tv::{Availability, Phase, TunePhase, WriteOp};
+use plx_data::live_tv::{Availability, Phase, Source, TunePhase, WriteOp};
 use plx_data::stores::live_tv::Write;
 use plx_machine::machine::{
     Canon, Cx, Delivery, Edge, Effects, Enter, EntryId, FocusKey, FocusTarget, Fx, GroupId, Handled, InputEvent,
@@ -43,6 +43,7 @@ pub const CONTENT: GroupId = GroupId(0);
 pub const HEAD: GroupId = GroupId(1);
 pub const PANEL: GroupId = GroupId(2);
 pub const RETRY_GROUP: GroupId = GroupId(3);
+pub const TABS: GroupId = GroupId(4);
 
 /// How long a notice stays up, ms of the tick clock.
 const NOTICE_MS: u32 = 5_000;
@@ -69,6 +70,8 @@ pub enum LiveTvOut {
     CancelTune,
     /// The page showed the tune's failure.
     DismissTuneFailure,
+    /// OK on a guide tab: show that lineup.
+    Source(Source),
     /// A DVR change.
     Write(Write),
     /// Try again on the failure read-out.
@@ -115,6 +118,11 @@ pub struct LiveTvScreen {
     wash: AmbientWash,
     /// The tick clock at the last tick (the wash's step).
     last_tick: Option<u32>,
+    /// Each guide tab's focus pill, 0 (a label) to 1 (the white pill): the one focus moves to
+    /// grows as the one it left shrinks.
+    tab_grow: Vec<plx_ui::Spring>,
+    /// How far the tab row has scrolled left to keep the focused tab on screen.
+    tab_scroll: plx_ui::Spring,
 }
 
 impl LiveTvScreen {
@@ -145,6 +153,8 @@ impl LiveTvScreen {
                 w
             },
             last_tick: None,
+            tab_grow: Vec::new(),
+            tab_scroll: plx_ui::Spring::at(0.0),
         }
     }
 
@@ -180,6 +190,11 @@ impl LiveTvScreen {
         self.fed = true;
         self.recs = model::rec_entries(&view.snap);
         self.rec_top = self.rec_top.min(self.recs.len().saturating_sub(1));
+        if view.snap.source != self.view.snap.source {
+            // another tab's lineup: its own rows, from the top
+            self.frame.row_top = 0;
+            self.last_cell = None;
+        }
         let n = view.channel_count();
         self.frame.row_top = self.frame.row_top.min(n.saturating_sub(1));
         self.view = view;
@@ -361,6 +376,14 @@ impl LiveTvScreen {
         if self.panel.is_some() {
             return Handled::Yes;
         }
+        if let Some(i) = model::tab_of(elem) {
+            if let Some(source) = model::tab_sources(&self.view.snap).get(i) {
+                if *source != self.view.snap.source {
+                    self.route(LiveTvOut::Source(source.clone()), fx);
+                }
+            }
+            return Handled::Yes;
+        }
         match elem {
             model::HEAD_GUIDE => self.set_mode(Mode::Guide, fx),
             model::HEAD_RECS => self.set_mode(Mode::Recordings, fx),
@@ -369,16 +392,17 @@ impl LiveTvScreen {
                 if let Some((row, slot)) = model::cell_of(elem) {
                     if slot == model::PLACEHOLDER {
                         // a row with no guide: OK watches the channel itself
-                        if self.view.snap.provider.as_ref().is_some_and(|p| p.tunable()) {
+                        if self.view.snap.can_watch() {
                             self.route(LiveTvOut::Watch { row, airing: None }, fx);
                         }
                     } else if let Some((_, airing)) = self.view.airing(self.frame.base, elem) {
                         // A show on now plays at once (recording it is the player's to offer); a
                         // later one opens its record choices.
-                        let tunable = self.view.snap.provider.as_ref().is_some_and(|p| p.tunable());
-                        if tunable && self.frame.now > 0 && airing.airs_at(self.frame.now) {
+                        if self.view.snap.can_watch() && self.frame.now > 0 && airing.airs_at(self.frame.now) {
                             let airing = airing.clone();
                             self.route(LiveTvOut::Watch { row, airing: Some(airing) }, fx);
+                        } else if self.view.snap.source.is_cloud() {
+                            // a Plex channel's later program: nothing to record it with
                         } else {
                             let target = Target::Airing { row, airing: airing.clone() };
                             self.open_panel(elem, target, fx);
@@ -467,6 +491,19 @@ impl LiveTvScreen {
         let target = self.wash_target();
         // decorative: the wash dissolving between programs moves no layout
         plx_machine::idle::decorative(|| self.wash.step(target, AmbientWash::K, dt));
+        let tabs = model::tab_sources(&self.view.snap).len();
+        self.tab_grow.resize(tabs, plx_ui::Spring::at(0.0));
+        let focused_tab = self.focus.and_then(model::tab_of);
+        for (i, g) in self.tab_grow.iter_mut().enumerate() {
+            let to = if focused_tab == Some(i) { 1.0 } else { 0.0 };
+            if !g.land(to, dt) {
+                g.step(to, TAB_K, dt);
+            }
+        }
+        let scroll = self.tab_scroll_target(cx.measure);
+        if !self.tab_scroll.land(scroll, dt) {
+            self.tab_scroll.step(scroll, TAB_K, dt);
+        }
         if let Some((_, until)) = &mut self.notice {
             let at = *until.get_or_insert(ms.wrapping_add(NOTICE_MS));
             // the tick clock wraps: gone once `ms` passes `at`
@@ -490,6 +527,92 @@ impl LiveTvScreen {
                 Mode::Recordings => model::REC_BASE,
             };
             self.seat_elem(elem, fx);
+        }
+    }
+
+    /// Is the tab row up? In the Guide, once Plex's own channels answered (with only the DVR
+    /// there is nothing to switch to).
+    fn tabs_shown(&self) -> bool {
+        self.mode == Mode::Guide
+            && self.view.snap.availability == Availability::Available
+            && !self.view.snap.cloud_tabs.is_empty()
+            && self.panel.is_none()
+    }
+
+    /// Tab `i`'s words.
+    fn tab_label(&self, source: &Source) -> String {
+        match source {
+            Source::Dvr => self
+                .view
+                .snap
+                .provider
+                .as_ref()
+                .map(|p| if p.server_name.is_empty() { p.title.clone() } else { p.server_name.clone() })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| msg::live_tv_tab().to_string()),
+            Source::Plex => msg::live_tv_tab_plex_channels().to_string(),
+            Source::PlexTab(id) => self.view.snap.cloud_tabs.iter().find(|t| &t.identifier == id).map(|t| t.title.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// The tabs' rects at rest (unscrolled): each its words plus padding, a wider gap after
+    /// Plex Channels (the genres that follow are its own).
+    fn tab_rects(&self, measure: &dyn plx_machine::machine::Measure) -> Vec<Rect> {
+        let mut x = MARGIN_X;
+        model::tab_sources(&self.view.snap)
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let w = measure.width_str(&self.tab_label(s), theme::size::BODY, true) + 2.0 * TAB_PAD;
+                let r = Rect::new(x, geom::TABS_Y, w, geom::TABS_H);
+                x += w + if i == 1 { TAB_SPLIT } else { TAB_GAP };
+                r
+            })
+            .collect()
+    }
+
+    /// How far the row scrolls so the focused tab stands inside the screen's margins.
+    fn tab_scroll_target(&self, measure: &dyn plx_machine::machine::Measure) -> f32 {
+        let Some(i) = self.focus.and_then(model::tab_of) else { return self.tab_scroll.pos };
+        let rects = self.tab_rects(measure);
+        let Some(r) = rects.get(i) else { return 0.0 };
+        let right = SCR_W - MARGIN_X;
+        let mut s = self.tab_scroll.pos;
+        if r.x + r.w - s > right {
+            s = r.x + r.w - right;
+        }
+        if r.x - s < MARGIN_X {
+            s = r.x - MARGIN_X;
+        }
+        s.max(0.0)
+    }
+
+    /// The tab row: the tab shown underlined; the focused one in a white pill that grows in
+    /// as focus arrives and shrinks away as it leaves (its spring, [`Self::tab_grow`]).
+    fn draw_tabs<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
+        let sources = model::tab_sources(&self.view.snap);
+        let rects = self.tab_rects(f.measure);
+        let scroll = self.tab_scroll.pos;
+        let clip = p.clipped(Rect::new(MARGIN_X - TAB_PAD, geom::TABS_Y - 8.0, SCR_W - 2.0 * MARGIN_X + 2.0 * TAB_PAD, geom::TABS_H + 20.0));
+        for (i, (source, at)) in sources.iter().zip(&rects).enumerate() {
+            let r = Rect::new(at.x - scroll, at.y, at.w, at.h);
+            let g = self.tab_grow.get(i).map_or(0.0, |s| s.pos.clamp(0.0, 1.0));
+            if g > 0.01 {
+                let (w, h) = (r.w * (0.6 + 0.4 * g), r.h * (0.7 + 0.3 * g));
+                let pill = Rect::new(r.cx() - w * 0.5, r.y + (r.h - h) * 0.5, w, h);
+                clip.rrect(pill, h * 0.5, h * 0.5, theme::with_a(theme::ACCENT, g));
+            }
+            let ink = theme::mix(theme::TEXT_PRIMARY, theme::ACCENT_INK, g);
+            if let Ok(c) = CString::new(self.tab_label(source)) {
+                Label::new(c.as_ptr(), theme::size::BODY, ink).bold().h(HAlign::Center).v(VAlign::Middle).draw(clip, r);
+            }
+            if *source == self.view.snap.source && g < 0.5 {
+                clip.rrect(Rect::new(r.cx() - r.w * 0.3, r.y + r.h + 4.0, r.w * 0.6, 4.0), 2.0, 2.0, theme::with_a(theme::TEXT_PRIMARY, 1.0 - 2.0 * g));
+            }
+            if i == 1 {
+                clip.rrect(Rect::new(r.x + r.w + TAB_SPLIT * 0.5 - 1.0, r.y + 12.0, 2.0, r.h - 24.0), 1.0, 1.0, theme::TEXT_SEPARATOR);
+            }
+            f.stop(p, stop(self.key(model::TAB_BASE + i as u32), r));
         }
     }
 
@@ -1192,6 +1315,13 @@ const ART_FADE_STRIP: f32 = 10.0;
 /// A cell this wide shows its program's art; this wide, its episode title beside its times.
 const POSTER_MIN_CELL_W: f32 = 300.0;
 const EPISODE_MIN_CELL_W: f32 = 560.0;
+/// The tab row: padding round a tab's words, the gap between tabs, the wider one after Plex
+/// Channels, and the springs' stiffness (quick: a tab hop, not a page change).
+const TAB_PAD: f32 = 26.0;
+const TAB_GAP: f32 = 6.0;
+const TAB_SPLIT: f32 = 34.0;
+const TAB_K: f32 = 260.0;
+
 /// A cell this wide wears a premiere's NEW.
 const NEW_MIN_CELL_W: f32 = 240.0;
 
@@ -1383,6 +1513,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             return;
         }
         out.push(spec(HEAD, GroupKind::Row { wrap: false }, 2, Rect::new(MARGIN_X, geom::HEAD_Y, 2.0 * geom::PILL_W + geom::PILL_GAP, geom::HEAD_H)));
+        if self.tabs_shown() {
+            let n = model::tab_sources(&self.view.snap).len();
+            out.push(spec(TABS, GroupKind::Row { wrap: false }, n, Rect::new(MARGIN_X, geom::TABS_Y, SCR_W - 2.0 * MARGIN_X, geom::TABS_H)));
+        }
         if self.shows_retry() {
             out.push(spec(RETRY_GROUP, GroupKind::Row { wrap: false }, 1, retry_rect()));
         }
@@ -1412,6 +1546,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         match e {
             model::HEAD_GUIDE | model::HEAD_RECS => Some(HEAD),
             model::RETRY => self.shows_retry().then_some(RETRY_GROUP),
+            _ if model::tab_of(e).is_some() => self.tabs_shown().then_some(TABS),
             _ if model::cell_of(e).is_some() => (self.mode == Mode::Guide && self.has_content()).then_some(CONTENT),
             _ if model::rec_of(e).is_some() => (self.mode == Mode::Recordings && self.has_content()).then_some(CONTENT),
             _ => None,
@@ -1435,6 +1570,14 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             model::HEAD_GUIDE | model::HEAD_RECS | model::RETRY => return Step::Edge,
             _ => {}
         }
+        if let Some(i) = model::tab_of(e) {
+            let n = model::tab_sources(&self.view.snap).len();
+            return match dir {
+                Dir::Left if i > 0 => to(e - 1),
+                Dir::Right if i + 1 < n => to(e + 1),
+                _ => Step::Edge,
+            };
+        }
         if model::cell_of(e).is_some() {
             return model::guide_neighbour(&self.view, &self.frame, e, dir).map_or(Step::Edge, to);
         }
@@ -1448,7 +1591,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         Step::Edge
     }
 
-    fn place(&self, elem: &u32, _cx: &Cx<'_, H>, _at: At) -> Option<Placed> {
+    fn place(&self, elem: &u32, cx: &Cx<'_, H>, _at: At) -> Option<Placed> {
         let e = *elem;
         let placed = |rect: Rect, index: usize| Placed { rect, rest_rect: rect, clip: Rect::FULL, index: Some(index as u32) };
         if let Some(i) = model::action_of(e) {
@@ -1460,6 +1603,11 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             model::HEAD_RECS => return Some(placed(head_rect(1), 1)),
             model::RETRY => return Some(placed(retry_rect(), 0)),
             _ => {}
+        }
+        if let Some(i) = model::tab_of(e) {
+            let at = *self.tab_rects(cx.measure).get(i)?;
+            let s = self.tab_scroll.pos;
+            return Some(placed(Rect::new(at.x - s, at.y, at.w, at.h), i));
         }
         if let Some((row, _)) = model::cell_of(e) {
             return model::elem_rect(&self.view, &self.frame, e).map(|r| placed(r, row));
@@ -1490,6 +1638,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             model::HEAD_GUIDE | model::HEAD_RECS => return want,
             model::RETRY => return if self.shows_retry() { want } else { key(self.mode_pill()) },
             _ => {}
+        }
+        if let Some(i) = model::tab_of(e) {
+            let n = model::tab_sources(&self.view.snap).len();
+            return if self.tabs_shown() && i < n { want } else { key(self.mode_pill()) };
         }
         if let Some((row, slot)) = model::cell_of(e) {
             if self.mode != Mode::Guide || !self.has_content() {
@@ -1523,6 +1675,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             PANEL => key(model::ACTION_BASE),
             RETRY_GROUP => key(model::RETRY),
             HEAD => key(self.mode_pill()),
+            TABS => {
+                let at = model::tab_sources(&self.view.snap).iter().position(|s| *s == self.view.snap.source).unwrap_or(0);
+                key(model::TAB_BASE + at as u32)
+            }
             _ => match self.mode {
                 Mode::Guide => {
                     let fr = &self.frame;
@@ -1562,6 +1718,9 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
         let p = f.painter.alpha(f.page_alpha);
         self.draw_ground(p);
         self.draw_head(f, p);
+        if self.tabs_shown() {
+            self.draw_tabs(f, p);
+        }
         match self.readout() {
             Some(r) => self.draw_readout(f, p, r),
             None => match self.mode {
@@ -1590,8 +1749,15 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
         out.push(Link { from: strip, dir: Dir::Down, to: HEAD });
         out.push(Link { from: HEAD, dir: Dir::Up, to: strip });
         let below = if self.shows_retry() { RETRY_GROUP } else { CONTENT };
-        out.push(Link { from: HEAD, dir: Dir::Down, to: below });
-        out.push(Link { from: below, dir: Dir::Up, to: HEAD });
+        let over = if self.tabs_shown() {
+            out.push(Link { from: HEAD, dir: Dir::Down, to: TABS });
+            out.push(Link { from: TABS, dir: Dir::Up, to: HEAD });
+            TABS
+        } else {
+            HEAD
+        };
+        out.push(Link { from: over, dir: Dir::Down, to: below });
+        out.push(Link { from: below, dir: Dir::Up, to: over });
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)

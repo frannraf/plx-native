@@ -1,5 +1,6 @@
 {
   "live_tv.tab": "Live-TV",
+  "live_tv.tab.plex_channels": "Plex-Sender",
   "live_tv.mode.guide": "Programm",
   "live_tv.mode.recordings": "Aufnahmen",
   "live_tv.state.loading": "Programm wird geladen …",

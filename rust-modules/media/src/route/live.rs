@@ -38,6 +38,8 @@ pub struct LiveInfo {
     /// The program on air when tuned, epoch seconds (0 when unknown).
     pub begins_at: i64,
     pub ends_at: i64,
+    /// One of Plex's own channels (a provider's stream): nothing the server's DVR could record.
+    pub provider: bool,
 }
 
 /// Everything [`install_live`] needs: what was tuned, and the stream it was turned into.
@@ -60,6 +62,9 @@ pub struct LiveRoute {
     /// The encode's frame rate (0 = unknown: the Load's default envelope).
     pub fps: f64,
     pub info: LiveInfo,
+    /// A cloud provider's stream (Plex's own channels): no server session to keep alive or
+    /// release, and its HLS is read in the provider's shape (`ff::PROVIDER_STREAM`).
+    pub provider: bool,
 }
 
 /// The tuner and encoder a live playback holds. Dropping it releases both, once.
@@ -71,6 +76,8 @@ pub struct LiveLease {
     encoder_session: String,
     keepalive_stop: Arc<AtomicBool>,
     released: bool,
+    /// A provider's stream: nothing on the server to release.
+    provider: bool,
 }
 
 impl std::fmt::Debug for LiveLease {
@@ -107,7 +114,12 @@ impl LiveLease {
         // Whatever drops a lease (a stop, a reset, a plan assigned over the session), the next
         // stream the demuxer opens is not this channel's: never a library stream read as live.
         crate::ff::set_live_stream(false);
+        crate::ff::set_provider_stream(false);
         RECORD_ASKED.store(false, Ordering::Relaxed);
+        if self.provider {
+            crate::player::log("livetv: a provider's channel ends (nothing to release)");
+            return;
+        }
         let (sid, sub, key, rk, enc) = (
             self.sid,
             std::mem::take(&mut self.subscription_id),
@@ -179,6 +191,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         encoder_session: route.encoder_session.clone(),
         keepalive_stop: Arc::clone(&stop),
         released: false,
+        provider: route.provider,
     };
     super::decision::reset_for_live(ps);
     if !super::decision::set_stream_declaration(
@@ -198,6 +211,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
     }
     super::decision::install_live_lease(ps, lease, route.info.clone(), &route.url);
     crate::ff::set_live_stream(true);
+    crate::ff::set_provider_stream(route.provider);
     crate::player::log(&format!(
         "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, keepalive every {}s",
         route.video_codec,
@@ -208,7 +222,9 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         if route.subscription_id.is_empty() { "none" } else { "held" },
         KEEPALIVE_S
     ));
-    start_keepalive(route.sid, route.key, route.rating_key, route.encoder_session, stop);
+    if !route.provider {
+        start_keepalive(route.sid, route.key, route.rating_key, route.encoder_session, stop);
+    }
     true
 }
 
@@ -251,6 +267,11 @@ pub fn is_live(ps: &PlaybackSession) -> bool {
     super::decision::live_info(ps).is_some()
 }
 
+/// Is it a channel of the server's DVR (one its record disc can record)? Not one of Plex's own.
+pub fn is_recordable_live(ps: &PlaybackSession) -> bool {
+    super::decision::live_info(ps).is_some_and(|i| !i.provider)
+}
+
 /// At process exit: wait (bounded) for release workers already running, so a shutdown right after
 /// leaving a channel still frees the tuner.
 pub fn drain_live_releases() {
@@ -275,6 +296,7 @@ mod tests {
             encoder_session: "enc".into(),
             keepalive_stop: Arc::clone(&stop),
             released: false,
+            provider: false,
         };
         lease.release();
         assert!(lease.released && stop.load(Ordering::Acquire), "the keepalive is told to stop");

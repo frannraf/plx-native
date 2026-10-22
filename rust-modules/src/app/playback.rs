@@ -1219,7 +1219,7 @@ pub(crate) unsafe fn activate_player_row(
             pages,
             bridge,
         );
-    } else if btn == plx_appkit::player_hud::BTN_RECORD && plx_media::route::is_live(ps) {
+    } else if btn == plx_appkit::player_hud::BTN_RECORD && plx_media::route::is_recordable_live(ps) {
         // a live channel's middle disc records what is on now
         bridge.live_tv_record_playing();
     } else if btn == plx_appkit::player_hud::BTN_MORE {

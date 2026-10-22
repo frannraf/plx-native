@@ -1,5 +1,6 @@
 {
   "live_tv.tab": "Élő TV",
+  "live_tv.tab.plex_channels": "Plex-csatornák",
   "live_tv.mode.guide": "Műsorújság",
   "live_tv.mode.recordings": "Felvételek",
   "live_tv.state.loading": "Műsorújság betöltése…",

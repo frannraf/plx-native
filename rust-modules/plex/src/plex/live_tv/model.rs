@@ -13,6 +13,8 @@ pub struct EpgProvider {
     /// Empty when the server did not say, and then nothing on this provider can be tuned.
     pub dvr_key: String,
     pub title: String,
+    /// The server's own name (`friendlyName`): what the guide's tab for this DVR reads.
+    pub server_name: String,
     /// `Feature type="subscribe" flavor="record"`: airings of this provider can be recorded.
     pub recordable: bool,
     /// `Feature type="grid"`: the provider serves a time grid (the guide).
@@ -40,6 +42,11 @@ pub struct Channel {
     pub call_sign: String,
     pub thumb: String,
     pub hd: bool,
+    /// A Plex channel's HLS (`Media[0].Part[0].key`, a path on the cloud provider); empty on a
+    /// server's DVR lineup, whose channels are tuned instead.
+    pub part_key: String,
+    /// The channel needs DRM (Widevine), which this app does not have.
+    pub drm: bool,
 }
 
 impl Channel {
@@ -47,6 +54,15 @@ impl Channel {
     pub fn label(&self) -> &str {
         if self.call_sign.is_empty() { &self.title } else { &self.call_sign }
     }
+}
+
+/// One tab of Plex's own channels (the cloud provider's `GridChannelFilter`): a genre the lineup
+/// can be filtered by, as the guide's tab row shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CloudTab {
+    /// What `?genre=` takes.
+    pub identifier: String,
+    pub title: String,
 }
 
 /// One airing: a program on a channel between two wall-clock instants (`Media.beginsAt` /

@@ -5,6 +5,10 @@
 //! assembled before they reach the demuxer (encryption, byte ranges, fMP4 maps and
 //! discontinuities). URI resolution is also part of the parser: every child stays on the source
 //! PMS origin, so a playlist cannot turn the media worker into an arbitrary URL fetcher.
+//!
+//! One other shape is read on request, [`Shape::Provider`]: a cloud provider's live stream (Plex's
+//! own channels), whose master lists several variants on a CDN and whose media playlists splice
+//! ads in with discontinuities. Encryption, byte ranges and fMP4 maps stay refused there too.
 use crate::abr::MediaTimeMs;
 use plx_plex::plex::{origin, Origin};
 use std::collections::BTreeMap;
@@ -25,7 +29,25 @@ pub struct Resource {
 #[derive(Clone, PartialEq, Eq)]
 pub struct InheritedAuth {
     token_pair: String,
+    /// The master's origin: the only one the credential is ever sent to.
+    origin: Origin,
 }
+
+/// Which HLS shape a playlist is read as. [`Shape::Pms`] is this module's contract (its doc).
+/// [`Shape::Provider`] is a cloud provider's live stream: it also takes a master with several
+/// variants (the richest up to 1080 lines is played), children on another https origin (the
+/// credential stays with the master's: [`InheritedAuth::request_path`]), a discontinuity between
+/// segments (each segment's timestamps start at its boundary anyway: [`SegmentTimeline`]), and
+/// tags it does not know (an ad marker).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shape {
+    #[default]
+    Pms,
+    Provider,
+}
+
+/// The tallest picture a provider variant is chosen at.
+const PROVIDER_MAX_LINES: u32 = 1_080;
 
 fn is_token_pair(pair: &str) -> bool {
     pair.split_once('=')
@@ -55,12 +77,17 @@ impl InheritedAuth {
         }
         Ok(Self {
             token_pair: token_pair.to_owned(),
+            origin: master.origin.clone(),
         })
     }
 
     /// A request path for the same-origin transport. A playlist may repeat the route credential,
     /// but it may not replace it with another value.
     pub fn request_path(&self, resource: &Resource) -> Result<String, Error> {
+        if resource.origin != self.origin {
+            // another origin (a provider's CDN): the credential is the master origin's alone
+            return Ok(resource.path.clone());
+        }
         if let Some((_, query)) = resource.path.split_once('?') {
             let mut found = query.split('&').filter(|pair| is_token_pair(pair));
             if let Some(pair) = found.next() {
@@ -197,6 +224,11 @@ impl Resource {
     /// Resolve one playlist URI. Relative and root-relative references inherit the base origin;
     /// an absolute HTTP(S) reference is accepted only when its parsed origin is exactly equal.
     pub fn resolve(&self, reference: &str) -> Result<Self, Error> {
+        self.resolve_as(reference, Shape::Pms)
+    }
+
+    /// [`Self::resolve`] for `shape`: a provider's child may stand on another https origin.
+    pub fn resolve_as(&self, reference: &str, shape: Shape) -> Result<Self, Error> {
         validate_uri_text(reference)?;
         if reference.is_empty() || reference.starts_with('?') {
             return Err(Error::InvalidUri("URI has no path"));
@@ -211,7 +243,8 @@ impl Resource {
             }
             let child_origin =
                 Origin::parse(reference).ok_or(Error::InvalidUri("malformed absolute URI"))?;
-            if child_origin != self.origin {
+            let elsewhere_allowed = shape == Shape::Provider && reference.starts_with("https://");
+            if child_origin != self.origin && !elsewhere_allowed {
                 return Err(Error::CrossOrigin);
             }
             let (_, path) = origin::split(reference);
@@ -467,11 +500,19 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Error> {
+    parse_master_as(Shape::Pms, source, text)
+}
+
+/// [`parse_master`] for `shape`. A provider's master may list several variants: the one with
+/// the most bandwidth at no more than [`PROVIDER_MAX_LINES`] is played (else the leanest).
+pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<MasterPlaylist, Error> {
     let lines = playlist_lines(text)?;
     let mut version = None;
     let mut independent_segments = false;
     let mut pending_bandwidth = None;
+    let mut pending_lines: Option<u32> = None;
     let mut variant = None;
+    let mut candidates: Vec<(Variant, Option<u32>)> = Vec::new();
 
     for (line_no, line) in lines.into_iter().skip(1) {
         if line.is_empty() {
@@ -492,10 +533,16 @@ pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Err
                 );
             }
             if let Some(value) = line.strip_prefix("#EXT-X-STREAM-INF:") {
-                if variant.is_some() {
+                if variant.is_some() && shape == Shape::Pms {
                     return Err(Error::MultipleVariants);
                 }
                 pending_bandwidth = Some(parse_variant_bandwidth(value, line_no)?);
+                pending_lines = value
+                    .split("RESOLUTION=")
+                    .nth(1)
+                    .and_then(|r| r.split(',').next())
+                    .and_then(|r| r.split_once('x'))
+                    .and_then(|(_, h)| h.trim().parse().ok());
             } else if let Some(value) = line.strip_prefix("#EXT-X-VERSION:") {
                 set_once(
                     &mut version,
@@ -513,9 +560,9 @@ pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Err
                 }
             } else if line == "#EXTM3U" {
                 return malformed(line_no, "duplicate header");
-            } else if let Some(feature) = forbidden_feature(line) {
+            } else if let Some(feature) = forbidden_feature(line, shape) {
                 return Err(Error::UnsupportedFeature(feature));
-            } else if line.starts_with("#EXT") {
+            } else if line.starts_with("#EXT") && shape == Shape::Pms {
                 return Err(Error::UnsupportedTag(tag_name(line).to_owned()));
             }
             continue;
@@ -525,17 +572,28 @@ pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Err
             line: line_no,
             reason: "URI has no EXT-X-STREAM-INF",
         })?;
-        if variant.is_some() {
+        if variant.is_some() && shape == Shape::Pms {
             return Err(Error::MultipleVariants);
         }
-        let resource = source.resolve(line)?;
+        let resource = source.resolve_as(line, shape)?;
         if !path_without_query(&resource.path).ends_with(".m3u8") {
             return Err(Error::ChildIsNotPlaylist);
         }
-        variant = Some(Variant {
+        let found = Variant {
             resource,
             bandwidth,
-        });
+        };
+        candidates.push((found.clone(), pending_lines.take()));
+        variant = Some(found);
+    }
+    if shape == Shape::Provider && candidates.len() > 1 {
+        let fits = |lines: &Option<u32>| lines.is_none_or(|l| l <= PROVIDER_MAX_LINES);
+        variant = candidates
+            .iter()
+            .filter(|(_, lines)| fits(lines))
+            .max_by_key(|(v, _)| v.bandwidth)
+            .or_else(|| candidates.iter().min_by_key(|(v, _)| v.bandwidth))
+            .map(|(v, _)| v.clone());
     }
 
     if pending_bandwidth.is_some() {
@@ -552,6 +610,12 @@ pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Err
 }
 
 pub fn parse_media(source: &Resource, text: &str) -> Result<MediaPlaylist, Error> {
+    parse_media_as(Shape::Pms, source, text)
+}
+
+/// [`parse_media`] for `shape`. A provider's playlist may splice in discontinuities and tags this
+/// reader has no use for (ad markers); both are passed over.
+pub fn parse_media_as(shape: Shape, source: &Resource, text: &str) -> Result<MediaPlaylist, Error> {
     let lines = playlist_lines(text)?;
     let mut version = None;
     let mut target_duration = None;
@@ -581,6 +645,9 @@ pub fn parse_media(source: &Resource, text: &str) -> Result<MediaPlaylist, Error
 
         if line.starts_with('#') {
             if pending_duration.is_some() {
+                if shape == Shape::Provider && !line.starts_with("#EXTINF") {
+                    continue;
+                }
                 return malformed(line_no, "segment URI must immediately follow EXTINF");
             }
             if let Some(value) = line.strip_prefix("#EXT-X-VERSION:") {
@@ -661,9 +728,9 @@ pub fn parse_media(source: &Resource, text: &str) -> Result<MediaPlaylist, Error
                 end_list = true;
             } else if line == "#EXTM3U" {
                 return malformed(line_no, "duplicate header");
-            } else if let Some(feature) = forbidden_feature(line) {
+            } else if let Some(feature) = forbidden_feature(line, shape) {
                 return Err(Error::UnsupportedFeature(feature));
-            } else if line.starts_with("#EXT") {
+            } else if line.starts_with("#EXT") && shape == Shape::Pms {
                 return Err(Error::UnsupportedTag(tag_name(line).to_owned()));
             }
             continue;
@@ -677,7 +744,7 @@ pub fn parse_media(source: &Resource, text: &str) -> Result<MediaPlaylist, Error
             .expect("EXTINF gate established the media sequence")
             .checked_add(segments.len() as u64)
             .ok_or(Error::SequenceOverflow)?;
-        let resource = source.resolve(line)?;
+        let resource = source.resolve_as(line, shape)?;
         if !path_without_query(&resource.path)
             .to_ascii_lowercase()
             .ends_with(".ts")
@@ -936,8 +1003,9 @@ fn set_once<T>(
     Ok(())
 }
 
-fn forbidden_feature(line: &str) -> Option<&'static str> {
+fn forbidden_feature(line: &str, shape: Shape) -> Option<&'static str> {
     match tag_name(line) {
+        "#EXT-X-DISCONTINUITY" | "#EXT-X-DISCONTINUITY-SEQUENCE" if shape == Shape::Provider => None,
         "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => Some("encrypted segments"),
         "#EXT-X-BYTERANGE" => Some("byte-range segments"),
         "#EXT-X-MAP" => Some("fMP4 initialization map"),
@@ -1048,6 +1116,47 @@ fn path_without_query(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider's master lists several variants on a CDN; the richest up to 1080 lines is played,
+    /// and the account credential never travels to the CDN.
+    #[test]
+    fn a_provider_master_picks_a_variant_and_keeps_the_credential_home() {
+        let master = Resource::new(Origin::parse("https://epg.example").unwrap(), "/library/parts/c.m3u8?X-Plex-Token=secret").unwrap();
+        let text = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS=\"avc1.64001e,mp4a.40.2\"\nhttps://cdn.example/v/360.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\nhttps://cdn.example/v/1080.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=3840x2160,CODECS=\"avc1.640033,mp4a.40.2\"\nhttps://cdn.example/v/2160.m3u8\n",
+        );
+        assert!(parse_master(&master, text).is_err(), "a server's shape refuses a CDN's several variants");
+        let parsed = parse_master_as(Shape::Provider, &master, text).unwrap();
+        assert_eq!(parsed.variant.bandwidth, 6_000_000, "the richest at no more than 1080 lines");
+        assert_eq!(parsed.variant.resource.path, "/v/1080.m3u8");
+        let auth = InheritedAuth::capture(&master).unwrap();
+        let child = auth.request_path(&parsed.variant.resource).unwrap();
+        assert!(!child.contains("secret"), "the CDN never sees the credential: {child}");
+        assert!(auth.request_path(&master).unwrap().contains("X-Plex-Token=secret"), "the master's origin still does");
+    }
+
+    /// A provider's media playlist splices ads in with discontinuities and markers this reader has
+    /// no use for; a server's shape still refuses both.
+    #[test]
+    fn a_provider_media_playlist_passes_discontinuities_and_ad_markers() {
+        let src = Resource::new(Origin::parse("https://cdn.example").unwrap(), "/v/1080.m3u8").unwrap();
+        let text = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:40\n",
+            "#EXTINF:6.006,\nhttps://cdn.example/v/s40.ts\n#EXT-X-CUE-OUT:30\n#EXT-X-DISCONTINUITY\n",
+            "#EXTINF:6.006,\nhttps://ads.example/a/s1.ts?x=1\n",
+        );
+        assert!(parse_media(&src, text).is_err(), "a server's shape refuses a discontinuity and a foreign host");
+        let parsed = parse_media_as(Shape::Provider, &src, text).unwrap();
+        assert_eq!(parsed.segments.len(), 2);
+        assert_eq!(parsed.segments[1].sequence, 41);
+        let keyed = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\ns.ts\n";
+        assert_eq!(parse_media_as(Shape::Provider, &src, keyed), Err(Error::UnsupportedFeature("encrypted segments")));
+        let http = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";
+        assert_eq!(parse_media_as(Shape::Provider, &src, http).map(|_| ()), Err(Error::CrossOrigin), "another origin only over https");
+    }
 
     fn source(path: &str) -> Resource {
         Resource::new(Origin::http("192.0.2.10", 32400), path).unwrap()

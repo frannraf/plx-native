@@ -5130,6 +5130,21 @@ pub(crate) fn set_live_stream(live: bool) {
     LIVE_STREAM.store(live, Ordering::Release);
 }
 
+/// **The live stream now playing is a cloud provider's** (Plex's own channels): its playlists are
+/// read as [`crate::hls::Shape::Provider`] and it starts near the live edge. Set and cleared
+/// with [`LIVE_STREAM`] by `route::live`; read once when a cursor opens.
+static PROVIDER_STREAM: AtomicBool = AtomicBool::new(false);
+
+/// See [`PROVIDER_STREAM`].
+pub(crate) fn set_provider_stream(provider: bool) {
+    PROVIDER_STREAM.store(provider, Ordering::Release);
+    crate::curlio::set_resolve_unpinned(provider);
+}
+
+/// Segments behind a provider's live edge a cursor starts at: a provider's window is a minute or
+/// more, and its first segment would play that far behind live.
+const PROVIDER_EDGE_SEGMENTS: usize = 3;
+
 /// Refreshes of a live playlist that may fail in a row before the stream is given up.
 const LIVE_REFRESH_RETRIES: u32 = 5;
 /// How long a live playlist may go without a new segment before the tune is over (a tuner lost,
@@ -5139,6 +5154,8 @@ const LIVE_STALL_MS: u64 = 60_000;
 struct HlsCursor {
     /// A live channel's never-ending playlist ([`LIVE_STREAM`]).
     live: bool,
+    /// The shape its playlists are read as ([`PROVIDER_STREAM`]).
+    shape: crate::hls::Shape,
     /// Milliseconds of refreshes since the last new segment (live stall detection).
     idle_ms: u64,
     /// Failed refreshes in a row (live only).
@@ -5191,16 +5208,19 @@ fn hls_cursor_open(
     // Parsed against where the fetch LANDED: a redirected master's children are relative to it.
     let (master_text, master_ms, master_landed) =
         hls_fetch_text(&master_resource, &auth, aq, net, reserve)?;
-    let master = crate::hls::parse_master(&master_landed, &master_text).map_err(|e| {
+    let shape = if PROVIDER_STREAM.load(Ordering::Acquire) { crate::hls::Shape::Provider } else { crate::hls::Shape::Pms };
+    let master = crate::hls::parse_master_as(shape, &master_landed, &master_text).map_err(|e| {
         crate::player::log(&format!("hls: master rejected: {e}"));
         HlsExit::Failed("HLS master rejected")
     })?;
     crate::player::log(&format!(
-        "hls: master one-variant bandwidth={} fetch_ms={master_ms}",
+        "hls: master {} bandwidth={} fetch_ms={master_ms}",
+        if shape == crate::hls::Shape::Provider { "provider variant" } else { "one-variant" },
         master.variant.bandwidth
     ));
     Ok(HlsCursor {
         live: LIVE_STREAM.load(Ordering::Acquire),
+        shape,
         idle_ms: 0,
         refresh_failures: 0,
         last_sequence: None,
@@ -5247,14 +5267,18 @@ fn hls_cursor_next(
             }
             Err(e) => return Err(e),
         };
-        let media = crate::hls::parse_media(&media_landed, &media_text).map_err(|e| {
+        let media = crate::hls::parse_media_as(cursor.shape, &media_landed, &media_text).map_err(|e| {
             crate::player::log(&format!("hls: media rejected: {e}"));
             HlsExit::Failed("HLS media playlist rejected")
         })?;
         cursor.target_duration_secs = media.target_duration_secs;
-        let start_index = media
-            .preferred_start_index()
-            .map_err(|_| HlsExit::Failed("HLS start offset is outside the supported timeline"))?;
+        let start_index = if cursor.shape == crate::hls::Shape::Provider && cursor.live && media.start_offset_micros.is_none() {
+            media.segments.len().saturating_sub(PROVIDER_EDGE_SEGMENTS)
+        } else {
+            media
+                .preferred_start_index()
+                .map_err(|_| HlsExit::Failed("HLS start offset is outside the supported timeline"))?
+        };
         let total_ns = i64::try_from(
             media
                 .total_duration()

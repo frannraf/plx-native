@@ -104,7 +104,59 @@ plx_base::dynlib! {
     fn curl_easy_setopt_long = "curl_easy_setopt"(handle: *mut CURL, option: c_int, ..., v: c_long) -> c_int;
     fn curl_easy_getinfo_long = "curl_easy_getinfo"(handle: *mut CURL, info: c_int, ..., out: *mut c_long) -> c_int;
     fn curl_easy_getinfo_ptr = "curl_easy_getinfo"(handle: *mut CURL, info: c_int, ..., out: *mut *const c_void) -> c_int;
+    fn curl_easy_getinfo_double = "curl_easy_getinfo"(handle: *mut CURL, info: c_int, ..., out: *mut f64) -> c_int;
 }}
+
+// `CURLINFO_DOUBLE` (0x300000) ids of a transfer's phase clocks, seconds from its start.
+const CURLINFO_TOTAL_TIME: c_int = 0x30_0003;
+const CURLINFO_NAMELOOKUP_TIME: c_int = 0x30_0004;
+const CURLINFO_CONNECT_TIME: c_int = 0x30_0005;
+const CURLINFO_STARTTRANSFER_TIME: c_int = 0x30_0011;
+const CURLINFO_APPCONNECT_TIME: c_int = 0x30_0021;
+
+/// `CURLINFO_OS_ERRNO` (LONG + 25): the errno of the transfer's last failed connect, 0 if none.
+const CURLINFO_OS_ERRNO: c_int = 0x20_0019;
+/// `CURLINFO_PRIMARY_IP` (STRING + 32): the address the transfer last dialled.
+const CURLINFO_PRIMARY_IP: c_int = 0x10_0020;
+
+/// Why a transfer's connect failed, as numbers: the OS errno of its last connect and the family of
+/// the address it dialled (4, 6, or 0 when it dialled none). Never the address itself.
+pub fn connect_failure(easy: *mut CURL) -> (c_long, u8) {
+    let mut errno: c_long = 0;
+    // SAFETY: a live easy handle; LONG info into a `long`, STRING info into a `char *`.
+    let _ = unsafe { curl_easy_getinfo_long(easy, CURLINFO_OS_ERRNO, &mut errno as *mut c_long) };
+    let mut ip: *const c_void = std::ptr::null();
+    let rc = unsafe { curl_easy_getinfo_ptr(easy, CURLINFO_PRIMARY_IP, &mut ip as *mut *const c_void) };
+    let family = if rc != 0 || ip.is_null() {
+        0
+    } else {
+        // SAFETY: libcurl's NUL-terminated string, valid while the handle lives.
+        let s = unsafe { std::ffi::CStr::from_ptr(ip as *const c_char) }.to_string_lossy();
+        if s.is_empty() { 0 } else if s.contains(':') { 6 } else { 4 }
+    };
+    (errno, family)
+}
+
+/// Where a transfer's time went, seconds from its start: name lookup, TCP connect, TLS handshake,
+/// first byte, total (a phase it never reached reads 0). Numbers only, so a stalled request's log
+/// line can say WHERE it stalled without naming a host or an address. On the
+/// [`curl_easy_getinfo_double`] wrapper of the same C symbol: the `_T` (curl_off_t) twins would be
+/// written through a 32-bit `c_long` on the television and overrun it.
+pub fn transfer_phases(easy: *mut CURL) -> [f64; 5] {
+    let read = |info| {
+        let mut v = 0.0f64;
+        // SAFETY: a live easy handle and a `double` out-parameter, as curl.h types these ids.
+        let rc = unsafe { curl_easy_getinfo_double(easy, info, &mut v as *mut f64) };
+        if rc == 0 { v } else { 0.0 }
+    };
+    [
+        read(CURLINFO_NAMELOOKUP_TIME),
+        read(CURLINFO_CONNECT_TIME),
+        read(CURLINFO_APPCONNECT_TIME),
+        read(CURLINFO_STARTTRANSFER_TIME),
+        read(CURLINFO_TOTAL_TIME),
+    ]
+}
 
 // curl.h option ids (CURLOPTTYPE_LONG=0, OBJECTPOINT=10000, FUNCTIONPOINT=20000).
 const CURLOPT_URL: c_int = 10002;

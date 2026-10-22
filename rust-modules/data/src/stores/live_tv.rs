@@ -22,8 +22,10 @@
 //! page stopped wanting it (cancelled, superseded, a reset or a server switch) is released here,
 //! against the server that tuned it, and never played.
 
-use crate::live_tv::{self as lt, Availability, GuideCache, Overlay, Phase, RecordKind, Snapshot, TunePhase, Tuned, WriteNotice, WriteOp};
-use plx_plex::plex::live_tv::{Airing, Channel, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
+use crate::live_tv::{
+    self as lt, Availability, CloudAuth, GuideCache, Overlay, Phase, RecordKind, Snapshot, Source, TunePhase, Tuned, WriteNotice, WriteOp,
+};
+use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
 use plx_plex::plex::ServerId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,6 +66,14 @@ pub enum Job {
     Release { subscription_id: String, session: String },
     /// The UltraBlur colours of a piece of guide art (the page's tint).
     Blur { art: String },
+    /// Plex's own channels: their genre tabs; a lineup (all of them, or one tab); one channel-day.
+    CloudTabs { auth: CloudAuth },
+    CloudChannels { source: Source, auth: CloudAuth },
+    CloudGrid { source: Source, ch: usize, channel: Channel, date: String, auth: CloudAuth },
+    /// The debug log's look at a Plex channel's stream (what the player would have to read).
+    CloudProbe { channel: Channel, auth: CloudAuth },
+    /// Watch a Plex channel: its stream's URL (and, in a debug build, its shape in the log).
+    CloudTune { serial: u32, channel: Channel, label: String, airing: Option<Airing>, auth: CloudAuth },
 }
 
 /// A write a page asked for.
@@ -86,6 +96,10 @@ pub enum Landing {
     Tuned { serial: u32, result: Result<Tuned, LiveError> },
     Released,
     Blur { art: String, result: Result<[[f32; 3]; 4], LiveError> },
+    CloudTabs(Result<Vec<CloudTab>, LiveError>),
+    CloudChannels { source: Source, result: Result<Vec<Channel>, LiveError> },
+    CloudGrid { source: Source, ch: usize, date: String, result: Result<Vec<Airing>, LiveError> },
+    CloudProbe(String),
 }
 
 /// What a successful write did.
@@ -172,12 +186,53 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
     match job {
         Job::Tune { serial, dvr_key, channel, label, airing, session } => {
             let result = tune(client, off, &dvr_key, &channel, &session)
-                .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing });
+                .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing, cloud: false });
             Landing::Tuned { serial, result }
         }
         Job::Release { subscription_id, session } => {
             release(client, &subscription_id, &session);
             Landing::Released
+        }
+        Job::CloudTabs { auth } => Landing::CloudTabs(auth.client().cloud_tabs()),
+        Job::CloudChannels { source, auth } => {
+            let result = auth.client().cloud_channels(source.genre());
+            Landing::CloudChannels { source, result }
+        }
+        Job::CloudGrid { source, ch, channel, date, auth } => {
+            let result = auth.client().cloud_grid(&channel, &date);
+            Landing::CloudGrid { source, ch, date, result }
+        }
+        Job::CloudProbe { channel, auth } => Landing::CloudProbe(auth.client().cloud_stream_shape(&channel)),
+        Job::CloudTune { serial, channel, label, airing, auth } => {
+            let client = auth.client();
+            let shape = client.cloud_stream_shape(&channel);
+            if !shape.is_empty() {
+                plx_base::eventlog::log(&format!("livetv dbg: Plex channel stream: {shape}"));
+            }
+            let result = client.cloud_stream_url(&channel).ok_or(LiveError::Invalid).map(|url| Tuned {
+                sid,
+                subscription_id: String::new(),
+                item: plx_plex::plex::live_tv::TunedItem {
+                    channel_title: channel.title.clone(),
+                    channel_vcn: channel.vcn.clone(),
+                    ..Default::default()
+                },
+                // a provider's HLS is H.264/AAC MPEG-TS (seen on the TV); its frame rate and
+                // raster the demuxer learns from the stream itself
+                stream: plx_plex::plex::live_tv::LiveStream {
+                    url,
+                    encoder_session: String::new(),
+                    video_codec: "h264".into(),
+                    audio_codec: "aac".into(),
+                    width: 0,
+                    height: 0,
+                    fps: 0.0,
+                },
+                channel: label,
+                airing,
+                cloud: true,
+            });
+            Landing::Tuned { serial, result }
         }
         Job::Blur { art } => {
             let result = client.ultrablur_colors(&art);
@@ -312,7 +367,22 @@ pub struct LiveTvStore {
     /// art was first asked in, for forgetting the oldest past [`MAX_BLURS`].
     blurs: HashMap<String, Option<[[f32; 3]; 4]>>,
     blur_order: VecDeque<String>,
+    /// Which lineup `channels`/`channels_phase`/`guide` are (the guide tab shown); the others a
+    /// page has shown are put aside with their caches, and their answers still land there.
+    source: Source,
+    stash: HashMap<Source, Lineup>,
+    /// Plex's own channels: their genre tabs, and who their reads act for.
+    cloud_tabs: Vec<CloudTab>,
+    cloud_auth: Option<CloudAuth>,
     generation: u32,
+}
+
+/// A lineup put aside (a guide tab not shown).
+#[derive(Default)]
+struct Lineup {
+    phase: Phase,
+    channels: Vec<Channel>,
+    guide: GuideCache,
 }
 
 impl Default for LiveTvStore {
@@ -355,6 +425,10 @@ impl LiveTvStore {
             offset_logged: false,
             blurs: HashMap::new(),
             blur_order: VecDeque::new(),
+            source: Source::Dvr,
+            stash: HashMap::new(),
+            cloud_tabs: Vec::new(),
+            cloud_auth: None,
             generation: 0,
         }
     }
@@ -418,6 +492,9 @@ impl LiveTvStore {
     /// press: its tune, if it lands, is released. `false` when nothing can be tuned (no lineup,
     /// a provider without a DVR).
     pub fn tune(&mut self, ch: usize, airing: Option<Airing>) -> bool {
+        if self.source.is_cloud() {
+            return self.watch_cloud(ch, airing);
+        }
         let Some(dvr_key) = self.provider.as_ref().filter(|p| p.tunable()).map(|p| p.dvr_key.clone()) else { return false };
         let Some(channel) = self.channels.get(ch).cloned() else { return false };
         if self.sid.is_none() {
@@ -432,6 +509,121 @@ impl LiveTvStore {
         self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id() });
         self.bump();
         true
+    }
+
+    /// Watch a Plex channel: the same Watch flow as a tune (the press supersedes an earlier one,
+    /// the page says it is on its way, the stream lands for the application to play), with no
+    /// tuner behind it — the provider hands out the stream.
+    fn watch_cloud(&mut self, ch: usize, airing: Option<Airing>) -> bool {
+        let (Some(channel), Some(auth)) = (self.channels.get(ch).cloned(), self.cloud_auth.clone()) else { return false };
+        if self.sid.is_none() {
+            return false;
+        }
+        self.cancel_tune();
+        self.tune_serial = self.tune_serial.wrapping_add(1);
+        self.tune_wanted = true;
+        let label = channel.label().to_string();
+        plx_base::eventlog::log(&format!("livetv: watch #{} of Plex channel row {ch}", self.tune_serial));
+        self.tune_phase = TunePhase::Tuning { channel: label.clone() };
+        self.tune_queue = Some(Job::CloudTune { serial: self.tune_serial, channel, label, airing, auth });
+        self.bump();
+        true
+    }
+
+    /// Which lineup the guide shows.
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Show `source`'s lineup (a guide tab). The lineup shown goes aside with its cache; one never
+    /// read (or that failed) is asked for. Plex's own channels need the profile's plex.tv identity.
+    pub fn select_source(&mut self, source: Source) {
+        if source == self.source {
+            return;
+        }
+        if source.is_cloud() && self.cloud_auth.is_none() {
+            self.cloud_auth = CloudAuth::capture();
+            if self.cloud_auth.is_none() {
+                plx_base::eventlog::log("livetv: Plex channels need a plex.tv sign-in");
+                return;
+            }
+        }
+        let shown = Lineup {
+            phase: std::mem::take(&mut self.channels_phase),
+            channels: std::mem::take(&mut self.channels),
+            guide: std::mem::take(&mut self.guide),
+        };
+        let left = std::mem::replace(&mut self.source, source.clone());
+        self.stash.insert(left, shown);
+        let next = self.stash.remove(&source).unwrap_or_default();
+        (self.channels_phase, self.channels, self.guide) = (next.phase, next.channels, next.guide);
+        plx_base::eventlog::log(&format!("livetv: guide tab {}", match &self.source {
+            Source::Dvr => "the DVR",
+            Source::Plex => "Plex Channels",
+            Source::PlexTab(_) => "a Plex genre",
+        }));
+        if matches!(self.channels_phase, Phase::Idle | Phase::Failed(_)) {
+            self.ask_lineup();
+        } else {
+            self.rewant();
+        }
+        self.bump();
+    }
+
+    /// A host test stands in for the profile's plex.tv identity (it has no session to capture).
+    #[cfg(test)]
+    pub(crate) fn set_cloud_auth(&mut self, auth: CloudAuth) {
+        self.cloud_auth = Some(auth);
+    }
+
+    /// Ask for the shown source's lineup.
+    fn ask_lineup(&mut self) {
+        match self.source.clone() {
+            Source::Dvr => {
+                if let Some(p) = &self.provider {
+                    self.channels_phase = Phase::Loading;
+                    self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
+                }
+            }
+            source => {
+                if let Some(auth) = self.cloud_auth.clone() {
+                    self.channels_phase = Phase::Loading;
+                    self.queue.push_front(Job::CloudChannels { source, auth });
+                }
+            }
+        }
+    }
+
+    /// A lineup answer for `source`: onto the one shown, or the one put aside.
+    fn land_lineup(&mut self, source: Source, result: Result<Vec<Channel>, LiveError>) {
+        let (phase, channels) = match result {
+            Ok(c) => (Phase::Ready, c),
+            Err(e) => (Phase::Failed(e.reason()), Vec::new()),
+        };
+        if source == self.source {
+            if phase.is_ready() {
+                self.channels = channels;
+                self.guide.clear();
+            }
+            self.channels_phase = phase;
+            self.rewant();
+        } else if let Some(l) = self.stash.get_mut(&source) {
+            if phase.is_ready() {
+                l.channels = channels;
+                l.guide.clear();
+            }
+            l.phase = phase;
+        }
+    }
+
+    /// A guide-day answer for `source`: onto the cache shown, or the one put aside.
+    fn land_day(&mut self, source: &Source, ch: usize, date: &str, result: Result<Vec<Airing>, LiveError>) {
+        let result = result.map_err(|e| e.reason());
+        if *source == self.source {
+            self.guide.land(ch, date, result);
+        } else if let Some(l) = self.stash.get_mut(source) {
+            l.guide.land(ch, date, result);
+        }
     }
 
     /// The page no longer wants its Watch press (BACK while tuning, the page left). A tune that
@@ -489,7 +681,16 @@ impl LiveTvStore {
     /// Asks for every channel-day it does not hold, nearest rows first.
     pub fn want_window(&mut self, rows: std::ops::Range<usize>, from: i64, to: i64) {
         self.window = Some((rows.clone(), from, to));
-        let Some(provider) = self.provider.as_ref().map(|p| p.identifier.clone()) else { return };
+        enum From {
+            Dvr(String),
+            Cloud(Source, CloudAuth),
+        }
+        let from_where = match (&self.source, &self.provider, &self.cloud_auth) {
+            (Source::Dvr, Some(p), _) => From::Dvr(p.identifier.clone()),
+            (Source::Dvr, None, _) => return,
+            (source, _, Some(auth)) => From::Cloud(source.clone(), auth.clone()),
+            (_, _, None) => return,
+        };
         if !self.channels_phase.is_ready() || to <= from {
             return;
         }
@@ -505,7 +706,10 @@ impl LiveTvStore {
         for (ch, date) in need.into_iter().rev() {
             self.guide.set_loading(ch, &date);
             let channel = self.channels[ch].clone();
-            self.queue.push_front(Job::Grid { provider: provider.clone(), ch, channel, date });
+            self.queue.push_front(match &from_where {
+                From::Dvr(provider) => Job::Grid { provider: provider.clone(), ch, channel, date },
+                From::Cloud(source, auth) => Job::CloudGrid { source: source.clone(), ch, channel, date, auth: auth.clone() },
+            });
         }
         self.guide.evict();
         self.bump();
@@ -519,10 +723,7 @@ impl LiveTvStore {
             self.refresh_dvr();
         }
         if matches!(self.channels_phase, Phase::Failed(_)) {
-            if let Some(p) = &self.provider {
-                self.channels_phase = Phase::Loading;
-                self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
-            }
+            self.ask_lineup();
         }
         if matches!(self.providers_phase, Phase::Failed(_)) {
             self.providers_phase = Phase::Loading;
@@ -663,6 +864,11 @@ impl LiveTvStore {
                             self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
                             self.dvr_phase = Phase::Loading;
                             self.queue.push_back(Job::Dvr);
+                            // the guide's tab row also offers Plex's own channels
+                            self.cloud_auth = CloudAuth::capture();
+                            if let Some(auth) = self.cloud_auth.clone() {
+                                self.queue.push_back(Job::CloudTabs { auth });
+                            }
                         }
                     }
                     Err(LiveError::Status(403)) => {
@@ -678,18 +884,33 @@ impl LiveTvStore {
             }
             Landing::Channels(r) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                match r {
-                    Ok(ch) => {
-                        self.channels = ch;
-                        self.channels_phase = Phase::Ready;
-                        self.guide.clear();
-                    }
-                    Err(e) => self.channels_phase = Phase::Failed(e.reason()),
-                }
+                self.land_lineup(Source::Dvr, r);
             }
             Landing::Grid { ch, date, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.guide.land(ch, &date, result.map_err(|e| e.reason()));
+                self.land_day(&Source::Dvr, ch, &date, result);
+            }
+            Landing::CloudChannels { source, result } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if let Err(e) = &result {
+                    plx_base::eventlog::log(&format!("livetv: Plex channels lineup failed: {}", e.reason()));
+                }
+                self.land_lineup(source, result);
+            }
+            Landing::CloudGrid { source, ch, date, result } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.land_day(&source, ch, &date, result);
+            }
+            Landing::CloudTabs(r) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                match r {
+                    Ok(tabs) => self.cloud_tabs = tabs,
+                    Err(e) => plx_base::eventlog::log(&format!("livetv: Plex channels tabs failed: {}", e.reason())),
+                }
+            }
+            Landing::CloudProbe(shape) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                plx_base::eventlog::log(&format!("livetv dbg: Plex channel stream: {shape}"));
             }
             Landing::Dvr(r) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -843,6 +1064,8 @@ impl LiveTvStore {
             writes_in_flight: u32::from(self.writing) + self.write_queue.len() as u32,
             tune: self.tune_phase.clone(),
             blurs: self.blurs.iter().filter_map(|(art, c)| c.map(|c| (art.clone(), c))).collect(),
+            source: self.source.clone(),
+            cloud_tabs: self.cloud_tabs.clone(),
         }
     }
 

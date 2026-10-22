@@ -7,7 +7,7 @@
 //! days land around it and the window scrolls, so focus never jumps when the guide fills in. A row
 //! with nothing to show (still loading, or a channel with no guide) has one placeholder key.
 
-use plx_data::live_tv::Snapshot;
+use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
 use plx_plex::plex::live_tv::{Airing, Grab, Subscription};
@@ -19,7 +19,7 @@ pub const HALF_HOUR: i64 = 1_800;
 /// How much time the guide shows across.
 pub const WINDOW_S: i64 = 2 * 3_600;
 /// Channel rows shown at once.
-pub const ROWS_SHOWN: usize = 5;
+pub const ROWS_SHOWN: usize = 4;
 /// Channel rows the guide can key (`row << 20` stays below the reserved keys).
 pub const MAX_ROWS: usize = 2_048;
 
@@ -30,6 +30,8 @@ pub const HEAD_GUIDE: u32 = 0xE000_0000;
 pub const HEAD_RECS: u32 = 0xE000_0001;
 /// The read-out's Try again.
 pub const RETRY: u32 = 0xE000_0010;
+/// A guide tab (the DVR, Plex Channels, a Plex genre): `TAB_BASE + index`.
+pub const TAB_BASE: u32 = 0xC000_0000;
 /// A Recordings-list row: `REC_BASE + index`.
 pub const REC_BASE: u32 = 0xD000_0000;
 /// An action of the open panel: `ACTION_BASE + index`.
@@ -50,6 +52,22 @@ pub fn cell_of(elem: u32) -> Option<(usize, u32)> {
 
 pub fn rec_of(elem: u32) -> Option<usize> {
     (REC_BASE..REC_BASE + 0x0100_0000).contains(&elem).then(|| (elem - REC_BASE) as usize)
+}
+
+pub fn tab_of(elem: u32) -> Option<usize> {
+    (TAB_BASE..TAB_BASE + 0x100).contains(&elem).then(|| (elem - TAB_BASE) as usize)
+}
+
+/// The guide's tabs, in order: the server's DVR, then (once Plex's own channels answered) all of
+/// them and each of their genres. `None` labels are the page's to word (the DVR's name, "Plex
+/// Channels").
+pub fn tab_sources(snap: &Snapshot) -> Vec<Source> {
+    let mut out = vec![Source::Dvr];
+    if !snap.cloud_tabs.is_empty() {
+        out.push(Source::Plex);
+        out.extend(snap.cloud_tabs.iter().map(|t| Source::PlexTab(t.identifier.clone())));
+    }
+    out
 }
 
 pub fn action_of(elem: u32) -> Option<usize> {
@@ -168,9 +186,12 @@ pub mod geom {
     /// The backdrop art's box: the right of the screen, from the top down to the ruler.
     pub const ART_X: f32 = SCR_W * 0.40;
     pub const ART_H: f32 = RULER_Y;
-    pub const RULER_Y: f32 = 496.0;
+    /// The guide's tab row, between the hero and the ruler.
+    pub const TABS_Y: f32 = 500.0;
+    pub const TABS_H: f32 = 52.0;
+    pub const RULER_Y: f32 = 566.0;
     pub const RULER_H: f32 = 34.0;
-    pub const ROWS_Y: f32 = 536.0;
+    pub const ROWS_Y: f32 = 606.0;
     pub const ROW_H: f32 = 92.0;
     pub const ROW_PITCH: f32 = 98.0;
     pub const CHANNEL_X: f32 = MARGIN_X;
@@ -178,7 +199,7 @@ pub mod geom {
     pub const GRID_X: f32 = MARGIN_X + CHANNEL_W + 10.0;
     /// The corner a live channel plays on in after BACK: 16:9 at the backdrop band's height, at
     /// the top right, where the art would be.
-    pub const MINI_H: f32 = ART_H;
+    pub const MINI_H: f32 = 496.0;
     pub const MINI_W: f32 = 882.0;
     pub const MINI_X: f32 = SCR_W - MINI_W;
     pub const MINI_Y: f32 = 0.0;

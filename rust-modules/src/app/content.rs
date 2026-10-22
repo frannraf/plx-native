@@ -1073,7 +1073,7 @@ fn live_tv_requests(app: &mut App) {
                 super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
             }
             LiveTvOut::Watch { row, .. } if corner => {
-                if app.bridge.live_tv_watching() == Some(*row) {
+                if app.bridge.live_tv_is_watching(*row) {
                     super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
                     continue;
                 }
@@ -1108,6 +1108,7 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
         LiveTvOut::Account => "the account chip".into(),
         LiveTvOut::Back => "back".into(),
         LiveTvOut::Watch { row, airing } => format!("watch row {row} ({})", if airing.is_some() { "the airing on now" } else { "no guide" }),
+        LiveTvOut::Source(_) => "a guide tab".into(),
         LiveTvOut::CancelTune => "cancel the tune".into(),
         LiveTvOut::DismissTuneFailure => "dismiss the tune failure".into(),
         LiveTvOut::Write(Write::Record { kind: RecordKind::This, .. }) => "record".into(),

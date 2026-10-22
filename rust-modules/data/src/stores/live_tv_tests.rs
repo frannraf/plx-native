@@ -38,7 +38,7 @@ fn sid() -> ServerId {
 }
 
 fn provider() -> EpgProvider {
-    EpgProvider { identifier: "tv.plex.providers.epg.cloud:1".into(), dvr_key: "1".into(), title: "DVR".into(), recordable: true, grid: true }
+    EpgProvider { identifier: "tv.plex.providers.epg.cloud:1".into(), dvr_key: "1".into(), title: "DVR".into(), recordable: true, grid: true, ..Default::default() }
 }
 
 fn channel(n: usize) -> Channel {
@@ -324,6 +324,7 @@ fn tuned(sub: &str, session: &str) -> Tuned {
         stream: plx_plex::plex::live_tv::LiveStream { url: "http://x/start.m3u8".into(), encoder_session: session.into(), ..Default::default() },
         channel: "C1".into(),
         airing: None,
+        cloud: false,
     }
 }
 
@@ -464,4 +465,32 @@ fn nothing_can_be_tuned_without_a_tunable_provider_or_a_lineup() {
     assert!(!s.tune(0, None), "no lineup yet");
     let mut s = ready(&script, 2);
     assert!(!s.tune(5, None), "no such row");
+}
+
+/// A Plex tab shows its own lineup; the DVR's waits aside, cache and all, and comes back unread.
+#[test]
+fn a_plex_tab_shows_its_own_lineup_and_the_dvr_comes_back_from_aside() {
+    use crate::live_tv::{CloudAuth, Source};
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.set_cloud_auth(CloudAuth { client_id: "cid".into(), credential: "secret".into() });
+    s.select_source(Source::Plex);
+    let snap = s.snapshot();
+    assert_eq!(snap.source, Source::Plex);
+    assert!(snap.channels.is_empty() && snap.channels_phase.is_loading());
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::CloudChannels { .. })).expect("the Plex lineup is asked");
+    let Job::CloudChannels { source, .. } = job else { unreachable!() };
+    assert_eq!(source, Source::Plex);
+    post.post(Landing::CloudChannels { source: Source::Plex, result: Ok((0..5).map(channel).collect()) });
+    s.pump();
+    assert_eq!(s.snapshot().channels.len(), 5);
+    s.select_source(Source::Dvr);
+    s.pump();
+    let snap = s.snapshot();
+    assert_eq!(snap.channels.len(), 3, "the DVR's lineup came back from aside");
+    assert!(snap.channels_phase.is_ready());
+    assert!(!script.take().iter().any(|(j, _)| matches!(j, Job::Channels { .. })), "and is not read again");
+    let shown = format!("{:?}", CloudAuth { client_id: "c".into(), credential: "secret".into() });
+    assert!(!shown.contains("secret"), "the credential never prints: {shown}");
 }

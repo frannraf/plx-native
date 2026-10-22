@@ -33,8 +33,9 @@ pub(crate) struct Feed {
     tried: Vec<plx_plex::plex::ServerId>,
     /// When a failed providers read is asked again (the app's logical clock, ms).
     retry_at: Option<u32>,
-    /// The channel row last asked to be watched: the player's record disc records what is on it.
-    watching: Option<usize>,
+    /// The channel last asked to be watched, as its tab and row: the player's record disc records
+    /// what is on it, and OK on it brings the corner's picture back.
+    watching: Option<(plx_data::live_tv::Source, usize)>,
 }
 
 /// How long after a failed providers read it is asked again: a set that booted before its network
@@ -152,11 +153,12 @@ impl Bridge {
         let store = &mut self.stores.live_tv;
         match out {
             LiveTvOut::Watch { row, airing } => {
-                self.live_tv.watching = Some(row);
+                self.live_tv.watching = Some((store.source().clone(), row));
                 if !store.tune(row, airing) {
                     plx_base::eventlog::log("livetv: nothing to tune on that row");
                 }
             }
+            LiveTvOut::Source(source) => store.select_source(source),
             LiveTvOut::CancelTune => store.cancel_tune(),
             LiveTvOut::DismissTuneFailure => store.clear_tune_failure(),
             LiveTvOut::Write(w) => store.write(w),
@@ -172,7 +174,7 @@ impl Bridge {
         if plx_media::route::record_asked() {
             return;
         }
-        let Some(row) = self.live_tv.watching else { return };
+        let Some((_, row)) = self.live_tv.watching.clone() else { return };
         let Some(airing) = self.stores.live_tv.on_now(row) else {
             plx_base::eventlog::log("livetv: record from the player: nothing on now on that row");
             return;
@@ -182,9 +184,10 @@ impl Bridge {
         plx_media::route::set_record_asked(true);
     }
 
-    /// The channel row last asked to be watched (the corner's channel, while one plays there).
-    pub(crate) fn live_tv_watching(&self) -> Option<usize> {
-        self.live_tv.watching
+    /// Is `row` of the tab shown the channel last asked to be watched (the corner's, while one
+    /// plays there)?
+    pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {
+        self.live_tv.watching.as_ref().is_some_and(|(source, r)| *r == row && source == self.stores.live_tv.source())
     }
 
     /// Forget a Watch press still on its way (the app is going to the background).
@@ -248,6 +251,7 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
         width: t.stream.width,
         height: t.stream.height,
         fps: t.stream.fps,
-        info: plx_media::route::LiveInfo { title, show_title, channel, begins_at, ends_at },
+        info: plx_media::route::LiveInfo { title, show_title, channel, begins_at, ends_at, provider: t.cloud },
+        provider: t.cloud,
     }
 }
