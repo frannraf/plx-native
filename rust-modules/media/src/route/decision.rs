@@ -806,8 +806,14 @@ pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::L
     ps.url = url.to_owned();
     ps.tsession.clear();
     ps.cur_rk.clear();
-    // The HUD's two lines: the program, and the channel it is on. An airing whose episode title is
-    // the show's own (a daily show's, seen on the TV as "Show · Show") names it once.
+    set_live_lines(ps, &info);
+    ps.live = Some(lease);
+    ps.live_info = Some(info);
+}
+
+/// The HUD's two lines of a live channel: the program, and the channel it is on. An airing whose
+/// episode title is the show's own (a daily show's, seen on the TV as "Show · Show") names it once.
+fn set_live_lines(ps: &mut PlaybackSession, info: &super::live::LiveInfo) {
     let title = if info.show_title.is_empty() || info.title.is_empty() || info.title.eq_ignore_ascii_case(&info.show_title) {
         if info.show_title.is_empty() { info.title.clone() } else { info.show_title.clone() }
     } else {
@@ -818,8 +824,31 @@ pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::L
         set_c(ps.title.as_mut_ptr(), ps.title.len(), &title);
         set_c(ps.ctxline.as_mut_ptr(), ps.ctxline.len(), &info.channel);
     }
-    ps.live = Some(lease);
-    ps.live_info = Some(info);
+}
+
+/// The program on the live channel moved on (the guide's clock passed its end): the HUD's lines
+/// and the bar's span follow it. Nothing off a live channel.
+pub(super) fn roll_live_program(ps: &mut PlaybackSession, title: String, show_title: String, begins_at: i64, ends_at: i64) -> bool {
+    let Some(info) = ps.live_info.as_mut() else { return false };
+    if info.begins_at == begins_at && info.ends_at == ends_at && info.title == title {
+        return false;
+    }
+    info.title = title;
+    info.show_title = show_title;
+    info.begins_at = begins_at;
+    info.ends_at = ends_at;
+    let info = info.clone();
+    set_live_lines(ps, &info);
+    true
+}
+
+/// The HUD's channel line of a live channel says something else for a while ("Tuning 4.2 KXYZ…"
+/// during a CH▲/CH▼); `None` puts the channel's own words back.
+pub(super) fn set_live_context(ps: &mut PlaybackSession, line: Option<&str>) {
+    let Some(info) = ps.live_info.as_ref() else { return };
+    let words = line.unwrap_or(&info.channel);
+    // SAFETY: the session's own fixed buffer, written with its own length.
+    unsafe { set_c(ps.ctxline.as_mut_ptr(), ps.ctxline.len(), words) };
 }
 
 /// Take the live lease (dropping it releases the tune) and forget the live identity.

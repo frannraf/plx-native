@@ -289,6 +289,34 @@ fn a_shrunken_recordings_list_settles_back_into_view() {
     assert_eq!(rec_settle(&long, top, 14), top, "nothing changed: nothing moves");
 }
 
+/// DOWN onto a row whose window has a gap at the anchor lands on that row's last program before
+/// it, not on one hours away (which dragged the window there).
+#[test]
+fn moving_down_into_a_gap_lands_on_the_windows_own_program() {
+    let mut v = view(4);
+    // row 3: 12:00-12:30, then nothing until 18:30
+    v.rows[3].airings = vec![airing(3, NOON, 30, "early"), airing(3, NOON + 6 * 3_600 + 1_800, 30, "late")];
+    let f = frame();
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON + 3_600), Dir::Down).and_then(|e| guide_neighbour(&v, &f, e, Dir::Down)).and_then(|e| guide_neighbour(&v, &f, e, Dir::Down)), Some(cell(3, NOON)), "the 12:00 program, in the window");
+    assert_eq!(follow(&v, &f, cell(3, NOON)).win_start, f.win_start, "the window stays");
+}
+
+/// A page move goes four rows at a time, stops at either end, and lands an off-air row on its
+/// placeholder.
+#[test]
+fn a_page_moves_four_rows_and_stops_at_the_ends() {
+    let v = view(10);
+    let f = frame();
+    assert_eq!(guide_page(&v, &f, cell(0, NOON), Dir::Down), Some(cell(4, NOON)));
+    assert_eq!(guide_page(&v, &f, cell(8, NOON), Dir::Down), Some(cell(9, NOON)), "the last row, short of a whole page");
+    assert_eq!(guide_page(&v, &f, cell(9, NOON), Dir::Down), None);
+    assert_eq!(guide_page(&v, &f, cell(9, NOON), Dir::Up), Some(cell(5, NOON)));
+    assert_eq!(guide_page(&v, &f, cell(3, NOON), Dir::Up), Some(cell(0, NOON)));
+    assert_eq!(guide_page(&v, &f, cell(0, NOON), Dir::Up), None);
+    assert_eq!(guide_page(&v, &f, cell(6, NOON), Dir::Up), Some(cell_elem(2, PLACEHOLDER)), "row 2 has nothing: its placeholder");
+    assert_eq!(guide_page(&v, &f, cell(0, NOON), Dir::Right), None);
+}
+
 /// UP/DOWN onto a long program already well in view leaves the window where the viewer had it,
 /// and onto a channel with nothing in the window lands on its placeholder, not hours ahead.
 #[test]

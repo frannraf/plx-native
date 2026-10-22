@@ -297,6 +297,36 @@ impl LiveTvScreen {
         fx.push(Fx::Deliver(fx.from(), Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { focus }))));
     }
 
+    /// Move focus a page (`whole`) or a row down the guide or the Recordings list, from the focused
+    /// row; nothing while a panel is up or focus is elsewhere.
+    fn page<H: ContentLike>(&mut self, dir: Dir, whole: bool, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
+        if self.panel.is_some() {
+            return;
+        }
+        let Some(e) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem) else { return };
+        let to = if model::cell_of(e).is_some() {
+            if whole {
+                model::guide_page(&self.view, &self.frame, e, dir)
+            } else {
+                model::guide_neighbour(&self.view, &self.frame, e, dir)
+            }
+        } else if let Some(i) = model::rec_of(e) {
+            let by = if whole { 6 } else { 1 };
+            let n = self.recs.len();
+            let target = match dir {
+                Dir::Up => i.saturating_sub(by),
+                _ => (i + by).min(n.saturating_sub(1)),
+            };
+            (target != i && n > 0).then(|| model::REC_BASE + target as u32)
+        } else {
+            None
+        };
+        if let Some(to) = to {
+            self.seat_elem(to, fx);
+            fx.invalidate(Provenance::Input);
+        }
+    }
+
     fn seat_elem<H: ContentLike>(&mut self, elem: u32, fx: &mut Effects<'_, H>) {
         let key = self.key(elem);
         self.seat_own(FocusTarget::Elem(key), fx);
@@ -741,11 +771,7 @@ impl LiveTvScreen {
     /// A time of day for instant `t`, at the offset in force then (an airing past a daylight-saving
     /// change reads its own hour, as the player's bar does), else the guide's.
     fn time_of(&self, t: i64) -> String {
-        let offset = match plx_platform::i18n::utc_offset_s(t) {
-            0 => self.view.snap.utc_offset,
-            off => off,
-        };
-        let local = (t + offset).rem_euclid(86_400);
+        let local = (t + plx_platform::i18n::utc_offset_s(t)).rem_euclid(86_400);
         plx_platform::i18n::current().time_of_day((local / 3_600) as u8, ((local % 3_600) / 60) as u8)
     }
 
@@ -1041,6 +1067,10 @@ impl LiveTvScreen {
                     // a row whose programs are on their way: one line of text that has not arrived
                     plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::SkeletonBar, "livetv-row");
                     msg::live_tv_row_loading()
+                } else if r.failed {
+                    // the server did not answer for this channel (asked again once a minute);
+                    // the channel itself still plays
+                    msg::live_tv_row_failed()
                 } else {
                     msg::live_tv_row_no_info()
                 };
@@ -1651,9 +1681,29 @@ impl<H: ContentLike> Machine<H> for LiveTvScreen {
             ScreenEvent::Input(InputEvent { kind: InputKind::Key { key: Key::Back, edge: Edge::Down, .. }, .. }) => {
                 self.back(cx, fx)
             }
+            // CH▲/CH▼ and PageUp/Down page the guide (four rows) and the Recordings list; the Magic
+            // Remote's wheel steps a row per tick. The D-pad is one row per press, and a lineup of
+            // several hundred channels is a long way one at a time.
+            ScreenEvent::Input(InputEvent { kind: InputKind::Key { sym, wcode, edge: Edge::Down, .. }, .. }) => {
+                match plx_ui::consts::page_dir(*sym, *wcode) {
+                    Some(d) => {
+                        self.page(if d < 0 { Dir::Up } else { Dir::Down }, true, cx, fx);
+                        Handled::Yes
+                    }
+                    None => Handled::No,
+                }
+            }
+            ScreenEvent::Input(InputEvent { kind: InputKind::Wheel { dy }, .. }) => {
+                if *dy != 0.0 {
+                    self.page(if *dy < 0.0 { Dir::Up } else { Dir::Down }, false, cx, fx);
+                }
+                Handled::Yes
+            }
             _ => Handled::No,
         }
     }
+
+
 }
 
 impl<H: ContentLike> Focusable<H> for LiveTvScreen {

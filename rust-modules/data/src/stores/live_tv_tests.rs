@@ -169,7 +169,13 @@ fn a_failed_day_is_not_asked_again_until_retry() {
     // Retry asks the last window again by itself: the page's window did not move
     s.retry_failed();
     s.pump();
-    assert_eq!(script.take().len(), 1);
+    let (job, post) = script.take().remove(0);
+    // …and while that second read is on its way the row still reads as failed, not "Loading…"
+    assert!(s.row_failed(0, NOON, NOON + 3600) && !s.row_pending(0, NOON, NOON + 3600), "a retried day keeps its failed look until it answers");
+    let Job::Grid { ch, date, .. } = job else { panic!() };
+    post.post(Landing::Grid { ch, date, result: Ok(vec![airing(0, NOON, "g", "s")]) });
+    s.pump();
+    assert!(!s.row_failed(0, NOON, NOON + 3600), "an answer clears it");
 }
 
 #[test]

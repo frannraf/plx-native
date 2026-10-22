@@ -21,6 +21,7 @@
   "live_tv.action.close": "Bezárás",
   "live_tv.row.loading": "Betöltés…",
   "live_tv.row.no_info": "Nincs információ",
+  "live_tv.row.failed": "A csatorna műsora nem tölthető be · az OK így is lejátssza",
   "live_tv.badge.recording": "Felvétel folyamatban",
   "live_tv.badge.scheduled": "Ütemezve",
   "live_tv.badge.failed": "Sikertelen",

@@ -279,6 +279,18 @@ pub fn release_live_tuner(ps: &mut PlaybackSession) -> bool {
     held
 }
 
+/// The program on the live channel moved on: the HUD's title and the bar's span follow it.
+/// `true` when something changed.
+pub fn roll_live_program(ps: &mut PlaybackSession, title: &str, show_title: &str, begins_at: i64, ends_at: i64) -> bool {
+    super::decision::roll_live_program(ps, title.to_owned(), show_title.to_owned(), begins_at, ends_at)
+}
+
+/// The HUD's channel line says `line` for a while (a CH▲/CH▼'s "Tuning…"); `None` puts the
+/// channel's own words back.
+pub fn set_live_context(ps: &mut PlaybackSession, line: Option<&str>) {
+    super::decision::set_live_context(ps, line)
+}
+
 /// Does the session still hold its live lease (a DVR channel's tuner, or a Plex channel's
 /// stream)? `false` once a CH▲/CH▼ handed a DVR channel's tuner back.
 pub fn live_lease_held(ps: &PlaybackSession) -> bool {

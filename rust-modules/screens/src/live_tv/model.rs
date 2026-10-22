@@ -299,12 +299,7 @@ pub fn guide_neighbour(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) ->
             if target >= view.channel_count() {
                 return None;
             }
-            // A channel with nothing in the window (off the air until morning): its placeholder,
-            // which watches it, rather than its next program hours away.
-            if !view.shows_any(target, frame.win_start, frame.win_start + WINDOW_S) {
-                return Some(cell_elem(target, PLACEHOLDER));
-            }
-            Some(view.cell_at(frame.base, target, anchor_time(view, frame, elem)))
+            Some(cell_in_window(view, frame, target, anchor_time(view, frame, elem)))
         }
         Dir::Left | Dir::Right => {
             if slot == PLACEHOLDER {
@@ -324,6 +319,43 @@ pub fn guide_neighbour(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) ->
             Some(cell_elem(row, slot_of(frame.base, next.begins_at)))
         }
     }
+}
+
+/// The cell an UP/DOWN (or a page) lands on in row `row` at time `t`, among the programs in the
+/// window: the one on at `t`, else the last one in the window before it, else the first in it;
+/// a row with nothing in the window (off the air until morning) lands on its placeholder, which
+/// watches it. Never a program hours away (`cell_at` would find the next one anywhere in the day,
+/// and the window followed it there).
+pub fn cell_in_window(view: &LiveTvView, frame: &Frame, row: usize, t: i64) -> u32 {
+    let (from, to) = (frame.win_start, frame.win_start + WINDOW_S);
+    let Some(r) = view.row(row) else { return cell_elem(row, PLACEHOLDER) };
+    let shown: Vec<&Airing> = r.airings.iter().filter(|a| a.ends_at > from && a.begins_at < to).collect();
+    let pick = shown
+        .iter()
+        .find(|a| a.begins_at <= t && t < a.ends_at)
+        .or_else(|| shown.iter().rev().find(|a| a.begins_at < t))
+        .or_else(|| shown.first());
+    match pick {
+        Some(a) => cell_elem(row, slot_of(frame.base, a.begins_at)),
+        None => cell_elem(row, PLACEHOLDER),
+    }
+}
+
+/// Where a page move (CH▲/CH▼, PageUp/Down) takes focus inside the guide: [`ROWS_SHOWN`] rows up
+/// or down, the last row at either end, at the time the focused cell keeps; `None` when already
+/// at that end. A row with nothing in the window lands on its placeholder, as a step does.
+pub fn guide_page(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) -> Option<u32> {
+    let (row, _) = cell_of(elem)?;
+    let n = view.channel_count();
+    let target = match dir {
+        Dir::Up => row.checked_sub(ROWS_SHOWN).unwrap_or(0),
+        Dir::Down => (row + ROWS_SHOWN).min(n.checked_sub(1)?),
+        Dir::Left | Dir::Right => return None,
+    };
+    if target == row {
+        return None;
+    }
+    Some(cell_in_window(view, frame, target, anchor_time(view, frame, elem)))
 }
 
 /// The frame after focus landed on `elem`: the rows and the window scroll just enough to show it,

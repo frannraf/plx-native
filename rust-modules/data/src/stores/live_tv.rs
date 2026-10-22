@@ -626,6 +626,13 @@ impl LiveTvStore {
 
     /// A guide-day answer for `source`: onto the cache shown, or the one put aside.
     fn land_day(&mut self, source: &Source, ch: usize, date: &str, result: Result<Vec<Airing>, LiveError>) {
+        // Which it was, for the log: a day the server has nothing for reads "No information" in the
+        // guide, a day it did not answer for reads as failed (and is asked again in a minute).
+        match &result {
+            Ok(a) if a.is_empty() => plx_base::eventlog::log(&format!("livetv: row {ch} has no programs for {date}")),
+            Err(e) => plx_base::eventlog::log(&format!("livetv: row {ch}'s programs for {date} did not load: {}", e.reason())),
+            Ok(_) => {}
+        }
         let result = result.map_err(|e| e.reason());
         if *source == self.source {
             self.guide.land(ch, date, result);
@@ -669,6 +676,13 @@ impl LiveTvStore {
     /// A taken stream the application could not play: release it.
     pub fn release_tuned(&mut self, t: Tuned) {
         self.owe_release(t);
+        self.bump();
+    }
+
+    /// A Watch the application holds back until a tuner comes back: the page shows it as tuning
+    /// `channel` meanwhile (and its BACK cancels it, through the application).
+    pub fn show_tuning(&mut self, channel: String) {
+        self.tune_phase = TunePhase::Tuning { channel };
         self.bump();
     }
 
@@ -767,6 +781,11 @@ impl LiveTvStore {
     /// How many channel rows the lineup shown has (the live player's CH▲/CH▼ wrap around them).
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// How channel row `ch` is named ("4.1 KXYZ"), for the player's lines.
+    pub fn channel_words(&self, ch: usize) -> Option<String> {
+        self.channels.get(ch).map(Channel::words)
     }
 
     /// The airing on now on channel row `ch`, from the guide cache (the player's record disc).

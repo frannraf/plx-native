@@ -87,6 +87,10 @@
     "value": "No information",
     "description": "A channel row of the Live TV guide with no program listed for the time shown."
   },
+  "live_tv.row.failed": {
+    "value": "The guide couldn't be loaded for this channel · OK still plays it",
+    "description": "A channel row of the Live TV guide whose program listing failed to load from the server (it is asked again once a minute); OK on the row plays the channel anyway."
+  },
   "live_tv.badge.recording": {
     "value": "Recording",
     "description": "Badge on a program the DVR is recording right now."

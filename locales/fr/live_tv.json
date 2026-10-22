@@ -21,6 +21,7 @@
   "live_tv.action.close": "Fermer",
   "live_tv.row.loading": "Chargement…",
   "live_tv.row.no_info": "Aucune information",
+  "live_tv.row.failed": "Le guide de cette chaîne n’a pas pu être chargé · OK la lit quand même",
   "live_tv.badge.recording": "Enregistrement",
   "live_tv.badge.scheduled": "Programmé",
   "live_tv.badge.failed": "Échec",

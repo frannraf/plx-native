@@ -1056,7 +1056,10 @@ fn tag_name(line: &str) -> &str {
 /// quotes: a URI may carry ",METHOD=NONE" of its own.
 fn key_method(line: &str) -> Option<&str> {
     let (_, attrs) = line.split_once(':')?;
-    attribute_items(attrs).into_iter().find_map(|a| a.trim().strip_prefix("METHOD=")).map(|m| m.trim_matches('"'))
+    let mut methods = attribute_items(attrs).into_iter().filter_map(|a| a.trim().strip_prefix("METHOD=")).map(|m| m.trim_matches('"'));
+    let first = methods.next()?;
+    // two METHODs (invalid: RFC 8216 §4.2) read differently to different parsers: not clear
+    methods.next().is_none().then_some(first)
 }
 
 /// An attribute list's items, split at the commas outside quoted values.
@@ -1283,6 +1286,8 @@ mod tests {
         // a METHOD=NONE inside a quoted URI is not the key's method
         let sly = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:URI=\"https://k/?a=1,METHOD=NONE\",METHOD=AES-128\n#EXTINF:6,\ns.ts\n";
         assert_eq!(parse_media_as(Shape::Provider, &src, sly).map(|_| ()), Err(Error::UnsupportedFeature("encrypted segments")));
+        let twice = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=NONE,METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\ns.ts\n";
+        assert_eq!(parse_media_as(Shape::Provider, &src, twice).map(|_| ()), Err(Error::UnsupportedFeature("encrypted segments")), "two METHODs: not clear");
         assert_eq!(parse_media_as(Shape::Provider, &src, clear).map(|m| m.segments.len()), Ok(1), "METHOD=NONE: nothing is encrypted");
         assert!(parse_media(&src, clear).is_err(), "a server's shape stays strict");
         let http ="#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";

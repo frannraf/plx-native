@@ -136,6 +136,9 @@ pub struct Day {
     pub airings: Vec<Airing>,
     /// The cache clock at the last time a window wanted this day (eviction order).
     pub wanted_at: u64,
+    /// Reads of this day that failed in a row: a day asked again after a failure keeps reading as
+    /// failed until an answer lands (not "Loading…" for the second it takes, then failed again).
+    pub failures: u32,
 }
 
 /// The guide's day cache: one entry per `(channel index, UTC date)`, bounded by [`DAYS_KEPT`]
@@ -201,8 +204,12 @@ impl GuideCache {
                 Ok(a) => {
                     d.airings = a;
                     d.phase = Phase::Ready;
+                    d.failures = 0;
                 }
-                Err(why) => d.phase = Phase::Failed(why),
+                Err(why) => {
+                    d.phase = Phase::Failed(why);
+                    d.failures = d.failures.saturating_add(1);
+                }
             }
         }
     }
@@ -237,13 +244,15 @@ impl GuideCache {
         out.dedup_by_key(|a| a.begins_at);
         out
     }
-    /// Is any day of channel `ch` covering `[from, to)` still loading or unasked?
+    /// Is any day of channel `ch` covering `[from, to)` still loading or unasked, for the first
+    /// time? (A day being asked again after a failure reads as failed meanwhile: [`Day::failures`].)
     pub fn pending(&self, ch: usize, dates: &[String]) -> bool {
-        dates.iter().any(|d| self.get(ch, d).is_none_or(|day| matches!(day.phase, Phase::Idle | Phase::Loading)))
+        dates.iter().any(|d| self.get(ch, d).is_none_or(|day| matches!(day.phase, Phase::Idle | Phase::Loading) && day.failures == 0))
     }
-    /// Did every day of channel `ch` in `dates` fail?
+    /// Did every day of channel `ch` in `dates` fail (or fail and not yet answer again)?
     pub fn failed(&self, ch: usize, dates: &[String]) -> bool {
-        !dates.is_empty() && dates.iter().all(|d| self.get(ch, d).is_some_and(|day| matches!(day.phase, Phase::Failed(_))))
+        !dates.is_empty()
+            && dates.iter().all(|d| self.get(ch, d).is_some_and(|day| matches!(day.phase, Phase::Failed(_)) || (day.failures > 0 && !day.phase.is_ready())))
     }
     /// Apply a recording change to every cached airing it covers: `rule` now covers airings of
     /// `guid` (an episode or movie rule) or of the show `guid` (a series rule), or, with

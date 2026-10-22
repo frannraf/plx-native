@@ -42,6 +42,8 @@ pub(crate) struct Feed {
     /// A tune waiting for a tuner to come back first: a DVR has none to spare (seen on the TV:
     /// "every tuner is busy" while the channel left was still being released).
     pending: Option<(Asked, Option<plx_plex::plex::live_tv::Airing>)>,
+    /// The store generation the player's program was last read at ([`Self::live_tv_program_now`]).
+    rolled_at: Option<u32>,
 }
 
 /// A Watch asked for: its tab and row, and whether the live player's CH▲/CH▼ asked it (its landing
@@ -127,7 +129,7 @@ impl Bridge {
                 self.live_tv.want = None;
             }
             // a Watch press whose page is gone is nobody's
-            self.stores.live_tv.cancel_tune();
+            self.live_tv_cancel_tune();
             return;
         };
         if self.live_tv.instance != Some(instance) {
@@ -169,7 +171,7 @@ impl Bridge {
         match out {
             LiveTvOut::Watch { row, airing } => self.live_tv_ask(row, airing, false),
             LiveTvOut::Source(source) => store.select_source(source),
-            LiveTvOut::CancelTune => store.cancel_tune(),
+            LiveTvOut::CancelTune => self.live_tv_cancel_tune(),
             LiveTvOut::DismissTuneFailure => store.clear_tune_failure(),
             LiveTvOut::Write(w) => store.write(w),
             LiveTvOut::Retry => store.retry_failed(),
@@ -210,6 +212,10 @@ impl Bridge {
         if !asked.source.is_cloud() && (plx_media::route::live_releasing() || store.tuners_settling()) {
             plx_base::eventlog::log(&format!("livetv: row {row} waits for a tuner to come back"));
             store.cancel_tune();
+            // …shown as tuning meanwhile, so the press is answered and BACK can take it back
+            if let Some(words) = store.channel_words(row) {
+                store.show_tuning(words);
+            }
             self.live_tv.asked = None;
             self.live_tv.pending = Some((asked, airing));
             return;
@@ -227,8 +233,11 @@ impl Bridge {
     /// screen that asked for it is up (a CH▲/CH▼'s the player, a guide press's the guide).
     pub(crate) fn live_tv_pump(&mut self, in_player: bool, in_guide: bool) {
         let Some((asked, _)) = &self.live_tv.pending else { return };
-        if (asked.step && !in_player) || (!asked.step && !in_guide) {
+        // …while the screen that asked is up and the guide still shows the tab it asked under (a
+        // row of another tab is another channel)
+        if (asked.step && !in_player) || (!asked.step && !in_guide) || &asked.source != self.stores.live_tv.source() {
             self.live_tv.pending = None;
+            self.stores.live_tv.cancel_tune();
             return;
         }
         if plx_media::route::live_releasing() || self.stores.live_tv.tuners_settling() {
@@ -262,6 +271,27 @@ impl Bridge {
     pub(crate) fn live_tv_step_to(&mut self, row: usize) {
         let airing = self.stores.live_tv.on_now(row);
         self.live_tv_ask(row, airing, true);
+    }
+
+    /// The program on now on the channel being watched, when the guide moved since it was last
+    /// asked (a landing, the minute): the player's lines and bar follow it. `None` while nothing
+    /// moved, while a CH▲/CH▼ is under way, or when the guide shows another tab.
+    pub(crate) fn live_tv_program_now(&mut self) -> Option<plx_plex::plex::live_tv::Airing> {
+        let generation = self.stores.live_tv.generation();
+        if self.live_tv.rolled_at == Some(generation) || self.live_tv_step_busy() {
+            return None;
+        }
+        self.live_tv.rolled_at = Some(generation);
+        let (source, row) = self.live_tv.watching.as_ref()?;
+        if source != self.stores.live_tv.source() {
+            return None;
+        }
+        self.stores.live_tv.on_now(*row)
+    }
+
+    /// How the channel row `row` of the tab shown is named ("4.1 KXYZ"), for the player's lines.
+    pub(crate) fn live_tv_channel_words(&self, row: usize) -> Option<String> {
+        self.stores.live_tv.channel_words(row)
     }
 
     /// Is a CH▲/CH▼ under way (waiting on a tuner, or tuning)?

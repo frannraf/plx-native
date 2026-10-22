@@ -648,7 +648,7 @@ pub(crate) fn player_requests(
             PlayerReq::Minimize => {
                 minimize_player(ps, pa, refresh_hubs, pages);
             }
-            PlayerReq::ChannelStep(step) => step_live_channel(ps, bridge, step),
+            PlayerReq::ChannelStep(step) => step_live_channel(ps, bridge, step, now, pages),
         }
     }
 }
@@ -657,7 +657,13 @@ pub(crate) fn player_requests(
 /// tune lands (`content::live_tv_requests`, which then swaps the stream in place). A DVR channel
 /// hands its tuner back first and the tune waits for that (the next channel may need the tuner);
 /// one of Plex's channels holds none, and its next tune goes at once.
-fn step_live_channel(ps: &mut plx_media::route::PlaybackSession, bridge: &mut super::bridge::Bridge, step: i32) {
+fn step_live_channel(
+    ps: &mut plx_media::route::PlaybackSession,
+    bridge: &mut super::bridge::Bridge,
+    step: i32,
+    now: u32,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+) {
     if !plx_media::route::is_live(ps) {
         return;
     }
@@ -668,6 +674,16 @@ fn step_live_channel(ps: &mut plx_media::route::PlaybackSession, bridge: &mut su
     // The DVR's tuner goes back now (the step's tune waits for it: `Bridge::live_tv_ask`).
     plx_media::route::release_live_tuner(ps);
     bridge.live_tv_step_to(row);
+    // The press is answered on screen at once: the HUD comes up with "Tuning 4.2 KXYZ…" on its
+    // channel line while the tune takes its seconds (the new channel's own lines replace it).
+    if let Some(words) = bridge.live_tv_channel_words(row) {
+        let line = plx_platform::i18n::msg::live_tv_tuning(&words);
+        plx_media::route::set_live_context(ps, Some(&line));
+    }
+    if let Some(player) = super::bridge::player_mut(pages) {
+        player.hud.extend(now, HUD_LINGER_MS);
+        player.publish();
+    }
 }
 
 /// Stop the live channel playing full screen for the one a CH▲/CH▼ tuned, without leaving the

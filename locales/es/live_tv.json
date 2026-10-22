@@ -21,6 +21,7 @@
   "live_tv.action.close": "Cerrar",
   "live_tv.row.loading": "Cargando…",
   "live_tv.row.no_info": "Sin información",
+  "live_tv.row.failed": "No se pudo cargar la guía de este canal · OK lo reproduce igualmente",
   "live_tv.badge.recording": "Grabando",
   "live_tv.badge.scheduled": "Programada",
   "live_tv.badge.failed": "Fallida",

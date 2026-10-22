@@ -21,6 +21,7 @@
   "live_tv.action.close": "Закрыць",
   "live_tv.row.loading": "Загрузка…",
   "live_tv.row.no_info": "Няма звестак",
+  "live_tv.row.failed": "Не ўдалося загрузіць праграму гэтага канала · OK усё роўна ўключыць яго",
   "live_tv.badge.recording": "Ідзе запіс",
   "live_tv.badge.scheduled": "Запланавана",
   "live_tv.badge.failed": "Збой",

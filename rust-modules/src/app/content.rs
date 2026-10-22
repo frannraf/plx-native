@@ -1048,6 +1048,10 @@ pub(crate) fn watchlist_navigation(
 /// strip, BACK and the chip navigate as the Watchlist's do; everything else is the store's.
 fn live_tv_requests(app: &mut App) {
     use plx_screens::live_tv::LiveTvOut;
+    // A step is dropped however the player was left (STOP, BACK, the end of the stream).
+    if app.route() != AppArg::Player {
+        app.bridge.live_tv_abandon_step();
+    }
     app.bridge.live_tv_pump(app.route() == AppArg::Player, app.route() == AppArg::LiveTv);
     // A CH▲/CH▼ whose tune failed: a DVR channel left has handed its tuner back and its picture is
     // dying, so the player goes back to the guide, whose notice says why; one of Plex's channels
@@ -1056,8 +1060,19 @@ fn live_tv_requests(app: &mut App) {
         if step && app.route() == AppArg::Player {
             if plx_media::route::live_lease_held(&app.player.session) {
                 app.bridge.live_tv_clear_tune_failure();
+                plx_media::route::set_live_context(&mut app.player.session, None);
             } else {
                 super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+            }
+        }
+    }
+    // The program on the channel playing moved on with the clock: the player's lines and its bar
+    // follow (they were fixed at tune time, so at the top of the hour the bar read full and the
+    // title was the last program's).
+    if plx_media::route::is_live(&app.player.session) {
+        if let Some(a) = app.bridge.live_tv_program_now() {
+            if plx_media::route::roll_live_program(&mut app.player.session, &a.title, &a.show_title, a.begins_at, a.ends_at) {
+                plx_base::eventlog::log("livetv: the program on the channel playing moved on");
             }
         }
     }
