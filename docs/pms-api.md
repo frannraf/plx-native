@@ -1539,9 +1539,13 @@ Both parameters are required. **`date` is a UTC calendar day**: one request answ
 programs overlapping that UTC day, so a window that crosses UTC midnight asks for two dates.
 `MediaContainer.Metadata[]`, one per program, with one `Media` per airing: `beginsAt`/`endsAt`
 (epoch seconds, number or string), `channelIdentifier`, `channelVcn`, `channelTitle`, `onAir`,
-`premiere`. Program fields: `ratingKey`, `key`, `guid` (what the record template takes),
+`premiere`. A daily show can be numbered by year the other way round from a season: a real guide
+sent `parentIndex` 335 and `index` 2026 for one, which Plex's own guide shows as "2026 E335".
+Program fields: `ratingKey`, `key`, `guid` (what the record template takes),
 `grandparentGuid`, `type`, `title`, `grandparentTitle`, `parentIndex`/`index`, `year`, `summary`,
-`thumb`, and the recording marks `subscriptionID` (this program) and `grandparentSubscriptionID`
+`thumb`/`grandparentThumb`, `art`/`grandparentArt` (the guide's backdrop), `Image[]` (`type`
+`coverPoster` + an absolute `url`: the cell's portrait art), `contentRating`, `Genre[].tag`,
+`Media.channelThumb` (the channel's logo), and the recording marks `subscriptionID` (this program) and `grandparentSubscriptionID`
 (its series), `"0"` meaning none. An airing that spans UTC midnight comes back in both days.
 
 ### 10.4 Recording rules — `/media/subscriptions`

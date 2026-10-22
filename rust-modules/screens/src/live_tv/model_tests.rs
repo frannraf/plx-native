@@ -128,7 +128,7 @@ fn the_wanted_window_covers_the_rows_shown_and_reaches_past_the_window() {
     let v = view(20);
     let f = Frame { row_top: 5, ..frame() };
     let w = want(&v, &f);
-    assert_eq!(w.rows, 3..13);
+    assert_eq!(w.rows, 3..(5 + ROWS_SHOWN + 2), "two rows of margin each way");
     assert!(w.to > f.win_start + WINDOW_S);
     assert_eq!(w.from, NOON, "nothing that ended before now's half hour is asked for");
     // scrolled right, LEFT's way back is read too (back to now at most)

@@ -296,6 +296,9 @@ pub enum TunePhase {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub generation: u32,
+    /// The server the store reads — the one the guide's art paths (logos, posters, backdrops) are
+    /// fetched through.
+    pub sid: Option<ServerId>,
     pub availability: Availability,
     pub providers_phase: Phase,
     pub provider: Option<EpgProvider>,

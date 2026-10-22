@@ -23,7 +23,7 @@ use plx_machine::machine::{
 };
 use plx_machine::present::Provenance;
 use plx_platform::i18n::msg;
-use plx_plex::plex::live_tv::{Airing, GrabStatus};
+use plx_plex::plex::live_tv::{Airing, Channel, GrabStatus};
 use plx_ui::consts::{MARGIN_X, SCR_H, SCR_W};
 use plx_ui::label::{HAlign, Label, VAlign};
 use plx_ui::screen::{
@@ -31,8 +31,8 @@ use plx_ui::screen::{
     HitSource, Hover, Link, Placed, RenderStrategy, Screen, ScreenEvent, Seat, Step, Stop,
 };
 use plx_ui::text_view::TextView;
-use plx_ui::widgets::{Button, ControlGround};
-use plx_ui::{theme, Env, Painter, Rect, View};
+use plx_ui::widgets::{resolve_tex_wh_on, Button, ControlGround};
+use plx_ui::{theme, Crop, Env, Painter, Rect, View};
 
 use super::model::{self, geom, Action, Frame, LiveTvView, Panel, RecEntry, Target, Want};
 use crate::registry::{AppFx, ContentLike, HomeTab};
@@ -532,48 +532,6 @@ impl LiveTvScreen {
         }
     }
 
-    /// The details of the focused airing (else the one on now in the first row shown).
-    fn draw_details<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
-        let focus = self.last_cell.filter(|e| self.view.holds(self.frame.base, *e)).unwrap_or_else(|| self.now_cell());
-        let Some((row, a)) = self.view.airing(self.frame.base, focus) else { return };
-        let x = MARGIN_X;
-        let w = SCR_W - 2.0 * MARGIN_X;
-        let title = if a.show_title.is_empty() { a.title.clone() } else { a.show_title.clone() };
-        TextView::new(&title, theme::size::TITLE, theme::TEXT_PRIMARY)
-            .bold()
-            .with_measure(f.measure)
-            .max_lines(1)
-            .draw(p, Rect::new(x, geom::DETAIL_Y, w, 0.0));
-        let mut parts = vec![format!(
-            "{} \u{2013} {}",
-            self.time_of(a.begins_at),
-            self.time_of(a.ends_at)
-        )];
-        if let Some(ch) = self.view.snap.channels.get(row) {
-            parts.push(if ch.vcn.is_empty() { ch.label().to_string() } else { format!("{} {}", ch.vcn, ch.label()) });
-        }
-        if a.season > 0 && a.episode > 0 {
-            parts.push(msg::live_tv_episode(&a.season.to_string(), &a.episode.to_string()));
-        }
-        if !a.show_title.is_empty() && !a.title.is_empty() && a.title != a.show_title {
-            parts.push(a.title.clone());
-        }
-        if let Some(badge) = self.badge(a) {
-            parts.push(badge);
-        }
-        let meta = parts.join(" \u{b7} ");
-        TextView::new(&meta, theme::size::BODY, theme::TEXT_SECONDARY)
-            .with_measure(f.measure)
-            .max_lines(1)
-            .draw(p, Rect::new(x, geom::DETAIL_Y + 58.0, w, 0.0));
-        if !a.summary.is_empty() {
-            TextView::new(&a.summary, theme::size::LABEL, theme::TEXT_READING)
-                .with_measure(f.measure)
-                .max_lines(2)
-                .draw(p, Rect::new(x, geom::DETAIL_Y + 100.0, w, 0.0));
-        }
-    }
-
     /// The airing's recording state, as its badge words.
     fn badge(&self, a: &Airing) -> Option<String> {
         match model::grab_for(&self.view.snap, a).map(|g| &g.status) {
@@ -591,20 +549,195 @@ impl LiveTvScreen {
         plx_platform::i18n::current().time_of_day((local / 3_600) as u8, ((local % 3_600) / 60) as u8)
     }
 
+    /// The airing the hero describes: the focused cell's (else the one on now in the first row
+    /// shown), with its row.
+    fn hero(&self) -> Option<(usize, &Airing)> {
+        let focus = self.last_cell.filter(|e| self.view.holds(self.frame.base, *e)).unwrap_or_else(|| self.now_cell());
+        self.view.airing(self.frame.base, focus)
+    }
+
+    /// The server the guide's art is fetched through.
+    fn srv(&self) -> Option<u16> {
+        self.view.snap.sid.filter(|s| s.is_set()).map(|s| s.raw())
+    }
+
+    /// The page's ground: a deep blue wash, and in the Guide the hero airing's backdrop on the right
+    /// of the band above the grid, fading into the wash leftward and down.
+    fn draw_ground(&self, p: Painter) {
+        p.rect(Rect::new(0.0, 0.0, SCR_W, geom::ART_H), 0.0, GROUND, GROUND, 0.0);
+        p.rect(Rect::new(0.0, geom::ART_H, SCR_W, SCR_H - geom::ART_H), 0.0, GROUND, GROUND_LOW, 0.0);
+        if self.mode != Mode::Guide || self.readout().is_some() {
+            return;
+        }
+        let (Some(srv), Some((_, a))) = (self.srv(), self.hero()) else { return };
+        if a.art.is_empty() {
+            return;
+        }
+        let (tex, tw, th) = resolve_tex_wh_on(srv, &a.art, ART_REQ.0, ART_REQ.1, 0);
+        if tex == 0 {
+            // placeholder-exempt: decoration over a ground that is already whole; nothing stands in
+            return;
+        }
+        let r = Rect::new(geom::ART_X, 0.0, SCR_W - geom::ART_X, geom::ART_H);
+        p.tex_uv(tex, r.cover_uv(tw, th, Crop::Centre), r, 0.0, theme::TINT_WHITE);
+        // the left fade, as strips: the painter's gradients run top to bottom only
+        let step = ART_FADE_W / ART_FADE_STEPS as f32;
+        for i in 0..ART_FADE_STEPS {
+            let t = i as f32 / ART_FADE_STEPS as f32;
+            let strip = Rect::new(geom::ART_X + i as f32 * step, 0.0, step + 0.5, geom::ART_H);
+            p.rrect(strip, 0.0, 0.0, theme::with_a(GROUND, (1.0 - t).powf(1.4)));
+        }
+        let fall = 180.0;
+        p.rect(Rect::new(geom::ART_X, geom::ART_H - fall, SCR_W - geom::ART_X, fall), 0.0, theme::with_a(GROUND, 0.0), GROUND, 0.0);
+    }
+
+    /// The hero: the focused airing's title, its facts (with how long is left of one on now), its
+    /// episode title and genres, and its summary, over the left of the backdrop.
+    fn draw_details<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
+        let Some((row, a)) = self.hero() else { return };
+        let x = MARGIN_X;
+        let w = geom::DETAIL_W;
+        let title = if a.show_title.is_empty() { a.title.clone() } else { a.show_title.clone() };
+        TextView::new(&title, theme::size::DISPLAY, theme::TEXT_PRIMARY)
+            .bold()
+            .with_measure(f.measure)
+            .max_lines(1)
+            .draw(p, Rect::new(x, geom::DETAIL_Y, w, 0.0));
+        let mut parts = Vec::new();
+        match episode_words(a.season, a.episode) {
+            Some(words) => parts.push(words),
+            None if a.year > 0 => parts.push(a.year.to_string()),
+            None => {}
+        }
+        parts.push(format!("{} \u{2013} {}", self.time_of(a.begins_at), self.time_of(a.ends_at)));
+        if let Some(ch) = self.view.snap.channels.get(row) {
+            parts.push(channel_words(ch));
+        }
+        if !a.content_rating.is_empty() {
+            parts.push(a.content_rating.clone());
+        }
+        let facts = parts.join("   ");
+        let y = geom::DETAIL_Y + 66.0;
+        let line = f.measure.line_h(theme::size::BODY);
+        TextView::new(&facts, theme::size::BODY, theme::TEXT_SECONDARY)
+            .with_measure(f.measure)
+            .max_lines(1)
+            .draw(p, Rect::new(x, y, w, 0.0));
+        let mut px = x + f.measure.width_str(&facts, theme::size::BODY, false).min(w) + 22.0;
+        let on_now = self.frame.now > 0 && a.airs_at(self.frame.now);
+        if on_now {
+            px += self.draw_left_pill(f, p, px, y + line * 0.5, a) + 16.0;
+        }
+        // the recording state; "On Now" is the pill's to say
+        if let Some(badge) = self.badge(a).filter(|b| b.as_str() != msg::live_tv_badge_on_now()) {
+            TextView::new(&badge, theme::size::BODY, theme::TEXT_PRIMARY)
+                .bold()
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(px, y, (x + w - px).max(0.0), 0.0));
+        }
+        let mut y = geom::DETAIL_Y + 108.0;
+        let mut second = Vec::new();
+        if !a.show_title.is_empty() && !a.title.is_empty() && a.title != a.show_title {
+            second.push(a.title.clone());
+        }
+        if !a.genres.is_empty() {
+            second.push(a.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+        }
+        if !second.is_empty() {
+            TextView::new(&second.join(" \u{b7} "), theme::size::LABEL, theme::TEXT_PRIMARY)
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(x, y, w, 0.0));
+            y += 40.0;
+        }
+        if !a.summary.is_empty() {
+            TextView::new(&a.summary, theme::size::LABEL, theme::TEXT_READING)
+                .with_measure(f.measure)
+                .max_lines(2)
+                .draw(p, Rect::new(x, y, w, 0.0));
+        }
+    }
+
+    /// The "1h 37m left" pill of an airing on now, its left edge at `x`, centred on `cy`; returns
+    /// its width. The ring counts down: the time left is lit, what has aired is dim.
+    fn draw_left_pill<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, x: f32, cy: f32, a: &Airing) -> f32 {
+        let now = self.frame.now;
+        let text = left_words(a.ends_at - now);
+        let size = theme::size::CAPTION;
+        let tw = f.measure.width_str(&text, size, true);
+        let (h, ring, pad) = (40.0, 22.0, 12.0);
+        let w = pad + ring + 10.0 + tw + pad;
+        p.rrect(Rect::new(x, cy - h * 0.5, w, h), 10.0, 10.0, theme::with_a(INK_BLACK, 0.72));
+        let span = (a.ends_at - a.begins_at).max(1) as f32;
+        let aired = ((now - a.begins_at) as f32 / span).clamp(0.0, 1.0);
+        draw_ring(p, x + pad + ring * 0.5, cy, ring * 0.5 - 2.0, aired);
+        let lh = f.measure.line_h(size);
+        TextView::new(&text, size, theme::TEXT_PRIMARY)
+            .bold()
+            .with_measure(f.measure)
+            .max_lines(1)
+            .draw(p, Rect::new(x + pad + ring + 10.0, cy - lh * 0.5, tw + 4.0, 0.0));
+        w
+    }
+
+    /// A row's channel: its logo (else its call sign) over its number.
+    fn draw_channel<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32) {
+        let r = Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, geom::ROW_H);
+        p.rrect(r, 10.0, 10.0, theme::with_a(INK_BLACK, 0.32));
+        let logo_box = Rect::new(r.x + 18.0, y + 10.0, r.w - 36.0, r.h - 44.0);
+        let thumb = if ch.thumb.is_empty() {
+            self.view.row(row).and_then(|rw| rw.airings.iter().map(|a| a.channel_thumb.as_str()).find(|t| !t.is_empty())).unwrap_or("")
+        } else {
+            ch.thumb.as_str()
+        };
+        let mut logo = false;
+        if let (Some(srv), false) = (self.srv(), thumb.is_empty()) {
+            let (tex, tw, th) = resolve_tex_wh_on(srv, thumb, LOGO_REQ.0, LOGO_REQ.1, 1);
+            if tex != 0 && tw > 0.0 && th > 0.0 {
+                p.tex(tex, contain(logo_box, tw, th), 0.0, theme::TINT_WHITE);
+                logo = true;
+            }
+        }
+        if !logo {
+            TextView::new(ch.label(), theme::size::LABEL, theme::TEXT_PRIMARY)
+                .bold()
+                .with_measure(f.measure)
+                .max_lines(1)
+                .h(HAlign::Center)
+                .draw(p, Rect::new(logo_box.x, logo_box.y + (logo_box.h - theme::size::LABEL as f32) * 0.5, logo_box.w, 0.0));
+        }
+        if !ch.vcn.is_empty() {
+            TextView::new(&ch.vcn, theme::size::CAPTION, theme::TEXT_SECONDARY)
+                .with_measure(f.measure)
+                .max_lines(1)
+                .h(HAlign::Center)
+                .draw(p, Rect::new(r.x, y + r.h - 32.0, r.w, 0.0));
+        }
+    }
+
     fn draw_guide<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
         self.draw_details(f, p);
         let fr = &self.frame;
-        // the ruler: a time at each half hour
+        // the ruler: a band with a time at each half hour
+        p.rrect(
+            Rect::new(geom::GRID_X, geom::RULER_Y, geom::GRID_W - geom::CELL_GAP, geom::RULER_H),
+            6.0,
+            6.0,
+            theme::with_a(INK_BLACK, 0.45),
+        );
         for k in 0..(model::WINDOW_S / model::HALF_HOUR) {
             let t = fr.win_start + k * model::HALF_HOUR;
             let x = model::x_of(fr.win_start, t);
             let label = self.time_of(t);
             if let Ok(c) = CString::new(label) {
-                Label::new(c.as_ptr(), theme::size::CAPTION, theme::TEXT_TERTIARY)
+                Label::new(c.as_ptr(), theme::size::CAPTION, theme::TEXT_SECONDARY)
                     .v(VAlign::Middle)
-                    .draw(p, Rect::new(x + 8.0, geom::RULER_Y, geom::GRID_W / 4.0, geom::RULER_H));
+                    .draw(p, Rect::new(x + 10.0, geom::RULER_Y, geom::GRID_W / 4.0, geom::RULER_H));
             }
-            p.rrect(Rect::new(x, geom::RULER_Y + 6.0, 2.0, geom::RULER_H - 12.0), 1.0, 1.0, theme::TEXT_SEPARATOR);
+            if k > 0 {
+                p.rrect(Rect::new(x - 1.0, geom::RULER_Y + 8.0, 2.0, geom::RULER_H - 16.0), 1.0, 1.0, theme::TEXT_SEPARATOR);
+            }
         }
         let n = self.view.channel_count();
         let rows = fr.row_top..(fr.row_top + model::ROWS_SHOWN).min(n);
@@ -612,13 +745,7 @@ impl LiveTvScreen {
         for row in rows {
             let y = model::row_y(fr, row);
             if let Some(ch) = self.view.snap.channels.get(row) {
-                p.rrect(Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, geom::ROW_H), 10.0, 10.0, theme::with_a(theme::TEXT_PRIMARY, 0.06));
-                let label = if ch.vcn.is_empty() { ch.label().to_string() } else { format!("{}  {}", ch.vcn, ch.label()) };
-                TextView::new(&label, theme::size::LABEL, theme::TEXT_PRIMARY)
-                    .bold()
-                    .with_measure(f.measure)
-                    .max_lines(1)
-                    .draw(p, Rect::new(geom::CHANNEL_X + 16.0, y + (geom::ROW_H - theme::size::LABEL as f32) * 0.5, geom::CHANNEL_W - 32.0, 0.0));
+                self.draw_channel(f, p, row, ch, y);
             }
             let Some(r) = self.view.row(row) else { continue };
             let shown: Vec<&Airing> = r.airings.iter().filter(|a| a.ends_at > fr.win_start && a.begins_at < fr.win_start + model::WINDOW_S).collect();
@@ -644,35 +771,83 @@ impl LiveTvScreen {
                 let Some(rect) = model::cell_rect(fr, row, a.begins_at, a.ends_at) else { continue };
                 let elem = model::cell_elem(row, model::slot_of(fr.base, a.begins_at));
                 let on = !panel_up && self.focused(f, elem);
-                let title = if a.show_title.is_empty() { &a.title } else { &a.show_title };
-                let sub = if !a.show_title.is_empty() && a.title != a.show_title { a.title.as_str() } else { "" };
                 let rec = a.is_recording_scheduled() || model::grab_for(&self.view.snap, a).is_some();
-                self.draw_cell(f, p, rect, title, sub, on, fr.now > 0 && a.airs_at(fr.now), rec);
+                self.draw_airing_cell(f, p, rect, a, on, rec);
                 f.stop(p, stop(self.key(elem), rect));
             }
         }
-        // the now line
+        // now, on the ruler
         if fr.now >= fr.win_start && fr.now < fr.win_start + model::WINDOW_S {
             let x = model::x_of(fr.win_start, fr.now);
-            let shown = (n.saturating_sub(fr.row_top)).min(model::ROWS_SHOWN) as f32;
-            p.rrect(Rect::new(x - 1.5, geom::RULER_Y, 3.0, geom::RULER_H + shown * geom::ROW_PITCH), 1.5, 1.5, theme::DANGER);
+            p.rrect(Rect::new(x - 2.0, geom::RULER_Y, 4.0, geom::RULER_H), 2.0, 2.0, LEFT_RING);
         }
     }
 
+    /// One airing's cell: on now, the part already aired is lit; wide enough, the program's art at
+    /// its left; its title over its times (and, focused and on now, how long is left).
+    fn draw_airing_cell<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, rect: Rect, a: &Airing, on: bool, rec: bool) {
+        let fr = &self.frame;
+        let now = fr.now > 0 && a.airs_at(fr.now);
+        let (fill, ink, ink2) = cell_colors(on, now);
+        p.rrect(rect, 10.0, 10.0, fill);
+        if now && !on {
+            let nx = model::x_of(fr.win_start, fr.now).clamp(rect.x, rect.x + rect.w);
+            if nx > rect.x + 1.0 {
+                let right = if nx >= rect.x + rect.w - 1.0 { 10.0 } else { 0.0 };
+                p.rrect(Rect::new(rect.x, rect.y, nx - rect.x, rect.h), 10.0, right, theme::with_a(theme::TEXT_PRIMARY, 0.10));
+            }
+        }
+        if rect.w < 40.0 {
+            return;
+        }
+        let mut tx = rect.x + 16.0;
+        if rect.w >= POSTER_MIN_CELL_W && !a.poster.is_empty() {
+            if let Some(srv) = self.srv() {
+                let pr = Rect::new(rect.x + 8.0, rect.y + 8.0, geom::POSTER_W, geom::POSTER_H);
+                let (tex, tw, th) = resolve_tex_wh_on(srv, &a.poster, POSTER_REQ.0, POSTER_REQ.1, 0);
+                if tex != 0 {
+                    p.tex_uv(tex, pr.cover_uv(tw, th, Crop::Centre), pr, 6.0, theme::TINT_WHITE);
+                    tx = pr.x + pr.w + 14.0;
+                } else if !plx_ui::tex::failed_on(srv, &a.poster, POSTER_REQ.0, POSTER_REQ.1, false) {
+                    plx_ui::placeholder::skeleton(p, plx_ui::placeholder::Reason::CardSkeleton, "livetv-poster", pr, 6.0);
+                    tx = pr.x + pr.w + 14.0;
+                }
+            }
+        }
+        let title = if a.show_title.is_empty() { a.title.as_str() } else { a.show_title.as_str() };
+        let mut sub = format!("{} \u{2013} {}", self.time_of(a.begins_at), self.time_of(a.ends_at));
+        if on && now {
+            sub = format!("{sub} \u{b7} {}", left_words(a.ends_at - fr.now));
+        } else if !a.show_title.is_empty() && !a.title.is_empty() && a.title != a.show_title && rect.w >= EPISODE_MIN_CELL_W {
+            sub = format!("{sub} \u{b7} {}", a.title);
+        }
+        let dot = if rec { 24.0 } else { 0.0 };
+        let w = rect.x + rect.w - 14.0 - dot - tx;
+        if w > 8.0 {
+            TextView::new(title, theme::size::LABEL, ink)
+                .bold()
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(tx, rect.y + 18.0, w, 0.0));
+            TextView::new(&sub, theme::size::CAPTION, ink2)
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(tx, rect.y + 56.0, w, 0.0));
+        }
+        if rec {
+            p.rrect(Rect::new(rect.x + rect.w - 14.0 - 12.0, rect.y + 20.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
+        }
+    }
+
+    /// A cell with words and no airing: a row still loading, or one with no guide.
     #[allow(clippy::too_many_arguments)]
     fn draw_cell<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, rect: Rect, title: &str, sub: &str, on: bool, now: bool, rec: bool) {
-        let (fill, ink, ink2) = if on {
-            (theme::ACCENT, theme::ACCENT_INK, theme::ACCENT_INK)
-        } else if now {
-            (theme::with_a(theme::TEXT_PRIMARY, 0.16), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
-        } else {
-            (theme::with_a(theme::TEXT_PRIMARY, 0.08), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
-        };
+        let (fill, ink, ink2) = cell_colors(on, now);
         p.rrect(rect, 10.0, 10.0, fill);
         if rect.w < 40.0 {
             return;
         }
-        let pad = 14.0;
+        let pad = 16.0;
         let dot = if rec { 22.0 } else { 0.0 };
         let w = rect.w - 2.0 * pad - dot;
         if w > 8.0 {
@@ -680,16 +855,16 @@ impl LiveTvScreen {
                 .bold()
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(rect.x + pad, rect.y + 14.0, w, 0.0));
+                .draw(p, Rect::new(rect.x + pad, rect.y + 18.0, w, 0.0));
             if !sub.is_empty() {
                 TextView::new(sub, theme::size::CAPTION, ink2)
                     .with_measure(f.measure)
                     .max_lines(1)
-                    .draw(p, Rect::new(rect.x + pad, rect.y + 46.0, w, 0.0));
+                    .draw(p, Rect::new(rect.x + pad, rect.y + 56.0, w, 0.0));
             }
         }
         if rec {
-            p.rrect(Rect::new(rect.x + rect.w - pad - 12.0, rect.y + 16.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
+            p.rrect(Rect::new(rect.x + rect.w - pad - 12.0, rect.y + 20.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
         }
     }
 
@@ -854,6 +1029,84 @@ fn action_label(a: Action) -> &'static str {
 }
 
 /// A write's outcome, in words.
+/// An airing's season and episode words. A guide that numbers a daily show by year can send the
+/// year as the episode index and the day's number as the season (a real guide: `parentIndex` 335,
+/// `index` 2026, which Plex's own guide shows as "2026 E335"), so a year reads as the season,
+/// written without the "S".
+fn episode_words(season: i64, episode: i64) -> Option<String> {
+    const YEAR: i64 = 1_900;
+    if season <= 0 || episode <= 0 {
+        return None;
+    }
+    if episode >= YEAR && season < YEAR {
+        return Some(format!("{episode} {}", msg::core_episode(season)));
+    }
+    if season >= YEAR {
+        return Some(format!("{season} {}", msg::core_episode(episode)));
+    }
+    Some(msg::live_tv_episode(&season.to_string(), &episode.to_string()))
+}
+
+/// The page's wash: a deep blue, darker toward the foot.
+const GROUND: [f32; 4] = [0.051, 0.098, 0.192, 1.0];
+const GROUND_LOW: [f32; 4] = [0.027, 0.047, 0.098, 1.0];
+/// The time left of an airing on now: the pill's ring, the ruler's now mark.
+const LEFT_RING: [f32; 4] = [0.976, 0.659, 0.149, 1.0];
+const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// The sizes the guide asks its art at: the backdrop, a cell's poster, a channel's logo (PNG, for
+/// its transparency).
+const ART_REQ: (i32, i32) = (1280, 720);
+const POSTER_REQ: (i32, i32) = (112, 168);
+const LOGO_REQ: (i32, i32) = (240, 112);
+/// The backdrop's left fade: how wide, in how many strips.
+const ART_FADE_W: f32 = 620.0;
+const ART_FADE_STEPS: usize = 48;
+/// A cell this wide shows its program's art; this wide, its episode title beside its times.
+const POSTER_MIN_CELL_W: f32 = 300.0;
+const EPISODE_MIN_CELL_W: f32 = 560.0;
+
+/// A cell's fill and inks: focused, on now, or neither.
+fn cell_colors(on: bool, now: bool) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    if on {
+        (theme::ACCENT, theme::ACCENT_INK, theme::ACCENT_INK)
+    } else if now {
+        (theme::with_a(theme::TEXT_PRIMARY, 0.13), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
+    } else {
+        (theme::with_a(theme::TEXT_PRIMARY, 0.07), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
+    }
+}
+
+/// A channel as the hero names it: its number and call sign.
+fn channel_words(ch: &Channel) -> String {
+    if ch.vcn.is_empty() { ch.label().to_string() } else { format!("{} {}", ch.vcn, ch.label()) }
+}
+
+/// "1h 37m left" / "36m left" for `secs` seconds, rounded up to the minute.
+fn left_words(secs: i64) -> String {
+    let mins = (secs.max(0) + 59) / 60;
+    if mins >= 60 { msg::core_time_left_hours(mins / 60, mins % 60) } else { msg::core_time_left_minutes(mins) }
+}
+
+/// `tw`×`th` fitted inside `b`, centred: a logo is never cropped.
+fn contain(b: Rect, tw: f32, th: f32) -> Rect {
+    let s = (b.w / tw).min(b.h / th);
+    let (w, h) = (tw * s, th * s);
+    Rect::new(b.x + (b.w - w) * 0.5, b.y + (b.h - h) * 0.5, w, h)
+}
+
+/// A countdown ring of dots round (`cx`, `cy`), clockwise from twelve: the `aired` fraction dim,
+/// the rest lit. Dots, because the painter has no arc.
+fn draw_ring(p: Painter, cx: f32, cy: f32, r: f32, aired: f32) {
+    const DOTS: usize = 20;
+    const D: f32 = 4.0;
+    for i in 0..DOTS {
+        let t = (i as f32 + 0.5) / DOTS as f32;
+        let ang = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let col = if t < aired { theme::with_a(theme::TEXT_PRIMARY, 0.22) } else { LEFT_RING };
+        p.rrect(Rect::new(cx + r * ang.cos() - D * 0.5, cy + r * ang.sin() - D * 0.5, D, D), D * 0.5, D * 0.5, col);
+    }
+}
+
 fn notice_text(n: &plx_data::live_tv::WriteNotice) -> String {
     if !n.ok {
         return msg::live_tv_notice_failed(&n.reason);
@@ -1155,6 +1408,7 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, H>) {
         plx_gfx::gfx::frame_clear(theme::CLEAR_RGB.0, theme::CLEAR_RGB.1, theme::CLEAR_RGB.2);
         let p = f.painter.alpha(f.page_alpha);
+        self.draw_ground(p);
         self.draw_head(f, p);
         match self.readout() {
             Some(r) => self.draw_readout(f, p, r),
@@ -1213,5 +1467,15 @@ mod tests {
         assert_eq!(LiveTvScreen::strip_press(TAB_KEY_HOME), Some(Some(LiveTvOut::Tab(HomeTab::Home))));
         assert_eq!(LiveTvScreen::strip_press(TAB_KEY_WATCHLIST), Some(Some(LiveTvOut::Tab(HomeTab::Watchlist))));
         assert_eq!(LiveTvScreen::strip_press(TAB_KEY_LIVE_TV), Some(None));
+    }
+
+    #[test]
+    fn a_year_numbered_episode_reads_as_the_year_first() {
+        assert_eq!(episode_words(2, 5), Some(msg::live_tv_episode("2", "5")));
+        let swapped = episode_words(335, 2026).expect("words");
+        assert!(swapped.starts_with("2026 ") && swapped.contains("335"), "{swapped}");
+        let ordered = episode_words(2026, 335).expect("words");
+        assert_eq!(ordered, swapped, "either order reads the same");
+        assert_eq!(episode_words(0, 4), None);
     }
 }

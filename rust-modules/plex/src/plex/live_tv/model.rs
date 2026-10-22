@@ -71,11 +71,22 @@ pub struct Airing {
     pub year: i64,
     pub summary: String,
     pub thumb: String,
+    /// The program's portrait art for a guide cell: the `coverPoster` image, else the show's
+    /// thumb, else the program's own. A path or an absolute URL.
+    pub poster: String,
+    /// The program's backdrop (`art`, else the show's `grandparentArt`). A path or an absolute URL.
+    pub art: String,
+    /// `TV-14`, `PG`, … as the guide spells it.
+    pub content_rating: String,
+    /// The guide's genre tags, in its order.
+    pub genres: Vec<String>,
     pub begins_at: i64,
     pub ends_at: i64,
     pub channel_identifier: String,
     pub channel_vcn: String,
     pub channel_title: String,
+    /// The channel's logo as the airing carries it (`Media.channelThumb`).
+    pub channel_thumb: String,
     /// PMS's own "on now" flag. A guide decides "now" from its clock; this is a hint.
     pub on_air: bool,
     pub premiere: bool,

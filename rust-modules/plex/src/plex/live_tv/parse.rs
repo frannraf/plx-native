@@ -182,6 +182,13 @@ fn airing_meta(m: &Value) -> Airing {
         year: int(m, "year"),
         summary: text(m, "summary"),
         thumb: { let t = text(m, "thumb"); if t.is_empty() { text(m, "grandparentThumb") } else { t } },
+        poster: {
+            let cover = many(m, "Image").into_iter().find(|i| text(i, "type") == "coverPoster").map(|i| text(i, "url"));
+            [cover.unwrap_or_default(), text(m, "grandparentThumb"), text(m, "thumb")].into_iter().find(|s| !s.is_empty()).unwrap_or_default()
+        },
+        art: { let a = text(m, "art"); if a.is_empty() { text(m, "grandparentArt") } else { a } },
+        content_rating: text(m, "contentRating"),
+        genres: many(m, "Genre").into_iter().map(|g| text(g, "tag")).filter(|t| !t.is_empty()).collect(),
         subscription_id: nonzero(text(m, "subscriptionID")),
         show_subscription_id: nonzero(text(m, "grandparentSubscriptionID")),
         ..Airing::default()
@@ -200,6 +207,7 @@ fn with_media(mut a: Airing, media: &Value) -> Airing {
     a.channel_identifier = text(media, "channelIdentifier");
     a.channel_vcn = text(media, "channelVcn");
     a.channel_title = text(media, "channelTitle");
+    a.channel_thumb = text(media, "channelThumb");
     a.on_air = flag(media, "onAir");
     a.premiere = flag(media, "premiere");
     a.media_id = text(media, "id");

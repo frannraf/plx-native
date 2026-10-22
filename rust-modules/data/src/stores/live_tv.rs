@@ -782,6 +782,7 @@ impl LiveTvStore {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             generation: self.generation,
+            sid: self.sid,
             availability: self.availability.clone(),
             providers_phase: self.providers_phase.clone(),
             provider: self.provider.clone(),

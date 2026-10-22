@@ -19,7 +19,7 @@ pub const HALF_HOUR: i64 = 1_800;
 /// How much time the guide shows across.
 pub const WINDOW_S: i64 = 2 * 3_600;
 /// Channel rows shown at once.
-pub const ROWS_SHOWN: usize = 6;
+pub const ROWS_SHOWN: usize = 5;
 /// Channel rows the guide can key (`row << 20` stays below the reserved keys).
 pub const MAX_ROWS: usize = 2_048;
 
@@ -161,15 +161,23 @@ pub mod geom {
     pub const HEAD_H: f32 = 60.0;
     pub const PILL_W: f32 = 240.0;
     pub const PILL_GAP: f32 = 16.0;
-    pub const DETAIL_Y: f32 = 280.0;
-    pub const RULER_Y: f32 = 430.0;
+    pub const DETAIL_Y: f32 = 246.0;
+    /// The hero's text column: the backdrop art owns the right of the band above the guide.
+    pub const DETAIL_W: f32 = 1_000.0;
+    /// The backdrop art's box: the right of the screen, from the top down to the ruler.
+    pub const ART_X: f32 = SCR_W * 0.40;
+    pub const ART_H: f32 = RULER_Y;
+    pub const RULER_Y: f32 = 468.0;
     pub const RULER_H: f32 = 36.0;
-    pub const ROWS_Y: f32 = 474.0;
-    pub const ROW_H: f32 = 78.0;
-    pub const ROW_PITCH: f32 = 88.0;
+    pub const ROWS_Y: f32 = 512.0;
+    pub const ROW_H: f32 = 98.0;
+    pub const ROW_PITCH: f32 = 106.0;
     pub const CHANNEL_X: f32 = MARGIN_X;
-    pub const CHANNEL_W: f32 = 240.0;
-    pub const GRID_X: f32 = MARGIN_X + CHANNEL_W + 12.0;
+    pub const CHANNEL_W: f32 = 170.0;
+    pub const GRID_X: f32 = MARGIN_X + CHANNEL_W + 10.0;
+    /// A guide cell's program art: portrait, the row's height less a margin.
+    pub const POSTER_H: f32 = ROW_H - 16.0;
+    pub const POSTER_W: f32 = POSTER_H * 2.0 / 3.0;
     pub const GRID_W: f32 = SCR_W - MARGIN_X - GRID_X;
     pub const CELL_GAP: f32 = 6.0;
     pub const RECS_Y: f32 = 290.0;
