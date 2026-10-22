@@ -25,12 +25,16 @@
 use crate::live_tv::{self as lt, Availability, GuideCache, Overlay, Phase, RecordKind, Snapshot, TunePhase, Tuned, WriteNotice, WriteOp};
 use plx_plex::plex::live_tv::{Airing, Channel, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
 use plx_plex::plex::ServerId;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Reads in flight at once (a guide window asks for a dozen channel-days).
 pub const IN_FLIGHT: usize = 4;
+
+/// Guide art whose UltraBlur colours are remembered; the oldest is forgotten first and asked
+/// again if its program is shown again.
+pub const MAX_BLURS: usize = 48;
 
 /// Release workers still running (waited for at exit, [`drain_releases`]).
 static RELEASING: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +62,8 @@ pub enum Job {
     Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, session: String },
     /// Release a tune nobody will play: stop its encode, delete its subscription.
     Release { subscription_id: String, session: String },
+    /// The UltraBlur colours of a piece of guide art (the page's tint).
+    Blur { art: String },
 }
 
 /// A write a page asked for.
@@ -79,6 +85,7 @@ pub enum Landing {
     Write { write: Write, result: Result<WriteDone, LiveError> },
     Tuned { serial: u32, result: Result<Tuned, LiveError> },
     Released,
+    Blur { art: String, result: Result<[[f32; 3]; 4], LiveError> },
 }
 
 /// What a successful write did.
@@ -171,6 +178,10 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
         Job::Release { subscription_id, session } => {
             release(client, &subscription_id, &session);
             Landing::Released
+        }
+        Job::Blur { art } => {
+            let result = client.ultrablur_colors(&art);
+            Landing::Blur { art, result }
         }
         Job::Providers => Landing::Providers(client.live_tv_providers()),
         Job::Channels { provider } => Landing::Channels(client.live_tv_channels(&provider)),
@@ -297,6 +308,10 @@ pub struct LiveTvStore {
     now: i64,
     utc_offset: i64,
     offset_logged: bool,
+    /// Guide art → its UltraBlur colours (`None`: asked, or the server had none), with the order
+    /// art was first asked in, for forgetting the oldest past [`MAX_BLURS`].
+    blurs: HashMap<String, Option<[[f32; 3]; 4]>>,
+    blur_order: VecDeque<String>,
     generation: u32,
 }
 
@@ -338,6 +353,8 @@ impl LiveTvStore {
             now: 0,
             utc_offset: 0,
             offset_logged: false,
+            blurs: HashMap::new(),
+            blur_order: VecDeque::new(),
             generation: 0,
         }
     }
@@ -526,6 +543,12 @@ impl LiveTvStore {
         self.guide.airings(ch, from, to)
     }
 
+    /// The airing on now on channel row `ch`, from the guide cache (the player's record disc).
+    pub fn on_now(&self, ch: usize) -> Option<Airing> {
+        let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        self.guide.airings(ch, now, now + 1).into_iter().find(|a| a.airs_at(now))
+    }
+
     /// Is channel row `ch` still loading for `[from, to)`?
     pub fn row_pending(&self, ch: usize, from: i64, to: i64) -> bool {
         self.guide.pending(ch, &lt::days_covering(from, to))
@@ -534,6 +557,22 @@ impl LiveTvStore {
     /// Did every day of channel row `ch` for `[from, to)` fail?
     pub fn row_failed(&self, ch: usize, from: i64, to: i64) -> bool {
         self.guide.failed(ch, &lt::days_covering(from, to))
+    }
+
+    /// The page's hero shows `art`: ask its UltraBlur colours, once (the page tints itself with
+    /// them; until they land it keeps its own ground).
+    pub fn want_blur(&mut self, art: &str) {
+        if self.sid.is_none() || art.is_empty() || self.blurs.contains_key(art) {
+            return;
+        }
+        if self.blur_order.len() >= MAX_BLURS {
+            if let Some(old) = self.blur_order.pop_front() {
+                self.blurs.remove(&old);
+            }
+        }
+        self.blurs.insert(art.to_string(), None);
+        self.blur_order.push_back(art.to_string());
+        self.queue.push_back(Job::Blur { art: art.to_string() });
     }
 
     /// Re-read the recording rules and operations.
@@ -696,6 +735,13 @@ impl LiveTvStore {
                 Err(_) => {}
             },
             Landing::Released => {}
+            Landing::Blur { art, result } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if let (Ok(colors), Some(slot)) = (result, self.blurs.get_mut(&art)) {
+                    *slot = Some(colors);
+                    self.bump();
+                }
+            }
             Landing::Write { write, result } => {
                 self.writing = false;
                 self.notice_serial = self.notice_serial.wrapping_add(1);
@@ -796,6 +842,7 @@ impl LiveTvStore {
             notice: self.notice.clone(),
             writes_in_flight: u32::from(self.writing) + self.write_queue.len() as u32,
             tune: self.tune_phase.clone(),
+            blurs: self.blurs.iter().filter_map(|(art, c)| c.map(|c| (art.clone(), c))).collect(),
         }
     }
 

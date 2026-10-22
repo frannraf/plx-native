@@ -652,6 +652,9 @@ impl TransportRow {
 /// its OK and its click, and a second literal `2` over there is exactly the drift `ControlSlot`
 /// was introduced to stop.
 pub const BTN_MORE: i32 = BTN_N - 1;
+/// On a live channel the FIRST disc (Subtitles elsewhere) records the program on now: what is
+/// playing can only be recorded from here, the guide's OK on it watches it.
+pub const BTN_RECORD: i32 = 0;
 /// width the disc row occupies, the floor for anything replacing it
 pub fn ctrl_row_w() -> f32 {
     disc_row().width()
@@ -1987,9 +1990,14 @@ pub fn draw_hud(
                     crate::skip_pill::draw(row, pc, pr, focus == 1, measure);
                 }
                 ControlSlot::Discs => {
+                    let live = plx_media::route::is_live(ps);
                     for i in 0..BTN_N {
                         let pop = row.scale(i);
-                        TransportButton::new(i, Rect::new(btn_x(i), BTN_Y, BTN_S, BTN_S))
+                        let mut disc = TransportButton::new(i, Rect::new(btn_x(i), BTN_Y, BTN_S, BTN_S));
+                        if live && i == BTN_RECORD {
+                            disc = disc.record(plx_media::route::record_asked());
+                        }
+                        disc
                             .focused(focus == 1 && btn == i)
                             // The whole control row stands on the VIDEO PLANE — see `ControlGround`. It is
                             // the HUD's own bottom ramp (drawn at the top of this function) that makes the

@@ -306,6 +306,18 @@ impl Client {
         Ok(airings)
     }
 
+    /// The four UltraBlur colours of an image (`url`: a PMS path or an absolute URL, as the guide's
+    /// art is), corner-major: top-left, top-right, bottom-right, bottom-left, each RGB in 0..1. What
+    /// the guide tints its page with; PMS extracts them, so the image never has to be decoded here.
+    pub fn ultrablur_colors(&self, url: &str) -> LiveResult<[[f32; 3]; 4]> {
+        if url.is_empty() {
+            return Err(LiveError::Invalid);
+        }
+        let path = QueryBuilder::new("/services/ultrablur/colors").str("url", url).build();
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        parse::ultrablur(&body).ok_or(LiveError::Unreadable)
+    }
+
     /// The recording rules, in priority order.
     pub fn dvr_subscriptions(&self) -> LiveResult<Vec<Subscription>> {
         let body = ok_body(self.json_value(Method::Get, "/media/subscriptions"))?;

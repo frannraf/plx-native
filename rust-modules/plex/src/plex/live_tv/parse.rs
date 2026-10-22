@@ -195,6 +195,25 @@ fn airing_meta(m: &Value) -> Airing {
     }
 }
 
+/// `GET /services/ultrablur/colors` → the four corners (object or array of one), corner-major:
+/// top-left, top-right, bottom-right, bottom-left. `None` unless all four read as hex RGB.
+pub(super) fn ultrablur(body: &Value) -> Option<[[f32; 3]; 4]> {
+    let c = container(body)?;
+    let colors = many(c, "UltraBlurColors").into_iter().next()?;
+    let corner = |key: &str| hex_rgb(&text(colors, key));
+    Some([corner("topLeft")?, corner("topRight")?, corner("bottomRight")?, corner("bottomLeft")?])
+}
+
+/// `"44181b"` (or `"#44181b"`) → RGB in 0..1.
+fn hex_rgb(s: &str) -> Option<[f32; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 || !s.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok().map(|b| f32::from(b) / 255.0);
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
 /// `"0"` means "no rule" on the wire as much as an absent field does.
 fn nonzero(s: String) -> String {
     if s.trim() == "0" { String::new() } else { s }

@@ -1165,6 +1165,9 @@ pub(crate) unsafe fn activate_player_row(
             pages,
             bridge,
         );
+    } else if btn == plx_appkit::player_hud::BTN_RECORD && plx_media::route::is_live(ps) {
+        // a live channel's first disc records what is on now
+        bridge.live_tv_record_playing();
     } else if btn == plx_appkit::player_hud::BTN_MORE {
         // …so the discs are what row 1 holds — the complement of the arm above, and the row's only
         // other occupant. OK on a control disc PRESENTS its panel on this page's own stack.

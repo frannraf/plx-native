@@ -2,9 +2,10 @@
 //! has a DVR. Two modes under one header: the **Guide** (channels down, time across, the airing on
 //! now first) and **Recordings** (what will record, then the recording rules in priority order).
 //!
-//! OK on an airing opens the action panel: Watch (the airing is on now), Record, Record Series,
-//! Stop Recording, Cancel Recording, Cancel Series Recording. On a recording: Stop or Cancel; on a
-//! rule: Move to Top / Bottom, Delete. The page names no store: everything it asks for leaves as a
+//! OK on an airing that is on now watches it (recording what is playing is the player's offer);
+//! OK on a later one opens the action panel: Record, Record Series, Cancel Recording, Cancel Series
+//! Recording (and Watch for a channel with no tuner behind it never shows). On a recording: Stop or
+//! Cancel; on a rule: Move to Top / Bottom, Delete. The page names no store: everything it asks for leaves as a
 //! [`LiveTvOut`] the application routes (`app::content::live_tv_requests`), and everything it
 //! draws arrives as a [`LiveTvView`] the application feeds it (`Bridge::live_tv_feed`), with the
 //! guide window it wants read ([`LiveTvScreen::want`]).
@@ -31,7 +32,7 @@ use plx_ui::screen::{
     HitSource, Hover, Link, Placed, RenderStrategy, Screen, ScreenEvent, Seat, Step, Stop,
 };
 use plx_ui::text_view::TextView;
-use plx_ui::widgets::{resolve_tex_wh_on, Button, ControlGround};
+use plx_ui::widgets::{resolve_tex_wh_on, AmbientWash, Button, ControlGround};
 use plx_ui::{theme, Crop, Env, Painter, Rect, View};
 
 use super::model::{self, geom, Action, Frame, LiveTvView, Panel, RecEntry, Target, Want};
@@ -110,6 +111,10 @@ pub struct LiveTvScreen {
     /// The guide cell focus was last on: the details band keeps describing it while the panel
     /// (whose actions hold the focus) is about it.
     last_cell: Option<u32>,
+    /// The page's ground, keyed to the hero airing's art and dissolving between programs.
+    wash: AmbientWash,
+    /// The tick clock at the last tick (the wash's step).
+    last_tick: Option<u32>,
 }
 
 impl LiveTvScreen {
@@ -134,6 +139,12 @@ impl LiveTvScreen {
             seat_pending: false,
             focus: None,
             last_cell: None,
+            wash: {
+                let mut w = AmbientWash::flat(GROUND);
+                w.jump(PLAIN_WASH);
+                w
+            },
+            last_tick: None,
         }
     }
 
@@ -186,6 +197,11 @@ impl LiveTvScreen {
     pub fn want(&self) -> Option<Want> {
         (self.mode == Mode::Guide && self.frame.base > 0 && self.view.channel_count() > 0)
             .then(|| model::want(&self.view, &self.frame))
+    }
+
+    /// The art the hero shows, for the application to ask its UltraBlur colours.
+    pub fn hero_art(&self) -> Option<String> {
+        (self.mode == Mode::Guide).then(|| self.hero().map(|(_, a)| a.art.clone())).flatten().filter(|a| !a.is_empty())
     }
 
     pub fn mode(&self) -> Mode {
@@ -357,8 +373,16 @@ impl LiveTvScreen {
                             self.route(LiveTvOut::Watch { row, airing: None }, fx);
                         }
                     } else if let Some((_, airing)) = self.view.airing(self.frame.base, elem) {
-                        let target = Target::Airing { row, airing: airing.clone() };
-                        self.open_panel(elem, target, fx);
+                        // A show on now plays at once (recording it is the player's to offer); a
+                        // later one opens its record choices.
+                        let tunable = self.view.snap.provider.as_ref().is_some_and(|p| p.tunable());
+                        if tunable && self.frame.now > 0 && airing.airs_at(self.frame.now) {
+                            let airing = airing.clone();
+                            self.route(LiveTvOut::Watch { row, airing: Some(airing) }, fx);
+                        } else {
+                            let target = Target::Airing { row, airing: airing.clone() };
+                            self.open_panel(elem, target, fx);
+                        }
                     }
                 } else if let Some(i) = model::rec_of(elem) {
                     let target = match self.recs.get(i) {
@@ -438,6 +462,11 @@ impl LiveTvScreen {
         if let Some(elem) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem) {
             self.follow(elem);
         }
+        let dt = self.last_tick.map_or(0.0, |t| ms.wrapping_sub(t).min(100) as f32 / 1_000.0);
+        self.last_tick = Some(ms);
+        let target = self.wash_target();
+        // decorative: the wash dissolving between programs moves no layout
+        plx_machine::idle::decorative(|| self.wash.step(target, AmbientWash::K, dt));
         if let Some((_, until)) = &mut self.notice {
             let at = *until.get_or_insert(ms.wrapping_add(NOTICE_MS));
             // the tick clock wraps: gone once `ms` passes `at`
@@ -561,11 +590,20 @@ impl LiveTvScreen {
         self.view.snap.sid.filter(|s| s.is_set()).map(|s| s.raw())
     }
 
-    /// The page's ground: a deep blue wash, and in the Guide the hero airing's backdrop on the right
-    /// of the band above the grid, fading into the wash leftward and down.
+    /// The wash the page steps toward: the hero airing's UltraBlur corners held dark, else the
+    /// plain deep blue (and always in Recordings).
+    fn wash_target(&self) -> [[f32; 4]; 4] {
+        let art = self.hero_art();
+        match art.as_deref().and_then(|a| self.view.snap.blurs.get(a)) {
+            Some(c) => [tint(c[0], false), tint(c[1], false), tint(c[2], true), tint(c[3], true)],
+            None => PLAIN_WASH,
+        }
+    }
+
+    /// The page's ground: the wash, and in the Guide the hero airing's backdrop on the right of the
+    /// band above the grid, its left edge dissolving into the wash and its foot fading into it.
     fn draw_ground(&self, p: Painter) {
-        p.rect(Rect::new(0.0, 0.0, SCR_W, geom::ART_H), 0.0, GROUND, GROUND, 0.0);
-        p.rect(Rect::new(0.0, geom::ART_H, SCR_W, SCR_H - geom::ART_H), 0.0, GROUND, GROUND_LOW, 0.0);
+        self.wash.draw(p, Rect::FULL);
         if self.mode != Mode::Guide || self.readout().is_some() {
             return;
         }
@@ -579,16 +617,28 @@ impl LiveTvScreen {
             return;
         }
         let r = Rect::new(geom::ART_X, 0.0, SCR_W - geom::ART_X, geom::ART_H);
-        p.tex_uv(tex, r.cover_uv(tw, th, Crop::Centre), r, 0.0, theme::TINT_WHITE);
-        // the left fade, as strips: the painter's gradients run top to bottom only
+        let [u0, v0, u1, v1] = r.cover_uv(tw, th, Crop::Centre);
+        let u_at = |x: f32| u0 + (x - r.x) / r.w * (u1 - u0);
+        // The left edge dissolves: the art's own alpha ramps up across the fade, so whatever colour
+        // the wash has under it shows through. In strips, because the painter's gradients run top
+        // to bottom only.
         let step = ART_FADE_W / ART_FADE_STEPS as f32;
         for i in 0..ART_FADE_STEPS {
-            let t = i as f32 / ART_FADE_STEPS as f32;
-            let strip = Rect::new(geom::ART_X + i as f32 * step, 0.0, step + 0.5, geom::ART_H);
-            p.rrect(strip, 0.0, 0.0, theme::with_a(GROUND, (1.0 - t).powf(1.4)));
+            let x = r.x + i as f32 * step;
+            let t = (i as f32 + 0.5) / ART_FADE_STEPS as f32;
+            let alpha = t * t;
+            p.tex_uv(tex, [u_at(x), v0, u_at(x + step), v1], Rect::new(x, r.y, step, r.h), 0.0, theme::with_a(theme::TINT_WHITE, alpha));
         }
-        let fall = 180.0;
-        p.rect(Rect::new(geom::ART_X, geom::ART_H - fall, SCR_W - geom::ART_X, fall), 0.0, theme::with_a(GROUND, 0.0), GROUND, 0.0);
+        let solid = r.x + ART_FADE_W;
+        p.tex_uv(tex, [u_at(solid), v0, u1, v1], Rect::new(solid, r.y, r.x + r.w - solid, r.h), 0.0, theme::TINT_WHITE);
+        // The foot fades into the wash, in its colour where they meet.
+        let seg = r.w / ART_FALL_SEGS as f32;
+        for j in 0..ART_FALL_SEGS {
+            let x = r.x + j as f32 * seg;
+            let c = self.wash.sample(Rect::FULL, x + seg * 0.5, r.y + r.h);
+            let col = [c[0], c[1], c[2], 1.0];
+            p.rect(Rect::new(x, r.y + r.h - ART_FALL, seg + 0.5, ART_FALL), 0.0, theme::with_a(col, 0.0), col, 0.0);
+        }
     }
 
     /// The hero: the focused airing's title, its facts (with how long is left of one on now), its
@@ -642,7 +692,7 @@ impl LiveTvScreen {
             second.push(a.title.clone());
         }
         if !a.genres.is_empty() {
-            second.push(a.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+            second.push(a.genres.join(", "));
         }
         if !second.is_empty() {
             TextView::new(&second.join(" \u{b7} "), theme::size::LABEL, theme::TEXT_PRIMARY)
@@ -1050,6 +1100,15 @@ fn episode_words(season: i64, episode: i64) -> Option<String> {
 /// The page's wash: a deep blue, darker toward the foot.
 const GROUND: [f32; 4] = [0.051, 0.098, 0.192, 1.0];
 const GROUND_LOW: [f32; 4] = [0.027, 0.047, 0.098, 1.0];
+/// The wash with no art to key it (corner-major: top-left, top-right, bottom-right, bottom-left).
+const PLAIN_WASH: [[f32; 4]; 4] = [GROUND, GROUND, GROUND_LOW, GROUND_LOW];
+/// How bright an art colour may make the ground (Rec.709 luma), and how far the ground leans
+/// toward it: Plex's own guide wears the program's colour, dark enough for its white text.
+const TINT_LUMA: f32 = 0.20;
+const TINT_W: f32 = 0.85;
+/// The backdrop's foot: how tall its fade into the wash is, in how many colour samples across.
+const ART_FALL: f32 = 200.0;
+const ART_FALL_SEGS: usize = 12;
 /// The time left of an airing on now: the pill's ring, the ruler's now mark.
 const LEFT_RING: [f32; 4] = [0.976, 0.659, 0.149, 1.0];
 const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -1064,6 +1123,16 @@ const ART_FADE_STEPS: usize = 48;
 /// A cell this wide shows its program's art; this wide, its episode title beside its times.
 const POSTER_MIN_CELL_W: f32 = 300.0;
 const EPISODE_MIN_CELL_W: f32 = 560.0;
+
+/// An UltraBlur corner as the page's ground: held under [`TINT_LUMA`] (a scalar dim, so its hue
+/// survives), leaned [`TINT_W`] of the way from the plain ground, and darker at the foot.
+fn tint(c: [f32; 3], low: bool) -> [f32; 4] {
+    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let k = if luma > TINT_LUMA { TINT_LUMA / luma } else { 1.0 };
+    let held = [c[0] * k, c[1] * k, c[2] * k, 1.0];
+    let t = theme::mix(if low { GROUND_LOW } else { GROUND }, held, TINT_W);
+    if low { [t[0] * 0.7, t[1] * 0.7, t[2] * 0.7, 1.0] } else { t }
+}
 
 /// A cell's fill and inks: focused, on now, or neither.
 fn cell_colors(on: bool, now: bool) -> ([f32; 4], [f32; 4], [f32; 4]) {
@@ -1094,16 +1163,23 @@ fn contain(b: Rect, tw: f32, th: f32) -> Rect {
     Rect::new(b.x + (b.w - w) * 0.5, b.y + (b.h - h) * 0.5, w, h)
 }
 
+/// The countdown ring's dots: the unit circle at the middles of twenty equal steps, clockwise
+/// from twelve (screen y grows down). A table, so no transcendental runs on a screen.
+const RING: [(f32, f32); 20] = [
+    (0.1564, -0.9877), (0.4540, -0.8910), (0.7071, -0.7071), (0.8910, -0.4540), (0.9877, -0.1564),
+    (0.9877, 0.1564), (0.8910, 0.4540), (0.7071, 0.7071), (0.4540, 0.8910), (0.1564, 0.9877),
+    (-0.1564, 0.9877), (-0.4540, 0.8910), (-0.7071, 0.7071), (-0.8910, 0.4540), (-0.9877, 0.1564),
+    (-0.9877, -0.1564), (-0.8910, -0.4540), (-0.7071, -0.7071), (-0.4540, -0.8910), (-0.1564, -0.9877),
+];
+
 /// A countdown ring of dots round (`cx`, `cy`), clockwise from twelve: the `aired` fraction dim,
 /// the rest lit. Dots, because the painter has no arc.
 fn draw_ring(p: Painter, cx: f32, cy: f32, r: f32, aired: f32) {
-    const DOTS: usize = 20;
     const D: f32 = 4.0;
-    for i in 0..DOTS {
-        let t = (i as f32 + 0.5) / DOTS as f32;
-        let ang = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+    for (i, (ux, uy)) in RING.iter().enumerate() {
+        let t = (i as f32 + 0.5) / RING.len() as f32;
         let col = if t < aired { theme::with_a(theme::TEXT_PRIMARY, 0.22) } else { LEFT_RING };
-        p.rrect(Rect::new(cx + r * ang.cos() - D * 0.5, cy + r * ang.sin() - D * 0.5, D, D), D * 0.5, D * 0.5, col);
+        p.rrect(Rect::new(cx + r * ux - D * 0.5, cy + r * uy - D * 0.5, D, D), D * 0.5, D * 0.5, col);
     }
 }
 

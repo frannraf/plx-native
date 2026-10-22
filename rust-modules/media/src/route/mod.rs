@@ -21,7 +21,9 @@ pub use flight::{
     discard_stale_flight_landing, engineless_flight_outstanding, flight_is_current, flight_outstanding, recovery_flight_offset_ns, recovery_flight_outstanding, resume_flight_outstanding, retire_superseded_encoder, take_ready_flight,
     take_ready_recovery_flight, ReadyFlight, RecoveryLanding, RecoveryVerdict, SeekVerdict,
 };
-pub use live::{drain_live_releases, install_live, is_live, release_live, LiveInfo, LiveRoute, KEEPALIVE_S};
+pub use live::{
+    drain_live_releases, install_live, is_live, record_asked, release_live, set_record_asked, LiveInfo, LiveRoute, KEEPALIVE_S,
+};
 pub use plan::*;
 pub use prefs::*;
 pub use track_memory::{forced_only_language, forced_only_pick, memo_of_audio, memo_of_subtitle, subtitle_pick_changed, SubMode, TrackContext};

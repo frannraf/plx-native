@@ -643,7 +643,8 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                     InputKind::Pointer { x, y, .. } => {
                         self.last_pointer = Some((*x, *y));
                         if let Some((ax, ay)) = self.pointer_anchor {
-                            if self.hud.dismissed && (x - ax).hypot(y - ay) < POINTER_WAKE_PX {
+                            let (dx, dy) = (x - ax, y - ay);
+                            if self.hud.dismissed && dx * dx + dy * dy < POINTER_WAKE_PX * POINTER_WAKE_PX {
                                 return Handled::Yes;
                             }
                             self.pointer_anchor = None;

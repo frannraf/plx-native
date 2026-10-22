@@ -314,4 +314,7 @@ pub struct Snapshot {
     pub notice: Option<WriteNotice>,
     pub writes_in_flight: u32,
     pub tune: TunePhase,
+    /// Guide art → its UltraBlur colours (corner-major: top-left, top-right, bottom-right,
+    /// bottom-left), for the art that has them.
+    pub blurs: HashMap<String, [[f32; 3]; 4]>,
 }

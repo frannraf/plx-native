@@ -4849,8 +4849,16 @@ pub struct TransportButton {
     /// The FOCUS POP, as a factor on the frame — see [`CircleButton::scale`], whose contract this
     /// shares (these discs are that same face at 64px).
     pub scale: f32,
+    /// A live channel's record disc instead of `which`'s glyph: a red dot, ringed once the
+    /// recording is asked for (`Some(asked)`).
+    pub record: Option<bool>,
 }
 impl TransportButton {
+    /// Draw the live record disc (see [`Self::record`]).
+    pub fn record(mut self, asked: bool) -> Self {
+        self.record = Some(asked);
+        self
+    }
     pub fn new(which: i32, frame: Rect) -> Self {
         Self {
             frame,
@@ -4859,6 +4867,7 @@ impl TransportButton {
             ground: ControlGround::Keyed,
             palette: ControlPalette::default(),
             scale: 1.0,
+            record: None,
         }
     }
     pub fn focused(mut self, f: bool) -> Self {
@@ -4913,6 +4922,15 @@ impl View for TransportButton {
             self.focused,
             self.ground,
         );
+        if let Some(asked) = self.record {
+            let d = (r.w * 0.34).round();
+            p.rrect(Rect::new(r.x + (r.w - d) * 0.5, r.y + (r.h - d) * 0.5, d, d), d * 0.5, d * 0.5, theme::DANGER);
+            if asked {
+                let g = d + 14.0;
+                p.rring(Rect::new(r.x + (r.w - g) * 0.5, r.y + (r.h - g) * 0.5, g, g), g * 0.5, 3.0, theme::DANGER);
+            }
+            return;
+        }
         let id = match self.which {
             1 => Icon::Audio,
             2 => Icon::More,

@@ -414,3 +414,18 @@ fn enum_labels_decode_like_decode_uri_component() {
     assert_eq!(parse::pct_decode("100%"), "100%");
     assert_eq!(parse::pct_decode("%zz"), "%zz");
 }
+
+#[test]
+fn ultrablur_reads_four_corners_from_an_object_or_an_array() {
+    let one = serde_json::json!({"MediaContainer": {"size": 1, "UltraBlurColors": [
+        {"topLeft": "44181b", "topRight": "55140b", "bottomRight": "9a3936", "bottomLeft": "#31313a"}
+    ]}});
+    let c = parse::ultrablur(&one).expect("four corners");
+    assert!((c[0][0] - 0x44 as f32 / 255.0).abs() < 1e-6, "top-left red: {c:?}");
+    assert!((c[3][2] - 0x3a as f32 / 255.0).abs() < 1e-6, "bottom-left blue, '#' tolerated: {c:?}");
+    let obj = serde_json::json!({"MediaContainer": {"UltraBlurColors":
+        {"topLeft": "000000", "topRight": "ffffff", "bottomRight": "0000ff", "bottomLeft": "ff0000"}}});
+    assert_eq!(parse::ultrablur(&obj).expect("object form")[1], [1.0, 1.0, 1.0]);
+    let short = serde_json::json!({"MediaContainer": {"UltraBlurColors": [{"topLeft": "000000"}]}});
+    assert_eq!(parse::ultrablur(&short), None, "all four corners or none");
+}

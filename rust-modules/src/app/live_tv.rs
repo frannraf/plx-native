@@ -16,7 +16,8 @@
 //! * **Watch.** The store tunes off the frame; a landed stream is taken once
 //!   ([`Bridge::live_tv_take_tuned`]) and installed into the media route, whose lease releases the
 //!   tuner when the playback ends however it ends.
-use plx_data::live_tv::{Availability, Tuned};
+use plx_data::live_tv::{Availability, RecordKind, Tuned};
+use plx_data::stores::live_tv::Write;
 use plx_screens::live_tv::model::{LiveTvView, RowAirings, Want};
 use plx_screens::live_tv::page::{LiveTvOut, LiveTvScreen};
 use plx_screens::registry::AppArg;
@@ -32,6 +33,8 @@ pub(crate) struct Feed {
     tried: Vec<plx_plex::plex::ServerId>,
     /// When a failed providers read is asked again (the app's logical clock, ms).
     retry_at: Option<u32>,
+    /// The channel row last asked to be watched: the player's record disc records what is on it.
+    watching: Option<usize>,
 }
 
 /// How long after a failed providers read it is asked again: a set that booted before its network
@@ -117,6 +120,9 @@ impl Bridge {
             self.live_tv.want = None;
             self.stores.live_tv.refresh_dvr();
         }
+        if let Some(art) = page.hero_art() {
+            self.stores.live_tv.want_blur(&art);
+        }
         let want = page.want();
         if want != self.live_tv.want {
             if let Some(w) = &want {
@@ -146,6 +152,7 @@ impl Bridge {
         let store = &mut self.stores.live_tv;
         match out {
             LiveTvOut::Watch { row, airing } => {
+                self.live_tv.watching = Some(row);
                 if !store.tune(row, airing) {
                     plx_base::eventlog::log("livetv: nothing to tune on that row");
                 }
@@ -157,6 +164,22 @@ impl Bridge {
             LiveTvOut::RefreshDvr => store.refresh_dvr(),
             LiveTvOut::Tab(_) | LiveTvOut::Account | LiveTvOut::Back => {}
         }
+    }
+
+    /// The live player's record disc: record the program on now on the channel being watched,
+    /// once (the disc rings to say it was asked; the write's answer is the guide's notice).
+    pub(crate) fn live_tv_record_playing(&mut self) {
+        if plx_media::route::record_asked() {
+            return;
+        }
+        let Some(row) = self.live_tv.watching else { return };
+        let Some(airing) = self.stores.live_tv.on_now(row) else {
+            plx_base::eventlog::log("livetv: record from the player: nothing on now on that row");
+            return;
+        };
+        plx_base::eventlog::log(&format!("livetv: record from the player, row {row}"));
+        self.stores.live_tv.write(Write::Record { airing, kind: RecordKind::This });
+        plx_media::route::set_record_asked(true);
     }
 
     /// Forget a Watch press still on its way (the app is going to the background).

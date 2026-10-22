@@ -83,6 +83,20 @@ impl std::fmt::Debug for LiveLease {
 /// Release workers still running (waited for at shutdown).
 static RELEASING: AtomicUsize = AtomicUsize::new(0);
 
+/// Has the viewer asked, from the player's record disc, to record the program on now on the
+/// channel being watched? Cleared with the tune (a new channel, a release).
+static RECORD_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// The record disc was pressed (the application has queued the recording).
+pub fn set_record_asked(asked: bool) {
+    RECORD_ASKED.store(asked, Ordering::Relaxed);
+}
+
+/// Did the viewer ask to record what is on now (the record disc's ring)?
+pub fn record_asked() -> bool {
+    RECORD_ASKED.load(Ordering::Relaxed)
+}
+
 impl LiveLease {
     fn release(&mut self) {
         if self.released {
@@ -93,6 +107,7 @@ impl LiveLease {
         // Whatever drops a lease (a stop, a reset, a plan assigned over the session), the next
         // stream the demuxer opens is not this channel's: never a library stream read as live.
         crate::ff::set_live_stream(false);
+        RECORD_ASKED.store(false, Ordering::Relaxed);
         let (sid, sub, key, rk, enc) = (
             self.sid,
             std::mem::take(&mut self.subscription_id),
@@ -153,6 +168,7 @@ fn release_now(sid: ServerId, sub: &str, key: &str, rk: &str, enc: &str) {
 /// the tune is the route's: `false` (the declaration was refused, nothing installed) has already
 /// released it.
 pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
+    RECORD_ASKED.store(false, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     // Made first, so every way out of this function below releases the tune it holds.
     let lease = LiveLease {
