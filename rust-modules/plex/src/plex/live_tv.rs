@@ -383,6 +383,106 @@ impl Client {
     }
 }
 
+/// A live tune turned into what the native player opens: the universal transcoder's `start.m3u8`
+/// for the tuned key, encoded to the H.264/AAC HLS the player's segmented demuxer reads, with the
+/// codecs and raster the decision promised (the Starfish Load is declared from these).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveStream {
+    /// The playlist URL, token included — never logged.
+    pub url: String,
+    /// The transcoder session (`session=`), which a stop names.
+    pub encoder_session: String,
+    pub video_codec: String,
+    pub audio_codec: String,
+    pub width: i64,
+    pub height: i64,
+}
+
+/// The bound a live encode is asked for: 1080p at a rate a LAN carries comfortably. A tuner's
+/// MPEG-2 or interlaced H.264 is re-encoded either way (the HLS profile copies nothing), so this
+/// caps the server's work as much as the link's.
+pub const LIVE_CEILING: super::Ceiling = super::Ceiling { max_kbps: 12_000, max_w: 1920, max_h: 1080 };
+
+/// The transcode request for a live key: the same fixed-HLS contract the library's HLS rungs use.
+pub(super) fn live_spec<'a>(key: &'a str, session: &'a str) -> super::TranscodeSpec<'a> {
+    super::TranscodeSpec {
+        rating_key: "",
+        path_override: Some(key),
+        session,
+        encoder_session: session,
+        contract: super::EncodeContract {
+            remux: false,
+            no_video_copy: true,
+            ceiling: Some(LIVE_CEILING),
+            delivery: super::TranscodeDelivery::FixedHls { seconds_per_segment: 2 },
+            audio: super::AudioEnhancements::NONE,
+        },
+        audio_stream_id: 0,
+        subtitle_stream_id: 0,
+        client_subtitles: false,
+        offset: super::TranscodeOffset::Fresh,
+    }
+}
+
+impl Client {
+    /// Register a transcode of the tuned `key` (`TunedItem::key`) and answer the playlist the player
+    /// opens. `session` is a fresh opaque id that names the encode from now until its stop.
+    /// A refusal is `Server` with PMS's own sentence; nothing is left running (the decision of a
+    /// refused encode registers nothing that needs a stop, and a transport failure is stopped by
+    /// the caller with [`Client::live_stream_stop`] to be sure).
+    pub fn live_stream(&self, off: &plx_base::task::OffFrame, key: &str, session: &str) -> LiveResult<LiveStream> {
+        if !key.starts_with('/') || session.is_empty() {
+            return Err(LiveError::Invalid);
+        }
+        let spec = live_spec(key, session);
+        let decision = self.transcode_decision(off, &spec).ok_or(LiveError::Transport)?;
+        if let Some(code) = decision.general_decision_code {
+            if !(1000..2000).contains(&code) {
+                let text = if decision.transcode_decision_text.is_empty() { decision.general_decision_text.clone() } else { decision.transcode_decision_text.clone() };
+                return Err(LiveError::Server { status: code, message: text });
+            }
+        }
+        let media = decision.metadata.first().and_then(|m| m.media.first());
+        let streams: Vec<&super::models::Stream> = media.map(|m| m.part.iter().flat_map(|p| p.stream.iter()).collect()).unwrap_or_default();
+        let codec = |kind: i64, fallback: &str| {
+            streams.iter().find(|s| s.stream_type == kind).map(|s| s.codec.clone()).filter(|c| !c.is_empty())
+                .or_else(|| media.map(|m| if kind == 1 { m.video_codec.clone() } else { m.audio_codec.clone() }).filter(|c| !c.is_empty()))
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        Ok(LiveStream {
+            url: self.transcode_start_url(&spec).to_url(),
+            encoder_session: session.to_string(),
+            video_codec: codec(1, "h264"),
+            audio_codec: codec(2, "aac"),
+            width: media.map_or(0, |m| m.width),
+            height: media.map_or(0, |m| m.height),
+        })
+    }
+
+    /// Stop a live encode (and free its streaming resource). `true` when the server took it.
+    pub fn live_stream_stop(&self, session: &str) -> bool {
+        self.transcode_stop(session)
+    }
+
+    /// One `/:/timeline` report for a live session: the tuned item's key and ratingKey with
+    /// `time=0&duration=0`, so the server keeps the tune alive and records no resume point
+    /// (`docs/pms-api.md` §10). `state` is `playing`, `paused` or `stopped`.
+    pub fn live_timeline(&self, key: &str, rating_key: &str, state: &str, session: &str) -> bool {
+        if key.is_empty() || session.is_empty() {
+            return false;
+        }
+        let q = QueryBuilder::new("/:/timeline")
+            .opt_str("ratingKey", rating_key)
+            .str("key", key)
+            .str("state", state)
+            .int("time", 0)
+            .int("duration", 0)
+            .str("X-Plex-Session-Identifier", session);
+        let q = self.playback_identity(q);
+        self.post_ok(&q.build())
+    }
+}
+
 /// One line per write that went out: the operation and its status, never a path, id or token.
 fn log_write(op: &str, outcome: &ValueOutcome) {
     let what = match outcome {

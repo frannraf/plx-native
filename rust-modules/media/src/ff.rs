@@ -5118,7 +5118,33 @@ fn hls_upshift_strictly_improves(
         .is_some_and(|candidate| candidate.strictly_dominates(current))
 }
 
+/// **The stream now playing is a live channel** (`route::live`): its playlist never ends, so the
+/// cursor tolerates what a library transcode should not see — a refresh that fails a few times, a
+/// window that slid past the cursor — and treats a playlist that stopped growing as the end of the
+/// tune rather than as buffering. Set by `route::install_live`, cleared by its release; read once
+/// when a cursor opens.
+static LIVE_STREAM: AtomicBool = AtomicBool::new(false);
+
+/// See [`LIVE_STREAM`].
+pub(crate) fn set_live_stream(live: bool) {
+    LIVE_STREAM.store(live, Ordering::Release);
+}
+
+/// Refreshes of a live playlist that may fail in a row before the stream is given up.
+const LIVE_REFRESH_RETRIES: u32 = 5;
+/// How long a live playlist may go without a new segment before the tune is over (a tuner lost,
+/// a transcoder gone). A library transcode keeps buffering instead.
+const LIVE_STALL_MS: u64 = 60_000;
+
 struct HlsCursor {
+    /// A live channel's never-ending playlist ([`LIVE_STREAM`]).
+    live: bool,
+    /// Milliseconds of refreshes since the last new segment (live stall detection).
+    idle_ms: u64,
+    /// Failed refreshes in a row (live only).
+    refresh_failures: u32,
+    /// The last segment handed out, so a live resync never replays one.
+    last_sequence: Option<u64>,
     /// Whether this cursor's media playlist is the one describing WHAT IS PLAYING.
     ///
     /// A candidate cursor opened during a quality transaction reads a freshly created encoder
@@ -5174,6 +5200,10 @@ fn hls_cursor_open(
         master.variant.bandwidth
     ));
     Ok(HlsCursor {
+        live: LIVE_STREAM.load(Ordering::Acquire),
+        idle_ms: 0,
+        refresh_failures: 0,
+        last_sequence: None,
         publishes_duration,
         declared_bps: master.variant.bandwidth,
         auth,
@@ -5194,14 +5224,29 @@ fn hls_cursor_next(
 ) -> Result<Option<crate::hls::Segment>, HlsExit> {
     loop {
         if let Some(segment) = cursor.pending.pop_front() {
+            cursor.last_sequence = Some(segment.sequence);
             return Ok(Some(segment));
         }
         if cursor.ended {
             return Ok(None);
         }
         // Refreshed from the variant's own URL; its segments resolve against where it landed.
-        let (media_text, media_ms, media_landed) =
-            hls_fetch_text(&cursor.media, &cursor.auth, aq, net, reserve.as_deref_mut())?;
+        let fetched = hls_fetch_text(&cursor.media, &cursor.auth, aq, net, reserve.as_deref_mut());
+        let (media_text, media_ms, media_landed) = match fetched {
+            Ok(v) => {
+                cursor.refresh_failures = 0;
+                v
+            }
+            // A live playlist's refresh can fail for a moment (a busy server, a dropped packet):
+            // try again a few times, a second apart, before giving the channel up.
+            Err(HlsExit::NotReady | HlsExit::Failed(_)) if cursor.live && cursor.refresh_failures < LIVE_REFRESH_RETRIES => {
+                cursor.refresh_failures += 1;
+                crate::player::log(&format!("hls: live refresh failed ({}/{LIVE_REFRESH_RETRIES}), retrying", cursor.refresh_failures));
+                hls_wait(aq, std::time::Duration::from_millis(1_000), None, &mut plx_base::checkpoint::NoCheckpoint)?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let media = crate::hls::parse_media(&media_landed, &media_text).map_err(|e| {
             crate::player::log(&format!("hls: media rejected: {e}"));
             HlsExit::Failed("HLS media playlist rejected")
@@ -5217,13 +5262,33 @@ fn hls_cursor_next(
                 .as_nanos(),
         )
         .map_err(|_| HlsExit::Failed("HLS playlist duration overflow"))?;
-        if cursor.publishes_duration {
+        // A live channel has no duration: its window's length is not the program's, and every
+        // seek path of the player keys on a known duration, so leaving it unpublished is also
+        // what keeps a live stream (which has no seekable timeline here) from being scrubbed.
+        if cursor.publishes_duration && !cursor.live {
             SHARED.duration_ns.store(total_ns, Ordering::Relaxed);
         }
-        let mut refresh = cursor.tracker.apply(&media).map_err(|e| {
-            crate::player::log(&format!("hls: refresh rejected: {e}"));
-            HlsExit::Failed("HLS media refresh rejected")
-        })?;
+        let mut refresh = match cursor.tracker.apply(&media) {
+            Ok(refresh) => refresh,
+            // A live window can slide past a cursor that fell behind (a pause, a slow segment):
+            // start tracking the window afresh and drop whatever was already played.
+            Err(e) if cursor.live => {
+                crate::player::log(&format!("hls: live resync after {e}"));
+                cursor.tracker = crate::hls::MediaTracker::default();
+                let mut refresh = cursor.tracker.apply(&media).map_err(|e| {
+                    crate::player::log(&format!("hls: refresh rejected: {e}"));
+                    HlsExit::Failed("HLS media refresh rejected")
+                })?;
+                if let Some(last) = cursor.last_sequence {
+                    refresh.new_segments.retain(|segment| segment.sequence > last);
+                }
+                refresh
+            }
+            Err(e) => {
+                crate::player::log(&format!("hls: refresh rejected: {e}"));
+                return Err(HlsExit::Failed("HLS media refresh rejected"));
+            }
+        };
         let mut skipped = 0usize;
         if !cursor.start_applied {
             let first_sequence = media
@@ -5251,6 +5316,9 @@ fn hls_cursor_next(
         ));
         cursor.pending.extend(refresh.new_segments);
         cursor.ended = refresh.end_list;
+        if !cursor.pending.is_empty() {
+            cursor.idle_ms = 0;
+        }
         if cursor.pending.is_empty() && !cursor.ended {
             let poll = std::time::Duration::from_millis(
                 cursor
@@ -5258,6 +5326,13 @@ fn hls_cursor_next(
                     .saturating_mul(500)
                     .clamp(250, 1_000),
             );
+            if cursor.live {
+                cursor.idle_ms = cursor.idle_ms.saturating_add(poll.as_millis() as u64);
+                if cursor.idle_ms > LIVE_STALL_MS {
+                    crate::player::log("hls: live playlist stopped growing; the tune is over");
+                    return Err(HlsExit::Failed("HLS live playlist stopped growing"));
+                }
+            }
             let reserve_snapshot = reserve
                 .as_deref_mut()
                 .and_then(|reserve| reserve.active(false));

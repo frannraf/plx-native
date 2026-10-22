@@ -414,6 +414,7 @@ pub(super) fn transcode_spec_carrying_burn<'a>(
 ) -> plx_plex::plex::TranscodeSpec<'a> {
     plx_plex::plex::TranscodeSpec {
         rating_key: rk,
+        path_override: None,
         session,
         encoder_session,
         contract,

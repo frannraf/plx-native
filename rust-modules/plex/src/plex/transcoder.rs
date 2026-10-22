@@ -400,8 +400,9 @@ impl Client {
         );
         let copy_ok = !hls && !(s.contract.no_video_copy && !s.contract.remux);
         let protocol = if hls { "hls" } else { "http" };
+        let path = s.path_override.map_or_else(|| format!("/library/metadata/{}", s.rating_key), str::to_owned);
         let mut q = QueryBuilder::new("")
-            .str("path", &format!("/library/metadata/{}", s.rating_key))
+            .str("path", &path)
             .int("mediaIndex", 0)
             .int("partIndex", 0)
             .str("protocol", protocol)
@@ -731,6 +732,7 @@ mod tests {
     ) -> TranscodeSpec<'a> {
         TranscodeSpec {
             rating_key: "5",
+            path_override: None,
             session: "s1",
             encoder_session: "s1",
             contract: EncodeContract {

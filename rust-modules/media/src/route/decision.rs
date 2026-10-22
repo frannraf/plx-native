@@ -462,6 +462,12 @@ pub struct PlaybackSession {
     /// machine still owns the engine, this says what the session may write. See
     /// [`preview_request`].
     resolved_as_preview: bool,
+    /// **A live channel's tuner and encoder** (`route::live`). Owned here so that whatever ends the
+    /// session — a real stop, a reset, a new plan assigned over it — drops it, and its `Drop` is the
+    /// one release. Never published to a screen (a copy that dropped it would release the tune).
+    live: Option<super::live::LiveLease>,
+    /// What the player shows about the live channel; `Some` exactly while [`Self::live`] is.
+    live_info: Option<super::live::LiveInfo>,
 }
 
 /// What the server actually did with a requested Plex Pass audio enhancement (issue #266) — as
@@ -556,6 +562,8 @@ impl PlaybackSession {
         now_ms: 0,
         preview: false,
         resolved_as_preview: false,
+        live: None,
+        live_info: None,
     };
 }
 
@@ -642,6 +650,9 @@ impl PlaybackSession {
             queue: _,
             preview: _,
             resolved_as_preview,
+            // The lease is the loop's: a screen copy that held it would release the tune on drop.
+            live: _,
+            live_info,
         } = self;
         PlaybackSession {
             direct_play_mode: *direct_play_mode,
@@ -709,6 +720,8 @@ impl PlaybackSession {
             // A screen copy is not the live preview. The loop reads the real session.
             preview: false,
             resolved_as_preview: *resolved_as_preview,
+            live: None,
+            live_info: live_info.clone(),
         }
     }
 }
@@ -777,6 +790,34 @@ pub fn set_url(ps: &mut PlaybackSession, s: &str) {
 }
 pub fn clear_url(ps: &mut PlaybackSession) {
     ps.url.clear()
+}
+
+/// Install a live channel's lease and stream (`route::live::install_live` is the caller). The URL
+/// is the route's like any selected stream's; the old lease, if any, is released by the assignment.
+pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::LiveLease, info: super::live::LiveInfo, url: &str) {
+    ps.url = url.to_owned();
+    ps.tsession.clear();
+    ps.cur_rk.clear();
+    // The HUD's two lines: the program, and the channel it is on.
+    let title = if info.show_title.is_empty() { info.title.clone() } else { format!("{} \u{b7} {}", info.show_title, info.title) };
+    // SAFETY: both are the session's own fixed buffers, written with their own lengths.
+    unsafe {
+        set_c(ps.title.as_mut_ptr(), ps.title.len(), &title);
+        set_c(ps.ctxline.as_mut_ptr(), ps.ctxline.len(), &info.channel);
+    }
+    ps.live = Some(lease);
+    ps.live_info = Some(info);
+}
+
+/// Take the live lease (dropping it releases the tune) and forget the live identity.
+pub(super) fn take_live_lease(ps: &mut PlaybackSession) -> Option<super::live::LiveLease> {
+    ps.live_info = None;
+    ps.live.take()
+}
+
+/// What the player shows about the live channel, `None` for every other playback.
+pub fn live_info(ps: &PlaybackSession) -> Option<&super::live::LiveInfo> {
+    ps.live_info.as_ref()
 }
 pub fn transcode_session(ps: &PlaybackSession) -> String {
     ps.tsession.clone()
@@ -8476,6 +8517,9 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             now_ms,
             preview,
             resolved_as_preview: preview,
+            // A library plan replaces a live channel: the assignment drops (releases) its lease.
+            live: None,
+            live_info: None,
         };
     } };
     if let (plx_plex::plex::TranscodeDelivery::FixedHls { .. }, Some(rung)) = (

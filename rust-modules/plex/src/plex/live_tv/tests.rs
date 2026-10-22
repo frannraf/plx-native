@@ -359,6 +359,46 @@ fn a_debug_build_sends_no_write_to_a_real_server() {
 }
 
 #[test]
+fn a_live_stream_is_an_h264_aac_hls_transcode_of_the_tuned_key() {
+    let decision = r#"{"MediaContainer":{"generalDecisionCode":1000,"Metadata":[{"Media":[{"width":1280,"height":720,
+        "Part":[{"decision":"transcode","Stream":[{"streamType":1,"codec":"h264"},{"streamType":2,"codec":"aac"}]}]}]}]}}"#;
+    let (port, server) = serve(vec![("200 OK", decision)]);
+    let client = loopback_client(port);
+    let off = plx_base::task::OffFrame::for_test();
+    let s = client.live_stream(&off, "/livetv/sessions/0e0e-1", "enc-1").unwrap();
+    assert_eq!((s.video_codec.as_str(), s.audio_codec.as_str(), s.width, s.height), ("h264", "aac", 1280, 720));
+    assert_eq!(s.encoder_session, "enc-1");
+    assert!(s.url.contains("/video/:/transcode/universal/start.m3u8?path=%2Flivetv%2Fsessions%2F0e0e-1"), "{}", s.url);
+    assert!(s.url.contains("protocol=hls") && s.url.contains("directStream=0") && s.url.contains("session=enc-1"));
+    let seen = server.join().unwrap();
+    assert!(seen[0].starts_with("GET /video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F0e0e-1&"), "{}", seen[0]);
+    assert_eq!(client.live_stream(&off, "livetv/sessions/x", "enc"), Err(LiveError::Invalid));
+}
+
+#[test]
+fn a_refused_live_decision_says_why() {
+    let refusal = r#"{"MediaContainer":{"generalDecisionCode":2000,"generalDecisionText":"Neither direct play nor conversion is available."}}"#;
+    let (port, server) = serve(vec![("200 OK", refusal)]);
+    let client = loopback_client(port);
+    let off = plx_base::task::OffFrame::for_test();
+    assert_eq!(
+        client.live_stream(&off, "/livetv/sessions/x", "enc"),
+        Err(LiveError::Server { status: 2000, message: "Neither direct play nor conversion is available.".into() })
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn the_live_keepalive_reports_the_tuned_key_with_no_position() {
+    let (port, server) = serve(vec![("200 OK", "")]);
+    let client = loopback_client(port);
+    assert!(client.live_timeline("/livetv/sessions/x", "9001", "playing", "enc"));
+    let seen = server.join().unwrap();
+    assert!(seen[0].starts_with("POST /:/timeline?ratingKey=9001&key=%2Flivetv%2Fsessions%2Fx&state=playing&time=0&duration=0&X-Plex-Session-Identifier=enc"), "{}", seen[0]);
+    assert!(!client.live_timeline("", "1", "playing", "enc"));
+}
+
+#[test]
 fn enum_labels_decode_like_decode_uri_component() {
     assert_eq!(parse::pct_decode("12%3A30%20AM"), "12:30 AM");
     assert_eq!(parse::pct_decode("a+b"), "a+b");

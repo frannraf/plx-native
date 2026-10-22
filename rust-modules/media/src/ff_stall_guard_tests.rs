@@ -346,6 +346,10 @@ fn the_lookahead_wiring_aborts_through_the_shared_reducer_when_the_guard_is_arme
     };
     let auth = crate::hls::InheritedAuth::capture(&master).expect("fixture token pair");
     let mut cursor = HlsCursor {
+        live: false,
+        idle_ms: 0,
+        refresh_failures: 0,
+        last_sequence: None,
         publishes_duration: true,
         declared_bps: 0,
         auth,
@@ -1211,6 +1215,10 @@ fn a_zero_byte_abort_reaches_the_controller_as_an_abandoned_sample() {
         path: "/master.m3u8?X-Plex-Token=test-token".to_string(),
     };
     let cursor_at = |pending| HlsCursor {
+        live: false,
+        idle_ms: 0,
+        refresh_failures: 0,
+        last_sequence: None,
         publishes_duration: true,
         declared_bps: 0,
         auth: crate::hls::InheritedAuth::capture(&master).expect("fixture token pair"),

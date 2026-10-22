@@ -2131,6 +2131,8 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         }
         if !for_reload {
             crate::route::scrobble_stop(ps, None, None);
+            // A live channel's tuner and encoder go with the playback (`route::live`).
+            crate::route::release_live(ps);
             crate::route::begin_engine_teardown(false);
             crate::route::drop_original_recovery(ps);
             crate::route::clear_url(ps);
@@ -2278,6 +2280,8 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     sp.mark("http_close");
     if !for_reload {
         crate::route::scrobble_stop(ps, final_report, eng.report_th.take());
+        // A live channel's tuner and encoder go with the playback (`route::live`).
+        crate::route::release_live(ps);
     }
     sp.mark("scrobble");
     // 3. Release the native object (see `release_native_object` for the proof chain), unless its

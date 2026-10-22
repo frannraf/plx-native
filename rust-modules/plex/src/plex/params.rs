@@ -193,6 +193,10 @@ impl EncodeContract {
 /// and 4 pin that a remux is only ever reached for a source under it.
 pub struct TranscodeSpec<'a> {
     pub rating_key: &'a str,
+    /// The `path=` of a source that is NOT a library item — a live tune's `/livetv/sessions/{uuid}`
+    /// key (`docs/pms-api.md` §10). `None` for every library playback, whose path is
+    /// `/library/metadata/{rating_key}`.
+    pub path_override: Option<&'a str>,
     /// The active encoder's PMS playback/timeline wire id.
     pub session: &'a str,
     /// Physical universal-transcoder identity. Production keeps it equal to `session`; the two
