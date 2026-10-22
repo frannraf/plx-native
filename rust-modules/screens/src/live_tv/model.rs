@@ -161,17 +161,18 @@ pub mod geom {
     pub const HEAD_H: f32 = 60.0;
     pub const PILL_W: f32 = 240.0;
     pub const PILL_GAP: f32 = 16.0;
-    pub const DETAIL_Y: f32 = 246.0;
+    /// Below the Guide/Recordings pills and the mark under the one shown.
+    pub const DETAIL_Y: f32 = 282.0;
     /// The hero's text column: the backdrop art owns the right of the band above the guide.
     pub const DETAIL_W: f32 = 1_000.0;
     /// The backdrop art's box: the right of the screen, from the top down to the ruler.
     pub const ART_X: f32 = SCR_W * 0.40;
     pub const ART_H: f32 = RULER_Y;
-    pub const RULER_Y: f32 = 468.0;
-    pub const RULER_H: f32 = 36.0;
-    pub const ROWS_Y: f32 = 512.0;
-    pub const ROW_H: f32 = 98.0;
-    pub const ROW_PITCH: f32 = 106.0;
+    pub const RULER_Y: f32 = 496.0;
+    pub const RULER_H: f32 = 34.0;
+    pub const ROWS_Y: f32 = 536.0;
+    pub const ROW_H: f32 = 92.0;
+    pub const ROW_PITCH: f32 = 98.0;
     pub const CHANNEL_X: f32 = MARGIN_X;
     pub const CHANNEL_W: f32 = 170.0;
     pub const GRID_X: f32 = MARGIN_X + CHANNEL_W + 10.0;

@@ -616,8 +616,8 @@ impl LiveTvScreen {
         if !a.content_rating.is_empty() {
             parts.push(a.content_rating.clone());
         }
-        let facts = parts.join("   ");
-        let y = geom::DETAIL_Y + 66.0;
+        let facts = parts.join(" \u{b7} ");
+        let y = geom::DETAIL_Y + 60.0;
         let line = f.measure.line_h(theme::size::BODY);
         TextView::new(&facts, theme::size::BODY, theme::TEXT_SECONDARY)
             .with_measure(f.measure)
@@ -636,7 +636,7 @@ impl LiveTvScreen {
                 .max_lines(1)
                 .draw(p, Rect::new(px, y, (x + w - px).max(0.0), 0.0));
         }
-        let mut y = geom::DETAIL_Y + 108.0;
+        let mut y = geom::DETAIL_Y + 100.0;
         let mut second = Vec::new();
         if !a.show_title.is_empty() && !a.title.is_empty() && a.title != a.show_title {
             second.push(a.title.clone());
@@ -649,7 +649,7 @@ impl LiveTvScreen {
                 .with_measure(f.measure)
                 .max_lines(1)
                 .draw(p, Rect::new(x, y, w, 0.0));
-            y += 40.0;
+            y += 38.0;
         }
         if !a.summary.is_empty() {
             TextView::new(&a.summary, theme::size::LABEL, theme::TEXT_READING)
@@ -828,11 +828,11 @@ impl LiveTvScreen {
                 .bold()
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(tx, rect.y + 18.0, w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 16.0, w, 0.0));
             TextView::new(&sub, theme::size::CAPTION, ink2)
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(tx, rect.y + 56.0, w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 52.0, w, 0.0));
         }
         if rec {
             p.rrect(Rect::new(rect.x + rect.w - 14.0 - 12.0, rect.y + 20.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
