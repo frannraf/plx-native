@@ -340,6 +340,47 @@ fn maybe_begin_hls_rebuffer(ps: &crate::route::PlaybackSession, mt: &MainThread,
     ));
 }
 
+/// Where the exported window shows the picture, authored 1920x1080: the whole screen, or the Live
+/// TV guide's corner while a channel plays on under it (`set_video_window`). Every placement reads
+/// it, so a size change or a re-place keeps the picture where it was put.
+static WINDOW: [std::sync::atomic::AtomicI32; 4] = [
+    std::sync::atomic::AtomicI32::new(0),
+    std::sync::atomic::AtomicI32::new(0),
+    std::sync::atomic::AtomicI32::new(1920),
+    std::sync::atomic::AtomicI32::new(1080),
+];
+/// The window moved since the last placement: the next pump re-places.
+static WINDOW_MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Show the picture at `(x, y, w, h)` (authored 1920x1080) from the next pump on; the whole
+/// screen is `(0, 0, 1920, 1080)`. The webOS 5+ exported window moves without a reload; on the ACB
+/// path nothing can move it and the answer is `false` (the caller keeps the picture full screen).
+pub fn set_video_window(x: i32, y: i32, w: i32, h: i32) -> bool {
+    for (slot, v) in WINDOW.iter().zip([x, y, w, h]) {
+        slot.store(v, Relaxed);
+    }
+    WINDOW_MOVED.store(true, Relaxed);
+    super::sink().window_mode() == super::VP_EXPORTED
+}
+
+/// Is the picture in a corner rather than the whole screen?
+pub fn video_window_is_mini() -> bool {
+    let [x, y, w, h] = video_window();
+    (x, y, w, h) != (0, 0, 1920, 1080)
+}
+
+/// Where the picture is shown (authored 1920x1080).
+pub fn video_window() -> [i32; 4] {
+    std::array::from_fn(|i| WINDOW[i].load(Relaxed))
+}
+
+/// A real stop puts the window back on the whole screen for whatever plays next.
+pub(super) fn reset_video_window() {
+    if video_window_is_mini() {
+        set_video_window(0, 0, 1920, 1080);
+    }
+}
+
 /// Place the webOS 5+ exported window: source frame -> on-screen rect.
 ///
 /// No-op on the ACB path. `src` is the frame being FED and `dst` where it lands, and the pair is
@@ -353,7 +394,8 @@ fn place_exported(mt: &MainThread, eng: &mut super::engine::Engine) {
     }
     let (w, h) = SHARED.video_raster();
     let src = if w > 0 && h > 0 { (w, h) } else { (1920, 1080) };
-    let rv = unsafe { super::sink().place_window(mt, src.0, src.1, 0, 0, 1920, 1080) };
+    let [x, y, w, h] = video_window();
+    let rv = unsafe { super::sink().place_window(mt, src.0, src.1, x, y, w, h) };
     eng.placed_src = src;
     // RECORD it, do not merely log it. These three fields had no writer anywhere in the tree, so
     // `dg_place_rv` sat at its `i32::MIN` "never called" sentinel for the life of the process and
@@ -365,7 +407,7 @@ fn place_exported(mt: &MainThread, eng: &mut super::engine::Engine) {
     SHARED.dg_placed_w.store(src.0, Relaxed);
     SHARED.dg_placed_h.store(src.1, Relaxed);
     super::log(&format!(
-        "vplane: exported window placed src={}x{} rv={rv}",
+        "vplane: exported window placed src={}x{} at {x},{y} {w}x{h} rv={rv}",
         src.0, src.1
     ));
 }
@@ -2021,7 +2063,9 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     // ----------
     if eng.stage >= Stage::Playing && eng.placed_src != (0, 0) {
         let now = SHARED.video_raster();
-        if now.0 > 0 && now.1 > 0 && now != eng.placed_src {
+        // …or the window was moved (a live channel into the guide's corner, or back)
+        let moved = WINDOW_MOVED.swap(false, Relaxed);
+        if moved || (now.0 > 0 && now.1 > 0 && now != eng.placed_src) {
             place_exported(mt, eng);
         }
     }

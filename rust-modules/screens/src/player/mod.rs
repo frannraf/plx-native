@@ -924,7 +924,9 @@ impl PlayerScreen {
             }
             Key::Stop | Key::Back => {
                 if edge == Edge::Down {
-                    Self::ask(fx, PlayerReq::Exit);
+                    // a live channel's BACK keeps it playing in the guide's corner
+                    let corner = key == Key::Back && plx_media::route::is_live(ps);
+                    Self::ask(fx, if corner { PlayerReq::Minimize } else { PlayerReq::Exit });
                 }
                 Handled::Yes
             }

@@ -638,6 +638,9 @@ pub(crate) fn player_requests(
             PlayerReq::Exit => {
                 exit_player(ps, pa, refresh_hubs, pages);
             }
+            PlayerReq::Minimize => {
+                minimize_player(ps, pa, refresh_hubs, pages);
+            }
         }
     }
 }
@@ -721,6 +724,57 @@ pub(crate) fn exit_player(
     // Home floor in `return_from_player`, preserving `return_page`'s old anti-strand contract.
     return_from_player(pages);
     *refresh_hubs = true;
+}
+
+/// **BACK out of a live channel: it plays on in the Live TV guide's corner** — its window moved
+/// there, its tuner and keepalive kept, the guide back on screen (the origin the player was pushed
+/// over). OK on the same channel there restores it ([`restore_live_corner`]); anything that leaves
+/// the guide ends it ([`stop_live_corner`]). Where the window cannot move (the ACB path), BACK
+/// leaves as it always did.
+pub(crate) fn minimize_player(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    refresh_hubs: &mut bool,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+) {
+    use plx_screens::live_tv::model::geom::{MINI_H, MINI_W, MINI_X, MINI_Y};
+    if !plx_media::route::is_live(ps)
+        || !plx_media::player::set_video_window(MINI_X as i32, MINI_Y as i32, MINI_W as i32, MINI_H as i32)
+    {
+        exit_player(ps, pa, refresh_hubs, pages);
+        return;
+    }
+    plx_base::eventlog::log("livetv: the channel plays on in the guide's corner");
+    close_player_overlays(pages);
+    return_from_player(pages);
+}
+
+/// The corner's channel back to full screen: the window put back and the player pushed over the
+/// guide again, with no new tune or Load.
+pub(crate) fn restore_live_corner(
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    bridge: &mut super::bridge::Bridge,
+) {
+    plx_base::eventlog::log("livetv: the corner's channel goes full screen");
+    plx_media::player::set_video_window(0, 0, 1920, 1080);
+    enter_player(pages, bridge, Origin::Here, None);
+}
+
+/// End a channel playing on in the corner (the guide was left, another channel was asked for, the
+/// app went to the background): the engine stops, the tuner is released, no page moves. `false`
+/// when there was none.
+pub(crate) fn stop_live_corner(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+) -> bool {
+    if !plx_media::player::video_window_is_mini() {
+        return false;
+    }
+    plx_base::eventlog::log("livetv: the corner's channel stops");
+    plx_media::route::cancel_play(ps);
+    plx_media::player::stop_bufferfeed(ps, pa);
+    plx_media::route::release_live(ps);
+    true
 }
 
 /// **Home appears already correct** (layer-1 view state, owner decision 2): when the page being
@@ -1216,6 +1270,11 @@ pub(crate) unsafe fn key_play(
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
     bridge: &mut super::bridge::Bridge,
 ) {
+    // a channel playing on in the guide's corner: PLAY brings it back, it does not Load again
+    if plx_media::player::video_window_is_mini() && plx_media::route::is_live(ps) {
+        restore_live_corner(pages, bridge);
+        return;
+    }
     let was_off_player = super::bridge::player(pages).is_none();
     if was_off_player {
         foreground.discard_started_state();

@@ -168,6 +168,9 @@ pub struct ItemMenuReq {
 /// So the panel decides and the loop performs, exactly as `LibraryReq` does for the Library.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerReq {
+    /// BACK over a live channel's bare picture: it plays on in the Live TV guide's corner
+    /// (`app::playback::minimize_player`); STOP and the failure read-out still `Exit`.
+    Minimize,
     /// Accepted only after the owned player confirmation. Never emitted by boot or Play.
     RepairSandbox,
     /// The failure read-out's *Try again*: resolve the failed item again, unchanged, at the

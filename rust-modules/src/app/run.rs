@@ -1544,7 +1544,10 @@ fn park_playback(app: &mut App) {
     // A live channel is never parked: its tuner is held only while it is watched, and a restore
     // would reopen an encode the server has since reclaimed. It ends as a Stop ends it.
     if plx_media::route::is_live(&app.player.session) {
-        super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+        // in the guide's corner it just stops: the guide stays where it is
+        if !super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player) {
+            super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+        }
         return;
     }
     // INTENDED, not published: this snapshot is the only thing the foreground

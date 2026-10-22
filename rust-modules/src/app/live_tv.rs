@@ -182,6 +182,11 @@ impl Bridge {
         plx_media::route::set_record_asked(true);
     }
 
+    /// The channel row last asked to be watched (the corner's channel, while one plays there).
+    pub(crate) fn live_tv_watching(&self) -> Option<usize> {
+        self.live_tv.watching
+    }
+
     /// Forget a Watch press still on its way (the app is going to the background).
     pub(crate) fn live_tv_cancel_tune(&mut self) {
         self.stores.live_tv.cancel_tune();

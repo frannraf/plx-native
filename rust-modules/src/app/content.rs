@@ -1055,6 +1055,10 @@ fn live_tv_requests(app: &mut App) {
             app.bridge.live_tv_drop_tuned(tuned);
         }
     }
+    // A channel playing on in the guide's corner goes when the guide does.
+    if !matches!(app.route(), AppArg::LiveTv | AppArg::Player) {
+        super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+    }
     for (source, request, ret) in app.bridge.take_live_tv_reqs() {
         let MachineId::Instance(instance) = source else { continue };
         let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
@@ -1062,6 +1066,21 @@ fn live_tv_requests(app: &mut App) {
             continue;
         }
         plx_base::eventlog::log(&format!("livetv: page asked {}", live_tv_request_word(&request)));
+        // leaving the guide ends a channel in its corner; OK on that channel brings it back
+        let corner = plx_media::player::video_window_is_mini() && plx_media::route::is_live(&app.player.session);
+        match &request {
+            LiveTvOut::Back | LiveTvOut::Tab(_) | LiveTvOut::Account => {
+                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+            }
+            LiveTvOut::Watch { row, .. } if corner => {
+                if app.bridge.live_tv_watching() == Some(*row) {
+                    super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
+                    continue;
+                }
+                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+            }
+            _ => {}
+        }
         match request {
             LiveTvOut::Back => bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, None, Some(ret)),
             LiveTvOut::Tab(tab) => {

@@ -595,7 +595,15 @@ impl LiveTvScreen {
     fn wash_target(&self) -> [[f32; 4]; 4] {
         let art = self.hero_art();
         match art.as_deref().and_then(|a| self.view.snap.blurs.get(a)) {
-            Some(c) => [tint(c[0], false), tint(c[1], false), tint(c[2], true), tint(c[3], true)],
+            Some(c) => {
+                // ONE hue, as Plex's own guide wears: four corners of different colours read as a
+                // muddy gradient (red to green on a news set). The most saturated corner is the
+                // art's colour; the foot is the same hue, darker.
+                let chroma = |k: &[f32; 3]| k.iter().cloned().fold(0.0, f32::max) - k.iter().cloned().fold(1.0, f32::min);
+                let hue = c.iter().max_by(|a, b| chroma(a).total_cmp(&chroma(b))).copied().unwrap_or(c[0]);
+                let (top, low) = (tint(hue, false), tint(hue, true));
+                [top, top, low, low]
+            }
             None => PLAIN_WASH,
         }
     }
@@ -603,6 +611,11 @@ impl LiveTvScreen {
     /// The page's ground: the wash, and in the Guide the hero airing's backdrop on the right of the
     /// band above the grid, its left edge dissolving into the wash and its foot fading into it.
     fn draw_ground(&self, p: Painter) {
+        if plx_media::player::video_window_is_mini() {
+            let [x, y, w, h] = plx_media::player::video_window();
+            self.draw_wash_around(p, Rect::new(x as f32, y as f32, w as f32, h as f32));
+            return;
+        }
         self.wash.draw(p, Rect::FULL);
         if self.mode != Mode::Guide || self.readout().is_some() {
             return;
@@ -617,20 +630,25 @@ impl LiveTvScreen {
             return;
         }
         let r = Rect::new(geom::ART_X, 0.0, SCR_W - geom::ART_X, geom::ART_H);
-        let [u0, v0, u1, v1] = r.cover_uv(tw, th, Crop::Centre);
-        let u_at = |x: f32| u0 + (x - r.x) / r.w * (u1 - u0);
-        // The left edge dissolves: the art's own alpha ramps up across the fade, so whatever colour
-        // the wash has under it shows through. In strips, because the painter's gradients run top
-        // to bottom only.
-        let step = ART_FADE_W / ART_FADE_STEPS as f32;
-        for i in 0..ART_FADE_STEPS {
-            let x = r.x + i as f32 * step;
-            let t = (i as f32 + 0.5) / ART_FADE_STEPS as f32;
-            let alpha = t * t;
-            p.tex_uv(tex, [u_at(x), v0, u_at(x + step), v1], Rect::new(x, r.y, step, r.h), 0.0, theme::with_a(theme::TINT_WHITE, alpha));
+        p.tex_uv(tex, r.cover_uv(tw, th, Crop::Centre), r, 0.0, theme::TINT_WHITE);
+        // The left edge dissolves into the wash: strips of the wash's own colour over the art,
+        // opaque at the fade's left and gone at its right, each a top-to-bottom gradient of the wash
+        // down its height (the painter's gradients run top to bottom only, hence strips). Whole
+        // pixels wide and placed on whole pixels: strips of a texture at fractional edges combed.
+        let mut x = r.x;
+        while x < r.x + ART_FADE_W {
+            let t = (x - r.x + ART_FADE_STRIP * 0.5) / ART_FADE_W;
+            let a = (1.0 - t) * (1.0 - t);
+            let (top, foot) = (self.wash.sample(Rect::FULL, x, r.y), self.wash.sample(Rect::FULL, x, r.y + r.h));
+            p.rect(
+                Rect::new(x, r.y, ART_FADE_STRIP, r.h),
+                0.0,
+                [top[0], top[1], top[2], a],
+                [foot[0], foot[1], foot[2], a],
+                0.0,
+            );
+            x += ART_FADE_STRIP;
         }
-        let solid = r.x + ART_FADE_W;
-        p.tex_uv(tex, [u_at(solid), v0, u1, v1], Rect::new(solid, r.y, r.x + r.w - solid, r.h), 0.0, theme::TINT_WHITE);
         // The foot fades into the wash, in its colour where they meet.
         let seg = r.w / ART_FALL_SEGS as f32;
         for j in 0..ART_FALL_SEGS {
@@ -638,6 +656,40 @@ impl LiveTvScreen {
             let c = self.wash.sample(Rect::FULL, x + seg * 0.5, r.y + r.h);
             let col = [c[0], c[1], c[2], 1.0];
             p.rect(Rect::new(x, r.y + r.h - ART_FALL, seg + 0.5, ART_FALL), 0.0, theme::with_a(col, 0.0), col, 0.0);
+        }
+    }
+
+    /// The wash around a channel playing on in the corner: everywhere but its window, which the
+    /// video plane shows through, feathered on its left and its foot so the picture melts into the
+    /// page the way the art does.
+    fn draw_wash_around(&self, p: Painter, hole: Rect) {
+        let at = |x: f32, y: f32| self.wash.sample(Rect::FULL, x, y);
+        let resting = self.wash.at_rest();
+        let part = |r: Rect| {
+            if r.w > 0.5 && r.h > 0.5 {
+                let k = [at(r.x, r.y), at(r.x + r.w, r.y), at(r.x + r.w, r.y + r.h), at(r.x, r.y + r.h)];
+                p.ambient(r, 1.0, k, resting);
+            }
+        };
+        let (right, foot) = (hole.x + hole.w, hole.y + hole.h);
+        part(Rect::new(0.0, 0.0, hole.x, SCR_H));
+        part(Rect::new(hole.x, 0.0, SCR_W - hole.x, hole.y));
+        part(Rect::new(hole.x, foot, SCR_W - hole.x, SCR_H - foot));
+        part(Rect::new(right, hole.y, SCR_W - right, hole.h));
+        // whole-pixel strips, as the art's fade (fractional edges comb)
+        let mut x = hole.x;
+        while x < hole.x + MINI_FEATHER_L {
+            let t = 1.0 - (x - hole.x + ART_FADE_STRIP * 0.5) / MINI_FEATHER_L;
+            let (top, low) = (at(x, hole.y), at(x, foot));
+            p.rect(Rect::new(x, hole.y, ART_FADE_STRIP, hole.h), 0.0, [top[0], top[1], top[2], t * t], [low[0], low[1], low[2], t * t], 0.0);
+            x += ART_FADE_STRIP;
+        }
+        let seg = hole.w / ART_FALL_SEGS as f32;
+        for j in 0..ART_FALL_SEGS {
+            let x = hole.x + j as f32 * seg;
+            let c = at(x + seg * 0.5, foot);
+            let col = [c[0], c[1], c[2], 1.0];
+            p.rect(Rect::new(x, foot - MINI_FEATHER_B, seg + 0.5, MINI_FEATHER_B), 0.0, theme::with_a(col, 0.0), col, 0.0);
         }
     }
 
@@ -879,12 +931,9 @@ impl LiveTvScreen {
             let tw = f.measure.width_str(words, theme::size::MICRO, true);
             let b = Rect::new(rect.x + rect.w - 12.0 - dot - tw - 16.0, rect.y + 10.0, tw + 16.0, 28.0);
             p.rring(b, 6.0, 1.5, theme::with_a(ink2, 0.8));
-            TextView::new(words, theme::size::MICRO, ink2)
-                .bold()
-                .with_measure(f.measure)
-                .max_lines(1)
-                .h(HAlign::Center)
-                .draw(p, Rect::new(b.x, b.y + (b.h - f.measure.line_h(theme::size::MICRO)) * 0.5, b.w, 0.0));
+            if let Ok(c) = CString::new(words) {
+                Label::new(c.as_ptr(), theme::size::MICRO, ink2).bold().h(HAlign::Center).v(VAlign::Middle).draw(p, b);
+            }
             badge_w = b.w + 10.0;
         }
         let w = rect.x + rect.w - 14.0 - dot - badge_w - tx;
@@ -1121,6 +1170,10 @@ const PLAIN_WASH: [[f32; 4]; 4] = [GROUND, GROUND, GROUND_LOW, GROUND_LOW];
 /// toward it: Plex's own guide wears the program's colour, dark enough for its white text.
 const TINT_LUMA: f32 = 0.20;
 const TINT_W: f32 = 0.85;
+/// A channel playing on in the corner melts into the page this far from its left edge and up
+/// from its foot.
+const MINI_FEATHER_L: f32 = 240.0;
+const MINI_FEATHER_B: f32 = 140.0;
 /// The backdrop's foot: how tall its fade into the wash is, in how many colour samples across.
 const ART_FALL: f32 = 200.0;
 const ART_FALL_SEGS: usize = 12;
@@ -1132,9 +1185,10 @@ const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const ART_REQ: (i32, i32) = (1280, 720);
 const POSTER_REQ: (i32, i32) = (112, 168);
 const LOGO_REQ: (i32, i32) = (240, 112);
-/// The backdrop's left fade: how wide, in how many strips.
+/// The backdrop's left fade: how wide.
 const ART_FADE_W: f32 = 620.0;
-const ART_FADE_STEPS: usize = 48;
+/// One strip of the art's left fade, in whole pixels.
+const ART_FADE_STRIP: f32 = 10.0;
 /// A cell this wide shows its program's art; this wide, its episode title beside its times.
 const POSTER_MIN_CELL_W: f32 = 300.0;
 const EPISODE_MIN_CELL_W: f32 = 560.0;
@@ -1499,7 +1553,12 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
     }
     fn prepare(&mut self, _: &mut plx_ui::frame::Budget, _: &Cx<'_, H>) {}
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, H>) {
-        plx_gfx::gfx::frame_clear(theme::CLEAR_RGB.0, theme::CLEAR_RGB.1, theme::CLEAR_RGB.2);
+        if plx_media::player::video_window_is_mini() {
+            // a channel plays on in the corner: the frame is a hole the video plane shows through
+            plx_gfx::gfx::frame_clear_through();
+        } else {
+            plx_gfx::gfx::frame_clear(theme::CLEAR_RGB.0, theme::CLEAR_RGB.1, theme::CLEAR_RGB.2);
+        }
         let p = f.painter.alpha(f.page_alpha);
         self.draw_ground(p);
         self.draw_head(f, p);

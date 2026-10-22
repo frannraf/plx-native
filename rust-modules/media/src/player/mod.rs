@@ -363,8 +363,8 @@ pub use engine::{
 };
 
 pub use pump::{
-    drain_engineless_rollback, land_engineless_rollback, pump, recover_failed_foreground_original, ForegroundOriginalRecovery,
-    RollbackLanding,
+    drain_engineless_rollback, land_engineless_rollback, pump, recover_failed_foreground_original, set_video_window,
+    video_window, video_window_is_mini, ForegroundOriginalRecovery, RollbackLanding,
 };
 pub use shared::PlaybackState;
 

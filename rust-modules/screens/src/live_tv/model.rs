@@ -176,6 +176,12 @@ pub mod geom {
     pub const CHANNEL_X: f32 = MARGIN_X;
     pub const CHANNEL_W: f32 = 170.0;
     pub const GRID_X: f32 = MARGIN_X + CHANNEL_W + 10.0;
+    /// The corner a live channel plays on in after BACK: 16:9 at the backdrop band's height, at
+    /// the top right, where the art would be.
+    pub const MINI_H: f32 = ART_H;
+    pub const MINI_W: f32 = 882.0;
+    pub const MINI_X: f32 = SCR_W - MINI_W;
+    pub const MINI_Y: f32 = 0.0;
     /// A guide cell's program art: portrait, the row's height less a margin.
     pub const POSTER_H: f32 = ROW_H - 16.0;
     pub const POSTER_W: f32 = POSTER_H * 2.0 / 3.0;
