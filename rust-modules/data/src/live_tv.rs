@@ -9,7 +9,8 @@
 //! without a battery clock can read 1970 until NTP has run; [`plausible_now`] says so, and the
 //! store waits rather than asking the server for a guide of 1970.
 
-use plx_plex::plex::live_tv::{Airing, Channel, EpgProvider, Grab, Subscription};
+use plx_plex::plex::live_tv::{Airing, Channel, EpgProvider, Grab, LiveStream, Subscription, TunedItem};
+use plx_plex::plex::ServerId;
 use std::collections::HashMap;
 
 /// The wall clock, epoch seconds.
@@ -17,6 +18,20 @@ pub fn wall_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A fresh opaque id for a live encode (the transcoder `session`): the kernel's UUID on the
+/// television (Linux), else a process-unique token.
+pub fn new_session_id() -> String {
+    if let Ok(u) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let t = u.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    format!("plxnative-live-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Is `now` a believable date (after 2024)? Before NTP the set's clock reads 1970.
@@ -247,6 +262,32 @@ pub enum WriteOp {
     MoveRule,
 }
 
+/// A channel tuned and turned into a stream: everything the application needs to play it (the
+/// media route's `LiveRoute` is built from it) and, until it is installed, the obligation to
+/// release it — the tuner and the encoder are held from the moment this exists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tuned {
+    pub sid: ServerId,
+    /// The rolling subscription the tune created (empty when the server answered without one).
+    pub subscription_id: String,
+    pub item: TunedItem,
+    pub stream: LiveStream,
+    /// The channel row's label and the airing the page showed as on now (for the player's lines).
+    pub channel: String,
+    pub airing: Option<Airing>,
+}
+
+/// Where the page's last Watch press stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TunePhase {
+    #[default]
+    Idle,
+    /// Tuning channel `channel` (its label).
+    Tuning { channel: String },
+    /// The tune failed; `reason` is user-safe.
+    Failed { channel: String, reason: String },
+}
+
 /// Everything a Live TV page draws, by value. Built by the store when something moved.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -265,4 +306,5 @@ pub struct Snapshot {
     pub scheduled: Vec<Grab>,
     pub notice: Option<WriteNotice>,
     pub writes_in_flight: u32,
+    pub tune: TunePhase,
 }

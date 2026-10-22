@@ -144,23 +144,12 @@ fn release_now(sid: ServerId, sub: &str, key: &str, rk: &str, enc: &str) {
 }
 
 /// Install a tuned channel as the session's route and start its keepalive. The session's earlier
-/// lease (a live playback replaced by another) is released by the assignment. `false` when the
-/// declaration was refused (nothing installed).
+/// lease (a live playback replaced by another) is released by the assignment. From this call on
+/// the tune is the route's: `false` (the declaration was refused, nothing installed) has already
+/// released it.
 pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
-    if !super::decision::set_stream_declaration(
-        ps,
-        &route.video_codec,
-        &route.audio_codec,
-        0.0,
-        plx_data::metadata::Dovi::NONE,
-        false,
-    ) {
-        return false;
-    }
-    if route.width > 0 && route.height > 0 {
-        super::decision::set_stream_source_raster(ps, route.width.min(i64::from(u16::MAX)) as u16, route.height.min(i64::from(u16::MAX)) as u16);
-    }
     let stop = Arc::new(AtomicBool::new(false));
+    // Made first, so every way out of this function below releases the tune it holds.
     let lease = LiveLease {
         sid: route.sid,
         subscription_id: route.subscription_id.clone(),
@@ -170,6 +159,21 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         keepalive_stop: Arc::clone(&stop),
         released: false,
     };
+    if !super::decision::set_stream_declaration(
+        ps,
+        &route.video_codec,
+        &route.audio_codec,
+        0.0,
+        plx_data::metadata::Dovi::NONE,
+        false,
+    ) {
+        crate::player::log("livetv: the stream's declaration was refused");
+        drop(lease);
+        return false;
+    }
+    if route.width > 0 && route.height > 0 {
+        super::decision::set_stream_source_raster(ps, route.width.min(i64::from(u16::MAX)) as u16, route.height.min(i64::from(u16::MAX)) as u16);
+    }
     super::decision::install_live_lease(ps, lease, route.info.clone(), &route.url);
     crate::ff::set_live_stream(true);
     start_keepalive(route.sid, route.key, route.rating_key, route.encoder_session, stop);

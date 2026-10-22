@@ -395,6 +395,8 @@ pub enum LiveError {
     Refused,
     /// The caller passed an id or key that cannot name the resource (never sent).
     Invalid,
+    /// A tune the server answered with conflicts: every tuner is in use.
+    Busy,
 }
 
 impl LiveError {
@@ -411,6 +413,7 @@ impl LiveError {
             Self::Unreadable => "the server's answer could not be read".into(),
             Self::Refused => "debug build: writes to a real server are off".into(),
             Self::Invalid => "invalid request".into(),
+            Self::Busy => "every tuner is busy".into(),
         }
     }
 }

@@ -15,10 +15,14 @@
 //! [`WriteNotice`]. A successful record or cancel overlays the guide at once and re-reads the DVR
 //! lists; it never waits for the grid to be read again.
 //!
-//! **The live tune is not here.** Watching a channel is playback, and the tuner it takes is owned
-//! and released by the media route (`plx_media::route`), which outlives any page.
+//! **The live tune is only begun here.** A Watch press tunes the channel and opens its encode off
+//! the frame ([`LiveTvStore::tune`]); the application takes the [`Tuned`] stream
+//! ([`LiveTvStore::take_tuned`]) and hands it to the media route, whose lease owns the tuner from
+//! then on and outlives any page. Until it is taken the store owns it: a tune that lands after the
+//! page stopped wanting it (cancelled, superseded, a reset or a server switch) is released here,
+//! against the server that tuned it, and never played.
 
-use crate::live_tv::{self as lt, Availability, GuideCache, Overlay, Phase, RecordKind, Snapshot, WriteNotice, WriteOp};
+use crate::live_tv::{self as lt, Availability, GuideCache, Overlay, Phase, RecordKind, Snapshot, TunePhase, Tuned, WriteNotice, WriteOp};
 use plx_plex::plex::live_tv::{Airing, Channel, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
 use plx_plex::plex::ServerId;
 use std::collections::VecDeque;
@@ -35,6 +39,10 @@ pub enum Job {
     Grid { provider: String, ch: usize, channel: Channel, date: String },
     Dvr,
     Write(Write),
+    /// Tune `channel` on DVR `dvr_key` and open its encode under `session`.
+    Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, session: String },
+    /// Release a tune nobody will play: stop its encode, delete its subscription.
+    Release { subscription_id: String, session: String },
 }
 
 /// A write a page asked for.
@@ -54,6 +62,8 @@ pub enum Landing {
     Grid { ch: usize, date: String, result: Result<Vec<Airing>, LiveError> },
     Dvr(Result<(Vec<Subscription>, Vec<Grab>), LiveError>),
     Write { write: Write, result: Result<WriteDone, LiveError> },
+    Tuned { serial: u32, result: Result<Tuned, LiveError> },
+    Released,
 }
 
 /// What a successful write did.
@@ -92,8 +102,14 @@ struct Spawn;
 #[cfg(not(any(test, feature = "test-support")))]
 impl Runner for Spawn {
     fn run(&mut self, sid: ServerId, job: Job, post: Post) -> bool {
-        let Some(client) = plx_plex::plex::client_for(sid) else { return false };
-        plx_base::task::spawn_off_frame("livetv", move |_off| post.post(execute(client, job)))
+        let Some(client) = plx_plex::plex::client_for(sid) else {
+            // A server that is gone cannot be asked; its release has nobody left to ask.
+            if matches!(job, Job::Release { .. }) {
+                return true;
+            }
+            return false;
+        };
+        plx_base::task::spawn_off_frame("livetv", move |off| post.post(execute(client, off, sid, job)))
     }
 }
 
@@ -115,10 +131,19 @@ fn default_runner() -> Box<dyn Runner> {
     return Box::new(Refuse);
 }
 
-/// Do `job` against `client` (on a worker). Public so a test runner can execute jobs against a
-/// loopback client too.
-pub fn execute(client: &plx_plex::plex::Client, job: Job) -> Landing {
+/// Do `job` against `client` (server `sid`), on a worker. Public so a test runner can execute jobs
+/// against a loopback client too.
+pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
+        Job::Tune { serial, dvr_key, channel, label, airing, session } => {
+            let result = tune(client, off, &dvr_key, &channel.identifier, &session)
+                .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing });
+            Landing::Tuned { serial, result }
+        }
+        Job::Release { subscription_id, session } => {
+            release(client, &subscription_id, &session);
+            Landing::Released
+        }
         Job::Providers => Landing::Providers(client.live_tv_providers()),
         Job::Channels { provider } => Landing::Channels(client.live_tv_channels(&provider)),
         Job::Grid { provider, ch, channel, date } => {
@@ -134,6 +159,48 @@ pub fn execute(client: &plx_plex::plex::Client, job: Job) -> Landing {
                 Write::MoveRule { id, after } => client.dvr_move(id, after.as_deref()).map(|_| WriteDone::default()),
             };
             Landing::Write { write, result }
+        }
+    }
+}
+
+/// A tune and its encode. Whatever fails after the tune took a tuner releases it before answering,
+/// so an `Err` holds nothing on the server.
+fn tune(
+    client: &plx_plex::plex::Client,
+    off: &plx_base::task::OffFrame,
+    dvr_key: &str,
+    channel: &str,
+    session: &str,
+) -> Result<(String, plx_plex::plex::live_tv::TunedItem, plx_plex::plex::live_tv::LiveStream), LiveError> {
+    let t = client.live_tune(dvr_key, channel)?;
+    if !t.playable() {
+        if !t.subscription_id.is_empty() {
+            let _ = client.live_release(&t.subscription_id);
+        }
+        return Err(if t.has_conflicts() { LiveError::Busy } else { LiveError::Unreadable });
+    }
+    match client.live_stream(off, &t.item.key, session) {
+        Ok(stream) => Ok((t.subscription_id, t.item, stream)),
+        Err(e) => {
+            release(client, &t.subscription_id, session);
+            Err(e)
+        }
+    }
+}
+
+/// Stop a tune's encode and delete its subscription (a 404 is done; a silent server is tried twice
+/// more, a second apart).
+fn release(client: &plx_plex::plex::Client, subscription_id: &str, session: &str) {
+    if !session.is_empty() {
+        let _ = client.live_stream_stop(session);
+    }
+    if subscription_id.is_empty() {
+        return;
+    }
+    for attempt in 0..3 {
+        match client.live_release(subscription_id) {
+            Err(LiveError::Transport) if attempt < 2 => std::thread::sleep(std::time::Duration::from_secs(1)),
+            _ => break,
         }
     }
 }
@@ -178,6 +245,15 @@ pub struct LiveTvStore {
     scheduled: Vec<Grab>,
     notice: Option<WriteNotice>,
     notice_serial: u32,
+    /// The Watch press the page still wants (its serial), what it stands at, and the stream once
+    /// it landed and until the application takes it.
+    tune_serial: u32,
+    tune_wanted: bool,
+    tune_phase: TunePhase,
+    tune_queue: Option<Job>,
+    tuned: Option<Tuned>,
+    /// Releases owed to servers (an unwanted tune), each against the server that tuned it.
+    releases: VecDeque<(ServerId, Job)>,
     now: i64,
     utc_offset: i64,
     generation: u32,
@@ -211,6 +287,12 @@ impl LiveTvStore {
             scheduled: Vec::new(),
             notice: None,
             notice_serial: 0,
+            tune_serial: 0,
+            tune_wanted: false,
+            tune_phase: TunePhase::Idle,
+            tune_queue: None,
+            tuned: None,
+            releases: VecDeque::new(),
             now: 0,
             utc_offset: 0,
             generation: 0,
@@ -250,14 +332,78 @@ impl LiveTvStore {
 
     /// Forget everything (a profile or server switch, a sign-out). Late answers are dropped.
     pub fn reset(&mut self) {
-        let keep = (self.now, self.utc_offset, self.generation, self.notice_serial);
+        self.cancel_tune();
+        let keep = (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial);
+        let releases = std::mem::take(&mut self.releases);
+        // A tune still in flight lands under the old epoch: `pump` releases it, so the inbox
+        // stays (`with_runner` would orphan it) and only the epoch moves.
+        let inbox = Arc::clone(&self.inbox);
         let runner = std::mem::replace(&mut self.runner, Box::new(NoRun));
         let epoch = self.epoch + 1;
         *self = Self::with_runner(runner);
         self.epoch = epoch;
-        // the generation and notice serial never go back: a page compares them for "moved"
-        (self.now, self.utc_offset, self.generation, self.notice_serial) = keep;
+        self.inbox = inbox;
+        self.releases = releases;
+        // the generation and serials never go back: a page compares them for "moved"
+        (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial) = keep;
         self.bump();
+    }
+
+    /// Watch channel row `ch` (the page's OK on a channel that is on now). Supersedes an earlier
+    /// press: its tune, if it lands, is released. `false` when nothing can be tuned (no lineup,
+    /// a provider without a DVR).
+    pub fn tune(&mut self, ch: usize, airing: Option<Airing>) -> bool {
+        let Some(dvr_key) = self.provider.as_ref().filter(|p| p.tunable()).map(|p| p.dvr_key.clone()) else { return false };
+        let Some(channel) = self.channels.get(ch).cloned() else { return false };
+        if self.sid.is_none() {
+            return false;
+        }
+        self.cancel_tune();
+        self.tune_serial = self.tune_serial.wrapping_add(1);
+        self.tune_wanted = true;
+        let label = channel.label().to_string();
+        self.tune_phase = TunePhase::Tuning { channel: label.clone() };
+        self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id() });
+        self.bump();
+        true
+    }
+
+    /// The page no longer wants its Watch press (BACK while tuning, the page left). A tune that
+    /// already landed and was not taken is released now; one in flight is released when it lands.
+    pub fn cancel_tune(&mut self) {
+        if !self.tune_wanted && self.tuned.is_none() && matches!(self.tune_phase, TunePhase::Idle) {
+            return;
+        }
+        self.tune_wanted = false;
+        self.tune_queue = None;
+        if let Some(t) = self.tuned.take() {
+            self.owe_release(t);
+        }
+        self.tune_phase = TunePhase::Idle;
+        self.bump();
+    }
+
+    /// The landed stream, once: the caller (the application) installs it into the media route,
+    /// whose lease releases it from then on.
+    pub fn take_tuned(&mut self) -> Option<Tuned> {
+        let t = self.tuned.take()?;
+        self.tune_wanted = false;
+        self.tune_phase = TunePhase::Idle;
+        self.bump();
+        Some(t)
+    }
+
+    /// Forget a failed tune's message (the page showed it).
+    pub fn clear_tune_failure(&mut self) {
+        if matches!(self.tune_phase, TunePhase::Failed { .. }) {
+            self.tune_phase = TunePhase::Idle;
+            self.bump();
+        }
+    }
+
+    fn owe_release(&mut self, t: Tuned) {
+        plx_base::eventlog::log("livetv: releasing an unwanted tune");
+        self.releases.push_back((t.sid, Job::Release { subscription_id: t.subscription_id, session: t.stream.encoder_session }));
     }
 
     /// The guide window a page shows: channel rows `rows` between `from` and `to` (epoch seconds).
@@ -353,6 +499,10 @@ impl LiveTvStore {
         let landed: Vec<(u64, Landing)> = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
         for (epoch, landing) in landed {
             if epoch != self.epoch {
+                // A late tune still holds a tuner: release it; every other late answer is moot.
+                if let Landing::Tuned { result: Ok(t), .. } = landing {
+                    self.owe_release(t);
+                }
                 continue;
             }
             self.land(landing);
@@ -416,6 +566,25 @@ impl LiveTvStore {
                     Err(e) => self.dvr_phase = Phase::Failed(e.reason()),
                 }
             }
+            Landing::Tuned { serial, result } => match result {
+                Ok(t) if self.tune_wanted && serial == self.tune_serial => {
+                    self.tune_phase = TunePhase::Tuning { channel: t.channel.clone() };
+                    if let Some(old) = self.tuned.replace(t) {
+                        self.owe_release(old);
+                    }
+                }
+                Ok(t) => self.owe_release(t),
+                Err(e) if self.tune_wanted && serial == self.tune_serial => {
+                    self.tune_wanted = false;
+                    let channel = match &self.tune_phase {
+                        TunePhase::Tuning { channel } => channel.clone(),
+                        _ => String::new(),
+                    };
+                    self.tune_phase = TunePhase::Failed { channel, reason: e.reason() };
+                }
+                Err(_) => {}
+            },
+            Landing::Released => {}
             Landing::Write { write, result } => {
                 self.writing = false;
                 self.notice_serial = self.notice_serial.wrapping_add(1);
@@ -459,7 +628,21 @@ impl LiveTvStore {
 
     /// Start queued work up to the read budget, and the next write if none is running.
     fn start(&mut self) {
+        while let Some((owner, job)) = self.releases.pop_front() {
+            let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
+            if !self.runner.run(owner, job.clone(), post) {
+                // the OS refused a thread: try again next frame
+                self.releases.push_front((owner, job));
+                break;
+            }
+        }
         let Some(sid) = self.sid else { return };
+        if let Some(job) = self.tune_queue.take() {
+            let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
+            if !self.runner.run(sid, job.clone(), post) {
+                self.tune_queue = Some(job);
+            }
+        }
         if !self.writing {
             if let Some(w) = self.write_queue.pop_front() {
                 let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
@@ -500,6 +683,7 @@ impl LiveTvStore {
             scheduled: self.scheduled.clone(),
             notice: self.notice.clone(),
             writes_in_flight: u32::from(self.writing) + self.write_queue.len() as u32,
+            tune: self.tune_phase.clone(),
         }
     }
 

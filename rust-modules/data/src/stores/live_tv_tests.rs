@@ -11,14 +11,17 @@ use std::rc::Rc;
 #[derive(Default, Clone)]
 struct Script {
     jobs: Rc<RefCell<Vec<(Job, Post)>>>,
+    /// The server each job was run against, in run order.
+    sids: Rc<RefCell<Vec<ServerId>>>,
     refuse: Rc<RefCell<bool>>,
 }
 
 impl Runner for Script {
-    fn run(&mut self, _sid: ServerId, job: Job, post: Post) -> bool {
+    fn run(&mut self, sid: ServerId, job: Job, post: Post) -> bool {
         if *self.refuse.borrow() {
             return false;
         }
+        self.sids.borrow_mut().push(sid);
         self.jobs.borrow_mut().push((job, post));
         true
     }
@@ -295,4 +298,154 @@ fn days_covering_names_every_utc_day_a_window_touches() {
     assert_eq!(crate::live_tv::days_covering(NOON + 11 * 3600, NOON + 13 * 3600).len(), 2);
     assert!(!crate::live_tv::plausible_now(0));
     assert!(crate::live_tv::plausible_now(NOON));
+}
+
+fn tuned(sub: &str, session: &str) -> Tuned {
+    Tuned {
+        sid: sid(),
+        subscription_id: sub.into(),
+        item: plx_plex::plex::live_tv::TunedItem { key: "/livetv/sessions/u".into(), ..Default::default() },
+        stream: plx_plex::plex::live_tv::LiveStream { url: "http://x/start.m3u8".into(), encoder_session: session.into(), ..Default::default() },
+        channel: "C1".into(),
+        airing: None,
+    }
+}
+
+/// The one tune job of a script's batch, with its serial and session.
+fn tune_job(jobs: Vec<(Job, Post)>) -> (u32, String, Post) {
+    let mut found = jobs.into_iter().filter_map(|(j, p)| match j {
+        Job::Tune { serial, session, .. } => Some((serial, session, p)),
+        _ => None,
+    });
+    let one = found.next().expect("a tune job");
+    assert!(found.next().is_none(), "one tune at a time");
+    one
+}
+
+fn releases(jobs: &[(Job, Post)]) -> Vec<String> {
+    jobs.iter().filter_map(|(j, _)| match j { Job::Release { subscription_id, .. } => Some(subscription_id.clone()), _ => None }).collect()
+}
+
+#[test]
+fn a_watch_press_tunes_off_the_frame_and_the_app_takes_the_stream_once() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    assert!(s.tune(1, None));
+    assert_eq!(s.snapshot().tune, TunePhase::Tuning { channel: "Channel 1".into() });
+    s.pump();
+    let (serial, session, post) = tune_job(script.take());
+    assert!(!session.is_empty(), "a fresh encode session per press");
+    post.post(Landing::Tuned { serial, result: Ok(tuned("77", &session)) });
+    s.pump();
+    let t = s.take_tuned().expect("the stream is offered");
+    assert_eq!(t.subscription_id, "77");
+    assert!(s.take_tuned().is_none(), "offered once");
+    assert_eq!(s.snapshot().tune, TunePhase::Idle);
+    s.pump();
+    assert!(releases(&script.take()).is_empty(), "a taken tune is the route's to release");
+}
+
+#[test]
+fn a_tune_nobody_wants_any_more_is_released_against_the_server_that_tuned_it() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.tune(0, None);
+    s.pump();
+    let (serial, session, post) = tune_job(script.take());
+    s.cancel_tune();
+    assert_eq!(s.snapshot().tune, TunePhase::Idle);
+    post.post(Landing::Tuned { serial, result: Ok(tuned("41", &session)) });
+    s.pump();
+    assert!(s.take_tuned().is_none(), "a cancelled press is never played");
+    let jobs = script.take();
+    assert_eq!(releases(&jobs), vec!["41".to_string()]);
+    assert_eq!(*script.sids.borrow().last().unwrap(), sid());
+    let stopped = jobs.iter().any(|(j, _)| matches!(j, Job::Release { session: s, .. } if *s == session));
+    assert!(stopped, "the release names the encode to stop");
+}
+
+#[test]
+fn a_second_press_supersedes_the_first_whose_tune_is_released() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.tune(0, None);
+    s.pump();
+    let (first, session1, post1) = tune_job(script.take());
+    s.tune(2, None);
+    s.pump();
+    let (second, session2, post2) = tune_job(script.take());
+    assert_ne!(first, second);
+    assert_ne!(session1, session2);
+    post2.post(Landing::Tuned { serial: second, result: Ok(tuned("2", &session2)) });
+    post1.post(Landing::Tuned { serial: first, result: Ok(tuned("1", &session1)) });
+    s.pump();
+    assert_eq!(s.take_tuned().unwrap().subscription_id, "2");
+    assert_eq!(releases(&script.take()), vec!["1".to_string()]);
+}
+
+#[test]
+fn a_failed_tune_says_why_until_the_page_clears_it() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.tune(0, None);
+    s.pump();
+    let (serial, _, post) = tune_job(script.take());
+    post.post(Landing::Tuned { serial, result: Err(LiveError::Busy) });
+    s.pump();
+    match s.snapshot().tune {
+        TunePhase::Failed { channel, reason } => {
+            assert_eq!(channel, "Channel 0");
+            assert_eq!(reason, LiveError::Busy.reason());
+        }
+        other => panic!("{other:?}"),
+    }
+    s.clear_tune_failure();
+    assert_eq!(s.snapshot().tune, TunePhase::Idle);
+}
+
+#[test]
+fn a_reset_releases_an_untaken_tune_and_one_that_lands_after_it() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.tune(0, None);
+    s.pump();
+    let (serial, session, post) = tune_job(script.take());
+    post.post(Landing::Tuned { serial, result: Ok(tuned("5", &session)) });
+    s.pump();
+    // landed, not taken: the server switch releases it
+    s.reset();
+    s.pump();
+    assert_eq!(releases(&script.take()), vec!["5".to_string()]);
+    // one in flight across a reset lands under the old epoch and is released too
+    s.open(sid());
+    s.pump();
+    script.take().remove(0).1.post(Landing::Providers(Ok(vec![provider()])));
+    s.pump();
+    for (job, post) in script.take() {
+        match job {
+            Job::Channels { .. } => post.post(Landing::Channels(Ok((0..3).map(channel).collect()))),
+            Job::Dvr => post.post(Landing::Dvr(Ok((vec![], vec![])))),
+            _ => {}
+        }
+    }
+    s.pump();
+    s.tune(1, None);
+    s.pump();
+    let (serial, session, post) = tune_job(script.take());
+    s.reset();
+    post.post(Landing::Tuned { serial, result: Ok(tuned("6", &session)) });
+    s.pump();
+    assert_eq!(releases(&script.take()), vec!["6".to_string()]);
+    assert!(s.take_tuned().is_none());
+}
+
+#[test]
+fn nothing_can_be_tuned_without_a_tunable_provider_or_a_lineup() {
+    let script = Script::default();
+    let mut s = LiveTvStore::with_runner(Box::new(script.clone()));
+    assert!(!s.tune(0, None), "no server");
+    s.open(sid());
+    assert!(!s.tune(0, None), "no lineup yet");
+    let mut s = ready(&script, 2);
+    assert!(!s.tune(5, None), "no such row");
 }
