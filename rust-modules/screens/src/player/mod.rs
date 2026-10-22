@@ -154,7 +154,17 @@ pub struct PlayerScreen {
     failure_up: bool,
     /// The transport clocks' prewarm memo — a render resource, not logical state (`prepare`).
     clock_warm: plx_appkit::player_hud::ClockWarm,
+    /// Where the pointer last moved to (authored coordinates).
+    last_pointer: Option<(f32, f32)>,
+    /// Where the pointer rested when BACK hid the transport. A Magic Remote held still drifts a
+    /// few pixels, and that drift used to raise the transport again at once — so every BACK found
+    /// it on screen and only hid it, and BACK could not leave while the pointer showed (device,
+    /// 2026-10-22). Until the pointer moves [`POINTER_WAKE_PX`] from here, motion leaves it down.
+    pointer_anchor: Option<(f32, f32)>,
 }
+
+/// How far the pointer must move from where it rested at a BACK-hide to raise the transport again.
+const POINTER_WAKE_PX: f32 = 48.0;
 
 impl PlayerScreen {
     pub fn new(entry: EntryId) -> Self {
@@ -179,6 +189,8 @@ impl PlayerScreen {
             failure_sel: 0,
             failure_up: false,
             clock_warm: Default::default(),
+            last_pointer: None,
+            pointer_anchor: None,
         }
     }
 
@@ -628,7 +640,14 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                     // dismissal, which is how a Magic Remote user finds the HUD over full-screen
                     // video. `app/run.rs`'s own motion arm did this and then RETURNED, so the page
                     // never saw a pointer event at all.
-                    InputKind::Pointer { .. } => {
+                    InputKind::Pointer { x, y, .. } => {
+                        self.last_pointer = Some((*x, *y));
+                        if let Some((ax, ay)) = self.pointer_anchor {
+                            if self.hud.dismissed && (x - ax).hypot(y - ay) < POINTER_WAKE_PX {
+                                return Handled::Yes;
+                            }
+                            self.pointer_anchor = None;
+                        }
                         self.hud.dismissed = false;
                         self.hud.extend(input.at.ms, input::HUD_LINGER_MS);
                         self.publish();
@@ -898,6 +917,7 @@ impl PlayerScreen {
                 self.scrub.ns = -1;
                 self.scrub.disengage();
                 self.hud.dismissed = true;
+                self.pointer_anchor = self.last_pointer;
                 self.publish();
                 Handled::Yes
             }
@@ -3102,6 +3122,31 @@ mod scrub_ownership_tests {
         page.hud.visible_at_press = false; // the transport is not on screen at the press
         let (_, reqs) = back(&mut page, at + 500);
         assert_eq!(reqs, vec![PlayerReq::Exit], "an ordinary BACK over a bare picture: {reqs:?}");
+    }
+
+    /// **BACK leaves while the pointer shows.** A Magic Remote held still drifts a few pixels; that
+    /// drift must not raise a transport BACK just hid, or every BACK only hides it again (device,
+    /// 2026-10-22). A deliberate move still raises it.
+    #[test]
+    fn pointer_drift_after_a_back_hide_leaves_the_transport_down() {
+        let _g = plx_base::testlock::serial();
+        let _f = Fixture::new(false);
+        playhead(50 * S);
+        let mut page = page_on_the_bar();
+        pointer(&mut page, InputKind::Pointer { x: 900.0, y: 500.0, hit: None }, 1_000);
+        let (_, reqs) = back(&mut page, 1_200);
+        assert!(reqs.is_empty() && page.hud.dismissed, "the first BACK hides the transport: {reqs:?}");
+        pointer(&mut page, InputKind::Pointer { x: 906.0, y: 497.0, hit: None }, 1_400);
+        assert!(page.hud.dismissed, "drift does not raise it");
+        page.hud.visible_at_press = false; // what the next press samples: not on screen
+        let (_, reqs) = back(&mut page, 1_800);
+        assert_eq!(reqs, vec![PlayerReq::Exit], "the second BACK leaves: {reqs:?}");
+
+        let mut page = page_on_the_bar();
+        pointer(&mut page, InputKind::Pointer { x: 900.0, y: 500.0, hit: None }, 1_000);
+        back(&mut page, 1_200);
+        pointer(&mut page, InputKind::Pointer { x: 1_100.0, y: 620.0, hit: None }, 1_400);
+        assert!(!page.hud.dismissed, "a real move raises it again");
     }
 
     /// **B.5 — taps move the target and commit NOTHING**, playing or paused: not on release and
