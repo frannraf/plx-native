@@ -1061,6 +1061,7 @@ fn live_tv_requests(app: &mut App) {
         if app.route() != AppArg::LiveTv || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) {
             continue;
         }
+        plx_base::eventlog::log(&format!("livetv: page asked {}", live_tv_request_word(&request)));
         match request {
             LiveTvOut::Back => bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, None, Some(ret)),
             LiveTvOut::Tab(tab) => {
@@ -1078,6 +1079,28 @@ fn live_tv_requests(app: &mut App) {
     }
 }
 
+/// What a Live TV page request was, for the event log: the kind and a row, never a title.
+fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
+    use plx_data::live_tv::RecordKind;
+    use plx_data::stores::live_tv::Write;
+    use plx_screens::live_tv::LiveTvOut;
+    match request {
+        LiveTvOut::Tab(_) => "a tab".into(),
+        LiveTvOut::Account => "the account chip".into(),
+        LiveTvOut::Back => "back".into(),
+        LiveTvOut::Watch { row, airing } => format!("watch row {row} ({})", if airing.is_some() { "the airing on now" } else { "no guide" }),
+        LiveTvOut::CancelTune => "cancel the tune".into(),
+        LiveTvOut::DismissTuneFailure => "dismiss the tune failure".into(),
+        LiveTvOut::Write(Write::Record { kind: RecordKind::This, .. }) => "record".into(),
+        LiveTvOut::Write(Write::Record { kind: RecordKind::Series, .. }) => "record series".into(),
+        LiveTvOut::Write(Write::CancelRule { .. }) => "cancel a rule".into(),
+        LiveTvOut::Write(Write::StopGrab { .. }) => "stop/cancel a recording".into(),
+        LiveTvOut::Write(Write::MoveRule { after, .. }) => format!("move a rule ({})", if after.is_some() { "bottom" } else { "top" }),
+        LiveTvOut::Retry => "retry".into(),
+        LiveTvOut::RefreshDvr => "the recordings lists".into(),
+    }
+}
+
 /// Play a landed tune: the route takes the stream (and with it the tuner's release), then the one
 /// start ritual pushes the player over the Live TV page, which is where Stop and BACK return.
 fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) {
@@ -1086,8 +1109,10 @@ fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) {
     // No library item is playing: the player's Info card must not describe the last one.
     app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
     if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
+        plx_base::eventlog::log("livetv: the route refused the live stream's declaration (tune released)");
         return;
     }
+    plx_base::eventlog::log("livetv: starting live playback");
     if !start_playback(
         &mut app.player.session,
         &mut app.adapters.player,

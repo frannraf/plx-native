@@ -2181,6 +2181,7 @@ pub(crate) unsafe fn construct(
     // dev: /tmp/plxnative-watchlist-live — the owner's switch that lets a debug build write to the
     // real plex.tv Watchlist; latched here, and logged once when it is on.
     plx_plex::plex::watchlist::announce_live_writes();
+    plx_plex::plex::live_tv::guard::announce_live_writes();
     // dev: /tmp/plxnative-discover (or the plextv redirect) — resolve where Discover lives NOW, so
     // the event log says whether this boot's person and Watchlist reads reach a stand-in, the real
     // provider, or nothing, before any request is made.

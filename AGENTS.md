@@ -232,7 +232,9 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   refuses them unless the server is the synthetic mock (`tests/mock_pms.py --livetv`) or
   `plxnative-livetv-live` exists in the install's runtime root; the same hook refuses an agent
   command that would create that file, and the same rule applies: **only when the owner asks for it
-  in that same session** (`docs/pms-api.md` §10).
+  in that same session** (`docs/pms-api.md` §10). A build made with `PLX_LIVETV_WRITES=1` in its
+  environment carries the switch compiled in (`live_tv::guard::BUILT_WITH_WRITES`), for an owner's
+  own test build; the same rule holds: no agent builds with it unless the owner asks in that session.
 - Hold the TV lock around the device commands themselves and release as soon as the device work
   pauses. Do not hold a lease while building, reading screenshots or writing Markdown; other lanes
   queue behind it.

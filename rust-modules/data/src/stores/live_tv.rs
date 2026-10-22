@@ -401,6 +401,7 @@ impl LiveTvStore {
         self.tune_serial = self.tune_serial.wrapping_add(1);
         self.tune_wanted = true;
         let label = channel.label().to_string();
+        plx_base::eventlog::log(&format!("livetv: tune #{} asked for channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
         self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id() });
         self.bump();
@@ -598,6 +599,17 @@ impl LiveTvStore {
                         // the first provider that can tune; else the first with a guide
                         self.provider = list.iter().find(|p| p.tunable() && p.grid).or_else(|| list.iter().find(|p| p.grid)).cloned();
                         self.availability = if self.provider.is_some() { Availability::Available } else { Availability::None };
+                        plx_base::eventlog::log(&format!(
+                            "livetv: server sid={} has {} ({} provider(s); the chosen one {})",
+                            self.sid.map_or(0, |s| s.raw()),
+                            if self.provider.is_some() { "Live TV" } else { "no Live TV" },
+                            list.len(),
+                            match &self.provider {
+                                Some(p) if p.tunable() => "tunes and has a guide",
+                                Some(_) => "has a guide but no DVR to tune",
+                                None => "-",
+                            }
+                        ));
                         if let Some(p) = &self.provider {
                             self.channels_phase = Phase::Loading;
                             self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
@@ -606,10 +618,14 @@ impl LiveTvStore {
                         }
                     }
                     Err(LiveError::Status(403)) => {
+                        plx_base::eventlog::log("livetv: providers answered 403: this account may not use the DVR");
                         self.providers_phase = Phase::Ready;
                         self.availability = Availability::None;
                     }
-                    Err(e) => self.providers_phase = Phase::Failed(e.reason()),
+                    Err(e) => {
+                        plx_base::eventlog::log(&format!("livetv: providers failed: {}", e.reason()));
+                        self.providers_phase = Phase::Failed(e.reason())
+                    }
                 }
             }
             Landing::Channels(r) => {
@@ -645,6 +661,14 @@ impl LiveTvStore {
             }
             Landing::Tuned { serial, result } => match result {
                 Ok(t) if self.tune_wanted && serial == self.tune_serial => {
+                    plx_base::eventlog::log(&format!(
+                        "livetv: tune #{serial} landed: stream {}/{} {}x{}, subscription {}",
+                        t.stream.video_codec,
+                        t.stream.audio_codec,
+                        t.stream.width,
+                        t.stream.height,
+                        if t.subscription_id.is_empty() { "none" } else { "held" }
+                    ));
                     self.tune_phase = TunePhase::Tuning { channel: t.channel.clone() };
                     if let Some(old) = self.tuned.replace(t) {
                         self.owe_release(old);
@@ -652,6 +676,7 @@ impl LiveTvStore {
                 }
                 Ok(t) => self.owe_release(t),
                 Err(e) if self.tune_wanted && serial == self.tune_serial => {
+                    plx_base::eventlog::log(&format!("livetv: tune #{serial} failed: {}", e.reason()));
                     self.tune_wanted = false;
                     let channel = match &self.tune_phase {
                         TunePhase::Tuning { channel } => channel.clone(),

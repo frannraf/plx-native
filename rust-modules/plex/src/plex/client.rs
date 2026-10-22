@@ -867,31 +867,38 @@ impl Client {
     /// `body: None` beside the status, never a transport failure.
     #[track_caller]
     pub(super) fn json_value(&self, method: Method, path_no_token: &str) -> ValueOutcome {
-        let reply = match method {
-            Method::Get => self.send_bulk(path_no_token, &[ACCEPT_JSON]),
-            _ => self.send(path_no_token, method, &[ACCEPT_JSON]),
-        };
-        let Some(reply) = reply else {
-            return ValueOutcome::Transport;
-        };
-        let body = if reply.body.iter().all(u8::is_ascii_whitespace) {
-            None
-        } else {
-            match serde_json::from_slice::<serde_json::Value>(&reply.body) {
-                Ok(v) => Some(v),
-                Err(error) => {
-                    // The ENDPOINT only, as `get_json` logs it — never the built path.
-                    plx_base::eventlog::log(&format!(
-                        "pms: {:?} {} answered {} bytes that will not parse — {error}",
-                        method,
-                        path_no_token.split('?').next().unwrap_or(path_no_token),
-                        reply.body.len()
-                    ));
-                    None
+        let started = std::time::Instant::now();
+        let outcome = (|| {
+            let reply = match method {
+                Method::Get => self.send_bulk(path_no_token, &[ACCEPT_JSON]),
+                _ => self.send(path_no_token, method, &[ACCEPT_JSON]),
+            };
+            let Some(reply) = reply else {
+                return ValueOutcome::Transport;
+            };
+            let body = if reply.body.iter().all(u8::is_ascii_whitespace) {
+                None
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&reply.body) {
+                    Ok(v) => Some(v),
+                    Err(error) => {
+                        // The ENDPOINT only, as `get_json` logs it — never the built path.
+                        plx_base::eventlog::log(&format!(
+                            "pms: {:?} {} answered {} bytes that will not parse — {error}",
+                            method,
+                            path_no_token.split('?').next().unwrap_or(path_no_token),
+                            reply.body.len()
+                        ));
+                        None
+                    }
                 }
-            }
-        };
-        ValueOutcome::Response { status: reply.status, body }
+            };
+            ValueOutcome::Response { status: reply.status, body }
+        })();
+        // Live TV's debug output (`live_tv::debug`): the operation, its status, its time, the
+        // answer's shape. Nothing but Live TV calls this door.
+        super::live_tv::debug::exchange(method, path_no_token, &outcome, started.elapsed().as_millis());
+        outcome
     }
 
     /// POST → parse the `{ "MediaContainer": … }` envelope — /playQueues (the returned ids).

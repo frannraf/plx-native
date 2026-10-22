@@ -5306,6 +5306,16 @@ fn hls_cursor_next(
                 .retain(|segment| segment.sequence >= first_sequence);
             skipped = before.saturating_sub(refresh.new_segments.len());
             cursor.start_applied = true;
+            if cursor.live {
+                crate::player::log(&format!(
+                    "hls: live window target={}s segments={} media_sequence={} start_sequence={first_sequence} total_ms={} end={}",
+                    media.target_duration_secs,
+                    media.segments.len(),
+                    media.media_sequence,
+                    total_ns / 1_000_000,
+                    refresh.end_list
+                ));
+            }
         }
         crate::player::log(&format!(
             "hls: refresh new={} skipped={} total_ms={} end={} fetch_ms={media_ms}",

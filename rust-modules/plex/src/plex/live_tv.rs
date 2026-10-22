@@ -20,6 +20,7 @@ use super::client::{Client, QueryBuilder, ValueOutcome};
 use crate::http::Method;
 use serde_json::Value;
 
+pub(super) mod debug;
 mod model;
 mod parse;
 #[cfg(test)]
@@ -45,8 +46,24 @@ pub mod guard {
         false
     }
 
+    /// **The owner's standing permission, compiled into one build**: a build made with
+    /// `PLX_LIVETV_WRITES=1` in its environment writes Live TV and DVR changes to a real server
+    /// with no switch, as if the switch were always armed. For the owner's own test builds: on
+    /// 2026-10-22 they asked for a debug build that records and tunes without a switch. A plain
+    /// `make` does not set it, so the default stays the gate; **no agent builds with it unless the
+    /// owner asks for it in that session** (AGENTS.md).
+    pub(super) const BUILT_WITH_WRITES: bool = match option_env!("PLX_LIVETV_WRITES") {
+        Some(v) => is_one(v.as_bytes()),
+        None => false,
+    };
+
+    /// `"1"`, compared in a const context (a `str` pattern is not allowed there).
+    const fn is_one(b: &[u8]) -> bool {
+        b.len() == 1 && b[0] == b'1'
+    }
+
     /// The pure decision: a release build always writes; a debug build writes only to the mock or
-    /// under the owner's switch.
+    /// under the owner's switch (armed by the file, or compiled in).
     pub(super) fn permit(devtriggers_build: bool, mock_server: bool, live: bool) -> bool {
         !devtriggers_build || mock_server || live
     }
@@ -67,7 +84,7 @@ pub mod guard {
     /// May this process write to the server that reports `version`? Logs a refusal by operation
     /// name only.
     pub(super) fn allow(op: &str, version: &str) -> bool {
-        let live = live_armed();
+        let live = live_armed() || BUILT_WITH_WRITES;
         let ok = permit(cfg!(feature = "devtriggers"), is_mock_version(version), live);
         LAST_REFUSED.store(!ok, std::sync::atomic::Ordering::Relaxed);
         if !ok {
@@ -82,8 +99,14 @@ pub mod guard {
     /// in a release build; the trigger's name rides its own gate (`ci/check-package.py`).
     pub fn announce_live_writes() {
         #[cfg(feature = "devtriggers")]
-        if live_armed() {
-            plx_base::eventlog::log("livetv: LIVE writes enabled by trigger (plxnative-livetv-live)");
+        {
+            if BUILT_WITH_WRITES {
+                plx_base::eventlog::log("livetv: LIVE writes enabled by the build (PLX_LIVETV_WRITES=1)");
+            } else if live_armed() {
+                plx_base::eventlog::log("livetv: LIVE writes enabled by trigger (plxnative-livetv-live)");
+            } else {
+                plx_base::eventlog::log("livetv: LIVE writes off (debug build; the mock is still written)");
+            }
         }
     }
 }
@@ -241,21 +264,41 @@ impl Client {
     /// has no DVR or the account may not use it.
     pub fn live_tv_providers(&self) -> LiveResult<Vec<EpgProvider>> {
         let body = ok_body(self.json_value(Method::Get, "/media/providers"))?;
-        Ok(parse::providers(&body))
+        let list = parse::providers(&body);
+        debug::parsed(&format!(
+            "providers parsed: {} EPG provider(s), {} tunable, {} with a guide",
+            list.len(),
+            list.iter().filter(|p| p.tunable()).count(),
+            list.iter().filter(|p| p.grid).count()
+        ));
+        Ok(list)
     }
 
     /// A provider's channel lineup.
     pub fn live_tv_channels(&self, provider: &str) -> LiveResult<Vec<Channel>> {
         let path = lineup_path(provider).ok_or(LiveError::Invalid)?;
         let body = ok_body(self.json_value(Method::Get, &path))?;
-        Ok(parse::channels(&body))
+        let channels = parse::channels(&body);
+        debug::parsed(&format!(
+            "lineup parsed: {} channel(s), {} with a grid key, {} with a number",
+            channels.len(),
+            channels.iter().filter(|c| !c.grid_key.is_empty()).count(),
+            channels.iter().filter(|c| !c.vcn.is_empty()).count()
+        ));
+        Ok(channels)
     }
 
     /// One channel's airings for one UTC day (`date` = [`utc_date`]).
     pub fn live_tv_grid(&self, provider: &str, channel: &Channel, date: &str) -> LiveResult<Vec<Airing>> {
         let path = grid_path(provider, &channel.grid_key, date).ok_or(LiveError::Invalid)?;
         let body = ok_body(self.json_value(Method::Get, &path))?;
-        Ok(parse::grid(&body, Some(channel)))
+        let airings = parse::grid(&body, Some(channel));
+        // An answer that held entries but parsed to no airing is a shape this parser misses.
+        let held = parse::container(&body).and_then(|c| c.get("size")).and_then(Value::as_i64).unwrap_or(0);
+        if airings.is_empty() && held > 0 {
+            debug::parsed(&format!("grid parsed: 0 airings from an answer of size {held}"));
+        }
+        Ok(airings)
     }
 
     /// The recording rules, in priority order.
@@ -281,7 +324,15 @@ impl Client {
     pub fn dvr_template(&self, guid: &str) -> LiveResult<Vec<TemplateChoice>> {
         let path = template_path(guid).ok_or(LiveError::Invalid)?;
         let body = ok_body(self.json_value(Method::Get, &path))?;
-        Ok(parse::template(&body))
+        let choices = parse::template(&body);
+        debug::parsed(&format!(
+            "template parsed: {} choice(s), kinds {:?}, {} with a library, {} with parameters",
+            choices.len(),
+            choices.iter().map(|c| c.kind).collect::<Vec<_>>(),
+            choices.iter().filter(|c| !c.target_section.is_empty()).count(),
+            choices.iter().filter(|c| !c.parameters.is_empty()).count()
+        ));
+        Ok(choices)
     }
 
     /// Create a recording rule. The rule exists on the server even when the answer carries
@@ -293,7 +344,16 @@ impl Client {
         }
         let outcome = self.json_value(Method::Post, &path);
         log_write("record", &outcome);
-        parse::created(&ok_body(outcome)?)
+        let made = parse::created(&ok_body(outcome)?);
+        match &made {
+            Ok(m) => debug::parsed(&format!(
+                "record parsed: rule id {}, {} conflict(s)",
+                if m.subscription_id.is_empty() { "missing" } else { "present" },
+                m.conflicts.len()
+            )),
+            Err(e) => debug::parsed(&format!("record answer unreadable: {}", e.reason())),
+        }
+        made
     }
 
     /// Change a rule's library or preferences.
@@ -360,7 +420,25 @@ impl Client {
         }
         let outcome = self.json_value(Method::Post, &path);
         log_write("tune", &outcome);
-        parse::tune(&ok_body(outcome)?)
+        let tuned = parse::tune(&ok_body(outcome)?);
+        match &tuned {
+            Ok(t) => debug::parsed(&format!(
+                "tune parsed: subscription {}, item key {:?}, ratingKey {}, playable {}, {} conflict(s), {} program(s), capture window {}, item {}x{} {}/{}",
+                if t.subscription_id.is_empty() { "missing" } else { "present" },
+                debug::path_shape(&t.item.key),
+                if t.item.rating_key.is_empty() { "missing" } else { "present" },
+                t.playable(),
+                t.conflicts.len(),
+                t.programs.len(),
+                if t.capture.is_some() { "present" } else { "missing" },
+                t.item.width,
+                t.item.height,
+                t.item.video_codec,
+                t.item.audio_codec
+            )),
+            Err(e) => debug::parsed(&format!("tune answer unreadable: {}", e.reason())),
+        }
+        tuned
     }
 
     /// Re-read a live tune's subscription: the program list moves on as programs end.
@@ -438,7 +516,29 @@ impl Client {
             return Err(LiveError::Invalid);
         }
         let spec = live_spec(key, session);
-        let decision = self.transcode_decision(off, &spec).ok_or(LiveError::Transport)?;
+        let started = std::time::Instant::now();
+        let decision = self.transcode_decision(off, &spec);
+        let Some(decision) = decision else {
+            debug::parsed(&format!("live decision: no answer after {} ms", started.elapsed().as_millis()));
+            return Err(LiveError::Transport);
+        };
+        debug::parsed(&format!(
+            "live decision in {} ms: general {:?} {:?}, transcode {:?} {:?}, {} metadata, streams {:?}",
+            started.elapsed().as_millis(),
+            decision.general_decision_code,
+            decision.general_decision_text,
+            decision.transcode_decision_code,
+            decision.transcode_decision_text,
+            decision.metadata.len(),
+            decision
+                .metadata
+                .iter()
+                .flat_map(|m| m.media.iter())
+                .flat_map(|m| m.part.iter())
+                .flat_map(|p| p.stream.iter())
+                .map(|s| format!("{}:{}@{}", s.stream_type, s.codec, s.frame_rate))
+                .collect::<Vec<_>>()
+        ));
         if let Some(code) = decision.general_decision_code {
             if !(1000..2000).contains(&code) {
                 let text = if decision.transcode_decision_text.is_empty() { decision.general_decision_text.clone() } else { decision.transcode_decision_text.clone() };

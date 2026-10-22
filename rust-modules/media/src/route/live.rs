@@ -182,6 +182,16 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
     }
     super::decision::install_live_lease(ps, lease, route.info.clone(), &route.url);
     crate::ff::set_live_stream(true);
+    crate::player::log(&format!(
+        "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, keepalive every {}s",
+        route.video_codec,
+        route.audio_codec,
+        route.width,
+        route.height,
+        route.fps,
+        if route.subscription_id.is_empty() { "none" } else { "held" },
+        KEEPALIVE_S
+    ));
     start_keepalive(route.sid, route.key, route.rating_key, route.encoder_session, stop);
     true
 }
@@ -191,10 +201,20 @@ fn start_keepalive(sid: ServerId, key: String, rk: String, enc: String, stop: Ar
         let Some(client) = plx_plex::plex::client_for(sid) else { return };
         // the first report at once: the session is playing from now on
         let mut since = KEEPALIVE_S;
+        let (mut sent, mut failed) = (0u32, 0u32);
         while !stop.load(Ordering::Acquire) {
             if since >= KEEPALIVE_S {
                 since = 0;
-                let _ = client.live_timeline(&key, &rk, "playing", &enc);
+                let ok = client.live_timeline(&key, &rk, "playing", &enc);
+                sent += 1;
+                // The first answer, every failure, and a tally once in a while: a server that
+                // stops taking the report is a tune about to be reclaimed.
+                if !ok {
+                    failed += 1;
+                    crate::player::log(&format!("livetv: keepalive #{sent} not taken ({failed} failed so far)"));
+                } else if sent == 1 || sent % 30 == 0 {
+                    crate::player::log(&format!("livetv: keepalive #{sent} taken ({failed} failed so far)"));
+                }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
             since += 1;
