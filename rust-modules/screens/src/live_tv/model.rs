@@ -292,7 +292,8 @@ pub fn follow(view: &LiveTvView, frame: &Frame, elem: u32) -> Frame {
         if a.begins_at >= win_end - HALF_HOUR {
             // a cell starting in the last half hour (or past it) brings its start to the second tick
             f.win_start = floor_half(a.begins_at) - HALF_HOUR;
-        } else if a.ends_at <= f.win_start + HALF_HOUR / 2 || (a.begins_at < f.win_start && a.ends_at <= f.win_start + HALF_HOUR) {
+        } else if a.begins_at < f.win_start {
+            // a cell that starts before the window brings its start in (as far back as now)
             f.win_start = floor_half(a.begins_at);
         }
     }
@@ -300,13 +301,16 @@ pub fn follow(view: &LiveTvView, frame: &Frame, elem: u32) -> Frame {
     f
 }
 
-/// The guide the page wants read for `frame`: the rows shown and two either side, from the
-/// window's start to three hours past its end (so RIGHT finds the next airing already there).
+/// The guide the page wants read for `frame`: the rows shown and two either side, from three hours
+/// before the window (LEFT walks back there) but never before the half hour now is in (an airing
+/// that ended is nothing to focus), to three hours past its end (RIGHT finds the next airing
+/// already there).
 pub fn want(view: &LiveTvView, frame: &Frame) -> Want {
     let n = view.channel_count();
     let from_row = frame.row_top.saturating_sub(2).min(n);
     let to_row = (frame.row_top + ROWS_SHOWN + 2).min(n);
-    Want { rows: from_row..to_row, from: frame.win_start - HALF_HOUR, to: frame.win_start + WINDOW_S + 3 * 3_600 }
+    let from = (frame.win_start - 3 * 3_600).max(floor_half(frame.now));
+    Want { rows: from_row..to_row, from, to: frame.win_start + WINDOW_S + 3 * 3_600 }
 }
 
 // ---- the Recordings list ------------------------------------------------------------------------

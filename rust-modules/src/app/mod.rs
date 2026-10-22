@@ -511,6 +511,8 @@ unsafe fn run_and_shutdown(app: &mut App) -> c_int {
     let failed = finish_recording(&mut app.rec, app.bridge.landgate())
         || app.bridge.controlled_failure().is_some();
     app.glass.sources.borrow_mut().clear();
+    // A tune the Live TV store still owns (landed, not played; owed a release) is freed first.
+    app.bridge.live_tv_release_for_exit();
     run::shutdown(&mut app.player.session, &mut app.adapters.player);
     i32::from(failed)
 }

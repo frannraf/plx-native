@@ -172,6 +172,13 @@ impl LiveTvScreen {
         let n = view.channel_count();
         self.frame.row_top = self.frame.row_top.min(n.saturating_sub(1));
         self.view = view;
+        // What landed can move the focused element (a heading added above a Recordings row, an
+        // airing filled in): keep it in view.
+        if let Some(elem) = self.focus {
+            if let Some(i) = model::rec_of(elem) {
+                self.rec_top = model::rec_follow(&self.recs, self.rec_top, i);
+            }
+        }
         plx_machine::idle::invalidate();
     }
 

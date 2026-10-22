@@ -26,10 +26,25 @@ use crate::live_tv::{self as lt, Availability, GuideCache, Overlay, Phase, Recor
 use plx_plex::plex::live_tv::{Airing, Channel, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
 use plx_plex::plex::ServerId;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Reads in flight at once (a guide window asks for a dozen channel-days).
 pub const IN_FLIGHT: usize = 4;
+
+/// Release workers still running (waited for at exit, [`drain_releases`]).
+static RELEASING: AtomicUsize = AtomicUsize::new(0);
+
+/// At exit: wait, at most about three seconds, for release workers already running, so a quit
+/// right after leaving a tune still frees the tuner. (A counted wait: no clock is read here.)
+pub fn drain_releases() {
+    for _ in 0..150 {
+        if RELEASING.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 /// A unit of server work.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,7 +124,20 @@ impl Runner for Spawn {
             }
             return false;
         };
-        plx_base::task::spawn_off_frame("livetv", move |off| post.post(execute(client, off, sid, job)))
+        let releasing = matches!(job, Job::Release { .. });
+        if releasing {
+            RELEASING.fetch_add(1, Ordering::AcqRel);
+        }
+        let ok = plx_base::task::spawn_off_frame("livetv", move |off| {
+            post.post(execute(client, off, sid, job));
+            if releasing {
+                RELEASING.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+        if !ok && releasing {
+            RELEASING.fetch_sub(1, Ordering::AcqRel);
+        }
+        ok
     }
 }
 
@@ -254,6 +282,9 @@ pub struct LiveTvStore {
     tuned: Option<Tuned>,
     /// Releases owed to servers (an unwanted tune), each against the server that tuned it.
     releases: VecDeque<(ServerId, Job)>,
+    /// The last guide window a page asked for: a Retry and the minute's re-ask of failed days
+    /// ask it again.
+    window: Option<(std::ops::Range<usize>, i64, i64)>,
     now: i64,
     utc_offset: i64,
     generation: u32,
@@ -293,6 +324,7 @@ impl LiveTvStore {
             tune_queue: None,
             tuned: None,
             releases: VecDeque::new(),
+            window: None,
             now: 0,
             utc_offset: 0,
             generation: 0,
@@ -398,6 +430,13 @@ impl LiveTvStore {
         Some(t)
     }
 
+    /// At exit: a tune landed and not played is released now (with every release still owed).
+    /// A tune still in flight cannot be named yet; the server reclaims it.
+    pub fn release_for_exit(&mut self) {
+        self.cancel_tune();
+        self.start();
+    }
+
     /// A taken stream the application could not play: release it.
     pub fn release_tuned(&mut self, t: Tuned) {
         self.owe_release(t);
@@ -420,6 +459,7 @@ impl LiveTvStore {
     /// The guide window a page shows: channel rows `rows` between `from` and `to` (epoch seconds).
     /// Asks for every channel-day it does not hold, nearest rows first.
     pub fn want_window(&mut self, rows: std::ops::Range<usize>, from: i64, to: i64) {
+        self.window = Some((rows.clone(), from, to));
         let Some(provider) = self.provider.as_ref().map(|p| p.identifier.clone()) else { return };
         if !self.channels_phase.is_ready() || to <= from {
             return;
@@ -445,6 +485,10 @@ impl LiveTvStore {
     /// Ask again for every guide day that failed (the page's Retry).
     pub fn retry_failed(&mut self) {
         self.guide.reset_failed();
+        self.rewant();
+        if matches!(self.dvr_phase, Phase::Failed(_)) {
+            self.refresh_dvr();
+        }
         if matches!(self.channels_phase, Phase::Failed(_)) {
             if let Some(p) = &self.provider {
                 self.channels_phase = Phase::Loading;
@@ -456,6 +500,13 @@ impl LiveTvStore {
             self.queue.push_front(Job::Providers);
         }
         self.bump();
+    }
+
+    /// Ask again for the last window (after failed days were reset to unasked).
+    fn rewant(&mut self) {
+        if let Some((rows, from, to)) = self.window.clone() {
+            self.want_window(rows, from, to);
+        }
     }
 
     /// The airings of channel row `ch` in `[from, to)`, from the cache.
@@ -504,6 +555,12 @@ impl LiveTvStore {
             if minute != self.now {
                 self.now = minute;
                 self.utc_offset = plx_platform::i18n::utc_offset_s(minute);
+                // A day that failed (a timeout, a busy server) is asked again once a minute while
+                // the page still shows it; nothing else would ever re-ask it.
+                if self.guide.has_failed() {
+                    self.guide.reset_failed();
+                    self.rewant();
+                }
                 self.bump();
             }
         }

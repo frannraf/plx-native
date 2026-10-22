@@ -166,10 +166,26 @@ fn a_failed_day_is_not_asked_again_until_retry() {
     s.want_window(0..1, NOON, NOON + 3600);
     s.pump();
     assert!(script.take().is_empty(), "a scroll does not hammer a failing server");
+    // Retry asks the last window again by itself: the page's window did not move
     s.retry_failed();
-    s.want_window(0..1, NOON, NOON + 3600);
     s.pump();
     assert_eq!(script.take().len(), 1);
+}
+
+#[test]
+fn retry_reads_a_failed_dvr_list_again() {
+    let script = Script::default();
+    let mut s = ready(&script, 2);
+    s.refresh_dvr();
+    s.pump();
+    let (job, post) = script.take().remove(0);
+    assert!(matches!(job, Job::Dvr));
+    post.post(Landing::Dvr(Err(LiveError::Transport)));
+    s.pump();
+    assert!(matches!(s.snapshot().dvr_phase, Phase::Failed(_)));
+    s.retry_failed();
+    s.pump();
+    assert!(script.take().iter().any(|(j, _)| matches!(j, Job::Dvr)), "Try again on the Recordings read-out reads the lists again");
 }
 
 #[test]

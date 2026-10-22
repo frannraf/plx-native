@@ -129,7 +129,19 @@ fn the_wanted_window_covers_the_rows_shown_and_reaches_past_the_window() {
     let f = Frame { row_top: 5, ..frame() };
     let w = want(&v, &f);
     assert_eq!(w.rows, 3..13);
-    assert!(w.from < f.win_start && w.to > f.win_start + WINDOW_S);
+    assert!(w.to > f.win_start + WINDOW_S);
+    assert_eq!(w.from, NOON, "nothing that ended before now's half hour is asked for");
+    // scrolled right, LEFT's way back is read too (back to now at most)
+    let later = Frame { win_start: NOON + 4 * 3_600, ..f };
+    assert_eq!(want(&v, &later).from, NOON + 3_600);
+}
+
+#[test]
+fn a_cell_that_starts_before_the_window_scrolls_it_back_to_its_start() {
+    let v = view(3);
+    // row 1 airs hour-long programs: focused at 13:00-14:00 with the window at 13:30
+    let f = Frame { win_start: NOON + 3 * 1_800, ..frame() };
+    assert_eq!(follow(&v, &f, cell(1, NOON + 3_600)).win_start, NOON + 3_600);
 }
 
 #[test]

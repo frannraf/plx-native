@@ -129,6 +129,10 @@ impl GuideCache {
         }
         need
     }
+    /// Does any day hold a failure?
+    pub fn has_failed(&self) -> bool {
+        self.days.values().any(|d| matches!(d.phase, Phase::Failed(_)))
+    }
     /// Every failed day goes back to unasked, so the next window asks again.
     pub fn reset_failed(&mut self) {
         for d in self.days.values_mut() {

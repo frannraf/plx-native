@@ -159,6 +159,17 @@ impl Bridge {
         }
     }
 
+    /// Forget a Watch press still on its way (the app is going to the background).
+    pub(crate) fn live_tv_cancel_tune(&mut self) {
+        self.stores.live_tv.cancel_tune();
+    }
+
+    /// At exit: release whatever tune the store still owns and wait (bounded) for its releases.
+    pub(crate) fn live_tv_release_for_exit(&mut self) {
+        self.stores.live_tv.release_for_exit();
+        plx_data::stores::live_tv::drain_releases();
+    }
+
     /// A tune that landed for the page, once: the caller installs it into the media route.
     pub(crate) fn live_tv_take_tuned(&mut self) -> Option<Tuned> {
         self.stores.live_tv.take_tuned()

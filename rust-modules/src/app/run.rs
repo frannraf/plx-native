@@ -899,6 +899,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         ) {
             plx_machine::idle::invalidate();
         }
+        // A Live TV tune still on its way is not played in the background: cancelled, its landing
+        // is released by the store (a tune already playing is a live session, stopped below).
+        app.bridge.live_tv_cancel_tune();
         // Playback owns its resolve and Engine before the queued Player page mounts. Page
         // presence only governs the screen-local cleanup below, never resource suspension.
         if !plx_media::route::preview_request(&app.player.session)
