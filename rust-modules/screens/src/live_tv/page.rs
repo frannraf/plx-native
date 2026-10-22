@@ -752,7 +752,8 @@ impl LiveTvScreen {
     /// The airing the hero describes: the focused cell's (else the one on now in the first row
     /// shown), with its row.
     fn hero(&self) -> Option<(usize, &Airing)> {
-        let focus = self.last_cell.filter(|e| self.view.holds(self.frame.base, *e)).unwrap_or_else(|| self.now_cell());
+        let (from, to) = (self.frame.win_start, self.frame.win_start + model::WINDOW_S);
+        let focus = self.last_cell.filter(|e| self.view.holds(self.frame.base, *e, from, to)).unwrap_or_else(|| self.now_cell());
         self.view.airing(self.frame.base, focus)
     }
 
@@ -1044,9 +1045,7 @@ impl LiveTvScreen {
                     msg::live_tv_row_no_info()
                 };
                 self.draw_cell(f, p, rect, words, "", on, false, false);
-                if !r.airings.is_empty() {
-                    continue;
-                }
+                // focusable whenever it stands for the whole window (OK on it watches the channel)
                 if !panel_up {
                     f.stop(p, stop(self.key(elem), rect));
                 }
@@ -1816,7 +1815,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             // An airing that ended while the page sat (the window moved on with now) gives way
             // to the one on now in its row.
             let ended = self.view.airing(self.frame.base, e).is_some_and(|(_, a)| a.ends_at <= self.frame.win_start);
-            if self.view.holds(self.frame.base, e) && !ended {
+            if self.view.holds(self.frame.base, e, self.frame.win_start, self.frame.win_start + model::WINDOW_S) && !ended {
                 return want;
             }
             if ended {

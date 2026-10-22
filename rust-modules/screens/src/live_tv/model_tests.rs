@@ -72,9 +72,11 @@ fn the_cell_at_a_time_is_the_airing_on_then_else_the_placeholder() {
     assert_eq!(v.cell_at(BASE, 0, NOON + 600), cell(0, NOON));
     assert_eq!(v.cell_at(BASE, 1, NOON + 1_900), cell(1, NOON));
     assert_eq!(v.cell_at(BASE, 2, NOON), cell_elem(2, PLACEHOLDER));
-    assert!(v.holds(BASE, cell_elem(2, PLACEHOLDER)));
-    assert!(!v.holds(BASE, cell_elem(0, PLACEHOLDER)), "a row with airings has no placeholder");
-    assert!(!v.holds(BASE, cell(9, NOON)), "no such row");
+    let (from, to) = (NOON, NOON + WINDOW_S);
+    assert!(v.holds(BASE, cell_elem(2, PLACEHOLDER), from, to));
+    assert!(!v.holds(BASE, cell_elem(0, PLACEHOLDER), from, to), "a row with a program in the window has no placeholder");
+    assert!(v.holds(BASE, cell_elem(0, PLACEHOLDER), NOON + 86_400, NOON + 86_400 + WINDOW_S), "nothing in a later window: it has one");
+    assert!(!v.holds(BASE, cell(9, NOON), from, to), "no such row");
 }
 
 #[test]
@@ -285,4 +287,25 @@ fn a_shrunken_recordings_list_settles_back_into_view() {
     assert_eq!(rec_settle(&short, top, 14), 0, "all four fit: from the top");
     assert_eq!(rec_settle(&[], top, 14), 0);
     assert_eq!(rec_settle(&long, top, 14), top, "nothing changed: nothing moves");
+}
+
+/// UP/DOWN onto a long program already well in view leaves the window where the viewer had it,
+/// and onto a channel with nothing in the window lands on its placeholder, not hours ahead.
+#[test]
+fn moving_up_and_down_keeps_the_window_and_meets_off_air_channels_on_their_placeholder() {
+    let mut v = view(4);
+    // row 3: one long film, 11:00-16:00
+    v.rows[3].airings = vec![airing(3, NOON - 3_600, 300, "film")];
+    let f = Frame { win_start: NOON + 2 * 3_600, ..frame() };
+    let film = cell(3, NOON - 3_600);
+    assert_eq!(follow(&v, &f, film).win_start, f.win_start, "the film fills the window: it stays");
+    // a cell showing only its last half hour still brings its start in
+    let tail = Frame { win_start: NOON + 3_600 + 1_800, ..f };
+    let half = cell(0, NOON + 3_600);
+    assert!(v.airing(BASE, half).is_some());
+    assert_eq!(follow(&v, &tail, half).win_start, NOON + 3_600, "little of it shows: its start comes in");
+    // row 2 has nothing at all; row 0's programs end at 17:00
+    assert_eq!(guide_neighbour(&v, &f, cell(1, NOON + 2 * 3_600), Dir::Down), Some(cell_elem(2, PLACEHOLDER)));
+    let evening = Frame { win_start: NOON + 6 * 3_600, ..frame() };
+    assert_eq!(guide_neighbour(&v, &evening, cell_elem(1, PLACEHOLDER), Dir::Up), Some(cell_elem(0, PLACEHOLDER)), "off the air in this window");
 }

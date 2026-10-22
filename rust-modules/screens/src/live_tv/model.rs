@@ -147,16 +147,20 @@ impl LiveTvView {
         }
     }
     /// Is this guide key one the view can show (its row exists; its airing is there, or it is a
-    /// placeholder of a row with no airings)?
-    pub fn holds(&self, base: i64, elem: u32) -> bool {
+    /// placeholder of a row with nothing in the window `[from, to)`)?
+    pub fn holds(&self, base: i64, elem: u32, from: i64, to: i64) -> bool {
         let Some((row, slot)) = cell_of(elem) else { return false };
         if row >= self.channel_count() {
             return false;
         }
         if slot == PLACEHOLDER {
-            return self.row(row).is_none_or(|r| r.airings.is_empty());
+            return !self.shows_any(row, from, to);
         }
         self.airing(base, elem).is_some()
+    }
+    /// Does row `row` have a program in the window `[from, to)`?
+    pub fn shows_any(&self, row: usize, from: i64, to: i64) -> bool {
+        self.row(row).is_some_and(|r| r.airings.iter().any(|a| a.ends_at > from && a.begins_at < to))
     }
 }
 
@@ -295,6 +299,11 @@ pub fn guide_neighbour(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) ->
             if target >= view.channel_count() {
                 return None;
             }
+            // A channel with nothing in the window (off the air until morning): its placeholder,
+            // which watches it, rather than its next program hours away.
+            if !view.shows_any(target, frame.win_start, frame.win_start + WINDOW_S) {
+                return Some(cell_elem(target, PLACEHOLDER));
+            }
             Some(view.cell_at(frame.base, target, anchor_time(view, frame, elem)))
         }
         Dir::Left | Dir::Right => {
@@ -333,8 +342,10 @@ pub fn follow(view: &LiveTvView, frame: &Frame, elem: u32) -> Frame {
         if a.begins_at >= win_end - HALF_HOUR {
             // a cell starting in the last half hour (or past it) brings its start to the second tick
             f.win_start = floor_half(a.begins_at) - HALF_HOUR;
-        } else if a.begins_at < f.win_start {
-            // a cell that starts before the window brings its start in (as far back as now)
+        } else if a.begins_at < f.win_start && a.ends_at.min(win_end) - f.win_start <= HALF_HOUR {
+            // a cell that starts before the window and shows little of itself brings its start in
+            // (as far back as now); one already well in view (a long film met moving up or down)
+            // leaves the window where the viewer had it
             f.win_start = floor_half(a.begins_at);
         }
     }
