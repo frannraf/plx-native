@@ -553,3 +553,19 @@ fn a_repeated_dvr_change_is_sent_once_while_the_first_is_on_its_way() {
     s.pump();
     assert!(script.take().iter().any(|(j, _)| matches!(j, Job::Write(_))), "landed: a new press is a new write");
 }
+
+/// A channel-day read a while ago is read again, its programs showing meanwhile; one read lately
+/// is left alone.
+#[test]
+fn a_stale_channel_day_is_read_again_while_its_programs_stay_on_screen() {
+    use crate::live_tv::GuideCache;
+    let mut g = GuideCache::default();
+    let dates = vec!["2026-10-22".to_string()];
+    assert_eq!(g.want([0].into_iter(), &dates).len(), 1);
+    g.land(0, "2026-10-22", Ok(vec![airing(0, NOON, "g", "s")]), 1_000);
+    assert!(!g.expire(1_000 + 14 * 60, 15 * 60), "read lately: left alone");
+    assert!(g.expire(1_000 + 15 * 60, 15 * 60));
+    assert_eq!(g.airings(0, NOON, NOON + 1).len(), 1, "its programs still show");
+    assert_eq!(g.want([0].into_iter(), &dates).len(), 1, "and it is asked again");
+    assert!(g.pending(0, &dates));
+}

@@ -536,8 +536,11 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
     let mut independent_segments = false;
     let mut pending_bandwidth = None;
     let mut pending_lines: Option<u32> = None;
+    // A provider variant whose CODECS name a video codec this player is not set up for (a cloud
+    // channel plays as H.264/AAC: HEVC, AV1, VP9 or Dolby Vision would open and fail to decode).
+    let mut pending_other_codec = false;
     let mut variant = None;
-    let mut candidates: Vec<(Variant, Option<u32>)> = Vec::new();
+    let mut candidates: Vec<(Variant, Option<u32>, bool)> = Vec::new();
 
     for (line_no, line) in lines.into_iter().skip(1) {
         if line.is_empty() {
@@ -562,6 +565,7 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
                     return Err(Error::MultipleVariants);
                 }
                 pending_bandwidth = Some(parse_variant_bandwidth(value, line_no)?);
+                pending_other_codec = shape == Shape::Provider && codecs_other_than_h264(value);
                 pending_lines = value
                     .split("RESOLUTION=")
                     .nth(1)
@@ -608,17 +612,20 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
             resource,
             bandwidth,
         };
-        candidates.push((found.clone(), pending_lines.take()));
+        candidates.push((found.clone(), pending_lines.take(), std::mem::take(&mut pending_other_codec)));
         variant = Some(found);
     }
     if shape == Shape::Provider && candidates.len() > 1 {
         let fits = |lines: &Option<u32>| lines.is_none_or(|l| l <= PROVIDER_MAX_LINES);
+        // the richest H.264 variant up to 1080 lines; else the leanest H.264 one; else (nothing
+        // says H.264) the leanest of all, and the demuxer's probe has the last word
         variant = candidates
             .iter()
-            .filter(|(_, lines)| fits(lines))
-            .max_by_key(|(v, _)| v.bandwidth)
-            .or_else(|| candidates.iter().min_by_key(|(v, _)| v.bandwidth))
-            .map(|(v, _)| v.clone());
+            .filter(|(_, lines, other)| fits(lines) && !other)
+            .max_by_key(|(v, _, _)| v.bandwidth)
+            .or_else(|| candidates.iter().filter(|(_, _, other)| !other).min_by_key(|(v, _, _)| v.bandwidth))
+            .or_else(|| candidates.iter().min_by_key(|(v, _, _)| v.bandwidth))
+            .map(|(v, _, _)| v.clone());
     }
 
     if pending_bandwidth.is_some() {
@@ -1052,6 +1059,17 @@ fn tag_name(line: &str) -> &str {
     line.split_once(':').map_or(line, |(name, _)| name)
 }
 
+/// Does a variant's CODECS attribute name a video codec other than H.264 (`avc1`/`avc3`)? HEVC
+/// (`hvc1`/`hev1`), AV1 (`av01`), VP9 (`vp09`) and Dolby Vision (`dvh1`/`dvhe`) are; audio-only
+/// entries and a missing attribute are not.
+fn codecs_other_than_h264(stream_inf: &str) -> bool {
+    let Some(codecs) = attribute_items(stream_inf).into_iter().find_map(|a| a.trim().strip_prefix("CODECS=")) else { return false };
+    codecs.trim_matches('"').split(',').any(|c| {
+        let id = c.trim().split('.').next().unwrap_or("").to_ascii_lowercase();
+        matches!(id.as_str(), "hvc1" | "hev1" | "av01" | "vp09" | "vp08" | "dvh1" | "dvhe")
+    })
+}
+
 /// A key tag's METHOD ("NONE", "AES-128", "SAMPLE-AES"…), unquoted. Attributes are split outside
 /// quotes: a URI may carry ",METHOD=NONE" of its own.
 fn key_method(line: &str) -> Option<&str> {
@@ -1254,6 +1272,19 @@ mod tests {
         assert_eq!(parsed.variant.bandwidth, 6_000_000, "the richest at no more than 1080 lines");
         assert_eq!(parsed.variant.resource.path, "/v/1080.m3u8");
         assert_eq!(parsed.variant.resource.origin.port(), 443, "a CDN's portless URI is https's own port, not PMS's 32400");
+        // a richer HEVC variant is passed over for the H.264 one this player decodes
+        let mixed = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\"\nhttps://cdn.example/v/720.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS=\"hvc1.1.6.L120.90,mp4a.40.2\"\nhttps://cdn.example/v/1080h.m3u8\n",
+        );
+        assert_eq!(parse_master_as(Shape::Provider, &master, mixed).unwrap().variant.resource.path, "/v/720.m3u8");
+        let hevc_only = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"hvc1.1.6.L120.90,mp4a.40.2\"\nhttps://cdn.example/v/a.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"hev1.1.6.L93.90,mp4a.40.2\"\nhttps://cdn.example/v/b.m3u8\n",
+        );
+        assert_eq!(parse_master_as(Shape::Provider, &master, hevc_only).unwrap().variant.resource.path, "/v/b.m3u8", "nothing H.264: the leanest, and the probe decides");
         let auth = InheritedAuth::capture(&master).unwrap();
         let child = auth.request_path(&parsed.variant.resource).unwrap();
         assert!(!child.contains("secret"), "the CDN never sees the credential: {child}");

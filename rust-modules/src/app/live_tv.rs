@@ -44,6 +44,8 @@ pub(crate) struct Feed {
     pending: Option<(Asked, Option<plx_plex::plex::live_tv::Airing>)>,
     /// The store generation the player's program was last read at ([`Self::live_tv_program_now`]).
     rolled_at: Option<u32>,
+    /// The wall-clock minute the guide and the recordings lists were last kept fresh at.
+    freshened: Option<i64>,
 }
 
 /// A Watch asked for: its tab and row, and whether the live player's CH▲/CH▼ asked it (its landing
@@ -123,6 +125,18 @@ impl Bridge {
     pub(crate) fn live_tv_feed(&mut self, d: &mut Dispatcher<AppHost>) {
         self.live_tv_aim();
         self.stores.live_tv.pump();
+        // While the guide is in use (its page up, or a channel playing from it) the guide and the
+        // recordings lists are kept fresh: stale channel-days are read again, the lists every five
+        // minutes. Idle on Home, nothing is asked.
+        let minute = plx_data::live_tv::wall_now() / 60;
+        let in_use = d.nav.tabs.stack.entries.iter().any(|e| e.arg == AppArg::LiveTv) || self.live_tv.watching.is_some();
+        if in_use && self.live_tv.freshened != Some(minute) {
+            self.live_tv.freshened = Some(minute);
+            self.stores.live_tv.refresh_stale();
+            if minute % 5 == 0 {
+                self.stores.live_tv.refresh_dvr_quietly();
+            }
+        }
         let Some((instance, page)) = Self::live_tv_page(d) else {
             if self.live_tv.instance.take().is_some() {
                 self.live_tv.generation = None;

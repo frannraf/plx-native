@@ -162,6 +162,10 @@ impl Runner for Spawn {
     }
 }
 
+/// How long a channel-day's programs are trusted before they are read again while the guide is in
+/// use: what a recording scheduled from another device, or a schedule change, takes to show.
+pub const GUIDE_FRESH_S: i64 = 15 * 60;
+
 /// Under test only an injected runner runs: a default-built store never reaches a server.
 #[cfg(any(test, feature = "test-support"))]
 struct Refuse;
@@ -634,11 +638,35 @@ impl LiveTvStore {
             Ok(_) => {}
         }
         let result = result.map_err(|e| e.reason());
+        let now = if self.now > 0 { self.now } else { lt::wall_now() };
         if *source == self.source {
-            self.guide.land(ch, date, result);
+            self.guide.land(ch, date, result, now);
         } else if let Some(l) = self.stash.get_mut(source) {
-            l.guide.land(ch, date, result);
+            l.guide.land(ch, date, result, now);
         }
+    }
+
+    /// Once a minute while the guide is in use: days read [`GUIDE_FRESH_S`] ago are read again,
+    /// the shown ones now (their programs stay on screen meanwhile), a stashed tab's when it is
+    /// shown again.
+    pub fn refresh_stale(&mut self) {
+        let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        for l in self.stash.values_mut() {
+            l.guide.expire(now, GUIDE_FRESH_S);
+        }
+        if self.guide.expire(now, GUIDE_FRESH_S) {
+            plx_base::eventlog::log("livetv: the guide shown is read again (older than its freshness)");
+            self.rewant();
+        }
+    }
+
+    /// Read the recordings lists again without saying so (a periodic refresh: the lists shown stay
+    /// until the new ones land, and an empty page keeps its advice rather than "Loading…").
+    pub fn refresh_dvr_quietly(&mut self) {
+        if self.sid.is_none() || self.queue.iter().any(|j| matches!(j, Job::Dvr)) || !self.dvr_phase.is_ready() {
+            return;
+        }
+        self.queue.push_back(Job::Dvr);
     }
 
     /// The page no longer wants its Watch press (BACK while tuning, the page left). A tune that

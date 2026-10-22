@@ -139,6 +139,9 @@ pub struct Day {
     /// Reads of this day that failed in a row: a day asked again after a failure keeps reading as
     /// failed until an answer lands (not "Loading…" for the second it takes, then failed again).
     pub failures: u32,
+    /// When its programs last landed, epoch seconds (0: never): a day read long ago is read again
+    /// ([`GuideCache::expire`]), its programs showing meanwhile.
+    pub landed_at: i64,
 }
 
 /// The guide's day cache: one entry per `(channel index, UTC date)`, bounded by [`DAYS_KEPT`]
@@ -197,14 +200,15 @@ impl GuideCache {
             d.phase = Phase::Loading;
         }
     }
-    /// A fetch landed. A day evicted meanwhile is not resurrected.
-    pub fn land(&mut self, ch: usize, date: &str, result: Result<Vec<Airing>, String>) {
+    /// A fetch landed (at `now`, epoch seconds). A day evicted meanwhile is not resurrected.
+    pub fn land(&mut self, ch: usize, date: &str, result: Result<Vec<Airing>, String>, now: i64) {
         if let Some(d) = self.days.get_mut(&(ch, date.to_string())) {
             match result {
                 Ok(a) => {
                     d.airings = a;
                     d.phase = Phase::Ready;
                     d.failures = 0;
+                    d.landed_at = now;
                 }
                 Err(why) => {
                     d.phase = Phase::Failed(why);
@@ -212,6 +216,20 @@ impl GuideCache {
                 }
             }
         }
+    }
+    /// Days read `max_age` or more seconds before `now` go back to unasked, their programs kept
+    /// (the guide shows them while the read is on its way): a recording scheduled elsewhere, a
+    /// listing the server corrected, a program that began recording, all reach the guide within
+    /// that long. `true` when any did.
+    pub fn expire(&mut self, now: i64, max_age: i64) -> bool {
+        let mut any = false;
+        for d in self.days.values_mut() {
+            if d.phase.is_ready() && d.landed_at > 0 && now - d.landed_at >= max_age {
+                d.phase = Phase::Idle;
+                any = true;
+            }
+        }
+        any
     }
     /// Evict least-recently-wanted days past [`DAYS_KEPT`], never one wanted by the last window.
     /// A day still loading may go too: its answer then lands nowhere ([`GuideCache::land`]), and
@@ -232,10 +250,11 @@ impl GuideCache {
     /// Every airing of channel `ch` overlapping `[from, to)`, across its cached days, sorted and
     /// de-duplicated (an airing across UTC midnight is in both days).
     pub fn airings(&self, ch: usize, from: i64, to: i64) -> Vec<Airing> {
+        // A day being read again (expired, or failed and retried) still shows what it had.
         let mut out: Vec<Airing> = self
             .days
             .iter()
-            .filter(|((c, _), d)| *c == ch && d.phase.is_ready())
+            .filter(|((c, _), d)| *c == ch && (d.phase.is_ready() || !d.airings.is_empty()))
             .flat_map(|(_, d)| d.airings.iter())
             .filter(|a| a.ends_at > from && a.begins_at < to)
             .cloned()
