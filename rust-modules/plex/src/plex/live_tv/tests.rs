@@ -361,13 +361,14 @@ fn a_debug_build_sends_no_write_to_a_real_server() {
 #[test]
 fn a_live_stream_is_an_h264_aac_hls_transcode_of_the_tuned_key() {
     let decision = r#"{"MediaContainer":{"generalDecisionCode":1000,"Metadata":[{"Media":[{"width":1280,"height":720,
-        "Part":[{"decision":"transcode","Stream":[{"streamType":1,"codec":"h264"},{"streamType":2,"codec":"aac"}]}]}]}]}}"#;
+        "Part":[{"decision":"transcode","Stream":[{"streamType":1,"codec":"h264","frameRate":59.94},{"streamType":2,"codec":"aac"}]}]}]}]}}"#;
     let (port, server) = serve(vec![("200 OK", decision)]);
     let client = loopback_client(port);
     let off = plx_base::task::OffFrame::for_test();
     let s = client.live_stream(&off, "/livetv/sessions/0e0e-1", "enc-1").unwrap();
     assert_eq!((s.video_codec.as_str(), s.audio_codec.as_str(), s.width, s.height), ("h264", "aac", 1280, 720));
     assert_eq!(s.encoder_session, "enc-1");
+    assert_eq!(s.fps, 59.94, "the Load declares the encode's own rate");
     assert!(s.url.contains("/video/:/transcode/universal/start.m3u8?path=%2Flivetv%2Fsessions%2F0e0e-1"), "{}", s.url);
     assert!(s.url.contains("protocol=hls") && s.url.contains("directStream=0") && s.url.contains("session=enc-1"));
     let seen = server.join().unwrap();

@@ -57,6 +57,8 @@ pub struct LiveRoute {
     pub audio_codec: String,
     pub width: i64,
     pub height: i64,
+    /// The encode's frame rate (0 = unknown: the Load's default envelope).
+    pub fps: f64,
     pub info: LiveInfo,
 }
 
@@ -167,7 +169,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         ps,
         &route.video_codec,
         &route.audio_codec,
-        0.0,
+        route.fps,
         plx_data::metadata::Dovi::NONE,
         false,
     ) {

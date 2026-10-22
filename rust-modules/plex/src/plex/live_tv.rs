@@ -386,7 +386,7 @@ impl Client {
 /// A live tune turned into what the native player opens: the universal transcoder's `start.m3u8`
 /// for the tuned key, encoded to the H.264/AAC HLS the player's segmented demuxer reads, with the
 /// codecs and raster the decision promised (the Starfish Load is declared from these).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LiveStream {
     /// The playlist URL, token included — never logged.
     pub url: String,
@@ -396,6 +396,9 @@ pub struct LiveStream {
     pub audio_codec: String,
     pub width: i64,
     pub height: i64,
+    /// The encode's frame rate as the decision states it (0 when it does not): what the Load
+    /// declares, so a 59.94 broadcast is not presented on a 30 fps lattice.
+    pub fps: f64,
 }
 
 /// The bound a live encode is asked for: 1080p at a rate a LAN carries comfortably. A tuner's
@@ -456,6 +459,7 @@ impl Client {
             audio_codec: codec(2, "aac"),
             width: media.map_or(0, |m| m.width),
             height: media.map_or(0, |m| m.height),
+            fps: streams.iter().find(|s| s.stream_type == 1).map(|s| s.frame_rate).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(0.0),
         })
     }
 

@@ -208,6 +208,7 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
         audio_codec: t.stream.audio_codec,
         width: t.stream.width,
         height: t.stream.height,
+        fps: t.stream.fps,
         info: plx_media::route::LiveInfo { title, show_title, channel, begins_at, ends_at },
     }
 }
