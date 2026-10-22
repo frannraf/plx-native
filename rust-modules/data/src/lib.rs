@@ -13,6 +13,7 @@
 //! crate enables it in `[dev-dependencies]` only, so no shipped build sees it.
 
 pub mod browse; // Library browse: per-section paged catalog (sparse store + off-thread page fetches)
+pub mod live_tv; // Live TV / DVR: the guide day cache, the page snapshot and the wall-clock seam
 pub mod catalog; // the catalog page's discover record, Membership and Load (plan W6)
 pub mod collection; // collection page model: tag resolution, header metadata and paged members
 pub mod metadata; // item detail data layer (detail page): full metadata + seasons/episodes + cast + related

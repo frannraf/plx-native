@@ -31,6 +31,23 @@ pub enum Clock {
     H24,
 }
 
+/// The local offset from UTC at `epoch_s`, in seconds, as the C library's time zone states it
+/// (`localtime_r`'s `tm_gmtoff`): what a guide adds to an airing's UTC instant to print its local
+/// time. 0 when the library cannot say — the device then reads UTC, which is also what it shows
+/// before its time zone is configured. Unverified on the set: whether webOS's libc carries the
+/// viewer's zone (`/etc/localtime`) is a device question this function does not answer.
+pub fn utc_offset_s(epoch_s: i64) -> i64 {
+    let t = epoch_s as libc::time_t;
+    // SAFETY: `localtime_r` writes only into `tm`, which outlives the call; `t` is a plain value.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        i64::from(tm.tm_gmtoff)
+    }
+}
+
 pub struct LocaleContext {
     preference: Preference,
     language: Language,
@@ -135,6 +152,23 @@ impl LocaleContext {
         d.multiply_pow10(-scale);
         d.pad_end(-scale);
         self.decimal.format(&d).to_string()
+    }
+    /// A wall-clock time of day for a guide or a recording line: `20:30` on a 24-hour clock,
+    /// `8:30 PM` on a 12-hour one. The user's 12/24 choice wins; `Locale` is 12-hour for English
+    /// and 24-hour for every other shipped language. `hour` 0-23, `minute` 0-59.
+    pub fn time_of_day(&self, hour: u8, minute: u8) -> String {
+        let h12 = match self.clock {
+            Clock::H12 => true,
+            Clock::H24 => false,
+            Clock::Locale => matches!(self.language, Language::En | Language::Pseudo),
+        };
+        let (hour, minute) = (hour % 24, minute % 60);
+        if h12 {
+            let h = if hour % 12 == 0 { 12 } else { hour % 12 };
+            format!("{h}:{minute:02} {}", if hour < 12 { "AM" } else { "PM" })
+        } else {
+            format!("{hour:02}:{minute:02}")
+        }
     }
     pub fn date(&self, year: i32, month: u8, day: u8) -> Option<String> {
         let d = icu_calendar::Date::try_new_gregorian(year, month, day).ok()?;

@@ -538,3 +538,23 @@ fn render_in_english_is_scoped_and_nests() {
     assert_eq!(inside, "3.5");
     assert_eq!(current().language(), Language::Be);
 }
+#[test]
+fn time_of_day_follows_the_clock_choice_and_the_language_default() {
+    let en = LocaleContext::resolve(Preference::En, None, None, None, None);
+    assert_eq!(en.time_of_day(20, 30), "8:30 PM");
+    assert_eq!(en.time_of_day(0, 5), "12:05 AM");
+    assert_eq!(en.time_of_day(12, 0), "12:00 PM");
+    let de = LocaleContext::resolve(Preference::De, None, None, None, None);
+    assert_eq!(de.time_of_day(20, 30), "20:30");
+    assert_eq!(de.time_of_day(7, 5), "07:05");
+    let en24 = LocaleContext::resolve(Preference::En, None, None, Some("24"), None);
+    assert_eq!(en24.time_of_day(20, 30), "20:30");
+    let de12 = LocaleContext::resolve(Preference::De, None, None, Some("12"), None);
+    assert_eq!(de12.time_of_day(9, 0), "9:00 AM");
+}
+#[test]
+fn the_utc_offset_is_a_whole_number_of_minutes_within_a_day() {
+    let off = utc_offset_s(1_760_000_000);
+    assert!(off.abs() <= 14 * 3600, "{off}");
+    assert_eq!(off % 60, 0, "{off}");
+}

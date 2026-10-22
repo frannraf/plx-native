@@ -66,6 +66,7 @@ mod content_arg;
 pub use content_arg::ContentArg;
 pub mod hubs;
 pub mod metadata;
+pub mod live_tv; // Live TV / DVR: providers, lineup, guide day cache, recording rules and writes (no StoreId)
 pub mod notify;
 pub mod notify_map;
 pub mod person;
@@ -105,6 +106,9 @@ pub struct Stores {
     /// The PMS notification feed's owner. Ships on for owned servers (`notify::NOTIFY_ENABLED`); no `StoreId`, no
     /// `StoreCmd`: the application pumps it and tells it the lifecycle (`Bridge::notify_*`).
     pub notify: notify::NotifyStore,
+    /// Live TV / DVR (`crate::live_tv`). No `StoreId`, no `StoreCmd`: the application opens it for
+    /// the current server, pumps it and feeds the Live TV page its snapshot (`Bridge::live_tv_feed`).
+    pub live_tv: live_tv::LiveTvStore,
     /// What the feed's play-state hints owe the screens (`notify_map`); nothing is read until it is
     /// pumped with the pages on the stack.
     notify_map: notify_map::NotifyMap,
@@ -135,6 +139,7 @@ impl Default for Stores {
             watchlist: watchlist::WatchlistStore::default(),
             catalog: catalog::CatalogStore::default(),
             notify: notify::NotifyStore::default(),
+            live_tv: live_tv::LiveTvStore::default(),
             notify_map: Default::default(),
             view_ledger: Default::default(),
             network_held: false,
