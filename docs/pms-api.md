@@ -1484,13 +1484,16 @@ was captured).
 
 ---
 
-## 10. Live TV & DVR — guide, recording rules, live tune (DOCUMENTED ONLY, not called live)
+## 10. Live TV & DVR — guide, recording rules, live tune (called by the Live TV page; not yet measured against a real server)
 
-**Status.** No endpoint here has been called against a real server by this project: every one is a
-write to a household tuner or recording schedule, or reads that only matter beside them. The
-contract below is assembled from three sources that agree on the paths and mostly on the shapes,
-and is pinned by synthetic fixtures (`rust-modules/plex/src/plex/live_tv/fixtures.rs`) and by the
-mock (`tests/mock_pms.py --livetv`, `tests/mock_livetv.py`):
+**Status.** The Live TV page (`screens::live_tv`, fed by `stores::live_tv`, playing through
+`plx_media::route::live`) calls these endpoints. None has yet been answered by a real server in
+this project: the writes (tune, record, cancel, stop, reorder) are refused in a `devtriggers` build
+unless the server is the mock or the owner armed `plxnative-livetv-live`
+(`plx_plex::plex::live_tv::guard`), and no agent has armed it. The contract below is assembled
+from three sources that agree on the paths and mostly on the shapes, and is pinned by synthetic
+fixtures (`rust-modules/plex/src/plex/live_tv/fixtures.rs`) and by the mock
+(`tests/mock_pms.py --livetv`, `tests/mock_livetv.py`):
 
 - the bundled spec ([`plex-openapi.json`](plex-openapi.json), API 1.2.1+ for the EPG paths), which
   documents every path but NOT the tune's real answer;

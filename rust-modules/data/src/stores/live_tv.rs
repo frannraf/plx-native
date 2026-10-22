@@ -316,6 +316,11 @@ impl LiveTvStore {
         &self.availability
     }
 
+    /// Did the providers read fail (nothing is known about this server's Live TV yet)?
+    pub fn providers_failed(&self) -> bool {
+        matches!(self.providers_phase, Phase::Failed(_))
+    }
+
     /// Read `sid`'s Live TV. A different server (or none) resets everything; the same server
     /// re-asks only what failed.
     pub fn open(&mut self, sid: ServerId) {
@@ -391,6 +396,12 @@ impl LiveTvStore {
         self.tune_phase = TunePhase::Idle;
         self.bump();
         Some(t)
+    }
+
+    /// A taken stream the application could not play: release it.
+    pub fn release_tuned(&mut self, t: Tuned) {
+        self.owe_release(t);
+        self.bump();
     }
 
     /// Forget a failed tune's message (the page showed it).

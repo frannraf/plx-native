@@ -88,6 +88,9 @@ impl LiveLease {
         }
         self.released = true;
         self.keepalive_stop.store(true, Ordering::Release);
+        // Whatever drops a lease (a stop, a reset, a plan assigned over the session), the next
+        // stream the demuxer opens is not this channel's: never a library stream read as live.
+        crate::ff::set_live_stream(false);
         let (sid, sub, key, rk, enc) = (
             self.sid,
             std::mem::take(&mut self.subscription_id),
@@ -159,6 +162,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         keepalive_stop: Arc::clone(&stop),
         released: false,
     };
+    super::decision::reset_for_live(ps);
     if !super::decision::set_stream_declaration(
         ps,
         &route.video_codec,
@@ -201,10 +205,7 @@ fn start_keepalive(sid: ServerId, key: String, rk: String, enc: String, stop: Ar
 
 /// Release the session's live lease now, if it holds one (a real stop). Idempotent.
 pub fn release_live(ps: &mut PlaybackSession) {
-    if let Some(lease) = super::decision::take_live_lease(ps) {
-        crate::ff::set_live_stream(false);
-        drop(lease);
-    }
+    drop(super::decision::take_live_lease(ps));
 }
 
 /// Is the session playing a live channel?

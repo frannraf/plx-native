@@ -1538,6 +1538,12 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
 /// does the pipeline taking the video decoder back ([`park_on_decoder_release`]); the restore is
 /// the foreground lifecycle's claim either way.
 fn park_playback(app: &mut App) {
+    // A live channel is never parked: its tuner is held only while it is watched, and a restore
+    // would reopen an encode the server has since reclaimed. It ends as a Stop ends it.
+    if plx_media::route::is_live(&app.player.session) {
+        super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+        return;
+    }
     // INTENDED, not published: this snapshot is the only thing the foreground
     // restore has, and `suspend_bufferfeed` below drops the pending seek target
     // with the session — so a background that lands while a seek is still
@@ -2930,6 +2936,7 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
                     crate::focusprobe::Screen::Catalog,
                 AppArg::Search => crate::focusprobe::Screen::Search,
                 AppArg::Watchlist => crate::focusprobe::Screen::Watchlist,
+                AppArg::LiveTv => crate::focusprobe::Screen::LiveTv,
                 // The same words the heartbeat's `overlay=` uses, and — since phase 9 — from the
                 // same place: the SURFACE that is up. There is no second table; see
                 // `heartbeat_word_tests::focusprobe_player_overlay_delegates_to_the_shared_overlay_word_function`.
@@ -3205,6 +3212,9 @@ pub(crate) unsafe fn shutdown(
     // resume point the user just earned is silently dropped. Same cost the old inline call
     // paid, except now it is paid once at exit instead of on every BACK out of a movie.
     plx_media::route::drain_scrobble();
+    // A live channel's tuner is freed before the process goes (`route::live`).
+    plx_media::route::release_live(ps);
+    plx_media::route::drain_live_releases();
     crate::capture::shutdown();
     crate::app::adapters::poster::shutdown();
     SDL_Quit();

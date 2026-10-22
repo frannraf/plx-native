@@ -36,7 +36,7 @@ pub mod guard {
         /// **The owner's live switch** (`plxnative-livetv-live` in the install's runtime root): a
         /// `devtriggers` build sends Live TV and DVR writes to a REAL server while it exists. Off by
         /// default, read once per process. **No agent creates this file unless the owner asks for it
-        /// in that session** (AGENTS.md; `.claude/hooks/livetv-live-guard.py` refuses a command that
+        /// in that session** (AGENTS.md; `.claude/hooks/watchlist-live-guard.py` refuses a command that
         /// would).
         fn live_armed = "livetv-live";
     );

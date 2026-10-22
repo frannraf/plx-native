@@ -701,6 +701,9 @@ pub(crate) fn exit_player(
     plx_media::route::cancel_play(ps); // BACK during a load: supersede, drop the landing
     close_player_overlays(pages);
     plx_media::player::stop_bufferfeed(ps, pa);
+    // A live channel's tuner goes with the playback, engine or not (a Load that never started
+    // has no teardown to release it).
+    plx_media::route::release_live(ps);
     // `stop_bufferfeed` reports/clears a real engine through `report::ended`, but a refusal or a
     // BACK during resolve has no engine for teardown to take. The exit ritual still ends that
     // attempt, so retire its in-memory trace here as the common backstop.

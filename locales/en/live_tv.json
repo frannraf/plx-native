@@ -1,0 +1,183 @@
+{
+  "live_tv.tab": {
+    "value": "Live TV",
+    "description": "Label of the Live TV tab in the top tab strip; the tab shows only when the server has Live TV & DVR."
+  },
+  "live_tv.mode.guide": {
+    "value": "Guide",
+    "description": "Live TV page header pill: shows the channel guide (a grid of channels and programs over time)."
+  },
+  "live_tv.mode.recordings": {
+    "value": "Recordings",
+    "description": "Live TV page header pill: shows upcoming DVR recordings and recording rules."
+  },
+  "live_tv.state.loading": {
+    "value": "Loading the guide…",
+    "description": "Live TV page read-out while the channel guide is being read from the server."
+  },
+  "live_tv.state.unavailable": {
+    "value": "This server has no Live TV.",
+    "description": "Live TV page read-out when the server has no DVR/tuner or this account may not use it."
+  },
+  "live_tv.state.failed": {
+    "value": "The guide could not be loaded.",
+    "description": "Live TV page read-out when reading the server's providers or channels failed; a Try Again button follows."
+  },
+  "live_tv.state.no_channels": {
+    "value": "No channels are set up on this server's DVR.",
+    "description": "Live TV page read-out when the DVR answered with an empty channel lineup."
+  },
+  "live_tv.action.retry": {
+    "value": "Try Again",
+    "description": "Button on the Live TV page's failure read-out: read the guide again."
+  },
+  "live_tv.action.watch": {
+    "value": "Watch",
+    "description": "Action on a program airing now in the Live TV guide: tune the channel and play it."
+  },
+  "live_tv.action.record": {
+    "value": "Record",
+    "description": "Action in the Live TV guide: record this one program (an episode or a movie) on the DVR."
+  },
+  "live_tv.action.record_series": {
+    "value": "Record Series",
+    "description": "Action in the Live TV guide: record every airing of this show (a series recording rule)."
+  },
+  "live_tv.action.stop_recording": {
+    "value": "Stop Recording",
+    "description": "Action on a program the DVR is recording right now: stop that recording."
+  },
+  "live_tv.action.cancel_recording": {
+    "value": "Cancel Recording",
+    "description": "Action on a program scheduled to record: do not record it."
+  },
+  "live_tv.action.cancel_series": {
+    "value": "Cancel Series Recording",
+    "description": "Action on a program covered by a series recording rule: delete that rule (no more episodes are recorded)."
+  },
+  "live_tv.action.move_top": {
+    "value": "Move to Top",
+    "description": "Action on a recording rule: give it the highest priority when recordings conflict."
+  },
+  "live_tv.action.move_bottom": {
+    "value": "Move to Bottom",
+    "description": "Action on a recording rule: give it the lowest priority when recordings conflict."
+  },
+  "live_tv.action.delete_rule": {
+    "value": "Delete Recording Rule",
+    "description": "Action on a recording rule in the Recordings list: delete the rule and its upcoming recordings."
+  },
+  "live_tv.action.close": {
+    "value": "Close",
+    "description": "Last action of the Live TV action panel: close the panel and do nothing."
+  },
+  "live_tv.row.loading": {
+    "value": "Loading…",
+    "description": "A channel row of the Live TV guide whose programs are still being read."
+  },
+  "live_tv.row.no_info": {
+    "value": "No information",
+    "description": "A channel row of the Live TV guide with no program listed for the time shown."
+  },
+  "live_tv.badge.recording": {
+    "value": "Recording",
+    "description": "Badge on a program the DVR is recording right now."
+  },
+  "live_tv.badge.scheduled": {
+    "value": "Scheduled",
+    "description": "Badge on a program the DVR will record."
+  },
+  "live_tv.badge.failed": {
+    "value": "Failed",
+    "description": "Badge on a recording that failed."
+  },
+  "live_tv.badge.on_now": {
+    "value": "On Now",
+    "description": "Badge on a program airing right now in the Live TV guide."
+  },
+  "live_tv.episode": {
+    "value": "S{season} E{episode}",
+    "args": {
+      "season": "str",
+      "episode": "str"
+    },
+    "description": "Season and episode numbers of a program in the Live TV guide, e.g. S2 E5."
+  },
+  "live_tv.tuning": {
+    "value": "Tuning {channel}…",
+    "args": {
+      "channel": "str"
+    },
+    "description": "Shown while a channel is being tuned before live playback starts; BACK cancels."
+  },
+  "live_tv.tune_failed": {
+    "value": "Couldn't tune {channel}: {reason}",
+    "args": {
+      "channel": "str",
+      "reason": "str"
+    },
+    "description": "Shown when tuning a channel for live playback failed; the reason is the server's."
+  },
+  "live_tv.notice.recorded": {
+    "value": "Recording scheduled.",
+    "description": "Notice after a Record press succeeded."
+  },
+  "live_tv.notice.recorded_series": {
+    "value": "Series recording scheduled.",
+    "description": "Notice after a Record Series press succeeded."
+  },
+  "live_tv.notice.conflicts": {
+    "value": "Scheduled, but it conflicts with {titles}.",
+    "args": {
+      "titles": "str"
+    },
+    "description": "Notice after a recording was scheduled that overlaps other recordings for the tuners."
+  },
+  "live_tv.notice.cancelled": {
+    "value": "Recording cancelled.",
+    "description": "Notice after a recording or recording rule was cancelled."
+  },
+  "live_tv.notice.stopped": {
+    "value": "Recording stopped.",
+    "description": "Notice after a running recording was stopped."
+  },
+  "live_tv.notice.moved": {
+    "value": "Priority changed.",
+    "description": "Notice after a recording rule was moved in the priority list."
+  },
+  "live_tv.notice.failed": {
+    "value": "That didn't work: {reason}",
+    "args": {
+      "reason": "str"
+    },
+    "description": "Notice after a DVR change failed; the reason is the server's."
+  },
+  "live_tv.recordings.upcoming": {
+    "value": "Upcoming",
+    "description": "Heading of the Recordings list section with recordings that will run (or are running)."
+  },
+  "live_tv.recordings.rules": {
+    "value": "Recording Rules",
+    "description": "Heading of the Recordings list section with the DVR's recording rules, in priority order."
+  },
+  "live_tv.recordings.empty": {
+    "value": "Nothing is scheduled to record.",
+    "description": "Recordings list read-out when there are no recordings and no rules."
+  },
+  "live_tv.recordings.loading": {
+    "value": "Loading recordings…",
+    "description": "Recordings list read-out while the DVR's recordings are being read."
+  },
+  "live_tv.recordings.failed": {
+    "value": "Recordings could not be loaded.",
+    "description": "Recordings list read-out when reading the DVR's recordings failed."
+  },
+  "live_tv.rule.series": {
+    "value": "Series",
+    "description": "Kind of a recording rule in the Recordings list: records every episode of a show."
+  },
+  "live_tv.rule.single": {
+    "value": "Single",
+    "description": "Kind of a recording rule in the Recordings list: records one program."
+  }
+}

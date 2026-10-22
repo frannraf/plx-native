@@ -792,6 +792,14 @@ pub fn clear_url(ps: &mut PlaybackSession) {
     ps.url.clear()
 }
 
+/// A live playback is a playback of its own: nothing of the last one (its item, tracks, queue,
+/// resume point, an earlier channel's lease) carries over. The clock reading stays.
+pub(super) fn reset_for_live(ps: &mut PlaybackSession) {
+    let now_ms = ps.now_ms;
+    *ps = PlaybackSession::IDLE;
+    ps.now_ms = now_ms;
+}
+
 /// Install a live channel's lease and stream (`route::live::install_live` is the caller). The URL
 /// is the route's like any selected stream's; the old lease, if any, is released by the assignment.
 pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::LiveLease, info: super::live::LiveInfo, url: &str) {

@@ -22,6 +22,7 @@ pub(crate) fn of<'a>(page: ScreenId, views: &AppViews<'a>) -> Option<Cow<'a, str
         page_id::HOME => msg::browse_chrome_home(),
         page_id::SEARCH => msg::browse_chrome_search(),
         page_id::WATCHLIST => msg::watchlist_page_title(),
+        page_id::LIVE_TV => msg::live_tv_tab(),
         page_id::LIBRARY_COLLECTIONS => msg::browse_kind_collections(),
         page_id::LIBRARY_RECOMMENDED => msg::library_header_recommended(),
         page_id::LIBRARY => {

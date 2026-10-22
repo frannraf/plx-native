@@ -1203,6 +1203,13 @@ fn grid_library_search_heroidx_arm(app: &mut App, _fr: &mut Frame) {
         if plx_base::devtrig::flag("watchlist") {
             crate::app::bridge::nav_select_tab(&mut app.pages, AppArg::Watchlist);
         }
+        // `/tmp/plxnative-livetv` — boot straight onto the Live TV page. It mounts before the DVR has
+        // answered (the page reads "Loading the guide…" until it does). Pair it with
+        // `tests/mock_pms.py --livetv`; against a real server a debug build reads the guide but its
+        // tunes and DVR changes are refused until the owner arms `plxnative-livetv-live`.
+        if plx_base::devtrig::flag("livetv") {
+            crate::app::bridge::nav_select_tab(&mut app.pages, AppArg::LiveTv);
+        }
         // `/tmp/plxnative-catalog=<24 hex>` — boot straight onto the catalog page of that title (a
         // `ContentArg::Catalog` push over Home, as a Watchlist tile's OK opens it). The page reads
         // the discover host like the Watchlist page, so pair it with `plxnative-discover=<mock
@@ -2277,7 +2284,7 @@ pub(crate) fn nav_osc_tick(app: &mut App, now: u32) {
             }
             AppArg::Library => {
                 let origin = crate::app::chrome::pill_at(
-                    app.bridge.browse_directory(), 1);
+                    app.bridge.browse_directory(), app.bridge.live_tv_on_strip(), 1);
                 crate::app::bridge::nav_tab(&mut app.pages, &mut app.bridge,
                     HomeTab::Home, Some(origin), None);
             }
@@ -2517,7 +2524,7 @@ fn push_bench_close(app: &mut App, opened: bench::PushTarget) {
             crate::app::bridge::nav_pop(&mut app.pages);
         }
         bench::PushTarget::Library => {
-            let origin = crate::app::chrome::pill_at(app.bridge.browse_directory(), 1);
+            let origin = crate::app::chrome::pill_at(app.bridge.browse_directory(), app.bridge.live_tv_on_strip(), 1);
             crate::app::bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, Some(origin), None);
         }
     }

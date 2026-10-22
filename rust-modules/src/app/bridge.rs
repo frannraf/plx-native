@@ -87,11 +87,12 @@ fn refresh_chrome(
     chrome: &mut super::chrome::ChromeSnapshot,
     measure: &dyn Measure,
     directory: plx_data::stores::browse::DirectoryView<'_>,
+    live_tv: bool,
     captured: Option<(&plx_plex::plex::session::CurrentProfile, &plx_plex::plex::session::Session)>,
 ) {
     match captured {
-        Some(captured) => chrome.refresh_with_profile(measure, directory, Some(captured)),
-        None => chrome.refresh(measure, directory),
+        Some(captured) => chrome.refresh_with_profile(measure, directory, live_tv, Some(captured)),
+        None => chrome.refresh(measure, directory, live_tv),
     }
 }
 
@@ -435,6 +436,10 @@ pub(crate) struct Bridge {
     watchlist_reqs: Vec<(MachineId, plx_screens::watchlist::page::WatchlistOut, ReturnState<u32, PageMemory>)>,
     /// What the Watchlist page was last handed from the store (`watchlist::Feed`).
     watchlist: watchlist::Feed,
+    /// What the Live TV page asked, drained by `content::live_tv_requests`.
+    live_tv_reqs: Vec<(MachineId, plx_screens::live_tv::LiveTvOut, ReturnState<u32, PageMemory>)>,
+    /// What the Live TV page was last handed, and the store's aim (`live_tv::Feed`).
+    live_tv: live_tv::Feed,
     /// The catalog page instance the store was last opened for (`watchlist::catalog_feed`).
     catalog_seat: Option<InstanceId>,
     #[cfg(test)]
@@ -646,6 +651,8 @@ impl Bridge {
             item_menu_reqs: Vec::new(),
             watchlist_reqs: Vec::new(),
             watchlist: watchlist::Feed::default(),
+            live_tv_reqs: Vec::new(),
+            live_tv: live_tv::Feed::default(),
             catalog_seat: None,
             #[cfg(test)]
             keyboard_calls: Vec::new(),
@@ -730,6 +737,7 @@ impl Bridge {
         match tab {
             HomeTab::Movies => self.directory.view().preferred(plx_data::browse::SecKind::Movie).is_some(),
             HomeTab::Shows => self.directory.view().preferred(plx_data::browse::SecKind::Show).is_some(),
+            HomeTab::LiveTv => self.live_tv_on_strip(),
             _ => true,
         }
     }
@@ -943,16 +951,18 @@ impl Bridge {
             d.nav.tabs.strip_fallback = Some(match route {
                 AppArg::Search => plx_ui::widgets::TAB_KEY_SEARCH,
                 AppArg::Watchlist => plx_ui::widgets::TAB_KEY_WATCHLIST,
+                AppArg::LiveTv => plx_ui::widgets::TAB_KEY_LIVE_TV,
                 _ => plx_screens::home::STRIP_HOME_ELEM,
             });
+            let live_tv = self.live_tv_on_strip();
             if let Some(io) = &self.home_io {
-                refresh_chrome(&mut self.chrome, &self.measure, self.directory.view(),
+                refresh_chrome(&mut self.chrome, &self.measure, self.directory.view(), live_tv,
                     Some((&io.profile, &io.preferences)));
             } else {
-                refresh_chrome(&mut self.chrome, &self.measure, self.directory.view(), None);
+                refresh_chrome(&mut self.chrome, &self.measure, self.directory.view(), live_tv, None);
             }
             // The page's own pill: Home's is the first, and a library page's is its library's type.
-            self.chrome_selection = pill_of_arg(route, self.directory.view()).unwrap_or(0) as u32;
+            self.chrome_selection = pill_of_arg(route, self.directory.view(), live_tv).unwrap_or(0) as u32;
             let selected = self.navigation_presentation().view_tab.unwrap_or(self.chrome_selection) as i32;
             self.publish_strip(d, selected);
         } else {
@@ -1943,6 +1953,7 @@ impl Bridge {
             AppFx::Player(req) => self.player_reqs.push(req),
             AppFx::ItemMenu(req) => self.item_menu_reqs.push(req),
             AppFx::Watchlist(req) => self.watchlist_reqs.push((from, req, self.effect_return.clone())),
+            AppFx::LiveTv(req) => self.live_tv_reqs.push((from, req, self.effect_return.clone())),
             // The catalog page's pill: the same write the item menu's rows make, so an Add pulses
             // the tab here too. The page flips nothing itself; the store's ledger flips the face.
             AppFx::Catalog(out) => self.catalog_effect(out),
@@ -2235,6 +2246,7 @@ fn frame_ingest(
     // landing began from the old ones (a snap, then a jump back).
     rig.watchlist_pump();
     rig.watchlist_feed(d);
+    rig.live_tv_feed(d);
     // Library used to be the only route that pumped Browse. Onboard schedules the roster-only
     // owner work from its Tick, but Tick runs after views are captured; land the roster first so
     // a discovery result and the directory publication are observed in one frame. Controlled
@@ -2315,7 +2327,7 @@ fn frame_ingest(
     // settled test, the navblur prototype). One writer, immediately after the container's own
     // frame, from the container's own transition — see `ui::nav`'s module doc.
     let tab = d.nav.tabs.stack.pending_dest()
-        .and_then(|arg| pill_of_arg(arg, rig.directory.view()));
+        .and_then(|arg| pill_of_arg(arg, rig.directory.view(), rig.live_tv_on_strip()));
     plx_ui::nav::publish(d.nav.tabs.stack.page_alpha(), d.nav.tabs.stack.chrome_alpha(), tab);
     // **The heartbeat's `route=` word IS the top page's own name** (§15.2). It used to be
     // `route_word(app.route)` with this line asserting the two agreed every frame; there is one
@@ -3170,17 +3182,18 @@ pub(crate) fn wears_tab_bar(arg: &AppArg) -> bool {
 /// The Library's pill is its TYPE, and the argument carries none (which library the grid shows is
 /// the `browse` store's business): the answer is the section the store is pointing at, which
 /// `nav_tab`'s `LibraryCmd::Enter` has already aimed.
-fn pill_of_arg(arg: &AppArg, directory: plx_data::stores::browse::DirectoryView<'_>) -> Option<usize> {
+fn pill_of_arg(arg: &AppArg, directory: plx_data::stores::browse::DirectoryView<'_>, live_tv: bool) -> Option<usize> {
     use crate::app::chrome::{pill_of, Pill};
     match arg {
-        AppArg::Home => pill_of(directory, Pill::Home),
-        AppArg::Search => pill_of(directory, Pill::Search),
-        AppArg::Watchlist => pill_of(directory, Pill::Watchlist),
+        AppArg::Home => pill_of(directory, live_tv, Pill::Home),
+        AppArg::Search => pill_of(directory, live_tv, Pill::Search),
+        AppArg::Watchlist => pill_of(directory, live_tv, Pill::Watchlist),
+        AppArg::LiveTv => pill_of(directory, live_tv, Pill::LiveTv),
         // The grid and the two pages its header pushes (Collections, Recommended) are all the
         // library's: they select its type's pill, the pill they were opened from.
         arg if arg.is_library_family() => {
             let kind = directory.current().map(|i| directory.sections()[i].kind)?;
-            pill_of(directory, Pill::Section(kind))
+            pill_of(directory, live_tv, Pill::Section(kind))
         }
         _ => None,
     }
@@ -3211,11 +3224,13 @@ pub(crate) fn nav_tab(
             // Keep the pill the user was standing on under focus. An IDENTITY, not an index: a
             // pill can appear or disappear while the dip runs, and `HomeCmd::FocusStrip` is
             // delivered when Home MOUNTS, not now.
-            if let Some(pill) = focus_pill.filter(|pill| crate::app::chrome::pill_of(rig.directory.view(), *pill).is_some()) {
+            let live_tv = rig.live_tv_on_strip();
+            if let Some(pill) = focus_pill.filter(|pill| crate::app::chrome::pill_of(rig.directory.view(), live_tv, *pill).is_some()) {
                 let want = match pill {
                     Pill::Home => HomeTab::Home,
                     Pill::Search => HomeTab::Search,
                     Pill::Watchlist => HomeTab::Watchlist,
+                    Pill::LiveTv => HomeTab::LiveTv,
                     Pill::Section(plx_data::browse::SecKind::Movie) => HomeTab::Movies,
                     Pill::Section(plx_data::browse::SecKind::Show) => HomeTab::Shows,
                 };
@@ -3231,6 +3246,13 @@ pub(crate) fn nav_tab(
         }
         HomeTab::Search => AppArg::Search,
         HomeTab::Watchlist => AppArg::Watchlist,
+        // The one door to the Live TV page: never while no server offers it.
+        HomeTab::LiveTv => {
+            if !rig.live_tv_on_strip() {
+                return;
+            }
+            AppArg::LiveTv
+        }
     };
     nav_peer(d, arg, ret);
 }
@@ -3922,6 +3944,10 @@ mod strip_home_pill_tests;
 
 #[path = "watchlist.rs"]
 mod watchlist;
+
+#[path = "live_tv.rs"]
+mod live_tv;
+pub(crate) use live_tv::live_route;
 pub(crate) use watchlist::{hex_of_guid, open_catalog, open_watchlist_menu};
 
 #[cfg(test)]

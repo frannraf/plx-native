@@ -476,6 +476,7 @@ pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
     library_requests(app, fr.now);
     search_requests(app);
     watchlist_requests(app);
+    live_tv_requests(app);
     // The player's overlays are surfaces on its own stack, so what they decide reaches the
     // loop the same way every other owned screen's decision does — as requests, drained here,
     // after the dispatcher and before the frame's own arms (`playback::player_requests`).
@@ -1040,6 +1041,66 @@ pub(crate) fn watchlist_navigation(
         _ => return Some(ret),
     }
     None
+}
+
+/// **The Live TV page's requests, and a landed tune.** A tune is played only while its page is the
+/// one on screen (a press whose page was covered meanwhile is handed back to be released); the
+/// strip, BACK and the chip navigate as the Watchlist's do; everything else is the store's.
+fn live_tv_requests(app: &mut App) {
+    use plx_screens::live_tv::LiveTvOut;
+    if let Some(tuned) = app.bridge.live_tv_take_tuned() {
+        if app.route() == AppArg::LiveTv {
+            start_live(app, tuned);
+        } else {
+            app.bridge.live_tv_drop_tuned(tuned);
+        }
+    }
+    for (source, request, ret) in app.bridge.take_live_tv_reqs() {
+        let MachineId::Instance(instance) = source else { continue };
+        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
+        if app.route() != AppArg::LiveTv || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) {
+            continue;
+        }
+        match request {
+            LiveTvOut::Back => bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, None, Some(ret)),
+            LiveTvOut::Tab(tab) => {
+                if !app.bridge.search_tab_available(tab) || tab == HomeTab::LiveTv {
+                    continue;
+                }
+                match tab {
+                    HomeTab::Home => bridge::nav_home_pill(&mut app.pages, &mut app.bridge, Some(ret)),
+                    other => bridge::nav_tab(&mut app.pages, &mut app.bridge, other, None, Some(ret)),
+                }
+            }
+            LiveTvOut::Account => chip_activate(&mut app.pages),
+            other => app.bridge.live_tv_request(other),
+        }
+    }
+}
+
+/// Play a landed tune: the route takes the stream (and with it the tuner's release), then the one
+/// start ritual pushes the player over the Live TV page, which is where Stop and BACK return.
+fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) {
+    // A trailer still playing would hold the engine the Load needs.
+    halt_preview_now(&mut app.player.session, &mut app.adapters.player);
+    // No library item is playing: the player's Info card must not describe the last one.
+    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
+    if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
+        return;
+    }
+    if !start_playback(
+        &mut app.player.session,
+        &mut app.adapters.player,
+        0,
+        Origin::Here,
+        HUD_LINGER_MS,
+        None,
+        &mut app.pages,
+        &mut app.bridge,
+    ) {
+        plx_base::eventlog::log("livetv: the player refused the live stream");
+        plx_media::route::release_live(&mut app.player.session);
+    }
 }
 
 fn home_tab_available(

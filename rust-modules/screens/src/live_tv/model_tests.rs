@@ -1,0 +1,241 @@
+//! The Live TV page's model: keys survive the guide filling in, moves keep the time anchor and
+//! never scroll into the past, the window follows focus, and each target offers the actions (and
+//! asks for the writes) its recording state allows.
+
+use super::model::*;
+use plx_data::live_tv::{Availability, Phase, RecordKind, Snapshot};
+use plx_data::stores::live_tv::Write;
+use plx_plex::plex::live_tv::{Airing, Channel, EpgProvider, Grab, GrabStatus, Subscription};
+use plx_ui::screen::Dir;
+
+const NOON: i64 = 1_760_011_200; // 2025-10-09T12:00:00Z
+const BASE: i64 = NOON - 12 * 3_600 - 2 * 86_400;
+
+fn airing(ch: usize, begins: i64, mins: i64, guid: &str) -> Airing {
+    Airing {
+        guid: guid.into(),
+        title: format!("{guid}"),
+        begins_at: begins,
+        ends_at: begins + mins * 60,
+        channel_identifier: format!("c{ch}"),
+        ..Airing::default()
+    }
+}
+
+/// `n` channels; row `r` airs 30-minute programs from 11:00 to 17:00, except row 1 which airs
+/// hour-long ones, and row 2 which has nothing yet.
+fn view(n: usize) -> LiveTvView {
+    let snap = Snapshot {
+        availability: Availability::Available,
+        provider: Some(EpgProvider { identifier: "p".into(), dvr_key: "1".into(), recordable: true, grid: true, ..Default::default() }),
+        channels_phase: Phase::Ready,
+        channels: (0..n).map(|i| Channel { identifier: format!("c{i}"), title: format!("Ch {i}"), ..Default::default() }).collect(),
+        now: NOON + 10 * 60,
+        ..Snapshot::default()
+    };
+    let rows = (0..n)
+        .map(|r| {
+            let step = if r == 1 { 60 } else { 30 };
+            let airings = if r == 2 {
+                Vec::new()
+            } else {
+                (0..(6 * 60 / step)).map(|k| airing(r, NOON - 3_600 + k * step * 60, step, &format!("g{r}-{k}"))).collect()
+            };
+            RowAirings { airings, pending: r == 2, failed: false }
+        })
+        .collect();
+    LiveTvView { snap, rows }
+}
+
+fn frame() -> Frame {
+    Frame { base: BASE, win_start: NOON, row_top: 0, now: NOON + 10 * 60 }
+}
+
+fn cell(row: usize, begins: i64) -> u32 {
+    cell_elem(row, slot_of(BASE, begins))
+}
+
+#[test]
+fn keys_round_trip_and_stay_clear_of_the_reserved_ranges() {
+    let e = cell(2047, NOON);
+    assert_eq!(cell_of(e), Some((2047, slot_of(BASE, NOON))));
+    assert!(e < REC_BASE && e < HEAD_GUIDE && e < ACTION_BASE && e < plx_ui::dispatch::STRIP_BASE);
+    assert_eq!(cell_of(HEAD_GUIDE), None);
+    assert_eq!(rec_of(REC_BASE + 3), Some(3));
+    assert_eq!(action_of(ACTION_BASE + 2), Some(2));
+    assert_eq!(rec_of(HEAD_GUIDE), None);
+}
+
+#[test]
+fn the_cell_at_a_time_is_the_airing_on_then_else_the_placeholder() {
+    let v = view(4);
+    assert_eq!(v.cell_at(BASE, 0, NOON + 600), cell(0, NOON));
+    assert_eq!(v.cell_at(BASE, 1, NOON + 1_900), cell(1, NOON));
+    assert_eq!(v.cell_at(BASE, 2, NOON), cell_elem(2, PLACEHOLDER));
+    assert!(v.holds(BASE, cell_elem(2, PLACEHOLDER)));
+    assert!(!v.holds(BASE, cell_elem(0, PLACEHOLDER)), "a row with airings has no placeholder");
+    assert!(!v.holds(BASE, cell(9, NOON)), "no such row");
+}
+
+#[test]
+fn up_and_down_keep_the_time_the_focused_cell_starts_on_screen() {
+    let v = view(5);
+    let f = frame();
+    // 12:30 on row 0 (30-min) -> row 1 airs 12:00-13:00 -> that one
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON + 1_800), Dir::Down), Some(cell(1, NOON)));
+    // from row 1's 12:00 back up keeps 12:00
+    assert_eq!(guide_neighbour(&v, &f, cell(1, NOON), Dir::Up), Some(cell(0, NOON)));
+    // into the row with nothing yet: its placeholder
+    assert_eq!(guide_neighbour(&v, &f, cell(1, NOON), Dir::Down), Some(cell_elem(2, PLACEHOLDER)));
+    // up from the first row is the guide's edge (the header link takes it)
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Up), None);
+    // down from the last row too
+    assert_eq!(guide_neighbour(&v, &f, cell(4, NOON), Dir::Down), None);
+}
+
+#[test]
+fn left_stops_at_the_airing_on_now_and_right_walks_the_row() {
+    let v = view(3);
+    let f = frame();
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Right), Some(cell(0, NOON + 1_800)));
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON + 1_800), Dir::Left), Some(cell(0, NOON)));
+    // 11:30-12:00 ended before now's half hour: no further left
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Left), None);
+    assert_eq!(guide_neighbour(&v, &f, cell_elem(2, PLACEHOLDER), Dir::Right), None);
+}
+
+#[test]
+fn the_window_follows_focus_right_and_back_but_never_before_now() {
+    let v = view(10);
+    let f = frame();
+    // 13:30 starts in the window's last half hour: it moves to the second tick
+    let moved = follow(&v, &f, cell(0, NOON + 3 * 1_800));
+    assert_eq!(moved.win_start, NOON + 3_600);
+    // back to 12:30: it ends before the window's first quarter -> the window starts there
+    let back = follow(&v, &moved, cell(0, NOON + 1_800));
+    assert_eq!(back.win_start, NOON + 1_800);
+    let home = follow(&v, &back, cell(0, NOON));
+    assert_eq!(home.win_start, NOON, "and never before the half hour now is in");
+    // rows scroll to keep the focused row in view
+    let down = follow(&v, &f, cell(8, NOON));
+    assert_eq!(down.row_top, 8 + 1 - ROWS_SHOWN);
+    let up = follow(&v, &down, cell(1, NOON));
+    assert_eq!(up.row_top, 1);
+}
+
+#[test]
+fn the_wanted_window_covers_the_rows_shown_and_reaches_past_the_window() {
+    let v = view(20);
+    let f = Frame { row_top: 5, ..frame() };
+    let w = want(&v, &f);
+    assert_eq!(w.rows, 3..13);
+    assert!(w.from < f.win_start && w.to > f.win_start + WINDOW_S);
+}
+
+#[test]
+fn an_airing_on_now_offers_watch_first_and_record_and_close() {
+    let v = view(2);
+    let a = &v.rows[0].airings[2]; // 12:00-12:30, now is 12:10
+    let actions = airing_actions(&v.snap, a);
+    assert_eq!(actions.first(), Some(&Action::Watch));
+    assert!(actions.contains(&Action::Record));
+    assert!(!actions.contains(&Action::RecordSeries), "a program with no show offers no series rule");
+    assert_eq!(actions.last(), Some(&Action::Close));
+    let later = &v.rows[0].airings[5];
+    assert!(!airing_actions(&v.snap, later).contains(&Action::Watch), "a later airing cannot be watched yet");
+}
+
+#[test]
+fn a_scheduled_episode_offers_cancel_and_its_write_deletes_its_rule() {
+    let v = view(2);
+    let mut a = v.rows[0].airings[4].clone();
+    a.grandparent_guid = "show".into();
+    a.subscription_id = "41".into();
+    let actions = airing_actions(&v.snap, &a);
+    assert!(!actions.contains(&Action::Record));
+    assert!(actions.contains(&Action::RecordSeries));
+    assert!(actions.contains(&Action::CancelRecording));
+    let target = Target::Airing { row: 0, airing: a.clone() };
+    assert_eq!(write_for(&v.snap, &target, Action::CancelRecording), Some(Write::CancelRule { id: "41".into() }));
+    assert_eq!(
+        write_for(&v.snap, &target, Action::RecordSeries),
+        Some(Write::Record { airing: a.clone(), kind: RecordKind::Series })
+    );
+}
+
+#[test]
+fn a_series_covered_airing_cancels_the_series_rule_or_skips_its_one_recording() {
+    let mut v = view(2);
+    let mut a = v.rows[0].airings[4].clone();
+    a.grandparent_guid = "show".into();
+    a.show_subscription_id = "7".into();
+    v.snap.scheduled = vec![Grab { key: "/media/grabbers/operations/9".into(), status: GrabStatus::Scheduled, airing: a.clone(), ..Grab::default() }];
+    let actions = airing_actions(&v.snap, &a);
+    assert!(actions.contains(&Action::CancelSeries) && actions.contains(&Action::CancelRecording));
+    assert!(!actions.contains(&Action::RecordSeries));
+    let target = Target::Airing { row: 0, airing: a };
+    assert_eq!(write_for(&v.snap, &target, Action::CancelSeries), Some(Write::CancelRule { id: "7".into() }));
+    assert_eq!(
+        write_for(&v.snap, &target, Action::CancelRecording),
+        Some(Write::StopGrab { key: "/media/grabbers/operations/9".into() })
+    );
+}
+
+#[test]
+fn an_airing_being_recorded_offers_stop_and_its_write_deletes_the_operation() {
+    let mut v = view(2);
+    let mut a = v.rows[0].airings[2].clone();
+    a.subscription_id = "5".into();
+    v.snap.scheduled = vec![Grab { key: "/media/grabbers/operations/3".into(), status: GrabStatus::InProgress, airing: a.clone(), ..Grab::default() }];
+    let actions = airing_actions(&v.snap, &a);
+    assert_eq!(&actions[..2], &[Action::Watch, Action::StopRecording]);
+    let target = Target::Airing { row: 0, airing: a };
+    assert_eq!(
+        write_for(&v.snap, &target, Action::StopRecording),
+        Some(Write::StopGrab { key: "/media/grabbers/operations/3".into() })
+    );
+}
+
+#[test]
+fn a_provider_that_cannot_tune_offers_no_watch() {
+    let mut v = view(2);
+    v.snap.provider.as_mut().unwrap().dvr_key.clear();
+    v.snap.provider.as_mut().unwrap().recordable = false;
+    let a = &v.rows[0].airings[2];
+    assert_eq!(airing_actions(&v.snap, a), vec![Action::Close]);
+}
+
+#[test]
+fn the_recordings_list_runs_recordings_first_then_rules_in_priority_order() {
+    let mut snap = Snapshot::default();
+    let g = |id: &str, begins: i64, status: GrabStatus| Grab { id: id.into(), key: format!("/k/{id}"), status, airing: airing(0, begins, 30, id), ..Grab::default() };
+    snap.scheduled = vec![g("later", NOON + 7_200, GrabStatus::Scheduled), g("now", NOON, GrabStatus::InProgress), g("soon", NOON + 3_600, GrabStatus::Scheduled), g("done", NOON - 3_600, GrabStatus::Complete)];
+    snap.rules = vec![Subscription { id: "a".into(), ..Subscription::default() }, Subscription { id: "b".into(), ..Subscription::default() }];
+    let e = rec_entries(&snap);
+    let ids: Vec<String> = e.iter().map(|r| match r { RecEntry::Grab(g) => g.id.clone(), RecEntry::Rule(s) => s.id.clone() }).collect();
+    assert_eq!(ids, vec!["now", "soon", "later", "a", "b"]);
+    assert!(rec_heads(&e, 0) && rec_heads(&e, 3) && !rec_heads(&e, 1) && !rec_heads(&e, 4));
+    assert_eq!(rec_y(&e, 0, 0), geom::RECS_Y + geom::REC_HEADING_H);
+    assert_eq!(rec_y(&e, 0, 3), geom::RECS_Y + 2.0 * geom::REC_HEADING_H + 3.0 * geom::REC_PITCH);
+    // a rule moves to the top with no `after`, to the bottom after the last other rule
+    let first = Target::Rule(snap.rules[1].clone());
+    assert_eq!(write_for(&snap, &first, Action::MoveTop), Some(Write::MoveRule { id: "b".into(), after: None }));
+    let last = Target::Rule(snap.rules[0].clone());
+    assert_eq!(write_for(&snap, &last, Action::MoveBottom), Some(Write::MoveRule { id: "a".into(), after: Some("b".into()) }));
+    assert_eq!(rule_actions(&snap, &snap.rules[0]), vec![Action::MoveBottom, Action::DeleteRule, Action::Close]);
+    assert_eq!(grab_actions(&snap.scheduled[1]), vec![Action::StopRecording, Action::Close]);
+    assert_eq!(grab_actions(&snap.scheduled[0]), vec![Action::CancelRecording, Action::Close]);
+}
+
+#[test]
+fn a_long_list_scrolls_to_keep_the_focused_row_in_view() {
+    let snap = Snapshot {
+        rules: (0..20).map(|i| Subscription { id: i.to_string(), ..Subscription::default() }).collect(),
+        ..Snapshot::default()
+    };
+    let e = rec_entries(&snap);
+    let top = rec_follow(&e, 0, 15);
+    assert!(top > 0);
+    assert!(rec_y(&e, top, 15) + geom::REC_H <= geom::RECS_BOTTOM);
+    assert_eq!(rec_follow(&e, top, 2), 2);
+}
