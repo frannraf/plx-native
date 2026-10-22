@@ -36,6 +36,11 @@ pub(crate) struct Feed {
     /// The channel last asked to be watched, as its tab and row: the player's record disc records
     /// what is on it, and OK on it brings the corner's picture back.
     watching: Option<(plx_data::live_tv::Source, usize)>,
+    /// A CH▲/CH▼ from the live player is tuning: its tune plays in place over the player when it
+    /// lands, where a guide press's plays only over the guide.
+    stepping: bool,
+    /// A CH▲/CH▼'s row, waiting for the channel left's tuner to be handed back before it tunes.
+    step_after_release: Option<usize>,
 }
 
 /// How long after a failed providers read it is asked again: a set that booted before its network
@@ -182,6 +187,64 @@ impl Bridge {
         plx_base::eventlog::log(&format!("livetv: record from the player, row {row}"));
         self.stores.live_tv.write(Write::Record { airing, kind: RecordKind::This });
         plx_media::route::set_record_asked(true);
+    }
+
+    /// CH▲/CH▼ in the live player: the row `step` from the one being watched, wrapping round the
+    /// lineup. Only within the lineup the guide shows (a channel watched from another tab has no
+    /// neighbours here).
+    pub(crate) fn live_tv_step_target(&self, step: i32) -> Option<usize> {
+        let store = &self.stores.live_tv;
+        let (source, row) = self.live_tv.watching.as_ref()?;
+        let n = store.channel_count();
+        if n < 2 || source != store.source() {
+            return None;
+        }
+        let next = (*row as i64 + i64::from(step)).rem_euclid(n as i64) as usize;
+        plx_base::eventlog::log(&format!("livetv: channel step {step:+} from row {row} to row {next}"));
+        Some(next)
+    }
+
+    /// Tune row `row` for a CH▲/CH▼, through the guide's own Watch flow: now, or (`after_release`:
+    /// the channel left handed its tuner back) once that release is done ([`Self::live_tv_step_pump`]).
+    pub(crate) fn live_tv_step_to(&mut self, row: usize, after_release: bool) {
+        self.live_tv.watching = Some((self.stores.live_tv.source().clone(), row));
+        if after_release {
+            self.live_tv.step_after_release = Some(row);
+        } else {
+            self.live_tv_step_tune(row);
+        }
+    }
+
+    fn live_tv_step_tune(&mut self, row: usize) {
+        let airing = self.stores.live_tv.on_now(row);
+        self.live_tv.stepping = self.stores.live_tv.tune(row, airing);
+        if !self.live_tv.stepping {
+            plx_base::eventlog::log("livetv: the channel step found nothing to tune");
+        }
+    }
+
+    /// Once a frame: a CH▲/CH▼ waiting on a release tunes when it is done, while the player is up.
+    pub(crate) fn live_tv_step_pump(&mut self, in_player: bool) {
+        let Some(row) = self.live_tv.step_after_release else { return };
+        if !in_player {
+            self.live_tv.step_after_release = None;
+            return;
+        }
+        if plx_media::route::live_releasing() {
+            return;
+        }
+        self.live_tv.step_after_release = None;
+        self.live_tv_step_tune(row);
+    }
+
+    /// Is a CH▲/CH▼ tune on its way (its landing plays over the player)?
+    pub(crate) fn live_tv_stepping(&self) -> bool {
+        self.live_tv.stepping
+    }
+
+    /// The step's tune landed or was dropped.
+    pub(crate) fn live_tv_step_done(&mut self) {
+        self.live_tv.stepping = false;
     }
 
     /// Is `row` of the tab shown the channel last asked to be watched (the corner's, while one

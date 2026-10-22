@@ -262,6 +262,25 @@ pub fn release_live(ps: &mut PlaybackSession) {
     drop(super::decision::take_live_lease(ps));
 }
 
+/// Give back the tuner a DVR channel holds while its picture plays on from what is buffered: the
+/// live player's CH▲/CH▼, whose next tune may need it (seen on the TV: "every tuner is busy" with
+/// the channel being left still held). The playback stays a live one until the next channel
+/// replaces it. A provider's channel holds no tuner and keeps its lease: `false`.
+pub fn release_live_tuner(ps: &mut PlaybackSession) -> bool {
+    if super::decision::live_info(ps).is_none_or(|i| i.provider) {
+        return false;
+    }
+    let lease = super::decision::take_live_lease_only(ps);
+    let held = lease.is_some();
+    drop(lease);
+    held
+}
+
+/// Is a released tune still being handed back (the next tune on that DVR waits for it)?
+pub fn live_releasing() -> bool {
+    RELEASING.load(Ordering::Acquire) > 0
+}
+
 /// Is the session playing a live channel?
 pub fn is_live(ps: &PlaybackSession) -> bool {
     super::decision::live_info(ps).is_some()
@@ -339,6 +358,32 @@ mod tests {
         assert!(super::super::decision::take_live_lease(&mut ps.publication()).is_none(), "the screen copy holds no lease");
         release_live(&mut ps);
         assert!(super::super::decision::take_live_lease(&mut ps).is_none());
+        drain_live_releases();
+    }
+
+    /// A CH▲/CH▼ hands a DVR channel's tuner back with the picture still a live one; a Plex channel
+    /// holds no tuner and keeps its lease.
+    #[test]
+    fn a_channel_step_hands_the_tuner_back_and_the_playback_stays_live() {
+        let mut ps = PlaybackSession::IDLE;
+        let dvr = LiveRoute { subscription_id: "77".into(), url: "http://127.0.0.1:9/x.m3u8".into(), ..LiveRoute::default() };
+        assert!(install_live(&mut ps, dvr));
+        assert!(release_live_tuner(&mut ps), "the DVR's tuner goes back");
+        assert!(is_live(&ps), "the picture is still a live channel's until the next replaces it");
+        assert!(super::super::decision::take_live_lease_only(&mut ps).is_none(), "no lease left");
+        assert!(!release_live_tuner(&mut ps), "nothing more to hand back");
+        release_live(&mut ps);
+        drain_live_releases();
+
+        let plex = LiveRoute {
+            url: "https://127.0.0.1:9/x.m3u8".into(),
+            provider: true,
+            info: LiveInfo { provider: true, ..LiveInfo::default() },
+            ..LiveRoute::default()
+        };
+        assert!(install_live(&mut ps, plex));
+        assert!(!release_live_tuner(&mut ps), "a Plex channel holds no tuner");
+        release_live(&mut ps);
         drain_live_releases();
     }
 

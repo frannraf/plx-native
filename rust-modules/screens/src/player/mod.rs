@@ -627,6 +627,15 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                 let ps = H::session(cx);
                 match &input.kind {
                     InputKind::Key { key, sym, wcode, edge, .. } => {
+                        // CH▲/CH▼ on a live channel (not over a failure read-out, which owns the
+                        // frame): the channel above or below it in the guide. The rocker's UP is a
+                        // page back in the library's terms, and the next channel up here.
+                        if let (Some(dir), Edge::Down) = (consts::page_dir(*sym, *wcode), *edge) {
+                            if plx_media::route::is_live(ps) && !plx_appkit::player_hud::transport_hidden(ps) {
+                                Self::ask(fx, PlayerReq::ChannelStep(-dir));
+                                return Handled::Yes;
+                            }
+                        }
                         self.handle_key(ps, consts::classify_input(*key, *sym, *wcode), *edge, input.at.ms, fx, H::metadata(cx))
                     }
                     InputKind::Click { hit, x, .. } => {

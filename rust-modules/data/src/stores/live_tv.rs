@@ -744,6 +744,11 @@ impl LiveTvStore {
         self.guide.airings(ch, from, to)
     }
 
+    /// How many channel rows the lineup shown has (the live player's CH▲/CH▼ wrap around them).
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
     /// The airing on now on channel row `ch`, from the guide cache (the player's record disc).
     pub fn on_now(&self, ch: usize) -> Option<Airing> {
         let now = if self.now > 0 { self.now } else { lt::wall_now() };

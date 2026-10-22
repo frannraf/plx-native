@@ -171,6 +171,9 @@ pub enum PlayerReq {
     /// BACK over a live channel's bare picture: it plays on in the Live TV guide's corner
     /// (`app::playback::minimize_player`); STOP and the failure read-out still `Exit`.
     Minimize,
+    /// CH▲/CH▼ over a live channel: the channel this many rows on in the guide's lineup (+1 the
+    /// next, -1 the one before), tuned and then played in place (`app::playback::step_live_channel`).
+    ChannelStep(i32),
     /// Accepted only after the owned player confirmation. Never emitted by boot or Play.
     RepairSandbox,
     /// The failure read-out's *Try again*: resolve the failed item again, unchanged, at the

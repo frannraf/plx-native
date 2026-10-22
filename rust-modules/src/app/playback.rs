@@ -641,8 +641,33 @@ pub(crate) fn player_requests(
             PlayerReq::Minimize => {
                 minimize_player(ps, pa, refresh_hubs, pages);
             }
+            PlayerReq::ChannelStep(step) => step_live_channel(ps, bridge, step),
         }
     }
+}
+
+/// CH▲/CH▼ in the live player: tune the channel `step` rows on. The picture plays on until that
+/// tune lands (`content::live_tv_requests`, which then swaps the stream in place). A DVR channel
+/// hands its tuner back first and the tune waits for that (the next channel may need the tuner);
+/// one of Plex's channels holds none, and its next tune goes at once.
+fn step_live_channel(ps: &mut plx_media::route::PlaybackSession, bridge: &mut super::bridge::Bridge, step: i32) {
+    if !plx_media::route::is_live(ps) {
+        return;
+    }
+    let Some(row) = bridge.live_tv_step_target(step) else {
+        plx_base::eventlog::log("livetv: no channel to step to");
+        return;
+    };
+    let released = plx_media::route::release_live_tuner(ps);
+    bridge.live_tv_step_to(row, released);
+}
+
+/// Stop the live channel playing full screen for the one a CH▲/CH▼ tuned, without leaving the
+/// player: the stream, its feed and its lease go; the page stays up for the next to start under.
+pub(crate) fn stop_live_for_step(ps: &mut plx_media::route::PlaybackSession, pa: &mut plx_media::player::adapter::PlayerAdapter) {
+    plx_media::route::cancel_play(ps);
+    plx_media::player::stop_bufferfeed(ps, pa);
+    plx_media::route::release_live(ps);
 }
 
 // (`reveal_played_episode` stood here. It answered one question — "is the page this session was

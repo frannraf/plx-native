@@ -828,6 +828,12 @@ pub(super) fn take_live_lease(ps: &mut PlaybackSession) -> Option<super::live::L
     ps.live.take()
 }
 
+/// Take the live lease alone, the live identity staying: a CH▲/CH▼ hands the tuner back before
+/// the next channel replaces this one (`live::release_live_tuner`).
+pub(super) fn take_live_lease_only(ps: &mut PlaybackSession) -> Option<super::live::LiveLease> {
+    ps.live.take()
+}
+
 /// What the player shows about the live channel, `None` for every other playback.
 pub fn live_info(ps: &PlaybackSession) -> Option<&super::live::LiveInfo> {
     ps.live_info.as_ref()

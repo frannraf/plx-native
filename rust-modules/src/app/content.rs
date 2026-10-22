@@ -1048,8 +1048,15 @@ pub(crate) fn watchlist_navigation(
 /// strip, BACK and the chip navigate as the Watchlist's do; everything else is the store's.
 fn live_tv_requests(app: &mut App) {
     use plx_screens::live_tv::LiveTvOut;
+    app.bridge.live_tv_step_pump(app.route() == AppArg::Player);
     if let Some(tuned) = app.bridge.live_tv_take_tuned() {
+        let stepping = app.bridge.live_tv_stepping();
+        app.bridge.live_tv_step_done();
         if app.route() == AppArg::LiveTv {
+            start_live(app, tuned);
+        } else if stepping && app.route() == AppArg::Player && plx_media::route::is_live(&app.player.session) {
+            // a CH▲/CH▼ from the live player: the new channel replaces the old in place
+            super::playback::stop_live_for_step(&mut app.player.session, &mut app.adapters.player);
             start_live(app, tuned);
         } else {
             app.bridge.live_tv_drop_tuned(tuned);
