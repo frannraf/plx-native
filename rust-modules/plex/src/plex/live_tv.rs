@@ -223,11 +223,16 @@ pub(super) fn grab_path(grab_key: &str) -> Option<String> {
     is_id(id).then(|| grab_key.to_string())
 }
 
-/// `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`. The channel identifier is percent-encoded as
-/// one path segment (it can carry `-`, `.`, and in some lineups `/`).
-pub(super) fn tune_path(dvr_key: &str, channel: &str) -> Option<String> {
-    (is_id(dvr_key) && !channel.is_empty())
-        .then(|| format!("/livetv/dvrs/{dvr_key}/channels/{}/tune", super::client::urlenc_str(channel)))
+/// `POST /livetv/dvrs/{dvr}/channels/{channel}/tune?X-Plex-Session-Identifier={session}`. The
+/// channel identifier is percent-encoded as one path segment (it can carry `-`, `.`, and in some
+/// lineups `/`). The session names who holds the tuner — the keepalive and the transcode name the
+/// same one — and a real server answered a tune without it HTTP 400.
+pub(super) fn tune_path(dvr_key: &str, channel: &str, session: &str) -> Option<String> {
+    (is_id(dvr_key) && !channel.is_empty() && !session.is_empty()).then(|| {
+        QueryBuilder::new(format!("/livetv/dvrs/{dvr_key}/channels/{}/tune", super::client::urlenc_str(channel)))
+            .str("X-Plex-Session-Identifier", session)
+            .build()
+    })
 }
 
 // ---- the operations ---------------------------------------------------------------------------
@@ -412,9 +417,9 @@ impl Client {
     /// Tune a channel to watch it live. On success the server holds a tuner for this client until
     /// [`Client::live_release`] (or until it notices nobody is watching). A tune answered with
     /// conflicts holds nothing playable but may still carry a subscription id, which the caller
-    /// releases too.
-    pub fn live_tune(&self, dvr_key: &str, channel: &str) -> LiveResult<TuneResult> {
-        let path = tune_path(dvr_key, channel).ok_or(LiveError::Invalid)?;
+    /// releases too. `session` is the one the stream and the keepalive will name.
+    pub fn live_tune(&self, dvr_key: &str, channel: &str, session: &str) -> LiveResult<TuneResult> {
+        let path = tune_path(dvr_key, channel, session).ok_or(LiveError::Invalid)?;
         if !self.live_write_allowed("tune") {
             return Err(LiveError::Refused);
         }

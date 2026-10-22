@@ -21,7 +21,8 @@ What is modelled, and how far:
 * `POST /livetv/dvrs/<dvr>/channels/<id>/tune` — a rolling subscription with one grab whose Video
   key is `/livetv/sessions/<uuid>`, a capture window, and the programs around now. With every tuner
   busy (`--livetv-tuners N`, default 2: live tunes plus recordings in progress) the answer carries
-  `Conflicts` instead, and the subscription key the caller must still release.
+  `Conflicts` instead, and the subscription key the caller must still release. A tune without
+  `X-Plex-Session-Identifier` is answered 400, as a real server answered one.
 * `GET /video/:/transcode/universal/decision?path=/livetv/sessions/…` answers an H.264/AAC HLS
   transcode; `start.m3u8` answers a one-variant master whose child media playlist grows by one
   2-second MPEG-TS segment per 2 seconds of wall clock (no ENDLIST, a sliding window of
@@ -456,6 +457,10 @@ class LiveTvFixture:
                 note_write(method, p)
                 if segs[2] != DVR_KEY:
                     return (404, "text/html", b"")
+                if not q.get("X-Plex-Session-Identifier"):
+                    # what a real server (2026-10-22) answered a tune that named no session
+                    return (400, "text/html", b"<html><head><title>Bad Request</title></head>"
+                                              b"<body><h1>400 Bad Request</h1></body></html>")
                 ch = next((n for n in range(CHANNELS) if channel_id(n) == urllib.parse.unquote(segs[4])), None)
                 if ch is None:
                     return (500, "text/html", b"<html><body><h1>500 Tuning failed</h1></body></html>")

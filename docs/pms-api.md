@@ -1575,7 +1575,11 @@ with a *rolling* (live viewer) subscription is resolved.
 ### 10.6 The live tune — `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`
 
 `{dvr}` is the provider's `parentID`; `{channel}` is the lineup `id`, percent-encoded as ONE path
-segment. Inline-preview clients add `autoPreview=1`; a full-screen tune does not.
+segment. **`X-Plex-Session-Identifier={session}` is required**: a real server (2026-10-22, an OTA
+tuner behind the cloud guide) answered a tune without it HTTP 400 with a bare HTML body; the
+keepalive and the transcode name the same session. Inline-preview clients add `autoPreview=1`; a
+full-screen tune does not. A tune the server rejects by lineup id (400/404) is asked once more by
+the channel's `vcn` — the form of the spec's own example (`2.1`).
 
 **The answer clients receive is a rolling subscription, not the spec's bare `Metadata`:**
 

@@ -164,7 +164,7 @@ fn default_runner() -> Box<dyn Runner> {
 pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
         Job::Tune { serial, dvr_key, channel, label, airing, session } => {
-            let result = tune(client, off, &dvr_key, &channel.identifier, &session)
+            let result = tune(client, off, &dvr_key, &channel, &session)
                 .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing });
             Landing::Tuned { serial, result }
         }
@@ -193,14 +193,23 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
 
 /// A tune and its encode. Whatever fails after the tune took a tuner releases it before answering,
 /// so an `Err` holds nothing on the server.
+///
+/// The lineup `id` is what the tune path takes; a channel the server rejects by that id (400/404)
+/// is asked once more by its number ("4.1", the form the spec's own example uses).
 fn tune(
     client: &plx_plex::plex::Client,
     off: &plx_base::task::OffFrame,
     dvr_key: &str,
-    channel: &str,
+    channel: &plx_plex::plex::live_tv::Channel,
     session: &str,
 ) -> Result<(String, plx_plex::plex::live_tv::TunedItem, plx_plex::plex::live_tv::LiveStream), LiveError> {
-    let t = client.live_tune(dvr_key, channel)?;
+    let t = match client.live_tune(dvr_key, &channel.identifier, session) {
+        Err(LiveError::Status(status @ (400 | 404))) if !channel.vcn.is_empty() && channel.vcn != channel.identifier => {
+            plx_base::eventlog::log(&format!("livetv: tune by lineup id answered HTTP {status}; asking by channel number"));
+            client.live_tune(dvr_key, &channel.vcn, session)?
+        }
+        other => other?,
+    };
     if !t.playable() {
         if !t.subscription_id.is_empty() {
             let _ = client.live_release(&t.subscription_id);

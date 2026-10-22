@@ -228,9 +228,17 @@ fn edit_move_delete_cancel_and_tune_paths() {
     assert_eq!(grab_path("/media/grabbers/operations/g1").unwrap(), "/media/grabbers/operations/g1");
     assert!(grab_path("/library/metadata/1").is_none(), "a server key may only name a grab");
     assert!(grab_path("/media/grabbers/operations/../x").is_none());
-    assert_eq!(tune_path("12", "s0a1-c001").unwrap(), "/livetv/dvrs/12/channels/s0a1-c001/tune");
-    assert_eq!(tune_path("12", "a/b c").unwrap(), "/livetv/dvrs/12/channels/a%2Fb%20c/tune", "the channel is one encoded segment");
-    assert!(tune_path("", "c").is_none());
+    assert_eq!(
+        tune_path("12", "s0a1-c001", "sess-1").unwrap(),
+        "/livetv/dvrs/12/channels/s0a1-c001/tune?X-Plex-Session-Identifier=sess-1"
+    );
+    assert_eq!(
+        tune_path("12", "a/b c", "s").unwrap(),
+        "/livetv/dvrs/12/channels/a%2Fb%20c/tune?X-Plex-Session-Identifier=s",
+        "the channel is one encoded segment"
+    );
+    assert!(tune_path("", "c", "s").is_none());
+    assert!(tune_path("12", "c", "").is_none(), "a tune names its session");
     assert_eq!(template_path("plex://episode/1").unwrap(), "/media/subscriptions/template?guid=plex%3A%2F%2Fepisode%2F1");
 }
 
@@ -325,16 +333,16 @@ fn a_read_parses_json_and_a_write_reports_its_status() {
     let (_registry, client) = registered_client(port, "1.41.0.0000-synthetic");
     let providers = client.live_tv_providers().unwrap();
     assert_eq!(providers[0].dvr_key, "12");
-    let tuned = client.live_tune("12", "s0a1-c001").unwrap();
+    let tuned = client.live_tune("12", "s0a1-c001", "sess-1").unwrap();
     assert_eq!(tuned.subscription_id, "77");
-    assert_eq!(client.live_tune("12", "s0a1-c001"), Err(LiveError::Status(500)), "Tuning failed is a status");
+    assert_eq!(client.live_tune("12", "s0a1-c001", "sess-1"), Err(LiveError::Status(500)), "Tuning failed is a status");
     let req = CreateSubscription { kind: 4, parameters: "hints%5Bguid%5D=x".into(), target_section: "3".into(), ..Default::default() };
     let made = client.dvr_create(&req).unwrap();
     assert_eq!(made.subscription_id, "44");
     assert_eq!(made.conflicts.len(), 1);
     let seen = server.join().unwrap();
     assert!(seen[0].starts_with("GET /media/providers?"));
-    assert!(seen[1].starts_with("POST /livetv/dvrs/12/channels/s0a1-c001/tune?"));
+    assert!(seen[1].starts_with("POST /livetv/dvrs/12/channels/s0a1-c001/tune?X-Plex-Session-Identifier=sess-1&"), "{}", seen[1]);
     assert!(seen[3].starts_with("POST /media/subscriptions?includeGrabs=1&targetLibrarySectionID=3&type=4&hints%5Bguid%5D=x&X-Plex-Token="), "{}", seen[3]);
 }
 
@@ -350,7 +358,7 @@ fn a_debug_build_sends_no_write_to_a_real_server() {
     assert_eq!(client.dvr_delete("41"), Err(LiveError::Refused));
     assert_eq!(client.dvr_move("41", None), Err(LiveError::Refused));
     assert_eq!(client.dvr_cancel_grab("/media/grabbers/operations/g1"), Err(LiveError::Refused));
-    assert_eq!(client.live_tune("12", "c"), Err(LiveError::Refused));
+    assert_eq!(client.live_tune("12", "c", "sess-1"), Err(LiveError::Refused));
     assert!(guard::last_write_refused());
     assert_eq!(client.live_release("77"), Ok(()), "a release goes out");
     let seen = server.join().unwrap();
