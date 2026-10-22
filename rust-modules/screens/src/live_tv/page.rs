@@ -502,11 +502,18 @@ impl LiveTvScreen {
 
     fn draw_readout<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter, r: Readout) {
         let text = match r {
-            Readout::Loading => msg::live_tv_state_loading(),
+            // A "Loading" read-out is a placeholder: counted where it is drawn (`ui::placeholder`).
+            Readout::Loading => {
+                plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, "livetv");
+                msg::live_tv_state_loading()
+            }
             Readout::Unavailable => msg::live_tv_state_unavailable(),
             Readout::Failed => msg::live_tv_state_failed(),
             Readout::NoChannels => msg::live_tv_state_no_channels(),
-            Readout::RecsLoading => msg::live_tv_recordings_loading(),
+            Readout::RecsLoading => {
+                plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, "livetv-recordings");
+                msg::live_tv_recordings_loading()
+            }
             Readout::RecsFailed => msg::live_tv_recordings_failed(),
             Readout::RecsEmpty => msg::live_tv_recordings_empty(),
         };
@@ -619,7 +626,13 @@ impl LiveTvScreen {
                 let elem = model::cell_elem(row, model::PLACEHOLDER);
                 let Some(rect) = model::placeholder_rect(fr, row) else { continue };
                 let on = !panel_up && self.focused(f, elem);
-                let words = if r.pending { msg::live_tv_row_loading() } else { msg::live_tv_row_no_info() };
+                let words = if r.pending {
+                    // a row whose programs are on their way: one line of text that has not arrived
+                    plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::SkeletonBar, "livetv-row");
+                    msg::live_tv_row_loading()
+                } else {
+                    msg::live_tv_row_no_info()
+                };
                 self.draw_cell(f, p, rect, words, "", on, false, false);
                 if !r.airings.is_empty() {
                     continue;
