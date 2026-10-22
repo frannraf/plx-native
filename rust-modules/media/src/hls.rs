@@ -1023,6 +1023,9 @@ fn set_once<T>(
 fn forbidden_feature(line: &str, shape: Shape) -> Option<&'static str> {
     match tag_name(line) {
         "#EXT-X-DISCONTINUITY" | "#EXT-X-DISCONTINUITY-SEQUENCE" if shape == Shape::Provider => None,
+        // A key whose METHOD is NONE says the segments are NOT encrypted (seen on the TV: a Plex
+        // channel that tags every playlist so, and was refused for it).
+        "#EXT-X-KEY" if shape == Shape::Provider && key_method(line) == Some("NONE") => None,
         "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => Some("encrypted segments"),
         "#EXT-X-BYTERANGE" => Some("byte-range segments"),
         "#EXT-X-MAP" => Some("fMP4 initialization map"),
@@ -1033,6 +1036,12 @@ fn forbidden_feature(line: &str, shape: Shape) -> Option<&'static str> {
 
 fn tag_name(line: &str) -> &str {
     line.split_once(':').map_or(line, |(name, _)| name)
+}
+
+/// A key tag's METHOD ("NONE", "AES-128", "SAMPLE-AES"…), unquoted.
+fn key_method(line: &str) -> Option<&str> {
+    let (_, attrs) = line.split_once(':')?;
+    attrs.split(',').find_map(|a| a.trim().strip_prefix("METHOD=")).map(|m| m.trim_matches('"'))
 }
 
 fn malformed<T>(line: usize, reason: &'static str) -> Result<T, Error> {
@@ -1147,11 +1156,22 @@ pub fn uri_shape(text: &str) -> String {
     let mut exts: Vec<(String, usize)> = Vec::new();
     let mut hosts: Vec<&str> = Vec::new();
     let mut tags: Vec<&str> = Vec::new();
+    // A key's METHOD and KEYFORMAT (AES-128 a client can decrypt, or a DRM's), never its URI or IV.
+    let mut keys: Vec<String> = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if line.starts_with('#') {
             let name = tag_name(line);
             if name != "#EXTINF" && !tags.contains(&name) {
                 tags.push(name);
+            }
+            if name == "#EXT-X-KEY" || name == "#EXT-X-SESSION-KEY" {
+                let attr = |key: &str| {
+                    line.split([':', ',']).find_map(|a| a.strip_prefix(key)).map(|v| v.trim_matches('"').chars().take(40).collect::<String>())
+                };
+                let shape = format!("{}/{}", attr("METHOD=").unwrap_or_default(), attr("KEYFORMAT=").unwrap_or_else(|| "identity".into()));
+                if !keys.contains(&shape) {
+                    keys.push(shape);
+                }
             }
             continue;
         }
@@ -1173,7 +1193,8 @@ pub fn uri_shape(text: &str) -> String {
         }
     }
     let exts: Vec<String> = exts.iter().map(|(e, n)| format!("{e}:{n}")).collect();
-    format!("uris [{}] on {} absolute host(s), tags [{}]", exts.join(" "), hosts.len(), tags.join(" "))
+    let keys = if keys.is_empty() { String::new() } else { format!(", keys [{}]", keys.join(" ")) };
+    format!("uris [{}] on {} absolute host(s), tags [{}]{keys}", exts.join(" "), hosts.len(), tags.join(" "))
 }
 
 #[cfg(test)]
@@ -1218,7 +1239,10 @@ mod tests {
         assert_eq!(parsed.segments[1].sequence, 41);
         let keyed = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\ns.ts\n";
         assert_eq!(parse_media_as(Shape::Provider, &src, keyed), Err(Error::UnsupportedFeature("encrypted segments")));
-        let http = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";
+        let clear = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6,\ns.ts\n";
+        assert_eq!(parse_media_as(Shape::Provider, &src, clear).map(|m| m.segments.len()), Ok(1), "METHOD=NONE: nothing is encrypted");
+        assert!(parse_media(&src, clear).is_err(), "a server's shape stays strict");
+        let http ="#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";
         assert_eq!(parse_media_as(Shape::Provider, &src, http).map(|_| ()), Err(Error::CrossOrigin), "another origin only over https");
     }
 
@@ -1623,6 +1647,11 @@ https://ads.example/a/c.mp4
         let shape = uri_shape(text);
         assert_eq!(shape, "uris [ts:1 none:1 mp4:1] on 1 absolute host(s), tags [#EXTM3U #EXT-X-TARGETDURATION #EXT-X-CUE-OUT]");
         assert!(!shape.contains("example") && !shape.contains("30"));
+
+        let keyed = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example/k?sig=s\",IV=0x0123\n#EXTINF:7,\ns.ts\n";
+        let shape = uri_shape(keyed);
+        assert!(shape.ends_with(", keys [AES-128/identity]"), "{shape}");
+        assert!(!shape.contains("keys.example") && !shape.contains("0x0123"), "no key URI or IV: {shape}");
     }
 
     #[test]
