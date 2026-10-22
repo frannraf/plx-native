@@ -272,6 +272,12 @@ pub fn is_recordable_live(ps: &PlaybackSession) -> bool {
     super::decision::live_info(ps).is_some_and(|i| !i.provider)
 }
 
+/// The span of the program on air when the channel was tuned, `(begins, ends)` in epoch seconds:
+/// what the player's bar fills by. `None` off a live channel or when the guide gave no span.
+pub fn live_airing(ps: &PlaybackSession) -> Option<(i64, i64)> {
+    super::decision::live_info(ps).filter(|i| i.begins_at > 0 && i.ends_at > i.begins_at).map(|i| (i.begins_at, i.ends_at))
+}
+
 /// At process exit: wait (bounded) for release workers already running, so a shutdown right after
 /// leaving a channel still frees the tuner.
 pub fn drain_live_releases() {
@@ -334,5 +340,25 @@ mod tests {
         release_live(&mut ps);
         assert!(super::super::decision::take_live_lease(&mut ps).is_none());
         drain_live_releases();
+    }
+
+    /// The HUD names the show and its episode, and a daily show whose episode title is its own name
+    /// once (seen on the TV: "Show · Show").
+    #[test]
+    fn the_hud_title_names_a_show_once_when_its_episode_is_named_the_same() {
+        let shown = |show: &str, title: &str| {
+            let mut ps = PlaybackSession::IDLE;
+            let info = LiveInfo { title: title.into(), show_title: show.into(), ..LiveInfo::default() };
+            assert!(install_live(&mut ps, LiveRoute { url: "http://127.0.0.1:9/x.m3u8".into(), info, ..LiveRoute::default() }));
+            // SAFETY: the session's own NUL-terminated title buffer, read while `ps` lives.
+            let text = unsafe { std::ffi::CStr::from_ptr(super::super::decision::title_cptr(&ps)) }.to_string_lossy().into_owned();
+            release_live(&mut ps);
+            drain_live_releases();
+            text
+        };
+        assert_eq!(shown("Morning Show", "Morning Show"), "Morning Show");
+        assert_eq!(shown("A Series", "An Episode"), "A Series \u{b7} An Episode");
+        assert_eq!(shown("", "A Movie"), "A Movie");
+        assert_eq!(shown("A Show", ""), "A Show");
     }
 }

@@ -54,6 +54,47 @@ impl Channel {
     pub fn label(&self) -> &str {
         if self.call_sign.is_empty() { &self.title } else { &self.call_sign }
     }
+
+    /// The station viewers know the channel by: its call sign's letters ([`station_id`]), else
+    /// the title. One of Plex's own channels goes by its title: its "call sign" is an internal
+    /// abbreviation (seven capitals, seen on the TV), not a broadcaster's.
+    pub fn station(&self) -> &str {
+        if !self.part_key.is_empty() {
+            return &self.title;
+        }
+        match station_id(&self.call_sign) {
+            "" => &self.title,
+            id => id,
+        }
+    }
+
+    /// The number a viewer would dial, "" when there is none: Plex's own channels all carry "000".
+    pub fn number(&self) -> &str {
+        if self.vcn.chars().all(|c| c == '0' || c == '.') { "" } else { &self.vcn }
+    }
+
+    /// The number and the station, as the guide, the tune notices and the player name a channel:
+    /// "4.1 KXYZ" (a Plex channel: its title alone).
+    pub fn words(&self) -> String {
+        match self.number() {
+            "" => self.station().to_string(),
+            n => format!("{n} {}", self.station()),
+        }
+    }
+}
+
+/// A broadcast call sign without its digital-service suffix: "KXYZDT2" and "WXYZ-HD" read "KXYZ" and
+/// "WXYZ", the letters viewers know the station by. A sign that would lose its own letters to the
+/// trim (fewer than three left) is kept whole.
+pub fn station_id(call_sign: &str) -> &str {
+    let sign = call_sign.trim();
+    let digits = sign.trim_end_matches(|c: char| c.is_ascii_digit());
+    let upper = digits.to_ascii_uppercase();
+    let stem = ["-DT", "-HD", "-TV", "-LD", "-CD", "DT"]
+        .iter()
+        .find_map(|suffix| upper.strip_suffix(suffix).map(|s| s.trim_end_matches('-').len()))
+        .unwrap_or(digits.len());
+    if stem >= 3 && stem < digits.len() { &sign[..stem] } else { sign }
 }
 
 /// One tab of Plex's own channels (the cloud provider's `GridChannelFilter`): a genre the lineup

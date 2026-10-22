@@ -24,7 +24,7 @@ use plx_machine::machine::{
 };
 use plx_machine::present::Provenance;
 use plx_platform::i18n::msg;
-use plx_plex::plex::live_tv::{Airing, Channel, GrabStatus};
+use plx_plex::plex::live_tv::{station_id, Airing, Channel, GrabStatus};
 use plx_ui::consts::{MARGIN_X, SCR_H, SCR_W};
 use plx_ui::label::{HAlign, Label, VAlign};
 use plx_ui::screen::{
@@ -799,13 +799,15 @@ impl LiveTvScreen {
         part(Rect::new(hole.x, 0.0, SCR_W - hole.x, hole.y));
         part(Rect::new(hole.x, foot, SCR_W - hole.x, SCR_H - foot));
         part(Rect::new(right, hole.y, SCR_W - right, hole.h));
-        // whole-pixel strips, as the art's fade (fractional edges comb)
+        // Whole-pixel strips, as the art's fade (fractional edges comb), but narrow and on an S-curve:
+        // over moving video, the art's 10 px t² steps (8% at the edge) read as bars on the TV.
         let mut x = hole.x;
         while x < hole.x + MINI_FEATHER_L {
-            let t = 1.0 - (x - hole.x + ART_FADE_STRIP * 0.5) / MINI_FEATHER_L;
+            let s = 1.0 - (x - hole.x + MINI_FEATHER_STRIP * 0.5) / MINI_FEATHER_L;
+            let a = s * s * (3.0 - 2.0 * s);
             let (top, low) = (at(x, hole.y), at(x, foot));
-            p.rect(Rect::new(x, hole.y, ART_FADE_STRIP, hole.h), 0.0, [top[0], top[1], top[2], t * t], [low[0], low[1], low[2], t * t], 0.0);
-            x += ART_FADE_STRIP;
+            p.rect(Rect::new(x, hole.y, MINI_FEATHER_STRIP, hole.h), 0.0, [top[0], top[1], top[2], a], [low[0], low[1], low[2], a], 0.0);
+            x += MINI_FEATHER_STRIP;
         }
         let seg = hole.w / ART_FALL_SEGS as f32;
         for j in 0..ART_FALL_SEGS {
@@ -925,15 +927,25 @@ impl LiveTvScreen {
             }
         }
         if !logo {
-            TextView::new(ch.label(), theme::size::LABEL, theme::TEXT_PRIMARY)
+            TextView::new(ch.station(), theme::size::LABEL, theme::TEXT_PRIMARY)
                 .bold()
                 .with_measure(f.measure)
                 .max_lines(1)
                 .h(HAlign::Center)
                 .draw(p, Rect::new(logo_box.x, logo_box.y + (logo_box.h - theme::size::LABEL as f32) * 0.5, logo_box.w, 0.0));
         }
-        if !ch.vcn.is_empty() {
-            TextView::new(&ch.vcn, theme::size::CAPTION, theme::TEXT_SECONDARY)
+        // Under a logo, the number and the station's own letters ("4.1 KXYZ"): a subchannel's logo is
+        // its network's, which says nothing of whose signal it rides. Without a logo the
+        // call sign is already the big label, so the number stands alone.
+        // A Plex channel's logo is the whole of its name: no number, no internal abbreviation.
+        let station = if logo && ch.part_key.is_empty() { station_id(&ch.call_sign) } else { "" };
+        let words = match (ch.number(), station) {
+            ("", s) => s.to_string(),
+            (n, "") => n.to_string(),
+            (n, s) => format!("{n} {s}"),
+        };
+        if !words.is_empty() {
+            TextView::new(&words, theme::size::CAPTION, theme::TEXT_SECONDARY)
                 .with_measure(f.measure)
                 .max_lines(1)
                 .h(HAlign::Center)
@@ -1060,7 +1072,9 @@ impl LiveTvScreen {
             badge_w = b.w + 10.0;
         }
         let w = rect.x + rect.w - 14.0 - dot - badge_w - tx;
-        if w > 8.0 {
+        // A sliver (a Plex channel's program that began a few minutes before the window) keeps
+        // its fill and no words: "L…" over "1…" said nothing.
+        if w >= CELL_TEXT_MIN_W {
             TextView::new(title, theme::size::LABEL, ink)
                 .bold()
                 .with_measure(f.measure)
@@ -1297,6 +1311,10 @@ const TINT_W: f32 = 0.85;
 /// from its foot.
 const MINI_FEATHER_L: f32 = 240.0;
 const MINI_FEATHER_B: f32 = 140.0;
+/// The corner picture's left feather strip: 120 strips, no step over 1.3% (the S-curve's steepest).
+const MINI_FEATHER_STRIP: f32 = 2.0;
+/// The narrowest room an airing cell writes its title and times in.
+const CELL_TEXT_MIN_W: f32 = 72.0;
 /// The backdrop's foot: how tall its fade into the wash is, in how many colour samples across.
 const ART_FALL: f32 = 200.0;
 const ART_FALL_SEGS: usize = 12;
@@ -1348,7 +1366,7 @@ fn cell_colors(on: bool, now: bool) -> ([f32; 4], [f32; 4], [f32; 4]) {
 
 /// A channel as the hero names it: its number and call sign.
 fn channel_words(ch: &Channel) -> String {
-    if ch.vcn.is_empty() { ch.label().to_string() } else { format!("{} {}", ch.vcn, ch.label()) }
+    ch.words()
 }
 
 /// "1h 37m left" / "36m left" for `secs` seconds, rounded up to the minute.
@@ -1770,6 +1788,24 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_sign_reads_as_the_station_without_its_digital_suffix() {
+        assert_eq!(station_id("KXYZDT"), "KXYZ");
+        assert_eq!(station_id("KXYZDT2"), "KXYZ");
+        assert_eq!(station_id("WXYZ-HD"), "WXYZ");
+        assert_eq!(station_id("WXY-TV"), "WXY");
+        assert_eq!(station_id("KQRS"), "KQRS");
+        assert_eq!(station_id("WKDT"), "WKDT", "too few letters would be left: kept whole");
+        assert_eq!(station_id(""), "");
+        let ch = Channel { vcn: "4.2".into(), call_sign: "KXYZDT2".into(), title: "A Network".into(), ..Channel::default() };
+        assert_eq!(channel_words(&ch), "4.2 KXYZ");
+        // Plex's own channels: a placeholder number and an internal abbreviation (seen on the TV:
+        // "000" and seven capitals); they go by their title.
+        let plex = Channel { vcn: "000".into(), call_sign: "CHANPRS".into(), title: "A Channel".into(), part_key: "/library/parts/x.m3u8".into(), ..Channel::default() };
+        assert_eq!((plex.number(), plex.station(), channel_words(&plex).as_str()), ("", "A Channel", "A Channel"));
+        assert_eq!(Channel { vcn: "10.0".into(), ..Channel::default() }.number(), "10.0");
+    }
 
     #[test]
     fn civil_dates_round_the_epoch_and_leap_days() {

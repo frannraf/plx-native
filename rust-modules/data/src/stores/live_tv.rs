@@ -503,7 +503,7 @@ impl LiveTvStore {
         self.cancel_tune();
         self.tune_serial = self.tune_serial.wrapping_add(1);
         self.tune_wanted = true;
-        let label = channel.label().to_string();
+        let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: tune #{} asked for channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
         self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id() });
@@ -522,7 +522,7 @@ impl LiveTvStore {
         self.cancel_tune();
         self.tune_serial = self.tune_serial.wrapping_add(1);
         self.tune_wanted = true;
-        let label = channel.label().to_string();
+        let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: watch #{} of Plex channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
         self.tune_queue = Some(Job::CloudTune { serial: self.tune_serial, channel, label, airing, auth });

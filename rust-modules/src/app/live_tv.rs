@@ -236,8 +236,10 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
         Some(a) => (a.title.clone(), a.show_title.clone(), a.begins_at, a.ends_at),
         None => (t.item.title.clone(), t.item.show_title.clone(), t.item.begins_at, t.item.ends_at),
     };
-    let channel = if t.item.channel_title.is_empty() { t.channel.clone() } else {
-        format!("{} {}", t.item.channel_vcn, t.item.channel_title).trim().to_string()
+    // The row's own words ("4.1 KXYZ"; a Plex channel's title alone), else what the tuned item says.
+    let channel = if !t.channel.is_empty() { t.channel.clone() } else {
+        let station = plx_plex::plex::live_tv::station_id(&t.item.channel_title);
+        format!("{} {station}", t.item.channel_vcn).trim().to_string()
     };
     plx_media::route::LiveRoute {
         sid: t.sid,

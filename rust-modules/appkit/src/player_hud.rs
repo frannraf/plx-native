@@ -1675,6 +1675,10 @@ pub struct Playbar {
     /// A live TV channel (`plx_media::route::is_live`): no duration, no position to scrub to. The
     /// bar is drawn full, to the live edge, and the elapsed clock under the knob reads LIVE.
     pub live: bool,
+    /// On a live channel whose program on air is known: its `(begins, ends)` and the wall clock
+    /// now, epoch seconds. The bar then fills to how far the program has run, as the guide's cell
+    /// does, and its right end says when it ends.
+    pub live_airing: Option<(i64, i64, i64)>,
 }
 
 impl Playbar {
@@ -1717,8 +1721,20 @@ impl Playbar {
             now,
             clock_grow: 0.0,
             live: plx_media::route::is_live(ps),
+            live_airing: plx_media::route::live_airing(ps).map(|(begins, ends)| (begins, ends, plx_data::live_tv::wall_now())),
         }
     }
+}
+
+/// How far a live program has run, 0 to 1: `(begins, ends, now)` in epoch seconds.
+fn airing_frac((begins, ends, now): (i64, i64, i64)) -> f64 {
+    if ends > begins { ((now - begins) as f64 / (ends - begins) as f64).clamp(0.0, 1.0) } else { 1.0 }
+}
+
+/// An epoch instant as the viewer's wall clock reads it ("2:00 PM"), as the guide prints its times.
+fn wall_time(t: i64) -> String {
+    let local = (t + plx_platform::i18n::utc_offset_s(t)).rem_euclid(86_400);
+    plx_platform::i18n::current().time_of_day((local / 3_600) as u8, ((local % 3_600) / 60) as u8)
 }
 
 /// The playbar: scrubber, playhead knob, elapsed/remaining clocks and the state read-out. The
@@ -1736,7 +1752,7 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     let dur = bar.dur_ns;
     let now = bar.now;
     let frac = if bar.live {
-        1.0
+        bar.live_airing.map_or(1.0, airing_frac)
     } else if dur > 0 {
         (dispos as f64 / dur as f64).clamp(0.0, 1.0)
     } else {
@@ -1804,7 +1820,11 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
         el_l = el_l.min(l);
         el_r = el_r.max(r);
     }
-    let rem = fmt_time(dur - dispos, true);
+    // A live program's right end is when it ends ("2:00 PM"), not a countdown of a duration it has not.
+    let rem = match (bar.live, bar.live_airing) {
+        (true, Some((_, ends, _))) => wall_time(ends),
+        _ => fmt_time(dur - dispos, true),
+    };
     // MEASURE the label, never estimate it. `chars * CAPTION * 0.52` was an Arial-calibrated
     // constant guarding a real behaviour — the remaining clock hides before the moving elapsed
     // clock can reach it — and it only ever worked because it over-estimated: under Arial it
@@ -2134,6 +2154,15 @@ pub fn overscan_rects(out: &mut Vec<(&'static str, Rect)>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_live_bar_fills_by_how_far_the_program_on_air_has_run() {
+        use super::airing_frac;
+        assert_eq!(airing_frac((1_000, 4_600, 2_800)), 0.5);
+        assert_eq!(airing_frac((1_000, 4_600, 900)), 0.0, "not begun: empty");
+        assert_eq!(airing_frac((1_000, 4_600, 9_000)), 1.0, "over (the next program has begun): full");
+        assert_eq!(airing_frac((1_000, 1_000, 1_000)), 1.0, "no span: the live edge");
+    }
+
     #[test]
     fn a_hold_doubles_its_scrub_speed_every_step_up_to_the_cap() {
         use super::{scrub_speed, SCRUB_BASE, SCRUB_MAX, SCRUB_STEP_MS};

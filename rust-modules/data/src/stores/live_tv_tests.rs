@@ -348,7 +348,7 @@ fn a_watch_press_tunes_off_the_frame_and_the_app_takes_the_stream_once() {
     let script = Script::default();
     let mut s = ready(&script, 3);
     assert!(s.tune(1, None));
-    assert_eq!(s.snapshot().tune, TunePhase::Tuning { channel: "Channel 1".into() });
+    assert_eq!(s.snapshot().tune, TunePhase::Tuning { channel: "1.1 Channel 1".into() });
     s.pump();
     let (serial, session, post) = tune_job(script.take());
     assert!(!session.is_empty(), "a fresh encode session per press");
@@ -411,7 +411,7 @@ fn a_failed_tune_says_why_until_the_page_clears_it() {
     s.pump();
     match s.snapshot().tune {
         TunePhase::Failed { channel, reason } => {
-            assert_eq!(channel, "Channel 0");
+            assert_eq!(channel, "0.1 Channel 0");
             assert_eq!(reason, LiveError::Busy.reason());
         }
         other => panic!("{other:?}"),

@@ -806,8 +806,13 @@ pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::L
     ps.url = url.to_owned();
     ps.tsession.clear();
     ps.cur_rk.clear();
-    // The HUD's two lines: the program, and the channel it is on.
-    let title = if info.show_title.is_empty() { info.title.clone() } else { format!("{} \u{b7} {}", info.show_title, info.title) };
+    // The HUD's two lines: the program, and the channel it is on. An airing whose episode title is
+    // the show's own (a daily show's, seen on the TV as "Show · Show") names it once.
+    let title = if info.show_title.is_empty() || info.title.is_empty() || info.title.eq_ignore_ascii_case(&info.show_title) {
+        if info.show_title.is_empty() { info.title.clone() } else { info.show_title.clone() }
+    } else {
+        format!("{} \u{b7} {}", info.show_title, info.title)
+    };
     // SAFETY: both are the session's own fixed buffers, written with their own lengths.
     unsafe {
         set_c(ps.title.as_mut_ptr(), ps.title.len(), &title);
