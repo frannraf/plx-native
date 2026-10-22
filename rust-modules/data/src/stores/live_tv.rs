@@ -287,6 +287,7 @@ pub struct LiveTvStore {
     window: Option<(std::ops::Range<usize>, i64, i64)>,
     now: i64,
     utc_offset: i64,
+    offset_logged: bool,
     generation: u32,
 }
 
@@ -327,6 +328,7 @@ impl LiveTvStore {
             window: None,
             now: 0,
             utc_offset: 0,
+            offset_logged: false,
             generation: 0,
         }
     }
@@ -554,7 +556,14 @@ impl LiveTvStore {
             let minute = now - now.rem_euclid(60);
             if minute != self.now {
                 self.now = minute;
-                self.utc_offset = plx_platform::i18n::utc_offset_s(minute);
+                let offset = plx_platform::i18n::utc_offset_s(minute);
+                if offset != self.utc_offset || !self.offset_logged {
+                    // Once, and on a change: the guide's times are UTC plus this, and whether the
+                    // set's libc knows the viewer's zone is a device question the log answers.
+                    self.offset_logged = true;
+                    plx_base::eventlog::log(&format!("livetv: guide local time is UTC{:+}:{:02}", offset / 3_600, (offset.abs() % 3_600) / 60));
+                }
+                self.utc_offset = offset;
                 // A day that failed (a timeout, a busy server) is asked again once a minute while
                 // the page still shows it; nothing else would ever re-ask it.
                 if self.guide.has_failed() {

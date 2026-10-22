@@ -38,6 +38,7 @@
   "live_tv.recordings.empty": "Es sind keine Aufnahmen geplant.",
   "live_tv.recordings.loading": "Aufnahmen werden geladen …",
   "live_tv.recordings.failed": "Die Aufnahmen konnten nicht geladen werden.",
+  "live_tv.hud.live": "LIVE",
   "live_tv.rule.series": "Serie",
   "live_tv.rule.single": "Einzeln"
 }

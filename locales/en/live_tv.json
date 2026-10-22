@@ -172,6 +172,10 @@
     "value": "Recordings could not be loaded.",
     "description": "Recordings list read-out when reading the DVR's recordings failed."
   },
+  "live_tv.hud.live": {
+    "value": "LIVE",
+    "description": "Shown on the player's progress bar while watching a live TV channel, in place of the elapsed time."
+  },
   "live_tv.rule.series": {
     "value": "Series",
     "description": "Kind of a recording rule in the Recordings list: records every episode of a show."

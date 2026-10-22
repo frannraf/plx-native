@@ -38,6 +38,7 @@
   "live_tv.recordings.empty": "Nincs ütemezett felvétel.",
   "live_tv.recordings.loading": "Felvételek betöltése…",
   "live_tv.recordings.failed": "A felvételek nem tölthetők be.",
+  "live_tv.hud.live": "ÉLŐ",
   "live_tv.rule.series": "Sorozat",
   "live_tv.rule.single": "Egyszeri"
 }

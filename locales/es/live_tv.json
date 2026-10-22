@@ -38,6 +38,7 @@
   "live_tv.recordings.empty": "No hay nada programado para grabar.",
   "live_tv.recordings.loading": "Cargando grabaciones…",
   "live_tv.recordings.failed": "No se pudieron cargar las grabaciones.",
+  "live_tv.hud.live": "EN DIRECTO",
   "live_tv.rule.series": "Serie",
   "live_tv.rule.single": "Individual"
 }

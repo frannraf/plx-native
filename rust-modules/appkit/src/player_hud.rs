@@ -1668,6 +1668,9 @@ pub struct Playbar {
     /// ([`crate::scrub_preview::Motion::clock_grow`]). The two sizes are CROSSFADED on it
     /// ([`crate::scrub_preview::clock_faces`]); a size is never tweened.
     pub clock_grow: f32,
+    /// A live TV channel (`plx_media::route::is_live`): no duration, no position to scrub to. The
+    /// bar is drawn full, to the live edge, and the elapsed clock under the knob reads LIVE.
+    pub live: bool,
 }
 
 impl Playbar {
@@ -1709,6 +1712,7 @@ impl Playbar {
             mark: transport_mark(paused, busy, scrub >= 0, dispos, livepos, since_play_ms),
             now,
             clock_grow: 0.0,
+            live: plx_media::route::is_live(ps),
         }
     }
 }
@@ -1727,7 +1731,9 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     let dispos = bar.pos_ns;
     let dur = bar.dur_ns;
     let now = bar.now;
-    let frac = if dur > 0 {
+    let frac = if bar.live {
+        1.0
+    } else if dur > 0 {
         (dispos as f64 / dur as f64).clamp(0.0, 1.0)
     } else {
         0.0
@@ -1784,7 +1790,9 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     // line. It is a CROSSFADE of two ladder rungs (the resting CAPTION and the one above it), each
     // laid out at its own size, never a tweened size or a scaled texture; the extents the rest of
     // the line clears are the union of the faces drawn.
-    let elapsed = fmt_time(dispos, false);
+    // A live channel has no elapsed time worth reading: the clock's place says LIVE (and, at the
+    // bar's right end, covers the remaining clock, which the overlap rule below then hides).
+    let elapsed = if bar.live { plx_platform::i18n::msg::live_tv_hud_live().to_string() } else { fmt_time(dispos, false) };
     let (mut el_l, mut el_r) = (f32::INFINITY, f32::NEG_INFINITY);
     for (sz, face_a) in crate::scrub_preview::clock_faces(theme::size::CAPTION, bar.clock_grow).into_iter().flatten() {
         let ety = plx_gfx::text::baseline_y(sz, 1, theme::size::CAPTION, 1, ty);

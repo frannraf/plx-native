@@ -479,6 +479,7 @@ impl Transport {
                 mark: self.mark(paused, live_ns),
                 now: self.now_ms,
                 clock_grow: 0.0,
+                live: false,
             },
             measure,
         );

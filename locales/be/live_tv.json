@@ -38,6 +38,7 @@
   "live_tv.recordings.empty": "Нічога не запланавана для запісу.",
   "live_tv.recordings.loading": "Загрузка запісаў…",
   "live_tv.recordings.failed": "Не ўдалося загрузіць запісы.",
+  "live_tv.hud.live": "ЭФІР",
   "live_tv.rule.series": "Серыял",
   "live_tv.rule.single": "Адзінкавы"
 }
