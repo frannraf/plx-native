@@ -227,6 +227,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   create that file unless the owner asks for it in that same session** — with it, a debug build
   writes to the owner's real Watchlist. `.claude/hooks/watchlist-live-guard.py` refuses a command
   that would (`docs/watchlist.md`, "The live switch").
+  Live TV and DVR are writes too: a tune takes a household tuner, and creating, editing, moving or
+  deleting a recording rule or stopping a recording changes what the server records. A debug build
+  refuses them unless the server is the synthetic mock (`tests/mock_pms.py --livetv`) or
+  `plxnative-livetv-live` exists in the install's runtime root; the same hook refuses an agent
+  command that would create that file, and the same rule applies: **only when the owner asks for it
+  in that same session** (`docs/pms-api.md` §10).
 - Hold the TV lock around the device commands themselves and release as soon as the device work
   pauses. Do not hold a lease while building, reading screenshots or writing Markdown; other lanes
   queue behind it.

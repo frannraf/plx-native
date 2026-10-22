@@ -1484,6 +1484,138 @@ was captured).
 
 ---
 
+## 10. Live TV & DVR — guide, recording rules, live tune (DOCUMENTED ONLY, not called live)
+
+**Status.** No endpoint here has been called against a real server by this project: every one is a
+write to a household tuner or recording schedule, or reads that only matter beside them. The
+contract below is assembled from three sources that agree on the paths and mostly on the shapes,
+and is pinned by synthetic fixtures (`rust-modules/plex/src/plex/live_tv/fixtures.rs`) and by the
+mock (`tests/mock_pms.py --livetv`, `tests/mock_livetv.py`):
+
+- the bundled spec ([`plex-openapi.json`](plex-openapi.json), API 1.2.1+ for the EPG paths), which
+  documents every path but NOT the tune's real answer;
+- the observable protocol behaviour of the official Plex clients (paths, parameters and the order
+  of calls only; no client code is reused), which call these paths with `Accept: application/xml`;
+- maintained open-source clients (Plezy, GPL-3.0; Rivulet, PolyForm Noncommercial) that parse the
+  same answers as **JSON** — the form this app asks for.
+
+The Rust surface is `plex::live_tv` (`live_tv.rs`, `live_tv/parse.rs`). **Every write is gated in a
+debug build**: refused unless the server identifies as the synthetic mock (`-synthetic` version) or
+the owner armed `plxnative-livetv-live` (`live_tv::guard`; AGENTS.md). A release build always writes.
+
+**TRAP — object or array.** PMS serialises one child as an object on one answer and as an array of
+one on the next (`MediaSubscription`, `MediaGrabOperation`, `TranscodeSession`, `Conflicts`), and
+names the tuned item `Video` on one and `Metadata` on another. The parser reads every child as
+"object or array" and every scalar as "string, number or bool"; a strict DTO would lose a tune's
+subscription id to the first surprise.
+
+### 10.1 Providers — `GET /media/providers`
+
+A provider is Live TV when its `identifier` contains `tv.plex.providers.epg` (one per DVR, e.g.
+`tv.plex.providers.epg.cloud:12`). Clients do not key on `protocols="livetv"`.
+
+| field | notes |
+|---|---|
+| `identifier` | the path prefix of the lineup and grid endpoints |
+| `parentID` | **the DVR key** — the `{dvrId}` of the tune path. Absent: the provider cannot tune |
+| `Feature[type=grid]` | the provider serves the time grid |
+| `Feature[type=subscribe][flavor=record]` | its airings can be recorded |
+
+The spec's schema puts the provider fields on `MediaContainer`; its example (and servers) list
+`MediaContainer.MediaProvider[]`. Both are read.
+
+### 10.2 Lineup — `GET /{provider}/lineups/dvr/channels`
+
+`MediaContainer.Channel[]`: `id` (the channel identifier: the tune path's `{channel}` and an airing's
+`Media.channelIdentifier`), `gridKey` (what the grid takes), `vcn` (display number, string or
+number), `title`, `callSign`, `thumb`, `isHd` (bool or `"1"`). Read whole; optional `genre` filter.
+
+### 10.3 Guide grid — `GET /{provider}/grid?channelGridKey={gridKey}&date=YYYY-MM-DD`
+
+Both parameters are required. **`date` is a UTC calendar day**: one request answers one channel's
+programs overlapping that UTC day, so a window that crosses UTC midnight asks for two dates.
+`MediaContainer.Metadata[]`, one per program, with one `Media` per airing: `beginsAt`/`endsAt`
+(epoch seconds, number or string), `channelIdentifier`, `channelVcn`, `channelTitle`, `onAir`,
+`premiere`. Program fields: `ratingKey`, `key`, `guid` (what the record template takes),
+`grandparentGuid`, `type`, `title`, `grandparentTitle`, `parentIndex`/`index`, `year`, `summary`,
+`thumb`, and the recording marks `subscriptionID` (this program) and `grandparentSubscriptionID`
+(its series), `"0"` meaning none. An airing that spans UTC midnight comes back in both days.
+
+### 10.4 Recording rules — `/media/subscriptions`
+
+| request | notes |
+|---|---|
+| `GET /media/subscriptions` | `MediaSubscription[]` **in priority order** (earlier wins a tuner conflict). Optional `includeGrabs=1` nests each rule's `MediaGrabOperation[]`. 403 = the account may not use this DVR |
+| `GET /media/subscriptions/{id}` | one rule; for a live tune's id, the tune (§10.6) |
+| `GET /media/subscriptions/template?guid={guid}` | `SubscriptionTemplate > MediaSubscription[]`: one entry per choice ("This Episode", "All Episodes"; a movie has one), each with `type`, `selected`, `targetLibrarySectionID`, `Setting[]` and **`parameters`**, a pre-encoded query string (`hints[...]`, `params[...]`) |
+| `POST /media/subscriptions?…` | create. Query only, no body: `includeGrabs=1`, `targetLibrarySectionID`, `targetSectionLocationID` (only when the library has several locations), `type` (the choice's), one `prefs%5B{id}%5D={value}` per setting (hidden settings included, value-less ones left out), then **the choice's `parameters` appended verbatim**. Answers the new `MediaSubscription` (its `key` is the id). 409 = an identical rule exists |
+| `PUT /media/subscriptions/{id}?…` | edit: the create parameters without `type` and `parameters` |
+| `DELETE /media/subscriptions/{id}` | delete the rule and every grab it scheduled; 404 = already gone |
+| `PUT /media/subscriptions/{id}/move[?after={other}]` | priority: after `other`, or **to the top with no `after`**. Admin only |
+
+`Setting`: `id` (the `prefs[...]` key), `label`, `type` (`bool`/`int`/`text`), `default`, `value`
+(bools come back as `true`/`false` or `1`/`0`; send `1`/`0`), `hidden`, `advanced`, `enumValues`
+(`value:label|…`, labels percent-encoded).
+
+**A create can answer conflicts** (`MediaSubscription > MediaGrabOperation > Conflicts >
+MediaGrabOperation[]`): the rule EXISTS. "Prefer this" is `PUT …/{id}/move` with no `after`;
+"Cancel this" is `DELETE …/{id}`.
+
+### 10.5 Recording operations — `GET /media/subscriptions/scheduled`, `DELETE /media/grabbers/operations/{id}`
+
+`MediaContainer.MediaGrabOperation[]`: `id`, `key` (`/media/grabbers/operations/{id}`),
+`mediaSubscriptionID`, `status` (`inactive|scheduled|inprogress|complete|cancelled|error|postprocessing|paused`),
+`percent`, and the airing as `Metadata` (one object). `DELETE` on a grab's key cancels that one
+recording — stops it if it is in progress — and leaves its rule; the spec says it is how a conflict
+with a *rolling* (live viewer) subscription is resolved.
+
+### 10.6 The live tune — `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`
+
+`{dvr}` is the provider's `parentID`; `{channel}` is the lineup `id`, percent-encoded as ONE path
+segment. Inline-preview clients add `autoPreview=1`; a full-screen tune does not.
+
+**The answer clients receive is a rolling subscription, not the spec's bare `Metadata`:**
+
+```jsonc
+{"MediaContainer": {"MediaSubscription": [{
+  "key": "77",                                    // the tune's id: refresh and release use it
+  "MediaGrabOperation": [{
+    "Video": {                                    // or "Metadata"
+      "key": "/livetv/sessions/{uuid}",           // what the universal transcoder plays (path=)
+      "TranscodeSession": {"timeStamp": …, "minOffsetAvailable": …, "maxOffsetAvailable": …},
+      "Media": [{"uuid": "{uuid}", "beginsAt": …, "endsAt": …, "channelIdentifier": …,
+                 "Part": [{"Stream": [ /* the tuner's codecs, e.g. mpeg2video + ac3 */ ]}]}]},
+    "Conflicts": {"MediaGrabOperation": [ /* when every tuner is busy */ ]}}],
+  "Timeline": {"Video": [ /* the programs around now on this channel */ ]}}]}}
+```
+
+The spec's own example (`Metadata[]` with `live: true` and the `/livetv/sessions/{uuid}` key, no
+subscription) is read too, with no id to release. A failed tune is HTTP 500 ("Tuning failed") or a
+2xx container with `status` ≠ 0 and a `message`. **A conflicted tune may still carry the
+subscription key**; the caller releases it like any other.
+
+**Playing it.** Clients do not fetch `/livetv/sessions/{uuid}/{consumer}/index.m3u8` themselves:
+they send the tuned item's `key` through the ordinary universal transcoder —
+`GET /video/:/transcode/universal/decision?path={key}&protocol=hls…`, then `start.m3u8` with the same
+parameters — and play the HLS (MPEG-TS) it answers. Timeshift re-requests `start.m3u8` with
+`offset={seconds from TranscodeSession.timeStamp}` on the same session.
+
+**Keeping it alive.** `/:/timeline` reports carry the tuned item's `key`/`ratingKey` with
+`time=0&duration=0` (no resume point is recorded); clients report every ~10 s while playing. Each
+timeline answer's `TranscodeSession` and `CaptureBuffer.TranscodeSession` carry the moving capture
+window. When the program on air changes, clients re-read `GET /media/subscriptions/{id}` for the
+new program list; one official client also polls `GET /activities` every 30 s for a `grabber.grab`
+activity whose `Context` names this subscription with `conflicts=1`.
+
+**Releasing it.** In order: the stopped `/:/timeline` report, `/video/:/transcode/universal/stop`,
+then `DELETE /media/subscriptions/{id}` (404 = already released). Open-source clients stop after the
+first two and one reports PMS drops an unreported grab after ~300 s; this app does all three
+(`Client::live_release`), and the release is never refused by the write gate.
+
+**Not determined without a capture:** the exact JSON nesting on a given PMS build, whether a
+conflicted tune leaves a subscription behind, the units of `timeStamp` / the offsets (epoch seconds
+is what clients assume), and the live transcode playlist's window (growing vs sliding).
+
 ## Paging, observed
 
 Observed on PMS 1.43.4 with a small library, by read-only GETs. Only the endpoints in the table were

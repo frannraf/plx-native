@@ -19,6 +19,7 @@ guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
 
 T = "/tmp/com.beb.plxnative.debug/plxnative-watchlist-live"
+L = "/tmp/com.beb.plxnative.debug/plxnative-livetv-live"
 BLOCK, ALLOW = True, False
 CASES = [
     # --- must be blocked: every way of creating the file -------------------------
@@ -48,6 +49,18 @@ CASES = [
     (ALLOW, "git commit -m 'watchlist: the plxnative-watchlist-live switch'"),
     # --- the owner's prefix ------------------------------------------------------
     (ALLOW, f"PLX_WATCHLIST_LIVE_OWNER=1 tools/tv-ssh ssh tv \"touch {T}\""),
+    # --- the Live TV / DVR switch: the same rule, with its own prefix --------------
+    (BLOCK, f"touch {L}"),
+    (BLOCK, f"tools/tv-ssh ssh tv \"touch {L}\""),
+    (BLOCK, f"echo 1 > {L}"),
+    (BLOCK, "tools/tv-session.sh up --arm livetv-live"),
+    (BLOCK, f"python3 -c \"open('{L}', 'w').close()\""),
+    (ALLOW, f"ls -la {L}"),
+    (ALLOW, f"rm -f {L}"),
+    (ALLOW, "grep -rn plxnative-livetv-live rust-modules"),
+    (ALLOW, f"PLX_LIVETV_LIVE_OWNER=1 touch {L}"),
+    (BLOCK, f"PLX_WATCHLIST_LIVE_OWNER=1 touch {L}"),
+    (BLOCK, f"PLX_LIVETV_LIVE_OWNER=1 touch {T}"),
 ]
 
 

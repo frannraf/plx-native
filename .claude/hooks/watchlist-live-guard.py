@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: an agent may not turn on the owner's live Watchlist switch.
+"""PreToolUse guard: an agent may not turn on one of the owner's LIVE switches.
+
+Two switches, one rule. `plxnative-watchlist-live` (below) and `plxnative-livetv-live`: the second
+lets a `devtriggers` build send Live TV / DVR writes - tune a channel, create, edit, re-prioritise or
+delete a recording rule, stop a recording - to a REAL Plex Media Server instead of the synthetic mock
+(`rust-modules/plex/src/plex/live_tv.rs`, `guard::live_armed`). Each has its own owner prefix:
+`PLX_WATCHLIST_LIVE_OWNER=1` and `PLX_LIVETV_LIVE_OWNER=1`.
 
 `plxnative-watchlist-live` in a debug install's runtime root (on the television
 `/tmp/com.beb.plxnative.debug/`) lets a `devtriggers` build send Watchlist add/remove to the REAL
@@ -26,35 +32,51 @@ import json
 import re
 import sys
 
-NAME = re.compile(r"plxnative-watchlist-live\b")
-BYPASS = re.compile(r"\bPLX_WATCHLIST_LIVE_OWNER=1\b")
-# `--arm watchlist-live` / `--arm=watchlist-live[=…]` on tv-session.sh writes plxnative-<name>.
-ARM = re.compile(r"--arm(?:=|\s+)['\"]?watchlist-live\b")
+# The switches: bare name -> the owner's prefix that lets that one through.
+SWITCHES = {"watchlist-live": "PLX_WATCHLIST_LIVE_OWNER", "livetv-live": "PLX_LIVETV_LIVE_OWNER"}
 # Commands that write a file named among their arguments.
 WRITERS = re.compile(r"(?:^|[\s;&|('\"`])(?:touch|tee|cp|mv|install|ln|dd|rsync|scp|truncate)(?=\s)")
-# A redirection whose target is the trigger: `> …plxnative-watchlist-live`, `>>`, `>|`, `&>`.
-REDIRECT = re.compile(r"(?:\d?>>?|>\||&>)\s*['\"]?[^\s;&|'\"]*plxnative-watchlist-live\b")
-# A script that opens it for writing: python `open(…, 'w'|'a'|'x')`, `.write_text(`, `.touch(`.
-SCRIPTED = re.compile(r"open\([^)]*plxnative-watchlist-live[^)]*,\s*['\"][wax]|"
-                      r"plxnative-watchlist-live[^;\n]*\.(?:write_text|write_bytes|touch)\(")
 # Statement separators. A pipe stays inside the segment on purpose: `echo 1 | tee <path>`.
 SPLIT = re.compile(r"&&|\|\||;|\n")
 
 
-def creates(cmd):
-    """Does `cmd` create the live trigger? Returns the offending segment, or None."""
-    if BYPASS.search(cmd):
+def creates_switch(cmd, switch):
+    """Does `cmd` create `plxnative-<switch>`? Returns the offending segment, or None."""
+    if re.search(r"\b%s=1\b" % SWITCHES[switch], cmd):
         return None
-    if ARM.search(cmd):
-        return ARM.search(cmd).group(0)
-    if not NAME.search(cmd):
+    sw = re.escape(switch)
+    name = re.compile(r"plxnative-%s\b" % sw)
+    # `--arm <switch>` / `--arm=<switch>[=…]` on tv-session.sh writes plxnative-<switch>.
+    arm = re.compile(r"--arm(?:=|\s+)['\"]?%s\b" % sw)
+    # A redirection whose target is the trigger: `> …plxnative-<switch>`, `>>`, `>|`, `&>`.
+    redirect = re.compile(r"(?:\d?>>?|>\||&>)\s*['\"]?[^\s;&|'\"]*plxnative-%s\b" % sw)
+    # A script that opens it for writing: python `open(…, 'w'|'a'|'x')`, `.write_text(`, `.touch(`.
+    scripted = re.compile(r"open\([^)]*plxnative-%s[^)]*,\s*['\"][wax]|"
+                          r"plxnative-%s[^;\n]*\.(?:write_text|write_bytes|touch)\(" % (sw, sw))
+    if arm.search(cmd):
+        return arm.search(cmd).group(0)
+    if not name.search(cmd):
         return None
-    if REDIRECT.search(cmd) or SCRIPTED.search(cmd):
+    if redirect.search(cmd) or scripted.search(cmd):
         return cmd
     for seg in SPLIT.split(cmd):
-        if NAME.search(seg) and WRITERS.search(seg):
+        if name.search(seg) and WRITERS.search(seg):
             return seg.strip()
     return None
+
+
+def creates(cmd):
+    """Does `cmd` create any live switch? Returns the offending segment, or None."""
+    for switch in SWITCHES:
+        seg = creates_switch(cmd, switch)
+        if seg is not None:
+            return seg
+    return None
+
+
+def which(cmd):
+    """The first switch `cmd` would create, or None."""
+    return next((s for s in SWITCHES if creates_switch(cmd, s) is not None), None)
 
 
 def main():
@@ -72,6 +94,17 @@ def main():
     seg = creates(cmd)
     if seg is None:
         return 0
+    if which(cmd) == "livetv-live":
+        sys.stderr.write(
+            "BLOCKED: this command would turn on the owner's live Live TV / DVR switch "
+            "(plxnative-livetv-live).\n"
+            "  the command: %s\n\n"
+            "With that file present a debug build tunes channels and creates, edits and deletes DVR\n"
+            "recordings on the household's REAL Plex Media Server. AGENTS.md: no agent creates it unless\n"
+            "the owner asks for it in this same session. Test against the mock instead\n"
+            "(`tests/mock_pms.py --livetv`). If the owner did ask, prefix the command with\n"
+            "PLX_LIVETV_LIVE_OWNER=1.\n" % seg[:160])
+        return 2
     sys.stderr.write(
         "BLOCKED: this command would turn on the owner's live Watchlist switch "
         "(plxnative-watchlist-live).\n"

@@ -213,6 +213,12 @@ GET that would carry more than BYTES body bytes after exactly BYTES of them, wit
 drops it. Every later request for that part is served whole, so the client's ranged reopen at the
 byte it reached should be answered by an honest 206 and playback continue. Only media parts are
 cut (not `--transcode-fixture`, whose progressive body has no length to be cut below).
+`--livetv` (default off) adds the synthetic Live TV / DVR surface of `tests/mock_livetv.py`: an EPG
+provider with a channel lineup and a wall-clock guide, recording rules and operations that can be
+created, edited, re-prioritised and cancelled, and live tunes that serve a growing HLS stream
+(ffmpeg cuts its segments once into a cache). `--livetv-tuners N` (default 2) is how many tuners
+the DVR has; with all of them busy a tune or a new recording answers with conflicts. The app's
+debug-build Live TV write gate accepts this server because `/identity` says `-synthetic`.
 `--part-range-answers-200` (default off) answers a part GET whose `Range` starts past byte 0 with
 a plain 200 and the whole file, as a server (or proxy) that ignores Range does; a client that
 splices that in as the bytes at its offset corrupts the picture, so it must refuse it. Combine the
@@ -238,6 +244,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # demo_library.qr
+import mock_livetv  # noqa: E402  (the `--livetv` surface)
 import link_conditioner  # noqa: E402
 
 VERIFY_SHOW_RK = 900001
@@ -2375,6 +2382,8 @@ class MockPms:
         # `--decision-delay-ms N`: hold every transcode decision/start request this long before
         # answering, so a flight's PMS half is observably in flight. 0 answers at once.
         self.decision_delay_ms = 0
+        # `--livetv`: the Live TV / DVR surface (`mock_livetv.LiveTvFixture`), None when off.
+        self.livetv = None
         # Every request `handle()` routed, in arrival order: {"method","path","query","session"}.
         # Query keys naming a token are stripped, never just redacted — never send a real value.
         self.request_log = []
@@ -2671,6 +2680,11 @@ class MockPms:
                           and segs[3] == "subtitles"))
         if write_path and not (method in ("GET", "HEAD") and p.startswith("/library/parts/")):
             self.note_write(method, path, body)
+
+        if self.livetv is not None:
+            answered = self.livetv.handle(method, p, q, headers, self.note_write, u.query)
+            if answered is not None:
+                return answered
 
         # plex.tv's QR sign-in, for `plxnative-plextv` (see the module doc). Pending — the state
         # the sign-in screen is captured in — unless `--authorize-after N` links it on the Nth poll.
@@ -3456,7 +3470,7 @@ def serve(port, seed=1, host="127.0.0.1", verbose=False, movies=48, rail_fixture
           home_users=1, second_account=False, link=(), link_faults=(), shows=6, seasons=2, episodes=6,
           resume_fixture=False, media_next_episode=False, next_episode_remux=False,
           media_forced_subtitle=False, smart_collections=False,
-          caption_edge_cases=False):
+          caption_edge_cases=False, livetv=False, livetv_tuners=2):
     """Start a mock PMS in a daemon thread; returns (server, pms). Loopback only by default: the
     app on the simulator is on this machine, and a LAN-facing listener would be one more thing
     the outbound guard has to reason about. `catalog` serves the demo library instead of a seed.
@@ -3522,6 +3536,8 @@ def serve(port, seed=1, host="127.0.0.1", verbose=False, movies=48, rail_fixture
     pms.cut_part_after = cut_part_after
     pms.part_range_answers_200 = part_range_answers_200
     pms.decision_delay_ms = decision_delay_ms
+    if livetv:
+        pms.livetv = mock_livetv.LiveTvFixture(tuners=livetv_tuners)
     if authorize_after is None and plaintext_only_lan:
         authorize_after = 2
     pms.authorize_after = authorize_after
@@ -4405,6 +4421,12 @@ def main():
                          "on-deck episode (S12E14, part-way through, the newest Continue Watching "
                          "entry); 970002 has 3 seasons and no on-deck. Default off: every other "
                          "answer is byte-identical")
+    ap.add_argument("--livetv", action="store_true",
+                    help="serve the synthetic Live TV / DVR surface (tests/mock_livetv.py): guide, "
+                         "recording rules, live tunes with a growing HLS stream. Default off: every "
+                         "other answer is byte-identical")
+    ap.add_argument("--livetv-tuners", type=int, default=2, metavar="N",
+                    help="with --livetv: how many tuners the DVR has (default 2)")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -4445,6 +4467,8 @@ def main():
         ap.error("--home-users must be between 1 and 16")
     if a.authorize_after is not None and a.authorize_after < 1:
         ap.error("--authorize-after must be at least 1")
+    if a.livetv_tuners < 1:
+        ap.error("--livetv-tuners must be at least 1")
     if a.selftest:
         selftest()
         return
@@ -4471,7 +4495,8 @@ def main():
                          next_episode_remux=a.media_next_episode_remux,
                          media_forced_subtitle=a.media_forced_subtitle,
                          smart_collections=a.smart_collections,
-                         caption_edge_cases=a.caption_edge_cases)
+                         caption_edge_cases=a.caption_edge_cases,
+                         livetv=a.livetv, livetv_tuners=a.livetv_tuners)
     except ValueError as e:
         ap.error(str(e))
     what = f"catalog={a.catalog}" if a.catalog else f"seed={a.seed}"
