@@ -773,12 +773,11 @@ impl LiveTvScreen {
             x += ART_FADE_STRIP;
         }
         // The foot fades into the wash, in its colour where they meet.
-        let seg = r.w / ART_FALL_SEGS as f32;
         for j in 0..ART_FALL_SEGS {
-            let x = r.x + j as f32 * seg;
+            let (x, seg) = fall_segment(r.x, r.w, j);
             let c = self.wash.sample(Rect::FULL, x + seg * 0.5, r.y + r.h);
             let col = [c[0], c[1], c[2], 1.0];
-            p.rect(Rect::new(x, r.y + r.h - ART_FALL, seg + 0.5, ART_FALL), 0.0, theme::with_a(col, 0.0), col, 0.0);
+            p.rect(Rect::new(x, r.y + r.h - ART_FALL, seg, ART_FALL), 0.0, theme::with_a(col, 0.0), col, 0.0);
         }
     }
 
@@ -809,12 +808,11 @@ impl LiveTvScreen {
             p.rect(Rect::new(x, hole.y, MINI_FEATHER_STRIP, hole.h), 0.0, [top[0], top[1], top[2], a], [low[0], low[1], low[2], a], 0.0);
             x += MINI_FEATHER_STRIP;
         }
-        let seg = hole.w / ART_FALL_SEGS as f32;
         for j in 0..ART_FALL_SEGS {
-            let x = hole.x + j as f32 * seg;
+            let (x, seg) = fall_segment(hole.x, hole.w, j);
             let c = at(x + seg * 0.5, foot);
             let col = [c[0], c[1], c[2], 1.0];
-            p.rect(Rect::new(x, foot - MINI_FEATHER_B, seg + 0.5, MINI_FEATHER_B), 0.0, theme::with_a(col, 0.0), col, 0.0);
+            p.rect(Rect::new(x, foot - MINI_FEATHER_B, seg, MINI_FEATHER_B), 0.0, theme::with_a(col, 0.0), col, 0.0);
         }
     }
 
@@ -1122,6 +1120,13 @@ impl LiveTvScreen {
     fn draw_recs<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
         let panel_up = self.panel.is_some();
         let w = SCR_W - 2.0 * MARGIN_X;
+        // A row beside the corner picture stops short of it (seen on the TV: a full-width row ran on
+        // under the video, its fill showing through the feather).
+        let corner = plx_media::player::video_window_is_mini().then(plx_media::player::video_window);
+        let row_w = |y: f32| match corner {
+            Some([cx, cy, _, ch]) if y < (cy + ch) as f32 => w.min(cx as f32 - CORNER_GAP - MARGIN_X),
+            _ => w,
+        };
         for i in self.rec_top..self.recs.len() {
             let y = model::rec_y(&self.recs, self.rec_top, i);
             if y + geom::REC_H > geom::RECS_BOTTOM {
@@ -1139,7 +1144,7 @@ impl LiveTvScreen {
                         .draw(p, Rect::new(MARGIN_X, y - geom::REC_HEADING_H, w, geom::REC_HEADING_H));
                 }
             }
-            let rect = Rect::new(MARGIN_X, y, w, geom::REC_H);
+            let rect = Rect::new(MARGIN_X, y, row_w(y), geom::REC_H);
             let elem = model::REC_BASE + i as u32;
             let on = !panel_up && self.focused(f, elem);
             let (title, sub, mark) = match &self.recs[i] {
@@ -1315,9 +1320,19 @@ const MINI_FEATHER_B: f32 = 140.0;
 const MINI_FEATHER_STRIP: f32 = 2.0;
 /// The narrowest room an airing cell writes its title and times in.
 const CELL_TEXT_MIN_W: f32 = 72.0;
+/// The room a Recordings row leaves before the corner picture.
+const CORNER_GAP: f32 = 24.0;
 /// The backdrop's foot: how tall its fade into the wash is, in how many colour samples across.
 const ART_FALL: f32 = 200.0;
 const ART_FALL_SEGS: usize = 12;
+
+/// Segment `j` of the [`ART_FALL_SEGS`] a fall is drawn in across `x..x + w`: whole pixels, edge to
+/// edge. The half-pixel overlap they had blended its column twice, a dark line between every two
+/// (seen on the TV over the corner picture's foot).
+fn fall_segment(x: f32, w: f32, j: usize) -> (f32, f32) {
+    let edge = |k: usize| (x + w * k as f32 / ART_FALL_SEGS as f32 + 0.5) as i32 as f32;
+    (edge(j), edge(j + 1) - edge(j))
+}
 /// The time left of an airing on now: the pill's ring, the ruler's now mark.
 const LEFT_RING: [f32; 4] = [0.976, 0.659, 0.149, 1.0];
 const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -1328,8 +1343,9 @@ const POSTER_REQ: (i32, i32) = (112, 168);
 const LOGO_REQ: (i32, i32) = (240, 112);
 /// The backdrop's left fade: how wide.
 const ART_FADE_W: f32 = 620.0;
-/// One strip of the art's left fade, in whole pixels.
-const ART_FADE_STRIP: f32 = 10.0;
+/// One strip of the art's left fade, in whole pixels: 155 of them, no step over 1.3% (10 px strips
+/// stepped 3%, faint bars on the TV).
+const ART_FADE_STRIP: f32 = 4.0;
 /// A cell this wide shows its program's art; this wide, its episode title beside its times.
 const POSTER_MIN_CELL_W: f32 = 300.0;
 const EPISODE_MIN_CELL_W: f32 = 560.0;
@@ -1805,6 +1821,18 @@ mod tests {
         let plex = Channel { vcn: "000".into(), call_sign: "CHANPRS".into(), title: "A Channel".into(), part_key: "/library/parts/x.m3u8".into(), ..Channel::default() };
         assert_eq!((plex.number(), plex.station(), channel_words(&plex).as_str()), ("", "A Channel", "A Channel"));
         assert_eq!(Channel { vcn: "10.0".into(), ..Channel::default() }.number(), "10.0");
+    }
+
+    #[test]
+    fn a_fall_is_cut_in_whole_pixel_segments_edge_to_edge() {
+        let mut right = 1038.0;
+        for j in 0..ART_FALL_SEGS {
+            let (x, w) = fall_segment(1038.0, 882.0, j);
+            assert_eq!(x, right, "segment {j} starts where the last ended");
+            assert_eq!(x, x as i32 as f32, "on a whole pixel");
+            right = x + w;
+        }
+        assert_eq!(right, 1920.0, "the last ends at the edge");
     }
 
     #[test]
