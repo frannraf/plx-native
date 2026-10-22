@@ -494,3 +494,56 @@ fn a_plex_tab_shows_its_own_lineup_and_the_dvr_comes_back_from_aside() {
     let shown = format!("{:?}", CloudAuth { client_id: "c".into(), credential: "secret".into() });
     assert!(!shown.contains("secret"), "the credential never prints: {shown}");
 }
+
+/// A DVR with no tuner to spare answers the next tune "busy" until every tuner it handed out is
+/// back: the store says while one is still coming (a tune on its way, a superseded one included,
+/// or a release owed), so the application can hold its next Watch until it is.
+#[test]
+fn the_store_says_while_a_tuner_is_still_coming_back() {
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    assert!(!s.tuners_settling());
+    assert!(s.tune(1, None));
+    s.pump();
+    let (serial, session, post) = tune_job(script.take());
+    assert!(s.tuners_settling(), "a tune on its way holds a tuner");
+    s.cancel_tune();
+    assert!(s.tuners_settling(), "superseded, it still lands on a tuner");
+    post.post(Landing::Tuned { serial, result: Ok(tuned("77", &session)) });
+    s.pump();
+    assert_eq!(releases(&script.take()), vec!["77".to_string()], "the unwanted tune goes back");
+    assert!(!s.tuners_settling(), "the release is under way (a real runner counts it running)");
+
+    assert!(s.tune(2, None));
+    s.pump();
+    let (serial, _, post) = tune_job(script.take());
+    post.post(Landing::Tuned { serial, result: Err(LiveError::Busy) });
+    s.pump();
+    assert!(s.tune_failed() && !s.tuners_settling());
+    s.clear_tune_failure();
+    assert!(!s.tune_failed());
+}
+
+/// OK pressed twice on Record before the first answer lands sends one write, not a duplicate rule;
+/// once it has landed the same press is a new write again.
+#[test]
+fn a_repeated_dvr_change_is_sent_once_while_the_first_is_on_its_way() {
+    let script = Script::default();
+    let mut s = ready(&script, 2);
+    let w = Write::Record { airing: airing(0, 9_000, "g", "show"), kind: RecordKind::This };
+    s.write(w.clone());
+    s.write(w.clone());
+    s.pump();
+    let writes: Vec<_> = script.take().into_iter().filter(|(j, _)| matches!(j, Job::Write(_))).collect();
+    assert_eq!(writes.len(), 1);
+    s.write(w.clone());
+    s.pump();
+    assert!(!script.take().iter().any(|(j, _)| matches!(j, Job::Write(_))), "still running: not sent again");
+    let (_, post) = writes.into_iter().next().unwrap();
+    post.post(Landing::Write { write: w.clone(), result: Ok(WriteDone::default()) });
+    s.pump();
+    script.take();
+    s.write(w);
+    s.pump();
+    assert!(script.take().iter().any(|(j, _)| matches!(j, Job::Write(_))), "landed: a new press is a new write");
+}

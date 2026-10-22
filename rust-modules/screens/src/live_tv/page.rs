@@ -19,7 +19,7 @@ use std::ffi::CString;
 use plx_data::live_tv::{Availability, Phase, Source, TunePhase, WriteOp};
 use plx_data::stores::live_tv::Write;
 use plx_machine::machine::{
-    Canon, Cx, Delivery, Edge, Effects, Enter, EntryId, FocusKey, FocusTarget, Fx, GroupId, Handled, InputEvent,
+    By, Canon, Cx, Delivery, Edge, Effects, Enter, EntryId, FocusKey, FocusTarget, Fx, GroupId, Handled, InputEvent,
     InputKind, Key, LogicalState, Machine,
 };
 use plx_machine::present::Provenance;
@@ -35,7 +35,7 @@ use plx_ui::text_view::TextView;
 use plx_ui::widgets::{resolve_tex_wh_on, AmbientWash, Button, ControlGround};
 use plx_ui::{theme, Crop, Env, Painter, Rect, View};
 
-use super::model::{self, geom, Action, Frame, LiveTvView, Panel, RecEntry, Target, Want};
+use super::model::{self, geom, Action, Frame, LiveTvView, Panel, RecEntry, RecGroup, Target, Want};
 use crate::registry::{AppFx, ContentLike, HomeTab};
 
 /// The page's content: the guide's cells, or the Recordings list's rows (one group, by mode).
@@ -87,6 +87,8 @@ enum Readout {
     Unavailable,
     Failed,
     NoChannels,
+    /// A Plex Channels category with no channels in it.
+    NoTabChannels,
     RecsLoading,
     RecsFailed,
     RecsEmpty,
@@ -200,11 +202,8 @@ impl LiveTvScreen {
         self.view = view;
         // What landed can move the focused element (a heading added above a Recordings row, an
         // airing filled in): keep it in view.
-        if let Some(elem) = self.focus {
-            if let Some(i) = model::rec_of(elem) {
-                self.rec_top = model::rec_follow(&self.recs, self.rec_top, i);
-            }
-        }
+        let focus = self.focus.and_then(model::rec_of).unwrap_or(self.rec_top);
+        self.rec_top = model::rec_settle(&self.recs, self.rec_top, focus);
         plx_machine::idle::invalidate();
     }
 
@@ -247,18 +246,24 @@ impl LiveTvScreen {
             Availability::None => return Some(Readout::Unavailable),
             Availability::Available => {}
         }
+        // The Recordings are the server's, whatever guide tab is selected (its lineup may be
+        // loading, failed or empty, and the tab row is not shown here to change it).
+        if self.mode == Mode::Recordings {
+            if self.recs.is_empty() {
+                return Some(match &s.dvr_phase {
+                    Phase::Failed(_) => Readout::RecsFailed,
+                    Phase::Ready => Readout::RecsEmpty,
+                    _ => Readout::RecsLoading,
+                });
+            }
+            return None;
+        }
         match &s.channels_phase {
             Phase::Failed(_) => return Some(Readout::Failed),
             Phase::Idle | Phase::Loading => return Some(Readout::Loading),
+            Phase::Ready if s.channels.is_empty() && s.source.is_cloud() => return Some(Readout::NoTabChannels),
             Phase::Ready if s.channels.is_empty() => return Some(Readout::NoChannels),
             Phase::Ready => {}
-        }
-        if self.mode == Mode::Recordings && self.recs.is_empty() {
-            return Some(match &s.dvr_phase {
-                Phase::Failed(_) => Readout::RecsFailed,
-                Phase::Ready => Readout::RecsEmpty,
-                _ => Readout::RecsLoading,
-            });
         }
         if self.mode == Mode::Guide && self.frame.base == 0 {
             return Some(Readout::Loading);
@@ -359,6 +364,9 @@ impl LiveTvScreen {
 
     /// A non-strip element activated (OK, or a pointer press).
     fn activate<H: ContentLike>(&mut self, elem: u32, fx: &mut Effects<'_, H>) -> Handled {
+        if self.panel.is_some() && model::action_of(elem).is_none() {
+            return Handled::Yes;
+        }
         if elem >= plx_ui::dispatch::STRIP_BASE {
             return match Self::strip_press(elem) {
                 Some(Some(out)) => {
@@ -401,6 +409,10 @@ impl LiveTvScreen {
                         if self.view.snap.can_watch() && self.frame.now > 0 && airing.airs_at(self.frame.now) {
                             let airing = airing.clone();
                             self.route(LiveTvOut::Watch { row, airing: Some(airing) }, fx);
+                        } else if self.view.snap.can_watch() && self.frame.now > 0 && airing.ends_at <= self.frame.now {
+                            // one that already ended (still drawn at the window's left): nothing to
+                            // record, so OK watches its channel, on now
+                            self.route(LiveTvOut::Watch { row, airing: None }, fx);
                         } else if self.view.snap.source.is_cloud() {
                             // a Plex channel's later program: nothing to record it with
                         } else {
@@ -410,7 +422,7 @@ impl LiveTvScreen {
                     }
                 } else if let Some(i) = model::rec_of(elem) {
                     let target = match self.recs.get(i) {
-                        Some(RecEntry::Grab(g)) => Target::Grab(g.clone()),
+                        Some(RecEntry::Grab(g, _)) => Target::Grab(g.clone()),
                         Some(RecEntry::Rule(s)) => Target::Rule(s.clone()),
                         None => return Handled::No,
                     };
@@ -466,13 +478,21 @@ impl LiveTvScreen {
     }
 
     /// Focus landed on `elem`: scroll it into view.
-    fn follow(&mut self, elem: u32) {
+    /// Focus moved to `elem`: the hero follows it, and (`scroll`) the guide's window or the
+    /// Recordings list moves to keep it in view. A pointer's focus never scrolls: what it points at
+    /// is on screen already, and moving the guide under a resting Magic Remote put a new program
+    /// under it, which scrolled again (seen in review: the window ran away an hour a time).
+    fn follow(&mut self, elem: u32, scroll: bool) {
         if self.focus == Some(elem) {
             return;
         }
         self.focus = Some(elem);
         if model::cell_of(elem).is_some() {
             self.last_cell = Some(elem);
+        }
+        if !scroll {
+            plx_machine::idle::invalidate();
+            return;
         }
         if model::cell_of(elem).is_some() {
             self.frame = model::follow(&self.view, &self.frame, elem);
@@ -484,7 +504,7 @@ impl LiveTvScreen {
 
     fn tick<H: ContentLike>(&mut self, ms: u32, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
         if let Some(elem) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem) {
-            self.follow(elem);
+            self.follow(elem, true);
         }
         let dt = self.last_tick.map_or(0.0, |t| ms.wrapping_sub(t).min(100) as f32 / 1_000.0);
         self.last_tick = Some(ms);
@@ -593,7 +613,8 @@ impl LiveTvScreen {
         let sources = model::tab_sources(&self.view.snap);
         let rects = self.tab_rects(f.measure);
         let scroll = self.tab_scroll.pos;
-        let clip = p.clipped(Rect::new(MARGIN_X - TAB_PAD, geom::TABS_Y - 8.0, SCR_W - 2.0 * MARGIN_X + 2.0 * TAB_PAD, geom::TABS_H + 20.0));
+        let shown = Rect::new(MARGIN_X - TAB_PAD, geom::TABS_Y - 8.0, SCR_W - 2.0 * MARGIN_X + 2.0 * TAB_PAD, geom::TABS_H + 20.0);
+        let clip = p.clipped(shown);
         for (i, (source, at)) in sources.iter().zip(&rects).enumerate() {
             let r = Rect::new(at.x - scroll, at.y, at.w, at.h);
             let g = self.tab_grow.get(i).map_or(0.0, |s| s.pos.clamp(0.0, 1.0));
@@ -612,7 +633,12 @@ impl LiveTvScreen {
             if i == 1 {
                 clip.rrect(Rect::new(r.x + r.w + TAB_SPLIT * 0.5 - 1.0, r.y + 12.0, 2.0, r.h - 24.0), 1.0, 1.0, theme::TEXT_SEPARATOR);
             }
-            f.stop(p, stop(self.key(model::TAB_BASE + i as u32), r));
+            // A tab scrolled out of the row catches no pointer (one in the gutter did, and pulled
+            // the row along under it); behind an open panel none does.
+            let hit = r.intersect(shown);
+            if self.panel.is_none() && hit.w > 1.0 && hit.h > 1.0 {
+                f.stop(p, stop(self.key(model::TAB_BASE + i as u32), hit));
+            }
         }
     }
 
@@ -634,21 +660,34 @@ impl LiveTvScreen {
             if elem == self.mode_pill() {
                 p.rrect(Rect::new(rect.cx() - 28.0, rect.y + rect.h + 8.0, 56.0, 4.0), 2.0, 2.0, theme::TEXT_PRIMARY);
             }
-            f.stop(p, stop(self.key(elem), rect));
+            if self.panel.is_none() {
+                f.stop(p, stop(self.key(elem), rect));
+            }
         }
         // the line at the right of the header: a tune on its way, else the last notice
         let line = match &self.view.snap.tune {
             TunePhase::Tuning { channel } => Some(msg::live_tv_tuning(channel)),
             _ => self.notice.as_ref().map(|(t, _)| t.clone()),
         };
+        // In a dark pill beside the header's, so it reads over bright art, and short of the corner
+        // picture when one plays there (it was drawn straight over the video).
         if let Some(line) = line {
-            let x = head_rect(1).x + geom::PILL_W + theme::space::LG;
-            let w = SCR_W - MARGIN_X - x;
-            TextView::new(&line, theme::size::BODY, theme::TEXT_PRIMARY)
-                .with_measure(f.measure)
-                .max_lines(1)
-                .h(HAlign::Right)
-                .draw(p, Rect::new(x, geom::HEAD_Y + (geom::HEAD_H - theme::size::BODY as f32) * 0.5, w, 0.0));
+            let pills = head_rect(1);
+            let x = pills.x + geom::PILL_W + theme::space::LG;
+            let right = if plx_media::player::video_window_is_mini() {
+                plx_media::player::video_window()[0] as f32 - CORNER_GAP
+            } else {
+                SCR_W - MARGIN_X
+            };
+            let tw = f.measure.width_str(&line, theme::size::BODY, false).min(right - x - 48.0);
+            if tw > 24.0 {
+                let pill = Rect::new(x, pills.y, tw + 48.0, pills.h);
+                p.rrect(pill, pill.h * 0.5, pill.h * 0.5, theme::with_a(INK_BLACK, 0.6));
+                TextView::new(&line, theme::size::BODY, theme::TEXT_PRIMARY)
+                    .with_measure(f.measure)
+                    .max_lines(1)
+                    .draw(p, Rect::new(pill.x + 24.0, pill.y + (pill.h - theme::size::BODY as f32) * 0.5 - 4.0, tw, 0.0));
+            }
         }
     }
 
@@ -662,6 +701,7 @@ impl LiveTvScreen {
             Readout::Unavailable => msg::live_tv_state_unavailable(),
             Readout::Failed => msg::live_tv_state_failed(),
             Readout::NoChannels => msg::live_tv_state_no_channels(),
+            Readout::NoTabChannels => msg::live_tv_state_no_tab_channels(),
             Readout::RecsLoading => {
                 plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, "livetv-recordings");
                 msg::live_tv_recordings_loading()
@@ -680,7 +720,9 @@ impl LiveTvScreen {
                     .ground(ControlGround::Keyed)
                     .draw(&Env::inert(), p);
             }
-            f.stop(p, stop(self.key(model::RETRY), rect));
+            if self.panel.is_none() {
+                f.stop(p, stop(self.key(model::RETRY), rect));
+            }
         }
     }
 
@@ -696,8 +738,14 @@ impl LiveTvScreen {
         }
     }
 
+    /// A time of day for instant `t`, at the offset in force then (an airing past a daylight-saving
+    /// change reads its own hour, as the player's bar does), else the guide's.
     fn time_of(&self, t: i64) -> String {
-        let local = (t + self.view.snap.utc_offset).rem_euclid(86_400);
+        let offset = match plx_platform::i18n::utc_offset_s(t) {
+            0 => self.view.snap.utc_offset,
+            off => off,
+        };
+        let local = (t + offset).rem_euclid(86_400);
         plx_platform::i18n::current().time_of_day((local / 3_600) as u8, ((local % 3_600) / 60) as u8)
     }
 
@@ -999,7 +1047,9 @@ impl LiveTvScreen {
                 if !r.airings.is_empty() {
                     continue;
                 }
-                f.stop(p, stop(self.key(elem), rect));
+                if !panel_up {
+                    f.stop(p, stop(self.key(elem), rect));
+                }
                 continue;
             }
             for a in shown {
@@ -1008,7 +1058,9 @@ impl LiveTvScreen {
                 let on = !panel_up && self.focused(f, elem);
                 let rec = a.is_recording_scheduled() || model::grab_for(&self.view.snap, a).is_some();
                 self.draw_airing_cell(f, p, rect, a, on, rec);
-                f.stop(p, stop(self.key(elem), rect));
+                if !panel_up {
+                    f.stop(p, stop(self.key(elem), rect));
+                }
             }
         }
         // now, on the ruler
@@ -1127,92 +1179,167 @@ impl LiveTvScreen {
             Some([cx, cy, _, ch]) if y < (cy + ch) as f32 => w.min(cx as f32 - CORNER_GAP - MARGIN_X),
             _ => w,
         };
+        let heading = |p: Painter, words: &str, y: f32| {
+            if let Ok(c) = CString::new(words) {
+                Label::new(c.as_ptr(), theme::size::LABEL, theme::TEXT_TERTIARY)
+                    .bold()
+                    .v(VAlign::Middle)
+                    .draw(p, Rect::new(MARGIN_X, y, w, geom::REC_HEADING_H));
+            }
+        };
+        // Rules but nothing scheduled: say so, and how to schedule something, above the rules.
+        if self.rec_top == 0 && model::rec_note(&self.recs) {
+            heading(p, msg::live_tv_recordings_upcoming(), geom::RECS_Y);
+            let note = Rect::new(MARGIN_X, geom::RECS_Y + geom::REC_HEADING_H, row_w(geom::RECS_Y), geom::REC_NOTE_H - 12.0);
+            p.rrect(note, 12.0, 12.0, theme::with_a(theme::TEXT_PRIMARY, 0.04));
+            TextView::new(msg::live_tv_recordings_none_scheduled(), theme::size::CAPTION, theme::TEXT_SECONDARY)
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(note.x + 20.0, note.y + (note.h - f.measure.line_h(theme::size::CAPTION)) * 0.5, note.w - 40.0, 0.0));
+        }
+        let today = model::local_day(self.view.snap.now, self.view.snap.utc_offset);
+        let first_rule = self.recs.iter().position(|e| matches!(e, RecEntry::Rule(_))).unwrap_or(0);
         for i in self.rec_top..self.recs.len() {
             let y = model::rec_y(&self.recs, self.rec_top, i);
             if y + geom::REC_H > geom::RECS_BOTTOM {
                 break;
             }
             if model::rec_heads(&self.recs, i) {
-                let heading = match self.recs[i] {
-                    RecEntry::Grab(_) => msg::live_tv_recordings_upcoming(),
-                    RecEntry::Rule(_) => msg::live_tv_recordings_rules(),
+                let words = match &self.recs[i] {
+                    RecEntry::Grab(_, RecGroup::Now) => msg::live_tv_recordings_now().to_string(),
+                    RecEntry::Grab(_, RecGroup::Day(d)) if *d <= today => msg::live_tv_recordings_today().to_string(),
+                    RecEntry::Grab(_, RecGroup::Day(d)) if *d == today + 1 => msg::live_tv_recordings_tomorrow().to_string(),
+                    RecEntry::Grab(_, RecGroup::Day(d)) => self.date_words(*d),
+                    RecEntry::Rule(_) => msg::live_tv_recordings_rules().to_string(),
                 };
-                if let Ok(c) = CString::new(heading) {
-                    Label::new(c.as_ptr(), theme::size::LABEL, theme::TEXT_TERTIARY)
-                        .bold()
-                        .v(VAlign::Middle)
-                        .draw(p, Rect::new(MARGIN_X, y - geom::REC_HEADING_H, w, geom::REC_HEADING_H));
-                }
+                heading(p, &words, y - geom::REC_HEADING_H);
             }
             let rect = Rect::new(MARGIN_X, y, row_w(y), geom::REC_H);
             let elem = model::REC_BASE + i as u32;
             let on = !panel_up && self.focused(f, elem);
-            let (title, sub, mark) = match &self.recs[i] {
-                RecEntry::Grab(g) => {
-                    let a = &g.airing;
-                    let title = if a.show_title.is_empty() { a.title.clone() } else { format!("{} \u{2014} {}", a.show_title, a.title) };
-                    let mut sub = vec![format!("{} {} \u{2013} {}", self.day_of(a.begins_at), self.time_of(a.begins_at), self.time_of(a.ends_at))];
-                    // the channel as the guide names it, else as the recording does
-                    match self.view.snap.channels.iter().find(|c| !a.channel_identifier.is_empty() && c.identifier == a.channel_identifier) {
-                        Some(ch) => sub.push(format!("{} {}", ch.vcn, ch.label()).trim().to_string()),
-                        None if !a.channel_title.is_empty() || !a.channel_vcn.is_empty() => {
-                            sub.push(format!("{} {}", a.channel_vcn, a.channel_title).trim().to_string())
-                        }
-                        None => {}
-                    }
-                    let mark = if g.status.is_recording() {
-                        Some(msg::live_tv_badge_recording())
-                    } else if g.status == GrabStatus::Error {
-                        Some(msg::live_tv_badge_failed())
-                    } else {
-                        Some(msg::live_tv_badge_scheduled())
-                    };
-                    (title, sub.join(" \u{b7} "), mark)
-                }
-                RecEntry::Rule(s) => {
-                    let title = [&s.hint.show_title, &s.hint.title, &s.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_default();
-                    let kind = if s.kind == 2 { msg::live_tv_rule_series() } else { msg::live_tv_rule_single() };
-                    let mut sub = vec![kind.to_string()];
-                    if !s.section_title.is_empty() {
-                        sub.push(s.section_title.clone());
-                    }
-                    (title, sub.join(" \u{b7} "), None)
-                }
-            };
             let (fill, ink, ink2) = if on {
                 (theme::ACCENT, theme::ACCENT_INK, theme::ACCENT_INK)
             } else {
                 (theme::with_a(theme::TEXT_PRIMARY, 0.07), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
             };
             p.rrect(rect, 12.0, 12.0, fill);
-            let mark_w = if mark.is_some() { 300.0 } else { 0.0 };
+            // the program's (a rule's show's) poster on the left
+            let poster = match &self.recs[i] {
+                RecEntry::Grab(g, _) => g.airing.poster.as_str(),
+                RecEntry::Rule(s) => s.hint.thumb.as_str(),
+            };
+            let pr = Rect::new(rect.x + 8.0, rect.y + 6.0, geom::REC_POSTER_W, geom::REC_POSTER_H);
+            self.draw_poster(p, poster, pr);
+            let mut tx = pr.x + pr.w + 22.0;
+            // a rule's place in the priority order, as the server ranks them
+            if let RecEntry::Rule(_) = &self.recs[i] {
+                let rank = (i + 1).saturating_sub(first_rule).to_string();
+                TextView::new(&rank, theme::size::BODY, ink2)
+                    .bold()
+                    .with_measure(f.measure)
+                    .max_lines(1)
+                    .draw(p, Rect::new(tx, rect.y + (rect.h - theme::size::BODY as f32) * 0.5 - 6.0, 48.0, 0.0));
+                tx += 52.0;
+            }
+            let (title, sub, mark) = self.rec_words(&self.recs[i]);
+            let mark_w = if mark.is_some() { 260.0 } else { 0.0 };
+            let tw = rect.x + rect.w - 24.0 - mark_w - tx;
             TextView::new(&title, theme::size::BODY, ink)
                 .bold()
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(rect.x + 20.0, rect.y + 8.0, rect.w - 40.0 - mark_w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 16.0, tw, 0.0));
             TextView::new(&sub, theme::size::CAPTION, ink2)
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(rect.x + 20.0, rect.y + 44.0, rect.w - 40.0 - mark_w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 56.0, tw, 0.0));
             if let Some(mark) = mark {
+                let recording = matches!(&self.recs[i], RecEntry::Grab(g, _) if g.status.is_recording());
+                let failed = matches!(&self.recs[i], RecEntry::Grab(g, _) if g.status == GrabStatus::Error);
+                let col = if on { ink } else if recording || failed { theme::DANGER } else { ink2 };
+                let mr = Rect::new(rect.x + rect.w - 24.0 - mark_w, rect.y, mark_w, rect.h);
                 if let Ok(c) = CString::new(mark) {
-                    let col = if on { ink } else if matches!(&self.recs[i], RecEntry::Grab(g) if g.status.is_recording()) { theme::DANGER } else { ink2 };
-                    Label::new(c.as_ptr(), theme::size::LABEL, col)
-                        .h(HAlign::Right)
-                        .draw(p, Rect::new(rect.x + rect.w - 20.0 - mark_w, rect.y, mark_w, rect.h));
+                    Label::new(c.as_ptr(), theme::size::LABEL, col).h(HAlign::Right).v(VAlign::Middle).draw(p, mr);
+                }
+                if recording {
+                    // the red dot a recording wears in the guide, before its word
+                    let lw = f.measure.width_str(mark, theme::size::LABEL, false);
+                    let dot = Rect::new(mr.x + mr.w - lw - 26.0, rect.y + rect.h * 0.5 - 7.0, 14.0, 14.0);
+                    p.rrect(dot, 7.0, 7.0, if on { ink } else { theme::DANGER });
                 }
             }
-            f.stop(p, stop(self.key(elem), rect));
+            if !panel_up {
+                f.stop(p, stop(self.key(elem), rect));
+            }
         }
     }
 
-    /// "Today"-free day label: the local weekday and date as numbers (`22/10`), so no word needs
-    /// translating; the time beside it carries the rest.
-    fn day_of(&self, t: i64) -> String {
-        let days = (t + self.view.snap.utc_offset).div_euclid(86_400);
-        let (_, m, d) = civil(days);
-        format!("{d}/{m}")
+    /// A Recordings row's words: its title, the line under it, and the state it wears on the right.
+    fn rec_words(&self, entry: &RecEntry) -> (String, String, Option<&'static str>) {
+        match entry {
+            RecEntry::Grab(g, _) => {
+                let a = &g.airing;
+                let title = if a.show_title.is_empty() { a.title.clone() } else { a.show_title.clone() };
+                let mut sub = vec![format!("{} \u{2013} {}", self.time_of(a.begins_at), self.time_of(a.ends_at))];
+                // the channel as the guide names it, else as the recording does
+                match self.view.snap.channels.iter().find(|c| !a.channel_identifier.is_empty() && c.identifier == a.channel_identifier) {
+                    Some(ch) => sub.push(ch.words()),
+                    None if !a.channel_title.is_empty() || !a.channel_vcn.is_empty() => {
+                        let station = station_id(&a.channel_title);
+                        sub.push(format!("{} {station}", a.channel_vcn).trim().to_string())
+                    }
+                    None => {}
+                }
+                if let Some(ep) = episode_words(a.season, a.episode) {
+                    sub.push(ep);
+                }
+                if !a.show_title.is_empty() && !a.title.is_empty() && a.title != a.show_title {
+                    sub.push(a.title.clone());
+                }
+                let mark = if g.status.is_recording() {
+                    msg::live_tv_badge_recording()
+                } else if g.status == GrabStatus::Error {
+                    msg::live_tv_badge_failed()
+                } else {
+                    msg::live_tv_badge_scheduled()
+                };
+                (title, sub.join(" \u{b7} "), Some(mark))
+            }
+            RecEntry::Rule(s) => {
+                let title = [&s.hint.show_title, &s.hint.title, &s.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_default();
+                let kind = if s.kind == 2 { msg::live_tv_rule_series() } else { msg::live_tv_rule_single() };
+                let mut sub = vec![kind.to_string()];
+                if !s.section_title.is_empty() {
+                    sub.push(s.section_title.clone());
+                }
+                (title, sub.join(" \u{b7} "), None)
+            }
+        }
+    }
+
+    /// A program's poster in `r`, through the server's photo transcoder; a quiet tile while it loads
+    /// or when there is none.
+    fn draw_poster(&self, p: Painter, path: &str, r: Rect) {
+        if let (Some(srv), false) = (self.srv(), path.is_empty()) {
+            let (tex, tw, th) = resolve_tex_wh_on(srv, path, POSTER_REQ.0, POSTER_REQ.1, 0);
+            if tex != 0 {
+                p.tex_uv(tex, r.cover_uv(tw, th, Crop::Centre), r, 6.0, theme::TINT_WHITE);
+                return;
+            }
+            if !plx_ui::tex::failed_on(srv, path, POSTER_REQ.0, POSTER_REQ.1, false) {
+                plx_ui::placeholder::skeleton(p, plx_ui::placeholder::Reason::CardSkeleton, "livetv-rec-poster", r, 6.0);
+                return;
+            }
+        }
+        p.rrect(r, 6.0, 6.0, theme::with_a(theme::TEXT_PRIMARY, 0.08));
+    }
+
+    /// A local date for a Recordings heading past tomorrow ("24 October"), from its day number.
+    fn date_words(&self, day: i64) -> String {
+        let (_, m, d) = civil(day);
+        plx_platform::i18n::current()
+            .month_day(m as u8, d as u8, plx_platform::i18n::MonthWidth::Long)
+            .unwrap_or_else(|| format!("{d}/{m}"))
     }
 
     fn draw_panel<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter, panel: &Panel) {
@@ -1510,9 +1637,9 @@ impl<H: ContentLike> Machine<H> for LiveTvScreen {
                 fx.invalidate(Provenance::Nav);
                 Handled::Yes
             }
-            ScreenEvent::FocusMoved { .. } => {
+            ScreenEvent::FocusMoved { by, .. } => {
                 if let Some(elem) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem) {
-                    self.follow(elem);
+                    self.follow(elem, *by != By::Pointer);
                 }
                 fx.invalidate(Provenance::Input);
                 Handled::Yes
@@ -1658,15 +1785,20 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
 
     fn reconcile(&self, want: FocusKey<u32>, _cx: &Cx<'_, H>) -> FocusKey<u32> {
         let e = want.elem;
-        if e >= plx_ui::dispatch::STRIP_BASE || want.entry != self.entry {
+        if want.entry != self.entry {
             return want;
         }
         let key = |elem| FocusKey { entry: self.entry, elem };
+        // An open panel is modal for the pointer too: a hover on the strip or the dimmed guide
+        // behind it lands back on the panel.
         if let Some(panel) = &self.panel {
             return match model::action_of(e) {
                 Some(i) if i < panel.actions.len() => want,
                 _ => key(model::ACTION_BASE),
             };
+        }
+        if e >= plx_ui::dispatch::STRIP_BASE {
+            return want;
         }
         match e {
             model::HEAD_GUIDE | model::HEAD_RECS => return want,

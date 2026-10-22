@@ -437,6 +437,12 @@ impl MediaTracker {
         for segment in &additions {
             self.seen.insert(segment.sequence, segment.clone());
         }
+        // A sliding live window never lists a segment below its media sequence again (one that did
+        // would be refused as unknown either way), so the replay check needs nothing below it: a
+        // channel left playing all day kept every segment it had played until Stop.
+        if playlist.media_sequence > 0 {
+            self.seen = self.seen.split_off(&playlist.media_sequence);
+        }
         self.source.get_or_insert_with(|| playlist.source.clone());
         self.next_sequence = Some(expected);
         self.ended |= playlist.end_list;
@@ -665,6 +671,12 @@ pub fn parse_media_as(shape: Shape, source: &Resource, text: &str) -> Result<Med
         if line.starts_with('#') {
             if pending_duration.is_some() {
                 if shape == Shape::Provider && !line.starts_with("#EXTINF") {
+                    // Between a segment's EXTINF and its URI (where a provider puts its markers)
+                    // a key, a byte range or a map changes the segment's bytes as much as it would
+                    // anywhere else, and is refused as anywhere else.
+                    if let Some(feature) = forbidden_feature(line, shape) {
+                        return Err(Error::UnsupportedFeature(feature));
+                    }
                     continue;
                 }
                 return malformed(line_no, "segment URI must immediately follow EXTINF");
@@ -1028,6 +1040,8 @@ fn forbidden_feature(line: &str, shape: Shape) -> Option<&'static str> {
         "#EXT-X-KEY" if shape == Shape::Provider && key_method(line) == Some("NONE") => None,
         "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => Some("encrypted segments"),
         "#EXT-X-BYTERANGE" => Some("byte-range segments"),
+        // a segment that is not there: fetching it anyway plays nothing, or the wrong thing
+        "#EXT-X-GAP" => Some("gap segments"),
         "#EXT-X-MAP" => Some("fMP4 initialization map"),
         "#EXT-X-DISCONTINUITY" | "#EXT-X-DISCONTINUITY-SEQUENCE" => Some("discontinuities"),
         _ => None,
@@ -1038,10 +1052,29 @@ fn tag_name(line: &str) -> &str {
     line.split_once(':').map_or(line, |(name, _)| name)
 }
 
-/// A key tag's METHOD ("NONE", "AES-128", "SAMPLE-AES"…), unquoted.
+/// A key tag's METHOD ("NONE", "AES-128", "SAMPLE-AES"…), unquoted. Attributes are split outside
+/// quotes: a URI may carry ",METHOD=NONE" of its own.
 fn key_method(line: &str) -> Option<&str> {
     let (_, attrs) = line.split_once(':')?;
-    attrs.split(',').find_map(|a| a.trim().strip_prefix("METHOD=")).map(|m| m.trim_matches('"'))
+    attribute_items(attrs).into_iter().find_map(|a| a.trim().strip_prefix("METHOD=")).map(|m| m.trim_matches('"'))
+}
+
+/// An attribute list's items, split at the commas outside quoted values.
+fn attribute_items(value: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                items.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&value[start..]);
+    items
 }
 
 fn malformed<T>(line: usize, reason: &'static str) -> Result<T, Error> {
@@ -1165,8 +1198,9 @@ pub fn uri_shape(text: &str) -> String {
                 tags.push(name);
             }
             if name == "#EXT-X-KEY" || name == "#EXT-X-SESSION-KEY" {
+                let attrs = line.split_once(':').map_or("", |(_, a)| a);
                 let attr = |key: &str| {
-                    line.split([':', ',']).find_map(|a| a.strip_prefix(key)).map(|v| v.trim_matches('"').chars().take(40).collect::<String>())
+                    attribute_items(attrs).into_iter().find_map(|a| a.trim().strip_prefix(key)).map(|v| v.trim_matches('"').chars().take(40).collect::<String>())
                 };
                 let shape = format!("{}/{}", attr("METHOD=").unwrap_or_default(), attr("KEYFORMAT=").unwrap_or_else(|| "identity".into()));
                 if !keys.contains(&shape) {
@@ -1240,6 +1274,15 @@ mod tests {
         let keyed = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\ns.ts\n";
         assert_eq!(parse_media_as(Shape::Provider, &src, keyed), Err(Error::UnsupportedFeature("encrypted segments")));
         let clear = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6,\ns.ts\n";
+        // a refusal is not skipped by placing the tag between a segment's EXTINF and its URI
+        let between = |tag: &str| format!("#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\n{tag}\ns.ts\n");
+        assert_eq!(parse_media_as(Shape::Provider, &src, &between("#EXT-X-BYTERANGE:1880000@0")).map(|_| ()), Err(Error::UnsupportedFeature("byte-range segments")));
+        assert_eq!(parse_media_as(Shape::Provider, &src, &between("#EXT-X-KEY:METHOD=AES-128,URI=\"k\"")).map(|_| ()), Err(Error::UnsupportedFeature("encrypted segments")));
+        assert_eq!(parse_media_as(Shape::Provider, &src, &between("#EXT-X-GAP")).map(|_| ()), Err(Error::UnsupportedFeature("gap segments")));
+        assert!(parse_media_as(Shape::Provider, &src, &between("#EXT-X-CUE-OUT:30")).is_ok(), "a marker still passes");
+        // a METHOD=NONE inside a quoted URI is not the key's method
+        let sly = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:URI=\"https://k/?a=1,METHOD=NONE\",METHOD=AES-128\n#EXTINF:6,\ns.ts\n";
+        assert_eq!(parse_media_as(Shape::Provider, &src, sly).map(|_| ()), Err(Error::UnsupportedFeature("encrypted segments")));
         assert_eq!(parse_media_as(Shape::Provider, &src, clear).map(|m| m.segments.len()), Ok(1), "METHOD=NONE: nothing is encrypted");
         assert!(parse_media(&src, clear).is_err(), "a server's shape stays strict");
         let http ="#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";
@@ -1279,6 +1322,21 @@ mod tests {
             text.push_str("#EXT-X-ENDLIST\n");
         }
         parse_media(&source, &text).unwrap()
+    }
+
+    /// A live window that slides all day keeps only its window in the tracker, and still refuses a
+    /// segment rewritten in place.
+    #[test]
+    fn a_sliding_live_window_keeps_only_its_window() {
+        let mut tracker = MediaTracker::default();
+        for start in 0..500u64 {
+            let names: Vec<String> = (start..start + 3).map(|n| format!("{n:05}.ts")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            tracker.apply(&media("/session/index.m3u8", start, &names, false)).unwrap();
+        }
+        assert!(tracker.seen.len() <= 3, "kept {}", tracker.seen.len());
+        let changed = media("/session/index.m3u8", 499, &["00499.ts", "XXXXX.ts", "00501.ts"], false);
+        assert_eq!(tracker.apply(&changed), Err(Error::SegmentChanged(500)));
     }
 
     #[test]

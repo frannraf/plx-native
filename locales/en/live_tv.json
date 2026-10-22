@@ -31,6 +31,10 @@
     "value": "No channels are set up on this server's DVR.",
     "description": "Live TV page read-out when the DVR answered with an empty channel lineup."
   },
+  "live_tv.state.no_tab_channels": {
+    "value": "No channels in this category right now.",
+    "description": "Live TV page read-out when a Plex Channels category tab has no channels."
+  },
   "live_tv.action.retry": {
     "value": "Try Again",
     "description": "Button on the Live TV page's failure read-out: read the guide again."
@@ -165,11 +169,11 @@
     "description": "Heading of the Recordings list section with recordings that will run (or are running)."
   },
   "live_tv.recordings.rules": {
-    "value": "Recording Rules",
+    "value": "Recording Priority",
     "description": "Heading of the Recordings list section with the DVR's recording rules, in priority order."
   },
   "live_tv.recordings.empty": {
-    "value": "Nothing is scheduled to record.",
+    "value": "Nothing is scheduled to record. Pick a show in the Guide and press OK to record it.",
     "description": "Recordings list read-out when there are no recordings and no rules."
   },
   "live_tv.recordings.loading": {
@@ -179,6 +183,22 @@
   "live_tv.recordings.failed": {
     "value": "Recordings could not be loaded.",
     "description": "Recordings list read-out when reading the DVR's recordings failed."
+  },
+  "live_tv.recordings.now": {
+    "value": "Recording Now",
+    "description": "Recordings list heading above the recordings the tuner is recording at this moment."
+  },
+  "live_tv.recordings.today": {
+    "value": "Today",
+    "description": "Recordings list heading above the recordings scheduled for later today."
+  },
+  "live_tv.recordings.tomorrow": {
+    "value": "Tomorrow",
+    "description": "Recordings list heading above the recordings scheduled for tomorrow."
+  },
+  "live_tv.recordings.none_scheduled": {
+    "value": "No recordings are scheduled. Pick a show in the Guide and press OK to record it.",
+    "description": "Note in the Recordings list when recording rules exist but no recording is scheduled; tells the viewer how to schedule one."
   },
   "live_tv.hud.live": {
     "value": "LIVE",

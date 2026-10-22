@@ -2021,6 +2021,12 @@ fn looked_up_entry(origin: &Origin) -> Option<String> {
         return None;
     }
     let port = u16::try_from(origin.port()).ok()?;
+    let key = format!("{}:{}", origin.host(), origin.port());
+    // Looked up once a minute per host, not for every playlist refresh, segment and ad redirect:
+    // each lookup blocks the demux thread, which Stop cannot interrupt.
+    if let Some(entry) = RESOLVED.lock().ok().and_then(|cache| cache.get(&key).filter(|(_, at)| at.elapsed() < RESOLVED_FOR).map(|(e, _)| e.clone())) {
+        return Some(entry);
+    }
     let started = std::time::Instant::now();
     let addrs: Vec<std::net::SocketAddr> = match (origin.host(), port).to_socket_addrs() {
         Ok(a) => a.collect(),
@@ -2029,19 +2035,37 @@ fn looked_up_entry(origin: &Origin) -> Option<String> {
             return None;
         }
     };
+    let addr = addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first())?;
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let entry = format!("{key}:{ip}");
     crate::player::log(&format!(
         "curlio: a provider host resolved to {} v4 / {} v6 in {} ms",
         addrs.iter().filter(|a| a.is_ipv4()).count(),
         addrs.iter().filter(|a| a.is_ipv6()).count(),
         started.elapsed().as_millis()
     ));
-    let addr = addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first())?;
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(v4) => v4.to_string(),
-        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-    };
-    Some(format!("{}:{}:{ip}", origin.host(), origin.port()))
+    if let Ok(mut cache) = RESOLVED.lock() {
+        if cache.len() >= MAX_RESOLVED && !cache.contains_key(&key) {
+            cache.retain(|_, (_, at)| at.elapsed() < RESOLVED_FOR);
+            if cache.len() >= MAX_RESOLVED {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (entry.clone(), std::time::Instant::now()));
+    }
+    Some(entry)
 }
+
+/// A provider host's lookup ([`looked_up_entry`]) is good for this long.
+const RESOLVED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+/// Provider hosts remembered at once (a stream's master, its CDN, an ad server or two).
+const MAX_RESOLVED: usize = 16;
+/// `host:port` → its `CURLOPT_RESOLVE` entry and when it was looked up.
+static RESOLVED: std::sync::Mutex<std::collections::BTreeMap<String, (String, std::time::Instant)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// One request of a redirect chain, and what is looked up by the host it dials. Built afresh for
 /// every hop ([`CurlSource::start_range_until`]): what `net::keypin` knows and what `net::resolve`

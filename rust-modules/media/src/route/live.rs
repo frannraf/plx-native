@@ -23,7 +23,7 @@
 
 use super::decision::PlaybackSession;
 use plx_plex::plex::ServerId;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Seconds between keepalive reports: the cadence clients use for live sessions.
@@ -92,16 +92,19 @@ static RELEASING: AtomicUsize = AtomicUsize::new(0);
 
 /// Has the viewer asked, from the player's record disc, to record the program on now on the
 /// channel being watched? Cleared with the tune (a new channel, a release).
-static RECORD_ASKED: AtomicBool = AtomicBool::new(false);
+/// The end (epoch seconds) of the program the record disc was pressed for; 0 when it was not.
+/// Per program, not per tune: the next program on the same channel can be recorded in its turn.
+static RECORD_ASKED: AtomicI64 = AtomicI64::new(0);
 
 /// The record disc was pressed (the application has queued the recording).
-pub fn set_record_asked(asked: bool) {
-    RECORD_ASKED.store(asked, Ordering::Relaxed);
+pub fn set_record_asked(until: i64) {
+    RECORD_ASKED.store(until, Ordering::Relaxed);
 }
 
 /// Did the viewer ask to record what is on now (the record disc's ring)?
 pub fn record_asked() -> bool {
-    RECORD_ASKED.load(Ordering::Relaxed)
+    let until = RECORD_ASKED.load(Ordering::Relaxed);
+    until > 0 && std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) < until
 }
 
 impl LiveLease {
@@ -115,7 +118,7 @@ impl LiveLease {
         // stream the demuxer opens is not this channel's: never a library stream read as live.
         crate::ff::set_live_stream(false);
         crate::ff::set_provider_stream(false);
-        RECORD_ASKED.store(false, Ordering::Relaxed);
+        RECORD_ASKED.store(0, Ordering::Relaxed);
         if self.provider {
             crate::player::log("livetv: a provider's channel ends (nothing to release)");
             return;
@@ -180,7 +183,7 @@ fn release_now(sid: ServerId, sub: &str, key: &str, rk: &str, enc: &str) {
 /// the tune is the route's: `false` (the declaration was refused, nothing installed) has already
 /// released it.
 pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
-    RECORD_ASKED.store(false, Ordering::Relaxed);
+    RECORD_ASKED.store(0, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     // Made first, so every way out of this function below releases the tune it holds.
     let lease = LiveLease {
@@ -274,6 +277,12 @@ pub fn release_live_tuner(ps: &mut PlaybackSession) -> bool {
     let held = lease.is_some();
     drop(lease);
     held
+}
+
+/// Does the session still hold its live lease (a DVR channel's tuner, or a Plex channel's
+/// stream)? `false` once a CH▲/CH▼ handed a DVR channel's tuner back.
+pub fn live_lease_held(ps: &PlaybackSession) -> bool {
+    super::decision::live_lease_held(ps)
 }
 
 /// Is a released tune still being handed back (the next tune on that DVR waits for it)?

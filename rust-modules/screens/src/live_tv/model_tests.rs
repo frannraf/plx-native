@@ -224,11 +224,12 @@ fn the_recordings_list_runs_recordings_first_then_rules_in_priority_order() {
     snap.scheduled = vec![g("later", NOON + 7_200, GrabStatus::Scheduled), g("now", NOON, GrabStatus::InProgress), g("soon", NOON + 3_600, GrabStatus::Scheduled), g("done", NOON - 3_600, GrabStatus::Complete)];
     snap.rules = vec![Subscription { id: "a".into(), ..Subscription::default() }, Subscription { id: "b".into(), ..Subscription::default() }];
     let e = rec_entries(&snap);
-    let ids: Vec<String> = e.iter().map(|r| match r { RecEntry::Grab(g) => g.id.clone(), RecEntry::Rule(s) => s.id.clone() }).collect();
+    let ids: Vec<String> = e.iter().map(|r| match r { RecEntry::Grab(g, _) => g.id.clone(), RecEntry::Rule(s) => s.id.clone() }).collect();
     assert_eq!(ids, vec!["now", "soon", "later", "a", "b"]);
-    assert!(rec_heads(&e, 0) && rec_heads(&e, 3) && !rec_heads(&e, 1) && !rec_heads(&e, 4));
+    // headings: recording now, the day of the next two, the rules
+    assert!(rec_heads(&e, 0) && rec_heads(&e, 1) && !rec_heads(&e, 2) && rec_heads(&e, 3) && !rec_heads(&e, 4));
     assert_eq!(rec_y(&e, 0, 0), geom::RECS_Y + geom::REC_HEADING_H);
-    assert_eq!(rec_y(&e, 0, 3), geom::RECS_Y + 2.0 * geom::REC_HEADING_H + 3.0 * geom::REC_PITCH);
+    assert_eq!(rec_y(&e, 0, 3), geom::RECS_Y + 3.0 * geom::REC_HEADING_H + 3.0 * geom::REC_PITCH);
     // a rule moves to the top with no `after`, to the bottom after the last other rule
     let first = Target::Rule(snap.rules[1].clone());
     assert_eq!(write_for(&snap, &first, Action::MoveTop), Some(Write::MoveRule { id: "b".into(), after: None }));
@@ -237,6 +238,27 @@ fn the_recordings_list_runs_recordings_first_then_rules_in_priority_order() {
     assert_eq!(rule_actions(&snap, &snap.rules[0]), vec![Action::MoveBottom, Action::DeleteRule, Action::Close]);
     assert_eq!(grab_actions(&snap.scheduled[1]), vec![Action::StopRecording, Action::Close]);
     assert_eq!(grab_actions(&snap.scheduled[0]), vec![Action::CancelRecording, Action::Close]);
+}
+
+#[test]
+fn upcoming_recordings_are_grouped_by_their_local_day_and_rules_alone_get_a_note() {
+    let day = 86_400;
+    let mut snap = Snapshot { now: 20 * day + 10 * 3_600, utc_offset: -7 * 3_600, ..Snapshot::default() };
+    let g = |id: &str, begins: i64| Grab { id: id.into(), status: GrabStatus::Scheduled, airing: airing(0, begins, 30, id), ..Grab::default() };
+    // 18:00 UTC is 11:00 local (today); 23:00 UTC 16:00 local (today); the next day's 08:00 UTC is 01:00 local (tomorrow)
+    snap.scheduled = vec![g("a", 20 * day + 18 * 3_600), g("b", 20 * day + 23 * 3_600), g("c", 21 * day + 8 * 3_600)];
+    let e = rec_entries(&snap);
+    let groups: Vec<RecGroup> = e.iter().filter_map(|r| match r { RecEntry::Grab(_, gr) => Some(*gr), RecEntry::Rule(_) => None }).collect();
+    let today = local_day(snap.now, snap.utc_offset);
+    assert_eq!(groups, vec![RecGroup::Day(today), RecGroup::Day(today), RecGroup::Day(today + 1)]);
+    assert!(rec_heads(&e, 0) && !rec_heads(&e, 1) && rec_heads(&e, 2));
+    assert!(!rec_note(&e), "recordings are listed: no note");
+
+    snap.scheduled.clear();
+    snap.rules = vec![Subscription { id: "r".into(), ..Subscription::default() }];
+    let e = rec_entries(&snap);
+    assert!(rec_note(&e));
+    assert_eq!(rec_y(&e, 0, 0), geom::RECS_Y + 2.0 * geom::REC_HEADING_H + geom::REC_NOTE_H, "the note and its heading above the rules' heading");
 }
 
 #[test]
@@ -250,4 +272,17 @@ fn a_long_list_scrolls_to_keep_the_focused_row_in_view() {
     assert!(top > 0);
     assert!(rec_y(&e, top, 15) + geom::REC_H <= geom::RECS_BOTTOM);
     assert_eq!(rec_follow(&e, top, 2), 2);
+}
+
+/// A list that shrinks under the focused row (a rule deleted with its recordings) shows what fits,
+/// from the top, never a blank page.
+#[test]
+fn a_shrunken_recordings_list_settles_back_into_view() {
+    let long = rec_entries(&Snapshot { rules: (0..15).map(|i| Subscription { id: i.to_string(), ..Subscription::default() }).collect(), ..Snapshot::default() });
+    let top = rec_follow(&long, 0, 14);
+    assert!(top > 0);
+    let short = rec_entries(&Snapshot { rules: (0..4).map(|i| Subscription { id: i.to_string(), ..Subscription::default() }).collect(), ..Snapshot::default() });
+    assert_eq!(rec_settle(&short, top, 14), 0, "all four fit: from the top");
+    assert_eq!(rec_settle(&[], top, 14), 0);
+    assert_eq!(rec_settle(&long, top, 14), top, "nothing changed: nothing moves");
 }

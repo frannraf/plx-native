@@ -337,6 +337,8 @@ pub struct LiveTvStore {
     in_flight: usize,
     write_queue: VecDeque<Write>,
     writing: bool,
+    /// The write running now (one at a time): a press repeated before it lands is not sent again.
+    write_running: Option<Write>,
     availability: Availability,
     providers_phase: Phase,
     provider: Option<EpgProvider>,
@@ -357,6 +359,8 @@ pub struct LiveTvStore {
     tuned: Option<Tuned>,
     /// Releases owed to servers (an unwanted tune), each against the server that tuned it.
     releases: VecDeque<(ServerId, Job)>,
+    /// Tune jobs started and not yet landed (a superseded one still takes a tuner until then).
+    tunes_running: usize,
     /// The last guide window a page asked for: a Retry and the minute's re-ask of failed days
     /// ask it again.
     window: Option<(std::ops::Range<usize>, i64, i64)>,
@@ -402,6 +406,7 @@ impl LiveTvStore {
             in_flight: 0,
             write_queue: VecDeque::new(),
             writing: false,
+            write_running: None,
             availability: Availability::Unknown,
             providers_phase: Phase::Idle,
             provider: None,
@@ -417,6 +422,7 @@ impl LiveTvStore {
             tune_wanted: false,
             tune_phase: TunePhase::Idle,
             tune_queue: None,
+            tunes_running: 0,
             tuned: None,
             releases: VecDeque::new(),
             window: None,
@@ -474,6 +480,7 @@ impl LiveTvStore {
         self.cancel_tune();
         let keep = (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial);
         let releases = std::mem::take(&mut self.releases);
+        let tunes_running = self.tunes_running;
         // A tune still in flight lands under the old epoch: `pump` releases it, so the inbox
         // stays (`with_runner` would orphan it) and only the epoch moves.
         let inbox = Arc::clone(&self.inbox);
@@ -483,6 +490,7 @@ impl LiveTvStore {
         self.epoch = epoch;
         self.inbox = inbox;
         self.releases = releases;
+        self.tunes_running = tunes_running;
         // the generation and serials never go back: a page compares them for "moved"
         (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial) = keep;
         self.bump();
@@ -664,6 +672,18 @@ impl LiveTvStore {
         self.bump();
     }
 
+    /// Is a tuner still to come back from this store: a tune owed a release, a release running, or
+    /// a tune still on its way (a superseded one holds a tuner until it lands and is released)? A
+    /// DVR with no tuner to spare answers the next tune "busy" until none is.
+    pub fn tuners_settling(&self) -> bool {
+        !self.releases.is_empty() || RELEASING.load(Ordering::Acquire) > 0 || self.tunes_running > 0
+    }
+
+    /// Did the last Watch press fail (its notice not yet dismissed)?
+    pub fn tune_failed(&self) -> bool {
+        matches!(self.tune_phase, TunePhase::Failed { .. })
+    }
+
     /// Forget a failed tune's message (the page showed it).
     pub fn clear_tune_failure(&mut self) {
         if matches!(self.tune_phase, TunePhase::Failed { .. }) {
@@ -798,6 +818,13 @@ impl LiveTvStore {
         if self.sid.is_none() {
             return;
         }
+        // The same write twice before the first lands (OK pressed again on a program whose record
+        // mark only appears when the answer does) would be a duplicate rule, or a failure notice
+        // right after the success.
+        if self.write_running.as_ref() == Some(&w) || self.write_queue.contains(&w) {
+            plx_base::eventlog::log("livetv: the same DVR change is already on its way");
+            return;
+        }
         self.write_queue.push_back(w);
         self.bump();
     }
@@ -830,6 +857,9 @@ impl LiveTvStore {
         }
         let landed: Vec<(u64, Landing)> = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
         for (epoch, landing) in landed {
+            if matches!(landing, Landing::Tuned { .. }) {
+                self.tunes_running = self.tunes_running.saturating_sub(1);
+            }
             if epoch != self.epoch {
                 // A late tune still holds a tuner: release it; every other late answer is moot.
                 if let Landing::Tuned { result: Ok(t), .. } = landing {
@@ -970,6 +1000,7 @@ impl LiveTvStore {
             }
             Landing::Write { write, result } => {
                 self.writing = false;
+                self.write_running = None;
                 self.notice_serial = self.notice_serial.wrapping_add(1);
                 let op = match &write {
                     Write::Record { kind: RecordKind::This, .. } => WriteOp::Record,
@@ -1022,7 +1053,9 @@ impl LiveTvStore {
         let Some(sid) = self.sid else { return };
         if let Some(job) = self.tune_queue.take() {
             let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
-            if !self.runner.run(sid, job.clone(), post) {
+            if self.runner.run(sid, job.clone(), post) {
+                self.tunes_running += 1;
+            } else {
                 self.tune_queue = Some(job);
             }
         }
@@ -1031,6 +1064,7 @@ impl LiveTvStore {
                 let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
                 if self.runner.run(sid, Job::Write(w.clone()), post) {
                     self.writing = true;
+                    self.write_running = Some(w);
                 } else {
                     self.write_queue.push_front(w);
                 }

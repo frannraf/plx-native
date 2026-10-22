@@ -1048,18 +1048,37 @@ pub(crate) fn watchlist_navigation(
 /// strip, BACK and the chip navigate as the Watchlist's do; everything else is the store's.
 fn live_tv_requests(app: &mut App) {
     use plx_screens::live_tv::LiveTvOut;
-    app.bridge.live_tv_step_pump(app.route() == AppArg::Player);
+    app.bridge.live_tv_pump(app.route() == AppArg::Player, app.route() == AppArg::LiveTv);
+    // A CH▲/CH▼ whose tune failed: a DVR channel left has handed its tuner back and its picture is
+    // dying, so the player goes back to the guide, whose notice says why; one of Plex's channels
+    // keeps its own picture, and the notice is forgotten.
+    if let Some(step) = app.bridge.live_tv_take_failure() {
+        if step && app.route() == AppArg::Player {
+            if plx_media::route::live_lease_held(&app.player.session) {
+                app.bridge.live_tv_clear_tune_failure();
+            } else {
+                super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+            }
+        }
+    }
     if let Some(tuned) = app.bridge.live_tv_take_tuned() {
-        let stepping = app.bridge.live_tv_stepping();
-        app.bridge.live_tv_step_done();
-        if app.route() == AppArg::LiveTv {
-            start_live(app, tuned);
-        } else if stepping && app.route() == AppArg::Player && plx_media::route::is_live(&app.player.session) {
-            // a CH▲/CH▼ from the live player: the new channel replaces the old in place
-            super::playback::stop_live_for_step(&mut app.player.session, &mut app.adapters.player);
-            start_live(app, tuned);
-        } else {
-            app.bridge.live_tv_drop_tuned(tuned);
+        // The landing answers the Watch last asked; it plays only over the screen that asked it.
+        match app.bridge.live_tv_take_asked() {
+            Some(asked) if !asked.step && app.route() == AppArg::LiveTv => {
+                if start_live(app, tuned) {
+                    app.bridge.live_tv_now_watching(&asked);
+                }
+            }
+            Some(asked) if asked.step && app.route() == AppArg::Player && plx_media::route::is_live(&app.player.session) => {
+                // a CH▲/CH▼ from the live player: the new channel replaces the old in place
+                super::playback::stop_live_for_step(&mut app.player.session, &mut app.adapters.player);
+                if start_live(app, tuned) {
+                    app.bridge.live_tv_now_watching(&asked);
+                } else {
+                    super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+                }
+            }
+            _ => app.bridge.live_tv_drop_tuned(tuned),
         }
     }
     // A channel playing on in the guide's corner goes when the guide does.
@@ -1130,14 +1149,15 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
 
 /// Play a landed tune: the route takes the stream (and with it the tuner's release), then the one
 /// start ritual pushes the player over the Live TV page, which is where Stop and BACK return.
-fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) {
+/// `false` when the route or the player refused it (the tune is released).
+fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) -> bool {
     // A trailer still playing would hold the engine the Load needs.
     halt_preview_now(&mut app.player.session, &mut app.adapters.player);
     // No library item is playing: the player's Info card must not describe the last one.
     app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
     if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
         plx_base::eventlog::log("livetv: the route refused the live stream's declaration (tune released)");
-        return;
+        return false;
     }
     plx_base::eventlog::log("livetv: starting live playback");
     if !start_playback(
@@ -1152,7 +1172,9 @@ fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) {
     ) {
         plx_base::eventlog::log("livetv: the player refused the live stream");
         plx_media::route::release_live(&mut app.player.session);
+        return false;
     }
+    true
 }
 
 fn home_tab_available(

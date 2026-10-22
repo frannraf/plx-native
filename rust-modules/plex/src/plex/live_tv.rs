@@ -242,7 +242,18 @@ pub(super) fn tune_path(dvr_key: &str, channel: &str, session: &str) -> Option<S
 fn ok_body(outcome: ValueOutcome) -> Result<Value, LiveError> {
     match outcome {
         ValueOutcome::Transport => Err(LiveError::Transport),
-        ValueOutcome::Response { status, .. } if !(200..300).contains(&status) => Err(LiveError::Status(status)),
+        // A refusal with the server's own sentence ("Tuning failed") says more than its status;
+        // the statuses callers act on (a retry by number, gone, forbidden, a duplicate) stay bare.
+        ValueOutcome::Response { status, body } if !(200..300).contains(&status) => {
+            let said = (!matches!(status, 400 | 403 | 404 | 409))
+                .then(|| body.as_ref().and_then(parse::container).map(|c| parse::text(c, "message")))
+                .flatten()
+                .filter(|m| !m.is_empty());
+            Err(match said {
+                Some(message) => LiveError::Server { status: status as i64, message },
+                None => LiveError::Status(status),
+            })
+        }
         ValueOutcome::Response { body: Some(v), .. } => match parse::container(&v).and_then(parse::server_error) {
             Some(e) => Err(e),
             None => Ok(v),

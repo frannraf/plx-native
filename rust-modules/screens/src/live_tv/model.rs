@@ -209,9 +209,14 @@ pub mod geom {
     pub const GRID_W: f32 = SCR_W - MARGIN_X - GRID_X;
     pub const CELL_GAP: f32 = 6.0;
     pub const RECS_Y: f32 = 290.0;
-    pub const REC_H: f32 = 74.0;
-    pub const REC_PITCH: f32 = 84.0;
-    pub const REC_HEADING_H: f32 = 52.0;
+    pub const REC_H: f32 = 100.0;
+    pub const REC_PITCH: f32 = 110.0;
+    pub const REC_HEADING_H: f32 = 56.0;
+    /// The note under an Upcoming heading when nothing is scheduled but rules exist.
+    pub const REC_NOTE_H: f32 = 64.0;
+    /// A Recordings row's poster: portrait, the row's height less a margin.
+    pub const REC_POSTER_H: f32 = REC_H - 12.0;
+    pub const REC_POSTER_W: f32 = REC_POSTER_H * 2.0 / 3.0;
     pub const RECS_BOTTOM: f32 = 1_020.0;
     pub const PANEL_W: f32 = 640.0;
     pub const ACTION_H: f32 = 64.0;
@@ -351,35 +356,67 @@ pub fn want(view: &LiveTvView, frame: &Frame) -> Want {
 
 // ---- the Recordings list ------------------------------------------------------------------------
 
-/// One row of the Recordings list: an upcoming (or running) recording, or a recording rule.
+/// One row of the Recordings list: an upcoming (or running) recording and the group it is listed
+/// under, or a recording rule.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecEntry {
-    Grab(Grab),
+    Grab(Grab, RecGroup),
     Rule(Subscription),
 }
 
-/// The list: what will record, soonest first (running ones first of all), then the rules in the
-/// server's priority order.
+/// The heading an upcoming recording is listed under: the ones recording now, then one per local
+/// day (its number of days since the epoch, local; one already begun but not yet recording counts
+/// as today).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecGroup {
+    Now,
+    Day(i64),
+}
+
+/// The list: what will record, soonest first (running ones first of all) under a heading per day,
+/// then the rules in the server's priority order.
 pub fn rec_entries(snap: &Snapshot) -> Vec<RecEntry> {
     let mut grabs: Vec<&Grab> = snap.scheduled.iter().filter(|g| !matches!(g.status, plx_plex::plex::live_tv::GrabStatus::Complete | plx_plex::plex::live_tv::GrabStatus::Cancelled)).collect();
     grabs.sort_by_key(|g| (!g.status.is_recording(), g.airing.begins_at));
-    let mut out: Vec<RecEntry> = grabs.into_iter().cloned().map(RecEntry::Grab).collect();
+    let today = local_day(snap.now, snap.utc_offset);
+    let mut out: Vec<RecEntry> = grabs
+        .into_iter()
+        .map(|g| {
+            let group = if g.status.is_recording() { RecGroup::Now } else { RecGroup::Day(local_day(g.airing.begins_at, snap.utc_offset).max(today)) };
+            RecEntry::Grab(g.clone(), group)
+        })
+        .collect();
     out.extend(snap.rules.iter().cloned().map(RecEntry::Rule));
     out
 }
 
-/// Does a section heading stand above list row `j` (the first recording, the first rule)?
+/// The local date of instant `t`, as days since the epoch.
+pub fn local_day(t: i64, utc_offset: i64) -> i64 {
+    (t + utc_offset).div_euclid(86_400)
+}
+
+/// Does a section heading stand above list row `j` (where the group of recordings changes, the
+/// first rule)?
 pub fn rec_heads(entries: &[RecEntry], j: usize) -> bool {
     match entries.get(j) {
-        Some(RecEntry::Grab(_)) => j == 0,
-        Some(RecEntry::Rule(_)) => j == 0 || matches!(entries.get(j - 1), Some(RecEntry::Grab(_))),
+        Some(RecEntry::Grab(_, group)) => j == 0 || !matches!(entries.get(j - 1), Some(RecEntry::Grab(_, prev)) if prev == group),
+        Some(RecEntry::Rule(_)) => j == 0 || matches!(entries.get(j - 1), Some(RecEntry::Grab(..))),
         None => false,
     }
+}
+
+/// Rules but nothing scheduled: the list opens with an Upcoming heading and a note saying so (and
+/// how to schedule something), above the rules.
+pub fn rec_note(entries: &[RecEntry]) -> bool {
+    !entries.is_empty() && !entries.iter().any(|e| matches!(e, RecEntry::Grab(..)))
 }
 
 /// The y of list row `i` with `top` the first row shown.
 pub fn rec_y(entries: &[RecEntry], top: usize, i: usize) -> f32 {
     let mut y = geom::RECS_Y;
+    if top == 0 && rec_note(entries) {
+        y += geom::REC_HEADING_H + geom::REC_NOTE_H;
+    }
     for j in top..i {
         if rec_heads(entries, j) {
             y += geom::REC_HEADING_H;
@@ -390,6 +427,19 @@ pub fn rec_y(entries: &[RecEntry], top: usize, i: usize) -> f32 {
         y += geom::REC_HEADING_H;
     }
     y
+}
+
+/// The first row to show after the list changed: the focused row (or the last, if the list got
+/// shorter than it) in view, and no blank room left at the bottom that rows above could fill (a
+/// deleted rule takes its recordings with it: the list left one row showing, or none).
+pub fn rec_settle(entries: &[RecEntry], top: usize, focus: usize) -> usize {
+    let Some(last) = entries.len().checked_sub(1) else { return 0 };
+    let focus = focus.min(last);
+    let mut top = rec_follow(entries, top.min(focus), focus);
+    while top > 0 && rec_y(entries, top - 1, last) + geom::REC_H <= geom::RECS_BOTTOM {
+        top -= 1;
+    }
+    top
 }
 
 /// The first row to show so that row `focus` is in view.
@@ -435,7 +485,8 @@ pub struct Panel {
 
 /// The recording operation that is this airing, if the server scheduled one.
 pub fn grab_for<'a>(snap: &'a Snapshot, a: &Airing) -> Option<&'a Grab> {
-    snap.scheduled.iter().find(|g| {
+    // A finished or cancelled operation the server still lists covers nothing (as in the list).
+    snap.scheduled.iter().filter(|g| !matches!(g.status, plx_plex::plex::live_tv::GrabStatus::Complete | plx_plex::plex::live_tv::GrabStatus::Cancelled)).find(|g| {
         g.airing.begins_at == a.begins_at
             && ((!a.guid.is_empty() && g.airing.guid == a.guid)
                 || (!a.channel_identifier.is_empty() && g.airing.channel_identifier == a.channel_identifier))

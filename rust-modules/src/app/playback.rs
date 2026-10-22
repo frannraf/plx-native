@@ -636,6 +636,13 @@ pub(crate) fn player_requests(
             // The STOP key, a BACK with nothing else open and the failure read-out's own BACK
             // escape all reach the same ritual.
             PlayerReq::Exit => {
+                bridge.live_tv_abandon_step();
+                exit_player(ps, pa, refresh_hubs, pages);
+            }
+            // A channel mid-step has handed its tuner back (a DVR's): its picture is dying, so
+            // there is nothing to keep in the corner and BACK leaves it.
+            PlayerReq::Minimize if bridge.live_tv_step_busy() => {
+                bridge.live_tv_abandon_step();
                 exit_player(ps, pa, refresh_hubs, pages);
             }
             PlayerReq::Minimize => {
@@ -658,8 +665,9 @@ fn step_live_channel(ps: &mut plx_media::route::PlaybackSession, bridge: &mut su
         plx_base::eventlog::log("livetv: no channel to step to");
         return;
     };
-    let released = plx_media::route::release_live_tuner(ps);
-    bridge.live_tv_step_to(row, released);
+    // The DVR's tuner goes back now (the step's tune waits for it: `Bridge::live_tv_ask`).
+    plx_media::route::release_live_tuner(ps);
+    bridge.live_tv_step_to(row);
 }
 
 /// Stop the live channel playing full screen for the one a CH▲/CH▼ tuned, without leaving the
