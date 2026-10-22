@@ -1,9 +1,12 @@
 //! **Live TV debug output** (a `devtriggers` build's event log): what each Live TV exchange with the
 //! server came back as — the operation, its HTTP status, how long it took, and the STRUCTURE of the
 //! answer: its keys, its array lengths and its value types, never its content. No title, summary,
-//! guid, id, name or URL reaches the log; a `key` path is printed with every id in it replaced by
-//! `#`, and only protocol words and numbers (decision codes, codecs, dimensions, `beginsAt`) are
-//! printed as they are. The structure is what this module's parsers are designed from, so a server
+//! guid, id, name or URL field reaches the log; a `key` path is printed with every id in it replaced
+//! by `#`, and only protocol words and numbers (decision codes, codecs, dimensions, `beginsAt`) are
+//! printed as they are. The one exception is a server SENTENCE ([`TEXTS`]: a decision's reason, an
+//! error's `message`), printed as the server wrote it because it is the answer to "why": it is
+//! generic protocol text, but nothing stops a server from quoting a title in one, so a line carrying
+//! one is not for pasting anywhere. The structure is what this module's parsers are designed from, so a server
 //! that answers differently from the protocol evidence (`docs/pms-api.md` §10) shows up as a shape
 //! to compare against the fixtures (`live_tv/fixtures.rs`).
 //!
