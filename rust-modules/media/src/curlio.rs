@@ -2010,11 +2010,11 @@ pub(crate) fn set_resolve_unpinned(on: bool) {
 
 /// **For a cloud provider's stream only**: the `CURLOPT_RESOLVE` entry for a name no pin covers,
 /// from the system resolver, for THIS one easy handle (nothing is added to `net::resolve`, whose
-/// pins are plex.direct names that cannot become wrong). libcurl's own resolver, driven from this
-/// module's multi loop, never finished a lookup on the television: a provider's host, 2026-10-22,
-/// "lookup 0.00s … total 11.35s" — while the same name resolved in milliseconds through
-/// `getaddrinfo`. The hostname stays in the URL, so SNI and the certificate's name check are
-/// untouched. An IPv4 answer is preferred (the set's IPv6 is not known to route).
+/// pins are plex.direct names that cannot become wrong), so no lookup is left to libcurl's
+/// resolver inside the multi loop (synchronous here: the module doc). The hostname stays in the
+/// URL, so SNI and the certificate's name check are untouched. An IPv4 answer is preferred (the
+/// set's IPv6 is not known to route). (The connect that never finished on the TV, 2026-10-22, was
+/// not the lookup's doing: a portless provider URL was dialled on Plex's 32400 — `hls::resolve_as`.)
 fn looked_up_entry(origin: &Origin) -> Option<String> {
     use std::net::ToSocketAddrs;
     if !RESOLVE_UNPINNED.load(Ordering::Acquire) || origin.host().parse::<std::net::IpAddr>().is_ok() {

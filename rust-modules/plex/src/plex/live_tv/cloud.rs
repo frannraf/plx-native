@@ -88,8 +88,9 @@ impl AccountClient {
             return None;
         }
         let token = self.headers().into_iter().find_map(|h| h.strip_prefix("X-Plex-Token: ").map(str::to_string))?;
+        // The port written out: the media plane parses a portless URL as a Plex server's (32400).
         Some(
-            QueryBuilder::new(format!("{BASE}{}", channel.part_key))
+            QueryBuilder::new(format!("{BASE}:443{}", channel.part_key))
                 .int("includeAllStreams", 1)
                 .str("X-Plex-Product", crate::plex::identity::PRODUCT)
                 .str("X-Plex-Token", &token)

@@ -1627,6 +1627,26 @@ first two and one reports PMS drops an unreported grab after ~300 s; this app do
 conflicted tune leaves a subscription behind, the units of `timeStamp` / the offsets (epoch seconds
 is what clients assume), and the live transcode playlist's window (growing vs sliding).
 
+### 10.7 Plex's own channels — `https://epg.provider.plex.tv` (measured on the TV, 2026-10-22)
+
+Not a PMS: Plex's cloud provider, read with the account's plex.tv identity (the `X-Plex-Token`
+of plex.tv, not a server's) and `X-Plex-Provider-Version: 7.2` (`plex::live_tv::cloud`).
+
+- `GET /` — the guide's genre tabs (`GridChannelFilter`: `identifier`, `title`); 16 seen.
+- `GET /lineups/plex/channels[?genre={identifier}]` — the lineup (693 seen). Each channel's
+  `Media[0].Part[0].key` is its stream; a `drm` channel is not playable here and is left out.
+- `GET /grid?channelGridKey={gridKey}&date=YYYY-MM-DD` — one channel-day, the same shape as §10.3.
+- **The stream:** `GET {base}{part key}?includeAllStreams=1&X-Plex-Product=…&X-Plex-Token=…` answers
+  `200` with an HLS master directly (no redirect): five variants (216–1080 lines, H.264 + AAC) on
+  the same host. Every variant URI is absolute and **carries a token the provider issued**, not the
+  request's — a PMS-shape credential check ("a playlist may not replace the route credential")
+  refuses it. Media playlists are live sliding windows (ten segments) of 7 s MPEG-TS segments with
+  `#EXT-X-DISCONTINUITY` at ad breaks, and **an ad break's segments are not all named `.ts`** — a
+  client that judges a segment by its name stops at the first ad. There is no `#EXT-X-MAP`, so
+  the bytes are a transport stream whatever the name.
+- **No port is written in these URLs.** A client whose URL parser defaults to PMS's 32400 dials
+  a port the CDN never answers (a 15 s connect timeout): the scheme's own port (443) is meant.
+
 ## Paging, observed
 
 Observed on PMS 1.43.4 with a small library, by read-only GETs. Only the endpoints in the table were

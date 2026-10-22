@@ -8,7 +8,9 @@
 //!
 //! One other shape is read on request, [`Shape::Provider`]: a cloud provider's live stream (Plex's
 //! own channels), whose master lists several variants on a CDN and whose media playlists splice
-//! ads in with discontinuities. Encryption, byte ranges and fMP4 maps stay refused there too.
+//! ads in with discontinuities. Encryption, byte ranges and fMP4 maps stay refused there too; a
+//! segment named other than `.ts` (an ad server's) is fetched and probed unless its name says it is
+//! something else ([`named_other_than_ts`]).
 use crate::abr::MediaTimeMs;
 use plx_plex::plex::{origin, Origin};
 use std::collections::BTreeMap;
@@ -31,6 +33,9 @@ pub struct InheritedAuth {
     token_pair: String,
     /// The master's origin: the only one the credential is ever sent to.
     origin: Origin,
+    /// A provider's playlist names its own credential for its own origin (a token of its issuing,
+    /// not the account's): its URI is fetched as written. [`InheritedAuth::for_provider`].
+    provider: bool,
 }
 
 /// Which HLS shape a playlist is read as. [`Shape::Pms`] is this module's contract (its doc).
@@ -78,7 +83,15 @@ impl InheritedAuth {
         Ok(Self {
             token_pair: token_pair.to_owned(),
             origin: master.origin.clone(),
+            provider: false,
         })
+    }
+
+    /// The credential for a [`Shape::Provider`] stream: a child URI on the master's origin may
+    /// carry a token the provider issued in place of the route's (seen on the TV: every variant
+    /// URI of Plex's own channels does). Still one token per URI, never sent to another origin.
+    pub fn for_provider(self) -> Self {
+        Self { provider: true, ..self }
     }
 
     /// A request path for the same-origin transport. A playlist may repeat the route credential,
@@ -91,7 +104,7 @@ impl InheritedAuth {
         if let Some((_, query)) = resource.path.split_once('?') {
             let mut found = query.split('&').filter(|pair| is_token_pair(pair));
             if let Some(pair) = found.next() {
-                if pair != self.token_pair {
+                if pair != self.token_pair && !self.provider {
                     return Err(Error::CredentialChanged);
                 }
                 if found.next().is_some() {
@@ -241,8 +254,14 @@ impl Resource {
             if !(reference.starts_with("http://") || reference.starts_with("https://")) {
                 return Err(Error::InvalidUri("unsupported URI scheme"));
             }
-            let child_origin =
-                Origin::parse(reference).ok_or(Error::InvalidUri("malformed absolute URI"))?;
+            // A provider's absolute URI is a public web URL: a missing port is the scheme's own
+            // (443/80), not the PMS default `Origin::parse` applies (32400, which a CDN never
+            // answers: seen on the TV, a connect that timed out on :32400).
+            let child_origin = match shape {
+                Shape::Provider => Origin::parse_connection(reference, if reference.starts_with("https://") { 443 } else { 80 }),
+                Shape::Pms => Origin::parse(reference),
+            }
+            .ok_or(Error::InvalidUri("malformed absolute URI"))?;
             let elsewhere_allowed = shape == Shape::Provider && reference.starts_with("https://");
             if child_origin != self.origin && !elsewhere_allowed {
                 return Err(Error::CrossOrigin);
@@ -745,10 +764,8 @@ pub fn parse_media_as(shape: Shape, source: &Resource, text: &str) -> Result<Med
             .checked_add(segments.len() as u64)
             .ok_or(Error::SequenceOverflow)?;
         let resource = source.resolve_as(line, shape)?;
-        if !path_without_query(&resource.path)
-            .to_ascii_lowercase()
-            .ends_with(".ts")
-        {
+        let name = path_without_query(&resource.path).to_ascii_lowercase();
+        if !name.ends_with(".ts") && (shape == Shape::Pms || named_other_than_ts(&name)) {
             return Err(Error::SegmentIsNotMpegTs);
         }
         segments.push(Segment {
@@ -1113,6 +1130,52 @@ fn path_without_query(path: &str) -> &str {
     path.split_once('?').map_or(path, |(path, _)| path)
 }
 
+/// A provider's segment whose name says it is not a transport stream. Anything else (no extension,
+/// an ad server's own) is fetched and left to the demuxer's probe: a playlist with no
+/// `#EXT-X-MAP` carries MPEG-TS whatever its segments are called. Seen on the TV, 2026-10-22: an ad
+/// break's segments were refused here by name alone and the channel stopped.
+fn named_other_than_ts(lowercase_path: &str) -> bool {
+    const OTHER: [&str; 12] = ["aac", "ac3", "ec3", "mp3", "vtt", "webvtt", "m4s", "mp4", "m4a", "m4v", "cmfv", "cmfa"];
+    let last = lowercase_path.rsplit('/').next().unwrap_or("");
+    last.rsplit_once('.').is_some_and(|(_, ext)| OTHER.contains(&ext))
+}
+
+/// What a playlist's URIs and tags look like, for the debug log when a provider's playlist is
+/// refused: each URI's extension with a count, how many hosts, and the tag names. No host, path,
+/// query or tag value is in it.
+pub fn uri_shape(text: &str) -> String {
+    let mut exts: Vec<(String, usize)> = Vec::new();
+    let mut hosts: Vec<&str> = Vec::new();
+    let mut tags: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with('#') {
+            let name = tag_name(line);
+            if name != "#EXTINF" && !tags.contains(&name) {
+                tags.push(name);
+            }
+            continue;
+        }
+        let rest = line.split_once("://").map(|(_, rest)| rest);
+        if let Some(host) = rest.and_then(|r| r.split('/').next()) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        let last = path_without_query(line).rsplit('/').next().unwrap_or("");
+        let ext = match last.rsplit_once('.') {
+            Some((_, e)) if (1..=5).contains(&e.len()) && e.bytes().all(|b| b.is_ascii_alphanumeric()) => e.to_ascii_lowercase(),
+            Some(_) => "long".to_owned(),
+            None => "none".to_owned(),
+        };
+        match exts.iter_mut().find(|(e, _)| *e == ext) {
+            Some((_, n)) => *n += 1,
+            None => exts.push((ext, 1)),
+        }
+    }
+    let exts: Vec<String> = exts.iter().map(|(e, n)| format!("{e}:{n}")).collect();
+    format!("uris [{}] on {} absolute host(s), tags [{}]", exts.join(" "), hosts.len(), tags.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1195,7 @@ mod tests {
         let parsed = parse_master_as(Shape::Provider, &master, text).unwrap();
         assert_eq!(parsed.variant.bandwidth, 6_000_000, "the richest at no more than 1080 lines");
         assert_eq!(parsed.variant.resource.path, "/v/1080.m3u8");
+        assert_eq!(parsed.variant.resource.origin.port(), 443, "a CDN's portless URI is https's own port, not PMS's 32400");
         let auth = InheritedAuth::capture(&master).unwrap();
         let child = auth.request_path(&parsed.variant.resource).unwrap();
         assert!(!child.contains("secret"), "the CDN never sees the credential: {child}");
@@ -1156,6 +1220,21 @@ mod tests {
         assert_eq!(parse_media_as(Shape::Provider, &src, keyed), Err(Error::UnsupportedFeature("encrypted segments")));
         let http = "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\nhttp://plain.example/s.ts\n";
         assert_eq!(parse_media_as(Shape::Provider, &src, http).map(|_| ()), Err(Error::CrossOrigin), "another origin only over https");
+    }
+
+    /// An ad server's segment need not be named `.ts`: a provider's is probed unless its name says
+    /// it is another format. A server's shape still refuses every other name.
+    #[test]
+    fn a_provider_ad_segment_is_judged_by_content_unless_named_otherwise() {
+        let src = Resource::new(Origin::parse("https://cdn.example").unwrap(), "/v/1080.m3u8").unwrap();
+        let with = |uri: &str| format!("#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:6,\n{uri}\n");
+        for unnamed in ["https://ads.example/seg/123?sig=a.b", "https://ads.example/a/s1.tsv", "s2"] {
+            assert!(parse_media_as(Shape::Provider, &src, &with(unnamed)).is_ok(), "{unnamed}");
+        }
+        assert_eq!(parse_media(&src, &with("s2")).map(|_| ()), Err(Error::SegmentIsNotMpegTs), "a server's shape judges by name");
+        for named in ["https://ads.example/a/s1.aac", "s1.m4s", "s1.MP4?x=1"] {
+            assert_eq!(parse_media_as(Shape::Provider, &src, &with(named)).map(|_| ()), Err(Error::SegmentIsNotMpegTs), "{named}");
+        }
     }
 
     fn source(path: &str) -> Resource {
@@ -1530,6 +1609,23 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_playlist_is_described_without_its_hosts_or_values() {
+        let text = "#EXTM3U
+#EXT-X-TARGETDURATION:7
+#EXTINF:7,
+seg1.ts?k=v
+#EXT-X-CUE-OUT:30
+#EXTINF:7,
+https://ads.example/a/b
+#EXTINF:7,
+https://ads.example/a/c.mp4
+";
+        let shape = uri_shape(text);
+        assert_eq!(shape, "uris [ts:1 none:1 mp4:1] on 1 absolute host(s), tags [#EXTM3U #EXT-X-TARGETDURATION #EXT-X-CUE-OUT]");
+        assert!(!shape.contains("example") && !shape.contains("30"));
+    }
+
+    #[test]
     fn transport_inherits_auth_without_exposing_or_replacing_it() {
         let master = source("/start.m3u8?session=s&X-Plex-Token=top-secret");
         let auth = InheritedAuth::capture(&master).unwrap();
@@ -1549,6 +1645,10 @@ mod tests {
             )),
             Err(Error::MultipleCredentials)
         );
+
+        let provider = auth.for_provider();
+        assert_eq!(provider.request_path(&source("/v.m3u8?X-Plex-Token=issued")).unwrap(), "/v.m3u8?X-Plex-Token=issued");
+        assert_eq!(provider.request_path(&source("/v.m3u8?X-Plex-Token=a&X-Plex-Token=b")), Err(Error::MultipleCredentials));
     }
 
     #[test]

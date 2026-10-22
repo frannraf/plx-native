@@ -4264,9 +4264,10 @@ fn hls_fetch_text(
     mut reserve: Option<&mut ReserveDeadlineState>,
 ) -> Result<(String, u128, crate::hls::Resource), HlsExit> {
     const MAX_PLAYLIST_BYTES: usize = 1024 * 1024;
-    let request_path = auth
-        .request_path(resource)
-        .map_err(|_| HlsExit::Failed("playlist credential rejected"))?;
+    let request_path = auth.request_path(resource).map_err(|e| {
+        crate::player::log(&format!("hls: playlist credential rejected: {e}"));
+        HlsExit::Failed("playlist credential rejected")
+    })?;
     let started = std::time::Instant::now();
     let mut watchdog = TransportWatchdog::for_origin(&resource.origin);
     let (mut src, size, landed) = loop {
@@ -5203,12 +5204,13 @@ fn hls_cursor_open(
 ) -> Result<HlsCursor, HlsExit> {
     let master_resource = crate::hls::Resource::new(origin.clone(), path)
         .map_err(|_| HlsExit::Failed("invalid HLS master URL"))?;
+    let shape = if PROVIDER_STREAM.load(Ordering::Acquire) { crate::hls::Shape::Provider } else { crate::hls::Shape::Pms };
     let auth = crate::hls::InheritedAuth::capture(&master_resource)
         .map_err(|_| HlsExit::Failed("HLS master has no unique credential"))?;
+    let auth = if shape == crate::hls::Shape::Provider { auth.for_provider() } else { auth };
     // Parsed against where the fetch LANDED: a redirected master's children are relative to it.
     let (master_text, master_ms, master_landed) =
         hls_fetch_text(&master_resource, &auth, aq, net, reserve)?;
-    let shape = if PROVIDER_STREAM.load(Ordering::Acquire) { crate::hls::Shape::Provider } else { crate::hls::Shape::Pms };
     let master = crate::hls::parse_master_as(shape, &master_landed, &master_text).map_err(|e| {
         crate::player::log(&format!("hls: master rejected: {e}"));
         HlsExit::Failed("HLS master rejected")
@@ -5269,6 +5271,9 @@ fn hls_cursor_next(
         };
         let media = crate::hls::parse_media_as(cursor.shape, &media_landed, &media_text).map_err(|e| {
             crate::player::log(&format!("hls: media rejected: {e}"));
+            if cursor.shape == crate::hls::Shape::Provider {
+                crate::player::log(&format!("hls: provider media shape: {}", crate::hls::uri_shape(&media_text)));
+            }
             HlsExit::Failed("HLS media playlist rejected")
         })?;
         cursor.target_duration_secs = media.target_duration_secs;
@@ -5348,17 +5353,31 @@ fn hls_cursor_next(
             total_ns / 1_000_000,
             refresh.end_list
         ));
+        if cursor.shape == crate::hls::Shape::Provider {
+            let other = refresh
+                .new_segments
+                .iter()
+                .filter(|s| !s.resource.path.split('?').next().unwrap_or("").to_ascii_lowercase().ends_with(".ts"))
+                .count();
+            if other > 0 {
+                crate::player::log(&format!("hls: {other} provider segment(s) not named .ts (an ad break), probed by content"));
+            }
+        }
         cursor.pending.extend(refresh.new_segments);
         cursor.ended = refresh.end_list;
         if !cursor.pending.is_empty() {
             cursor.idle_ms = 0;
         }
         if cursor.pending.is_empty() && !cursor.ended {
+            // Half a target duration between refreshes that found nothing (RFC 8216 §6.3.4),
+            // capped at a second for PMS's short segments. A provider's 7 s segments are polled at
+            // the full half (3.5 s): its live window starts three segments back, so there is time.
+            let ceiling = if cursor.shape == crate::hls::Shape::Provider { 5_000 } else { 1_000 };
             let poll = std::time::Duration::from_millis(
                 cursor
                     .target_duration_secs
                     .saturating_mul(500)
-                    .clamp(250, 1_000),
+                    .clamp(250, ceiling),
             );
             if cursor.live {
                 cursor.idle_ms = cursor.idle_ms.saturating_add(poll.as_millis() as u64);
