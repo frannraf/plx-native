@@ -1965,9 +1965,10 @@ impl TrackMenuState {
             plx_media::route::cur_memory_note(ps),
             forced,
         );
-        if self.search.is_some() {
-            // offered on direct play AND during a transcode: a downloaded sidecar is drawn by the
-            // client on one and burned by the server on the other, so it reaches the picture either way
+        // Offered on direct play AND during a transcode: a downloaded sidecar is drawn by the
+        // client on one and burned by the server on the other, so it reaches the picture either
+        // way. Not on a live channel: no library item to search for.
+        if self.search.is_some() && !plx_media::route::is_live(ps) {
             form = form.section(FormSection::new("").item(
                 TrackRow::OpenSearch,
                 RowKind::Nav(TrackPage::Search),
@@ -1985,7 +1986,14 @@ impl TrackMenuState {
         let subs: &[metadata::Stream] = tracks(meta).map(|t| t.subs.as_slice()).unwrap_or(&[]);
         let offered = visible_subs(ps, meta);
         let names = plx_media::player::SHARED.track_names.lock().unwrap();
-        sub_layout::sub_sections(subs, &offered, &names, &self.yours, show_timing)
+        let mut model = sub_layout::sub_sections(subs, &offered, &names, &self.yours, show_timing);
+        // A live channel's subtitles are its closed captions, on or off: no forced track to match.
+        if plx_media::route::is_live(ps) {
+            for section in &mut model.sections {
+                section.rows.retain(|r| *r != SubRow::ForcedOnly);
+            }
+        }
+        model
     }
 
     /// The [`TrackRow::Boost`]/[`TrackRow::Loudness`] pair's three inputs, read fresh

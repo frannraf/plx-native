@@ -1011,12 +1011,14 @@ impl LiveTvScreen {
         let span = (a.ends_at - a.begins_at).max(1) as f32;
         let aired = ((now - a.begins_at) as f32 / span).clamp(0.0, 1.0);
         draw_ring(p, x + pad + ring * 0.5, cy, ring * 0.5 - 2.0, aired);
-        let lh = f.measure.line_h(size);
-        TextView::new(&text, size, theme::TEXT_PRIMARY)
-            .bold()
-            .with_measure(f.measure)
-            .max_lines(1)
-            .draw(p, Rect::new(x + pad + ring + 10.0, cy - lh * 0.5, tw + 4.0, 0.0));
+        // the words centred on the pill's middle, as the ring is (a line box set by its top sat
+        // the glyphs a few pixels high: seen by the owner)
+        if let Ok(c) = CString::new(text.as_str()) {
+            Label::new(c.as_ptr(), size, theme::TEXT_PRIMARY)
+                .bold()
+                .v(VAlign::Middle)
+                .draw(p, Rect::new(x + pad + ring + 10.0, cy - h * 0.5, tw + 4.0, h));
+        }
         w
     }
 

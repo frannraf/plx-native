@@ -456,13 +456,23 @@ pub(crate) fn live_playing_item(t: &Tuned) -> plx_data::metadata::PlayingItem {
             .captions
             .iter()
             .filter(|c| c.id > 0)
-            .map(|c| plx_data::metadata::Stream {
-                id: c.id,
-                lang: c.language.clone(),
-                lang_code: c.language_code.clone(),
-                codec: c.codec.clone(),
-                title: c.title.clone(),
-                ..Default::default()
+            .map(|c| {
+                // A tuner's closed captions come with no language (seen on the set: CEA-608 on a
+                // US broadcast): they are the broadcast's, English on this continent's CC1, and
+                // a row that says so beats "Unknown" under Other languages.
+                let (lang, code) = if c.language.is_empty() && c.language_code.is_empty() {
+                    ("English".to_string(), "eng".to_string())
+                } else {
+                    (c.language.clone(), c.language_code.clone())
+                };
+                plx_data::metadata::Stream {
+                    id: c.id,
+                    lang,
+                    lang_code: code,
+                    codec: c.codec.clone(),
+                    title: c.title.clone(),
+                    ..Default::default()
+                }
             })
             .collect(),
         video_fps: t.stream.fps,
