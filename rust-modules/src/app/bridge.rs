@@ -821,6 +821,14 @@ impl Bridge {
         self.library_commands.push_back(plx_screens::registry::LibraryCmd::Enter(kind));
     }
 
+    /// [`Self::enter_library`] from a strip pill: the page then goes on to the library's
+    /// Recommended page (`LibraryCmd::Land`), the way the official app lands a library. The
+    /// `plxnative-library` trigger and the in-page switches enter the grid itself.
+    pub(crate) fn enter_library_from_strip(&mut self, kind: plx_data::browse::SecKind) {
+        self.enter_library(kind);
+        self.library_commands.push_back(plx_screens::registry::LibraryCmd::Land);
+    }
+
     /// **Aim the store at the PRESS, a dip-out ahead of a Library that is not on screen yet.** The
     /// page is shown as the one image captured on the frame it mounts (`PageImage`), and a Library
     /// that mounts over a store still pointing at another kind has nothing to draw there but its
@@ -3240,7 +3248,7 @@ pub(crate) fn nav_tab(
         }
         HomeTab::Movies | HomeTab::Shows => {
             let kind = if tab == HomeTab::Movies { plx_data::browse::SecKind::Movie } else { plx_data::browse::SecKind::Show };
-            rig.enter_library(kind);
+            rig.enter_library_from_strip(kind);
             if d.top_arg() != Some(&AppArg::Library) { rig.aim_library(kind); }
             AppArg::Library
         }

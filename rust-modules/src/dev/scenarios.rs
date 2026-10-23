@@ -2282,7 +2282,8 @@ pub(crate) fn nav_osc_tick(app: &mut App, now: u32) {
                     crate::app::bridge::nav_tab(&mut app.pages, &mut app.bridge, tab, None, None);
                 }
             }
-            AppArg::Library => {
+            // The strip lands a library on its Recommended page; the leg back is the same from either.
+            AppArg::Library | AppArg::LibraryRecommended { .. } => {
                 let origin = crate::app::chrome::pill_at(
                     app.bridge.browse_directory(), app.bridge.live_tv_on_strip(), 1);
                 crate::app::bridge::nav_tab(&mut app.pages, &mut app.bridge,

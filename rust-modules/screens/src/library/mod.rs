@@ -253,6 +253,41 @@ pub struct LibraryScreen {
     /// The standing "Hold OK for options" hint over a card (`plx_ui::hold_hint`, once per
     /// install). Paint-only: not hashed, not in the shape.
     hold_hint: plx_ui::hold_hint::HoldHint,
+    /// A strip pill opened this library (`LibraryCmd::Land`, after its `Enter`): the page goes on to
+    /// the library's Recommended page (its hubs, Recently Added among them) as soon as it knows its
+    /// section, the way the official app lands a library on Recommended. BACK from there is this
+    /// grid. A key the reader presses here first, or the page being left, keeps the grid. Not
+    /// canon: armed by the recorded command, and spent by the BACK that returns from the push it
+    /// asks for (or by the reader acting here first).
+    land: Land,
+}
+
+/// Where a strip press's landing on Recommended stands ([`LibraryScreen::land`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Land {
+    /// Nothing to do: the page stays where the reader is.
+    Off,
+    /// Go on to Recommended once the section is known.
+    Armed,
+    /// The push is on its way. The grid's arrival seat waits for BACK: a seat taken under the
+    /// push's dip is lost, the push returning to the focus it was asked from (the strip's).
+    Pushed,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// Whether a strip press lands this thread's libraries on Recommended. Off in the test rig, so
+    /// the route tables that walk the grid open on it; a test of the landing turns it on.
+    pub static TEST_LAND_RECOMMENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does a strip pill's `LibraryCmd::Land` go on to the library's Recommended page? Always in the
+/// app; per thread in a test ([`TEST_LAND_RECOMMENDED`]).
+fn lands_on_recommended() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    return TEST_LAND_RECOMMENDED.with(|cell| cell.get());
+    #[cfg(not(any(test, feature = "test-support")))]
+    true
 }
 
 impl LibraryScreen {
@@ -290,6 +325,7 @@ impl LibraryScreen {
             clock: Default::default(),
             plaintext_alert: super::plaintext_question::PlaintextAlert::new(PLAINTEXT_GROUP, PLAINTEXT_CANCEL, PLAINTEXT_CONNECT),
             hold_hint: plx_ui::hold_hint::HoldHint::new(),
+            land: Land::Off,
         }
     }
 
@@ -852,14 +888,15 @@ impl LibraryScreen {
 
     /// Push this library's `listing` page over the full grid. The pages are one screen in another
     /// `Listing` (`AppArg::LibraryCollections` / `LibraryRecommended`), mounted by the application.
-    /// Pressing the control of the page already shown does nothing.
-    pub(super) fn open_listing<H: LibraryLike>(&mut self, listing: Listing, _cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
-        if listing == self.listing { return; }
-        let Some(section) = self.section.as_ref().and_then(|section| u32::try_from(section.key).ok()) else { return };
+    /// Pressing the control of the page already shown does nothing. True when the push was asked for.
+    pub(super) fn open_listing<H: LibraryLike>(&mut self, listing: Listing, _cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> bool {
+        if listing == self.listing { return false; }
+        let Some(section) = self.section.as_ref().and_then(|section| u32::try_from(section.key).ok()) else { return false };
         if listing == Listing::Collections && self.listed != plx_data::browse::LibraryType::Collections {
             self.type_before_collections = Some(self.listed);
         }
         fx.push(Fx::App(AppFx::Library(LibraryReq::OpenListing { listing, section })));
+        true
     }
 
     /// Stage `kind` as the section's listing type, the edit the Sort & Filter menu's Show rows
@@ -1027,8 +1064,12 @@ impl LibraryScreen {
                 self.wanted_kind = Some(kind);
                 self.enter_remembered = false;
                 self.initial = true;
+                self.land = Land::Off;
                 self.page_fade.mount();
                 self.sync(cx);
+            }
+            LibraryCmd::Land => {
+                if self.listing == Listing::All && lands_on_recommended() { self.land = Land::Armed; }
             }
             LibraryCmd::FocusGrid { row, col } => {
                 if col >= self.layout.cols() { return Handled::No; }
@@ -1208,6 +1249,12 @@ impl LibraryScreen {
                 if let Enter::Fresh { focus: FocusTarget::Elem(key) } = enter {
                     self.seat_wanted = Some(key.elem).filter(|_| key.entry == self.entry);
                 }
+                // Back from the landing's Recommended page: the arrival seat it held runs now (the
+                // memory restored with the return marked the page as seated).
+                if matches!(enter, Enter::Restored) && self.land == Land::Pushed {
+                    self.land = Land::Off;
+                    self.initial = true;
+                }
                 self.sync(cx);
                 self.follow_listing_type(cx, fx);
             }
@@ -1222,7 +1269,10 @@ impl LibraryScreen {
                 self.follow_listing_type(cx, fx);
             }
             ScreenEvent::WillLeave(leave) => {
-                if matches!(leave, plx_machine::machine::Leave::Deeper) { self.buried = true; }
+                let deeper = matches!(leave, plx_machine::machine::Leave::Deeper);
+                if deeper { self.buried = true; }
+                // Left before the landing asked for its push, or for good: nothing to land or hold.
+                if self.land == Land::Armed || !deeper { self.land = Land::Off; }
                 self.save_cursor(cx, fx);
                 self.flush(fx);
             }
@@ -1333,6 +1383,20 @@ impl LibraryScreen {
                     directory.preferred(kind).is_some() || directory.kind_fetch(kind) == SecFetch::Loading
                 });
                 let ready = self.readout != Readout::Loading && !waiting_for_kind;
+                // A strip press lands on the library's Recommended page once the section is known
+                // (not waiting for the grid: the push's dip covers it). A library already known to
+                // have failed or to be empty stays on the grid, whose read-out says so; one whose
+                // listing is still on its way lands, and the Recommended page reads it out instead.
+                let known = self.land == Land::Armed && self.live && !self.buried && !waiting_for_kind
+                    && self.pending.section().is_none() && self.section.is_some();
+                if known && matches!(self.readout, Readout::Failed | Readout::Empty) {
+                    self.land = Land::Off;
+                } else if known {
+                    // A page that has seated already holds nothing for BACK, nor does one whose push
+                    // was never asked for.
+                    let asked = self.open_listing(Listing::Recommended, cx, fx);
+                    self.land = if asked && self.initial { Land::Pushed } else { Land::Off };
+                }
                 let page_commit = self.page_fade.tick(tick.dt(), ready);
                 let grid_commit = self.grid_fade.tick(tick.dt(), ready);
                 if page_commit || (grid_commit && (self.switched || self.pending.section().is_none())) { self.flush(fx); }
@@ -1368,7 +1432,9 @@ impl LibraryScreen {
                     if self.owns_listing() { self.project_grid(cx); }
                     let hint = self.hint_input(cx);
                     self.hold_hint.step(hint, tick.ms, dt, &mut |ev| fx.note(ev));
-                    let arrival = if self.initial && self.layout.first().is_some() { self.arrival_group() } else { None };
+                    // A page going on to Recommended seats nothing under the push: its arrival stays
+                    // armed for BACK, where the grid comes back in its first poster.
+                    let arrival = if self.initial && self.land != Land::Pushed && self.layout.first().is_some() { self.arrival_group() } else { None };
                     if let Some(group) = arrival.filter(|_| self.seed_cursor(cx, fx)) {
                         self.initial = false;
                         // Only the page's OWN head seat is provisional. Any restore is the reader's:
@@ -1420,6 +1486,14 @@ impl LibraryScreen {
                 if matches!(input.kind, InputKind::Key { edge: Edge::Down, .. } | InputKind::Pointer { .. }
                     | InputKind::Click { .. } | InputKind::Drag { .. } | InputKind::Wheel { .. }) {
                     self.provisional = None;
+                }
+                // The reader is already acting on the grid: it stays, and a push still on its way
+                // that their press withdrew holds no seat for a BACK that will not come. (A Magic
+                // Remote pointer that only moves is a hand settling after the pill's click, not a
+                // choice.)
+                if !self.buried && matches!(input.kind, InputKind::Key { edge: Edge::Down, .. }
+                    | InputKind::Click { .. } | InputKind::Drag { .. } | InputKind::Wheel { .. }) {
+                    self.land = Land::Off;
                 }
                 // An arrow or a pointer acting on a page that has seated nothing yet is the reader's own
                 // move: the cells that land afterwards must not take the seat from it.

@@ -514,6 +514,9 @@ impl plx_machine::machine::LogicalState for ItemMenuArg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryCmd {
     Enter(plx_data::stores::browse::SecKind),
+    /// A strip pill's press, after its `Enter`: the page goes on to the library's Recommended page
+    /// once its section is known, the way the official app lands a library (`LibraryScreen::land`).
+    Land,
     /// Seat focus on one grid card (tests, and the screenshot pipeline's `plxnative-libgrid`).
     FocusGrid { row: usize, col: usize },
     /// Seat focus on one card of a hub shelf of the Recommended page, `shelf` counted from the top

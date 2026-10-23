@@ -267,6 +267,60 @@ fn recommended_opens_a_film_and_back_returns_to_the_card_then_the_control() {
     }]);
 }
 
+/// The Movies pill pressed from Home with the app's landing on (the rig keeps it off, so the rows
+/// above open on the grid): the library goes on to its Recommended page by itself, its first shelf
+/// seated, the grid under it.
+fn from_the_strip(w: &mut World) {
+    plx_screens::library::TEST_LAND_RECOMMENDED.with(|cell| cell.set(true));
+    show_page(&mut w.d, AppArg::Home);
+    w.frames(40);
+    for _ in 0..6 { if !here(w).starts_with("nav:") { w.press(Key::Up); } }
+    for _ in 0..6 { if here(w) != "nav:movies" { w.press(Key::Right); } }
+    assert_eq!(here(w), "nav:movies", "premise: focus walked to the Movies pill");
+    // OK on the pill: Home raises `HomeReq::Tab`, which the loop performs as this (the rig's pump
+    // performs the Library's requests, not Home's).
+    nav_tab(&mut w.d, &mut w.bridge, HomeTab::Movies, None, None);
+    w.frames(120);
+    assert_eq!(top(w), "recommended", "the strip press landed the library on Recommended (focus {})", here(w));
+}
+
+/// R9 from the strip: a library opens on its Recommended page (Recently Added among its shelves),
+/// the way the official app lands one; BACK is the grid, which stays.
+#[test]
+fn the_strip_opens_a_library_on_recommended_and_back_is_the_grid() {
+    run(vec![Row {
+        name: "r9-strip-landing",
+        setup: from_the_strip,
+        start: "shelf:0,0",
+        steps: vec![
+            /* 0 */ press(Key::Right, "", "recommended", "shelf:0,1"),
+            // The grid comes back arriving in its first poster, as the strip used to open it.
+            /* 1 */ press(Key::Back, "content:Back", "library", "grid:0,0"),
+            /* 2 */ press(Key::Right, "", "library", "grid:0,1"),
+        ],
+        end: |w| {
+            let mut fails = Vec::new();
+            w.frames(120);
+            if top(w) != "library" { fails.push(format!("the grid stays once BACK left Recommended, top is {}", top(w))); }
+            fails
+        },
+    }]);
+}
+
+/// Only a strip pill lands: the library's other door (the `plxnative-library` trigger the device
+/// scenes boot through, `enter_library` without the pill's `Land`) opens the grid they walk.
+#[test]
+fn only_a_strip_pill_lands_a_library_on_recommended() {
+    let mut w = World::new("strip-only-landing");
+    plx_screens::library::TEST_LAND_RECOMMENDED.with(|cell| cell.set(true));
+    show_page(&mut w.d, AppArg::Home);
+    w.frames(40);
+    w.bridge.enter_library(SecKind::Movie);
+    nav_select_tab(&mut w.d, AppArg::Library);
+    w.frames(120);
+    assert_eq!(top(&w), "library", "the trigger's library stays on its grid (focus {})", here(&w));
+}
+
 #[test]
 fn the_crumb_root_pops_to_the_library_and_up_from_it_is_the_movies_pill() {
     run(vec![
