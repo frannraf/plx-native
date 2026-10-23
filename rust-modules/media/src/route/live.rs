@@ -61,6 +61,9 @@ pub struct LiveRoute {
     pub height: i64,
     /// The encode's frame rate (0 = unknown: the Load's default envelope).
     pub fps: f64,
+    /// The caption stream the server burns into the encode (0 for none): what the Subtitles
+    /// menu shows as chosen.
+    pub subtitle_stream_id: i64,
     pub info: LiveInfo,
     /// A cloud provider's stream (Plex's own channels): no server session to keep alive or
     /// release, and its HLS is read in the provider's shape (`ff::PROVIDER_STREAM`).
@@ -213,16 +216,19 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         super::decision::set_stream_source_raster(ps, route.width.min(i64::from(u16::MAX)) as u16, route.height.min(i64::from(u16::MAX)) as u16);
     }
     super::decision::install_live_lease(ps, lease, route.info.clone(), &route.url);
+    // the caption stream burned in is the subtitle "on": the menu checks its row
+    super::decision::set_subtitle(ps, route.subtitle_stream_id.max(0));
     crate::ff::set_live_stream(true);
     crate::ff::set_provider_stream(route.provider);
     crate::player::log(&format!(
-        "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, keepalive every {}s",
+        "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, captions {}, keepalive every {}s",
         route.video_codec,
         route.audio_codec,
         route.width,
         route.height,
         route.fps,
         if route.subscription_id.is_empty() { "none" } else { "held" },
+        if route.subtitle_stream_id > 0 { "burned in" } else { "off" },
         KEEPALIVE_S
     ));
     if !route.provider {

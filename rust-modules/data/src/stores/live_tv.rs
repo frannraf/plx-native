@@ -60,8 +60,9 @@ pub enum Job {
     Grid { provider: String, ch: usize, channel: Channel, date: String },
     Dvr,
     Write(Write),
-    /// Tune `channel` on DVR `dvr_key` and open its encode under `session`.
-    Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, session: String },
+    /// Tune `channel` on DVR `dvr_key` and open its encode under `session`, with the broadcast's
+    /// closed captions burned in when `captions`.
+    Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, session: String, captions: bool },
     /// Release a tune nobody will play: stop its encode, delete its subscription.
     Release { subscription_id: String, session: String },
     /// The UltraBlur colours of a piece of guide art (the page's tint).
@@ -188,8 +189,8 @@ fn default_runner() -> Box<dyn Runner> {
 /// against a loopback client too.
 pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
-        Job::Tune { serial, dvr_key, channel, label, airing, session } => {
-            let result = tune(client, off, &dvr_key, &channel, &session)
+        Job::Tune { serial, dvr_key, channel, label, airing, session, captions } => {
+            let result = tune(client, off, &dvr_key, &channel, &session, captions)
                 .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing, cloud: false });
             Landing::Tuned { serial, result }
         }
@@ -231,6 +232,7 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
                     width: 0,
                     height: 0,
                     fps: 0.0,
+                    subtitle_stream_id: 0,
                 },
                 channel: label,
                 airing,
@@ -272,6 +274,7 @@ fn tune(
     dvr_key: &str,
     channel: &plx_plex::plex::live_tv::Channel,
     session: &str,
+    captions: bool,
 ) -> Result<(String, plx_plex::plex::live_tv::TunedItem, plx_plex::plex::live_tv::LiveStream), LiveError> {
     let t = match client.live_tune(dvr_key, &channel.identifier, session) {
         Err(LiveError::Status(status @ (400 | 404))) if !channel.vcn.is_empty() && channel.vcn != channel.identifier => {
@@ -286,7 +289,9 @@ fn tune(
         }
         return Err(if t.has_conflicts() { LiveError::Busy } else { LiveError::Unreadable });
     }
-    match client.live_stream(off, &t.item.key, session) {
+    // the broadcast's closed captions, when asked for: the server burns them into the encode
+    let sub = if captions { t.item.captions.iter().map(|c| c.id).find(|id| *id > 0).unwrap_or(0) } else { 0 };
+    match client.live_stream(off, &t.item.key, session, sub) {
         Ok(stream) => Ok((t.subscription_id, t.item, stream)),
         Err(e) => {
             release(client, &t.subscription_id, session);
@@ -360,6 +365,8 @@ pub struct LiveTvStore {
     tune_wanted: bool,
     tune_phase: TunePhase,
     tune_queue: Option<Job>,
+    /// Closed captions wanted on the channels tuned (the viewer's choice; kept across tunes).
+    captions: bool,
     tuned: Option<Tuned>,
     /// Releases owed to servers (an unwanted tune), each against the server that tuned it.
     releases: VecDeque<(ServerId, Job)>,
@@ -426,6 +433,7 @@ impl LiveTvStore {
             tune_wanted: false,
             tune_phase: TunePhase::Idle,
             tune_queue: None,
+            captions: false,
             tunes_running: 0,
             tuned: None,
             releases: VecDeque::new(),
@@ -518,9 +526,20 @@ impl LiveTvStore {
         let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: tune #{} asked for channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
-        self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id() });
+        self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id(), captions: self.captions });
         self.bump();
         true
+    }
+
+    /// Are the broadcast's closed captions wanted on the channels tuned from now on?
+    pub fn captions_wanted(&self) -> bool {
+        self.captions
+    }
+
+    /// Closed captions on (the server burns a tuned channel's caption stream into its encode) or
+    /// off, for every tune from now on: the viewer's choice in the player's Subtitles menu.
+    pub fn set_captions(&mut self, on: bool) {
+        self.captions = on;
     }
 
     /// Watch a Plex channel: the same Watch flow as a tune (the press supersedes an earlier one,

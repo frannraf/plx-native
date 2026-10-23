@@ -27,6 +27,12 @@ use std::collections::HashMap;
 use super::track_label::{self, Kind};
 use super::Stream;
 
+/// A broadcast's closed captions (CEA-608/708), which a live channel's row badges "CC". Not an
+/// image codec: nothing here decodes them, the server burns them into a live encode.
+pub fn is_closed_caption_codec(codec: &str) -> bool {
+    matches!(codec.to_ascii_lowercase().as_str(), "eia_608" | "eia_708" | "cea_608" | "cea_708" | "cc_dec")
+}
+
 /// Image (bitmap) subtitle codecs — PGS/VobSub/DVD/DVB. The demuxer software-decodes these to
 /// RGBA and the player composites them over the video, so they render on the direct-play path;
 /// the menu tags the codec for clarity.
@@ -297,6 +303,8 @@ fn sub_tracks(
             };
             if let Some(name) = image_codec_badge(&s.codec) {
                 badges.push(RowBadge::Codec(name));
+            } else if is_closed_caption_codec(&s.codec) {
+                badges.push(RowBadge::Codec("CC"));
             }
             let (group, key) = group_of(s, i, &lang);
             let track = SubTrack { i, lang, detail, kind: label.kind, badges, ordinal: None };

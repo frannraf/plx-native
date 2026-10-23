@@ -273,7 +273,8 @@ impl Bridge {
             _ => return None,
         };
         let n = store.channel_count();
-        if n < 2 || &from.0 != store.source() {
+        // a step of 0 is the same channel tuned again (closed captions on or off)
+        if n == 0 || (step != 0 && n < 2) || &from.0 != store.source() {
             return None;
         }
         let next = (from.1 as i64 + i64::from(step)).rem_euclid(n as i64) as usize;
@@ -306,6 +307,16 @@ impl Bridge {
     /// How the channel row `row` of the tab shown is named ("4.1 KXYZ"), for the player's lines.
     pub(crate) fn live_tv_channel_words(&self, row: usize) -> Option<String> {
         self.stores.live_tv.channel_words(row)
+    }
+
+    /// Are the broadcast's closed captions wanted on the channels tuned?
+    pub(crate) fn live_tv_captions_wanted(&self) -> bool {
+        self.stores.live_tv.captions_wanted()
+    }
+
+    /// Closed captions on or off for the channels tuned from now on (the player's Subtitles menu).
+    pub(crate) fn live_tv_set_captions(&mut self, on: bool) {
+        self.stores.live_tv.set_captions(on);
     }
 
     /// Is a CH▲/CH▼ under way (waiting on a tuner, or tuning)?
@@ -424,7 +435,43 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
         width: t.stream.width,
         height: t.stream.height,
         fps: t.stream.fps,
+        subtitle_stream_id: t.stream.subtitle_stream_id,
         info: plx_media::route::LiveInfo { title, show_title, channel, begins_at, ends_at, provider: t.cloud },
         provider: t.cloud,
+    }
+}
+
+/// What the player's track menus read of a live channel: no audio to choose (the encode carries
+/// the broadcast's), and the broadcast's caption streams as subtitles — picking one has the server
+/// burn it in (`playback::live_captions_commit`). No library item: `rk` is empty.
+pub(crate) fn live_playing_item(t: &Tuned) -> plx_data::metadata::PlayingItem {
+    plx_data::metadata::PlayingItem {
+        sid: t.sid,
+        rk: String::new(),
+        show_rk: String::new(),
+        kind: "live".into(),
+        audio: Vec::new(),
+        subs: t
+            .item
+            .captions
+            .iter()
+            .filter(|c| c.id > 0)
+            .map(|c| plx_data::metadata::Stream {
+                id: c.id,
+                lang: c.language.clone(),
+                lang_code: c.language_code.clone(),
+                codec: c.codec.clone(),
+                title: c.title.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        video_fps: t.stream.fps,
+        width: t.stream.width,
+        height: t.stream.height,
+        bitrate: 0,
+        dovi: Default::default(),
+        markers: Vec::new(),
+        chapters: Vec::new(),
+        hdr: false,
     }
 }

@@ -611,7 +611,11 @@ pub(crate) fn player_requests(
             // The pump keeps the pause across it (see `commit_seek`).
             PlayerReq::CommitSeek(ns) => commit_seek(ns),
             PlayerReq::More(action) => apply_more_action(ps, pa, bridge, action),
-            PlayerReq::CommitTrack(commit) => commit_track(ps, commit),
+            PlayerReq::CommitTrack(commit) => {
+                if !live_captions_commit(ps, bridge, &commit, now, pages) {
+                    commit_track(ps, commit);
+                }
+            }
             PlayerReq::ArmInfoPress => {
                 press.begin_ctl(now);
                 *ok_armed = true;
@@ -684,6 +688,34 @@ fn step_live_channel(
         player.hud.extend(now, HUD_LINGER_MS);
         player.publish();
     }
+}
+
+/// A subtitle pick on a live channel is the broadcast's closed captions on or off. The server burns
+/// them into the encode, so the channel is tuned again with the choice (a CH▲/CH▼ to its own row:
+/// "Tuning…", the new stream in place); a pick that changes nothing does nothing. `false` for any
+/// other commit, and off a live channel, which the library's commit performs.
+fn live_captions_commit(
+    ps: &mut plx_media::route::PlaybackSession,
+    bridge: &mut super::bridge::Bridge,
+    commit: &plx_appkit::track_menu::TrackCommit,
+    now: u32,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+) -> bool {
+    use plx_appkit::track_menu::TrackCommit;
+    if !plx_media::route::is_live(ps) {
+        return false;
+    }
+    let on = match commit {
+        TrackCommit::Subtitle { stream_id, .. } => *stream_id > 0,
+        TrackCommit::SubtitleForcedOnly { .. } => false,
+        _ => return false,
+    };
+    if on != bridge.live_tv_captions_wanted() {
+        plx_base::eventlog::log(&format!("livetv: closed captions {} (the channel is tuned again)", if on { "on" } else { "off" }));
+        bridge.live_tv_set_captions(on);
+        step_live_channel(ps, bridge, 0, now, pages);
+    }
+    true
 }
 
 /// Stop the live channel playing full screen for the one a CH▲/CH▼ tuned, without leaving the

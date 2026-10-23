@@ -373,7 +373,7 @@ fn a_live_stream_is_an_h264_aac_hls_transcode_of_the_tuned_key() {
     let (port, server) = serve(vec![("200 OK", decision)]);
     let client = loopback_client(port);
     let off = plx_base::task::OffFrame::for_test();
-    let s = client.live_stream(&off, "/livetv/sessions/0e0e-1", "enc-1").unwrap();
+    let s = client.live_stream(&off, "/livetv/sessions/0e0e-1", "enc-1", 0).unwrap();
     assert_eq!((s.video_codec.as_str(), s.audio_codec.as_str(), s.width, s.height), ("h264", "aac", 1280, 720));
     assert_eq!(s.encoder_session, "enc-1");
     assert_eq!(s.fps, 59.94, "the Load declares the encode's own rate");
@@ -381,7 +381,7 @@ fn a_live_stream_is_an_h264_aac_hls_transcode_of_the_tuned_key() {
     assert!(s.url.contains("protocol=hls") && s.url.contains("directStream=0") && s.url.contains("session=enc-1"));
     let seen = server.join().unwrap();
     assert!(seen[0].starts_with("GET /video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F0e0e-1&"), "{}", seen[0]);
-    assert_eq!(client.live_stream(&off, "livetv/sessions/x", "enc"), Err(LiveError::Invalid));
+    assert_eq!(client.live_stream(&off, "livetv/sessions/x", "enc", 0), Err(LiveError::Invalid));
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn a_refused_live_decision_says_why() {
     let client = loopback_client(port);
     let off = plx_base::task::OffFrame::for_test();
     assert_eq!(
-        client.live_stream(&off, "/livetv/sessions/x", "enc"),
+        client.live_stream(&off, "/livetv/sessions/x", "enc", 0),
         Err(LiveError::Server { status: 2000, message: "Neither direct play nor conversion is available.".into() })
     );
     server.join().unwrap();

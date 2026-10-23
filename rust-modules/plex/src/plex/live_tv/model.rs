@@ -368,8 +368,23 @@ pub struct TunedItem {
     pub video_codec: String,
     pub audio_codec: String,
     /// Every stream of the tuned part as `(streamType, codec)`, in the server's order: the log's
-    /// shape of the tune, and where a caption stream (`eia_608`) would be found.
+    /// shape of the tune.
     pub streams: Vec<(i64, String)>,
+    /// The broadcast's caption streams (`streamType` 3: closed captions as `eia_608`, a DVB
+    /// subtitle…), which the server can burn into the encode ([`super::Client::live_stream`]).
+    pub captions: Vec<LiveCaption>,
+}
+
+/// A caption stream of a tuned channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveCaption {
+    /// The stream id the transcode names (`subtitleStreamID`); 0 when the server gave none.
+    pub id: i64,
+    pub codec: String,
+    /// The display language ("English") and its code ("eng"), as the server says them.
+    pub language: String,
+    pub language_code: String,
+    pub title: String,
 }
 
 /// A tune's answer.

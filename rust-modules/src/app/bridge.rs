@@ -3947,7 +3947,7 @@ mod watchlist;
 
 #[path = "live_tv.rs"]
 mod live_tv;
-pub(crate) use live_tv::live_route;
+pub(crate) use live_tv::{live_playing_item, live_route};
 pub(crate) use watchlist::{hex_of_guid, open_catalog, open_watchlist_menu};
 
 #[cfg(test)]

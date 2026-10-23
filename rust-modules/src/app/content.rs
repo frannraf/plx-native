@@ -1174,8 +1174,9 @@ fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) -> bool {
     halt_preview_now(&mut app.player.session, &mut app.adapters.player);
     // No library item is playing: the player's Info card must not describe the last one, nor its
     // track menus offer the last one's subtitles and audio (and its chapters tab goes with them).
+    // What they read instead is the channel's own: its caption streams, as subtitles.
     app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
-    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(None));
+    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(bridge::live_playing_item(&tuned))));
     if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
         plx_base::eventlog::log("livetv: the route refused the live stream's declaration (tune released)");
         return false;

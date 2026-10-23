@@ -452,7 +452,7 @@ impl Client {
         let tuned = parse::tune(&ok_body(outcome)?);
         match &tuned {
             Ok(t) => debug::parsed(&format!(
-                "tune parsed: subscription {}, item key {:?}, ratingKey {}, playable {}, {} conflict(s), {} program(s), capture window {}, item {}x{} {}/{}, streams {:?}",
+                "tune parsed: subscription {}, item key {:?}, ratingKey {}, playable {}, {} conflict(s), {} program(s), capture window {}, item {}x{} {}/{}, streams {:?}, captions {:?}",
                 if t.subscription_id.is_empty() { "missing" } else { "present" },
                 debug::path_shape(&t.item.key),
                 if t.item.rating_key.is_empty() { "missing" } else { "present" },
@@ -464,7 +464,8 @@ impl Client {
                 t.item.height,
                 t.item.video_codec,
                 t.item.audio_codec,
-                t.item.streams
+                t.item.streams,
+                t.item.captions.iter().map(|c| (c.id > 0, c.codec.as_str(), c.language_code.as_str())).collect::<Vec<_>>()
             )),
             Err(e) => debug::parsed(&format!("tune answer unreadable: {}", e.reason())),
         }
@@ -507,6 +508,8 @@ pub struct LiveStream {
     /// The encode's frame rate as the decision states it (0 when it does not): what the Load
     /// declares, so a 59.94 broadcast is not presented on a 30 fps lattice.
     pub fps: f64,
+    /// The caption stream burned into the encode (`TunedItem::captions`), 0 for none.
+    pub subtitle_stream_id: i64,
 }
 
 /// The bound a live encode is asked for: 1080p at a rate a LAN carries comfortably. A tuner's
@@ -515,7 +518,9 @@ pub struct LiveStream {
 pub const LIVE_CEILING: super::Ceiling = super::Ceiling { max_kbps: 12_000, max_w: 1920, max_h: 1080 };
 
 /// The transcode request for a live key: the same fixed-HLS contract the library's HLS rungs use.
-pub(super) fn live_spec<'a>(key: &'a str, session: &'a str) -> super::TranscodeSpec<'a> {
+/// `subtitle_stream_id` names a caption stream of the tuned part to burn in (0 for none): the
+/// profile advertises no subtitle delivery, so the server's one way to show it is in the picture.
+pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64) -> super::TranscodeSpec<'a> {
     super::TranscodeSpec {
         rating_key: "",
         path_override: Some(key),
@@ -529,7 +534,7 @@ pub(super) fn live_spec<'a>(key: &'a str, session: &'a str) -> super::TranscodeS
             audio: super::AudioEnhancements::NONE,
         },
         audio_stream_id: 0,
-        subtitle_stream_id: 0,
+        subtitle_stream_id: subtitle_stream_id.max(0),
         client_subtitles: false,
         offset: super::TranscodeOffset::Fresh,
     }
@@ -541,11 +546,11 @@ impl Client {
     /// A refusal is `Server` with PMS's own sentence; nothing is left running (the decision of a
     /// refused encode registers nothing that needs a stop, and a transport failure is stopped by
     /// the caller with [`Client::live_stream_stop`] to be sure).
-    pub fn live_stream(&self, off: &plx_base::task::OffFrame, key: &str, session: &str) -> LiveResult<LiveStream> {
+    pub fn live_stream(&self, off: &plx_base::task::OffFrame, key: &str, session: &str, subtitle_stream_id: i64) -> LiveResult<LiveStream> {
         if !key.starts_with('/') || session.is_empty() {
             return Err(LiveError::Invalid);
         }
-        let spec = live_spec(key, session);
+        let spec = live_spec(key, session, subtitle_stream_id);
         let started = std::time::Instant::now();
         let decision = self.transcode_decision(off, &spec);
         let Some(decision) = decision else {
@@ -553,8 +558,9 @@ impl Client {
             return Err(LiveError::Transport);
         };
         debug::parsed(&format!(
-            "live decision in {} ms: general {:?} {:?}, transcode {:?} {:?}, {} metadata, streams {:?}",
+            "live decision in {} ms (captions {}): general {:?} {:?}, transcode {:?} {:?}, {} metadata, streams {:?}",
             started.elapsed().as_millis(),
+            if subtitle_stream_id > 0 { "asked" } else { "none" },
             decision.general_decision_code,
             decision.general_decision_text,
             decision.transcode_decision_code,
@@ -585,6 +591,7 @@ impl Client {
         Ok(LiveStream {
             url: self.transcode_start_url(&spec).to_url(),
             encoder_session: session.to_string(),
+            subtitle_stream_id: subtitle_stream_id.max(0),
             video_codec: codec(1, "h264"),
             audio_codec: codec(2, "aac"),
             width: media.map_or(0, |m| m.width),
