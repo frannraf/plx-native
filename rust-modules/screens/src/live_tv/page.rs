@@ -125,6 +125,10 @@ pub struct LiveTvScreen {
     tab_grow: Vec<plx_ui::Spring>,
     /// How far the tab row has scrolled left to keep the focused tab on screen.
     tab_scroll: plx_ui::Spring,
+    /// Guide cells on the move, 0 (at rest) to 1 (grown): the row focus arrives at grows taller as
+    /// the one it left shrinks back (the frame's `grown`, as the stock guide does). A cell at rest
+    /// leaves the list.
+    cell_grow: Vec<(u32, plx_ui::Spring)>,
 }
 
 impl LiveTvScreen {
@@ -157,7 +161,24 @@ impl LiveTvScreen {
             last_tick: None,
             tab_grow: Vec::new(),
             tab_scroll: plx_ui::Spring::at(0.0),
+            cell_grow: Vec::new(),
         }
+    }
+
+    /// The frame's grown rows from the cells on the move: the two most grown, a row once (focus
+    /// moving along a row keeps it tall).
+    fn grown_rows(&self) -> [(usize, u16); 2] {
+        let mut rows: Vec<(usize, u16)> = Vec::new();
+        for (e, g) in &self.cell_grow {
+            let Some((row, _)) = model::cell_of(*e) else { continue };
+            let mille = (g.pos.clamp(0.0, 1.0) * 1000.0) as u16;
+            match rows.iter_mut().find(|(r, _)| *r == row) {
+                Some((_, m)) => *m = (*m).max(mille),
+                None => rows.push((row, mille)),
+            }
+        }
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        [rows.first().copied().unwrap_or((0, 0)), rows.get(1).copied().unwrap_or((0, 0))]
     }
 
     // ---- what the application reads and feeds ---------------------------------------------------
@@ -519,6 +540,9 @@ impl LiveTvScreen {
         self.focus = Some(elem);
         if model::cell_of(elem).is_some() {
             self.last_cell = Some(elem);
+            if !self.cell_grow.iter().any(|(e, _)| *e == elem) {
+                self.cell_grow.push((elem, plx_ui::Spring::at(0.0)));
+            }
         }
         if !scroll {
             plx_machine::idle::invalidate();
@@ -554,6 +578,16 @@ impl LiveTvScreen {
         if !self.tab_scroll.land(scroll, dt) {
             self.tab_scroll.step(scroll, TAB_K, dt);
         }
+        // the focused cell grows, every other one on the list shrinks back and leaves it at rest
+        let (focus, panel_up) = (self.focus, self.panel.is_some());
+        for (e, g) in &mut self.cell_grow {
+            let to = if focus == Some(*e) && !panel_up { 1.0 } else { 0.0 };
+            if !g.land(to, dt) {
+                g.step(to, CELL_K, dt);
+            }
+        }
+        self.cell_grow.retain(|(e, g)| focus == Some(*e) || g.pos > 0.002 || g.vel.abs() > 0.002);
+        self.frame.grown = self.grown_rows();
         if let Some((_, until)) = &mut self.notice {
             let at = *until.get_or_insert(ms.wrapping_add(NOTICE_MS));
             // the tick clock wraps: gone once `ms` passes `at`
@@ -982,8 +1016,8 @@ impl LiveTvScreen {
     }
 
     /// A row's channel: its logo (else its call sign) over its number.
-    fn draw_channel<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32) {
-        let r = Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, geom::ROW_H);
+    fn draw_channel<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32, h: f32) {
+        let r = Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, h);
         p.rrect(r, 10.0, 10.0, theme::with_a(INK_BLACK, 0.32));
         let logo_box = Rect::new(r.x + 18.0, y + 10.0, r.w - 36.0, r.h - 44.0);
         let thumb = if ch.thumb.is_empty() {
@@ -1055,7 +1089,7 @@ impl LiveTvScreen {
         for row in rows {
             let y = model::row_y(fr, row);
             if let Some(ch) = self.view.snap.channels.get(row) {
-                self.draw_channel(f, p, row, ch, y);
+                self.draw_channel(f, p, row, ch, y, model::row_h(fr, row));
             }
             let Some(r) = self.view.row(row) else { continue };
             let shown: Vec<&Airing> = r.airings.iter().filter(|a| a.ends_at > fr.win_start && a.begins_at < fr.win_start + model::WINDOW_S).collect();
@@ -1116,10 +1150,13 @@ impl LiveTvScreen {
         if rect.w < 40.0 {
             return;
         }
+        // A grown row's cell: its poster grows with it and its words stay centred in it.
+        let dy = (rect.h - geom::ROW_H) * 0.5;
         let mut tx = rect.x + 16.0;
         if rect.w >= POSTER_MIN_CELL_W && !a.poster.is_empty() {
             if let Some(srv) = self.srv() {
-                let pr = Rect::new(rect.x + 8.0, rect.y + 8.0, geom::POSTER_W, geom::POSTER_H);
+                let ph = rect.h - 16.0;
+                let pr = Rect::new(rect.x + 8.0, rect.y + 8.0, (ph * 2.0 / 3.0).round(), ph);
                 let (tex, tw, th) = resolve_tex_wh_on(srv, &a.poster, POSTER_REQ.0, POSTER_REQ.1, 0);
                 if tex != 0 {
                     p.tex_uv(tex, pr.cover_uv(tw, th, Crop::Centre), pr, 6.0, theme::TINT_WHITE);
@@ -1158,11 +1195,11 @@ impl LiveTvScreen {
                 .bold()
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(tx, rect.y + 16.0, w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 16.0 + dy, w, 0.0));
             TextView::new(&sub, theme::size::CAPTION, ink2)
                 .with_measure(f.measure)
                 .max_lines(1)
-                .draw(p, Rect::new(tx, rect.y + 52.0, w, 0.0));
+                .draw(p, Rect::new(tx, rect.y + 52.0 + dy, w, 0.0));
         }
         if rec {
             p.rrect(Rect::new(rect.x + rect.w - 14.0 - 12.0, rect.y + 20.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
@@ -1511,6 +1548,8 @@ const TAB_PAD: f32 = 26.0;
 const TAB_GAP: f32 = 6.0;
 const TAB_SPLIT: f32 = 34.0;
 const TAB_K: f32 = 260.0;
+/// The guide rows' grow spring (the frame's `grown`, [`model::ROW_EXTRA`] taller at 1).
+const CELL_K: f32 = 260.0;
 
 /// A cell this wide wears a premiere's NEW.
 const NEW_MIN_CELL_W: f32 = 240.0;

@@ -48,7 +48,7 @@ fn view(n: usize) -> LiveTvView {
 }
 
 fn frame() -> Frame {
-    Frame { base: BASE, win_start: NOON, row_top: 0, now: NOON + 10 * 60 }
+    Frame { base: BASE, win_start: NOON, row_top: 0, now: NOON + 10 * 60, grown: [(0, 0); 2] }
 }
 
 fn cell(row: usize, begins: i64) -> u32 {
@@ -299,6 +299,24 @@ fn moving_down_into_a_gap_lands_on_the_windows_own_program() {
     let f = frame();
     assert_eq!(guide_neighbour(&v, &f, cell(0, NOON + 3_600), Dir::Down).and_then(|e| guide_neighbour(&v, &f, e, Dir::Down)).and_then(|e| guide_neighbour(&v, &f, e, Dir::Down)), Some(cell(3, NOON)), "the 12:00 program, in the window");
     assert_eq!(follow(&v, &f, cell(3, NOON)).win_start, f.win_start, "the window stays");
+}
+
+/// A grown row is taller and the rows below it move down by as much; rows above and rows
+/// scrolled off are untouched, and a row named twice grows once.
+#[test]
+fn a_grown_row_is_taller_and_pushes_the_rows_below_it() {
+    let f = Frame { grown: [(1, 1000), (1, 500)], ..frame() };
+    assert_eq!(row_y(&f, 0), geom::ROWS_Y);
+    assert_eq!(row_y(&f, 1), geom::ROWS_Y + geom::ROW_PITCH);
+    assert_eq!(row_h(&f, 1), geom::ROW_H + ROW_EXTRA, "the larger of its two entries, once");
+    assert_eq!(row_y(&f, 2), geom::ROWS_Y + 2.0 * geom::ROW_PITCH + ROW_EXTRA);
+    assert_eq!(row_h(&f, 2), geom::ROW_H);
+    let half = Frame { grown: [(0, 500), (3, 1000)], ..frame() };
+    assert_eq!(row_y(&half, 1), geom::ROWS_Y + geom::ROW_PITCH + ROW_EXTRA * 0.5);
+    assert_eq!(row_y(&half, 3), geom::ROWS_Y + 3.0 * geom::ROW_PITCH + ROW_EXTRA * 0.5, "row 3's own growth moves nothing above it");
+    let scrolled = Frame { row_top: 2, grown: [(1, 1000), (0, 0)], ..frame() };
+    assert_eq!(row_y(&scrolled, 3), geom::ROWS_Y + geom::ROW_PITCH, "a grown row scrolled off counts for nothing");
+    assert_eq!(cell_rect(&f, 1, NOON, NOON + 1_800).unwrap().h, geom::ROW_H + ROW_EXTRA);
 }
 
 /// A page move goes four rows at a time, stops at either end, and lands an off-air row on its

@@ -174,6 +174,24 @@ pub struct Frame {
     pub win_start: i64,
     pub row_top: usize,
     pub now: i64,
+    /// Rows grown taller, as the stock guide does for the focused one: `(row, per mille)`, the
+    /// row focus is on growing to 1000 as the one it left shrinks to 0 (the page's springs). The
+    /// rows below move down by what they grew ([`row_y`], [`row_h`]).
+    pub grown: [(usize, u16); 2],
+}
+
+/// How much taller a grown row stands (px) at 1000 per mille.
+pub const ROW_EXTRA: f32 = 36.0;
+
+/// What row `row` has grown by, px.
+pub fn row_extra(frame: &Frame, row: usize) -> f32 {
+    let mille = frame.grown.iter().filter(|(r, g)| *r == row && *g > 0).map(|(_, g)| *g).max().unwrap_or(0);
+    ROW_EXTRA * f32::from(mille.min(1000)) / 1000.0
+}
+
+/// Row `row`'s height: the row's, plus what it has grown.
+pub fn row_h(frame: &Frame, row: usize) -> f32 {
+    geom::ROW_H + row_extra(frame, row)
 }
 
 pub mod geom {
@@ -244,7 +262,7 @@ pub fn cell_rect(frame: &Frame, row: usize, begins_at: i64, ends_at: i64) -> Opt
     let x0 = x_of(frame.win_start, begins_at.max(frame.win_start));
     let x1 = x_of(frame.win_start, ends_at.min(win_end)) - geom::CELL_GAP;
     let y = row_y(frame, row);
-    Some(Rect::new(x0, y, (x1 - x0).max(4.0), geom::ROW_H))
+    Some(Rect::new(x0, y, (x1 - x0).max(4.0), row_h(frame, row)))
 }
 
 /// The rect of a row's placeholder (the whole window).
@@ -252,11 +270,17 @@ pub fn placeholder_rect(frame: &Frame, row: usize) -> Option<Rect> {
     if row < frame.row_top || row >= frame.row_top + ROWS_SHOWN {
         return None;
     }
-    Some(Rect::new(geom::GRID_X, row_y(frame, row), geom::GRID_W - geom::CELL_GAP, geom::ROW_H))
+    Some(Rect::new(geom::GRID_X, row_y(frame, row), geom::GRID_W - geom::CELL_GAP, row_h(frame, row)))
 }
 
+/// The top of row `row`: its place in the rows shown, moved down by what the grown rows above it
+/// (among those shown) have grown.
 pub fn row_y(frame: &Frame, row: usize) -> f32 {
-    geom::ROWS_Y + (row as f32 - frame.row_top as f32) * geom::ROW_PITCH
+    let mut y = geom::ROWS_Y + (row as f32 - frame.row_top as f32) * geom::ROW_PITCH;
+    for r in frame.row_top..row.min(frame.row_top + ROWS_SHOWN) {
+        y += row_extra(frame, r);
+    }
+    y
 }
 
 /// The rect a guide key is drawn at, where it would be drawn even when scrolled off (a row above
@@ -265,7 +289,7 @@ pub fn elem_rect(view: &LiveTvView, frame: &Frame, elem: u32) -> Option<Rect> {
     let (row, slot) = cell_of(elem)?;
     let y = row_y(frame, row);
     if slot == PLACEHOLDER {
-        return Some(Rect::new(geom::GRID_X, y, geom::GRID_W - geom::CELL_GAP, geom::ROW_H));
+        return Some(Rect::new(geom::GRID_X, y, geom::GRID_W - geom::CELL_GAP, row_h(frame, row)));
     }
     let (_, a) = view.airing(frame.base, elem)?;
     let win_end = frame.win_start + WINDOW_S;
@@ -277,7 +301,7 @@ pub fn elem_rect(view: &LiveTvView, frame: &Frame, elem: u32) -> Option<Rect> {
     };
     let x0 = x_of(frame.win_start, b);
     let x1 = x_of(frame.win_start, e) - geom::CELL_GAP;
-    Some(Rect::new(x0, y, (x1 - x0).max(4.0), geom::ROW_H))
+    Some(Rect::new(x0, y, (x1 - x0).max(4.0), row_h(frame, row)))
 }
 
 /// The time an UP/DOWN move keeps: where the focused cell starts on screen.
