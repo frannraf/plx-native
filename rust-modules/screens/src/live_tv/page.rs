@@ -1140,11 +1140,19 @@ impl LiveTvScreen {
         let now = fr.now > 0 && a.airs_at(fr.now);
         let (fill, ink, ink2) = cell_colors(on, now);
         p.rrect(rect, 10.0, 10.0, fill);
-        if now && !on {
+        // A program on now fills from its left up to now, as the stock guide's does: a milky white
+        // over a cell at rest; the focused cell is white already, so what is still to come dims
+        // instead, and its elapsed part reads as the fill.
+        if now {
             let nx = model::x_of(fr.win_start, fr.now).clamp(rect.x, rect.x + rect.w);
-            if nx > rect.x + 1.0 {
+            if on {
+                if nx < rect.x + rect.w - 1.0 {
+                    let left = if nx <= rect.x + 1.0 { 10.0 } else { 0.0 };
+                    p.rrect(Rect::new(nx, rect.y, rect.x + rect.w - nx, rect.h), left, 10.0, theme::with_a(INK_BLACK, 0.09));
+                }
+            } else if nx > rect.x + 1.0 {
                 let right = if nx >= rect.x + rect.w - 1.0 { 10.0 } else { 0.0 };
-                p.rrect(Rect::new(rect.x, rect.y, nx - rect.x, rect.h), 10.0, right, theme::with_a(theme::TEXT_PRIMARY, 0.10));
+                p.rrect(Rect::new(rect.x, rect.y, nx - rect.x, rect.h), 10.0, right, theme::with_a(theme::TEXT_PRIMARY, ON_NOW_FILL));
             }
         }
         if rect.w < 40.0 {
@@ -1565,6 +1573,9 @@ fn tint(c: [f32; 3], low: bool) -> [f32; 4] {
 }
 
 /// A cell's fill and inks: focused, on now, or neither.
+/// How white the elapsed part of a program on now is painted over its cell at rest.
+const ON_NOW_FILL: f32 = 0.24;
+
 fn cell_colors(on: bool, now: bool) -> ([f32; 4], [f32; 4], [f32; 4]) {
     if on {
         (theme::ACCENT, theme::ACCENT_INK, theme::ACCENT_INK)
