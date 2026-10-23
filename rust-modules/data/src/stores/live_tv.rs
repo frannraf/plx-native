@@ -289,8 +289,23 @@ fn tune(
         }
         return Err(if t.has_conflicts() { LiveError::Busy } else { LiveError::Unreadable });
     }
-    // the broadcast's closed captions, when asked for: the server burns them into the encode
+    // The broadcast's closed captions, when asked for: the server burns them into the encode.
+    // The encode burns the part's SELECTED subtitle, and on a live session the `subtitleStreamID`
+    // of the stream URL alone does not select it (measured on the set 2026-10-22/23: the decision
+    // echoed the caption and drew nothing; with the selection written first its streams list the
+    // caption and the picture carries it), so the selection is written to the tuned part first,
+    // as a library part's is. A refused write is logged and the encode still asked, as before.
     let sub = if captions { t.item.captions.iter().map(|c| c.id).find(|id| *id > 0).unwrap_or(0) } else { 0 };
+    if sub > 0 && t.item.part_id > 0 {
+        let status = client.select_streams(&plx_plex::plex::StreamSelection {
+            part_id: t.item.part_id,
+            audio_stream_id: 0,
+            subtitle_stream_id: Some(sub),
+        });
+        if status != 200 {
+            plx_base::eventlog::log(&format!("livetv: the caption selection on part {} answered HTTP {status}", t.item.part_id));
+        }
+    }
     match client.live_stream(off, &t.item.key, session, sub) {
         Ok(stream) => Ok((t.subscription_id, t.item, stream)),
         Err(e) => {

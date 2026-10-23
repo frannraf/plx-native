@@ -499,6 +499,7 @@ fn tuned_item(m: &Value) -> TunedItem {
         video_codec: video.map(|v| text(v, "codec")).unwrap_or_default(),
         audio_codec: audio.map(|a| text(a, "codec")).unwrap_or_default(),
         streams: streams.iter().map(|s| (int(s, "streamType"), text(s, "codec"))).collect(),
+        part_id: media.and_then(|md| many(md, "Part").into_iter().next()).map_or(0, |p| int(p, "id")),
         captions: streams
             .iter()
             .filter(|s| int(s, "streamType") == 3)

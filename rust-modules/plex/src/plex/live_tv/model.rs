@@ -373,6 +373,9 @@ pub struct TunedItem {
     /// The broadcast's caption streams (`streamType` 3: closed captions as `eia_608`, a DVB
     /// subtitle…), which the server can burn into the encode ([`super::Client::live_stream`]).
     pub captions: Vec<LiveCaption>,
+    /// The tuned part's id (0 when the tune names none): what the stream selection the encode
+    /// honours is written against (`PUT /library/parts/{id}`, [`super::Client::select_streams`]).
+    pub part_id: i64,
 }
 
 /// A caption stream of a tuned channel.
