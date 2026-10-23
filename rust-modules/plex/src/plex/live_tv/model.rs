@@ -367,6 +367,9 @@ pub struct TunedItem {
     pub height: i64,
     pub video_codec: String,
     pub audio_codec: String,
+    /// Every stream of the tuned part as `(streamType, codec)`, in the server's order: the log's
+    /// shape of the tune, and where a caption stream (`eia_608`) would be found.
+    pub streams: Vec<(i64, String)>,
 }
 
 /// A tune's answer.

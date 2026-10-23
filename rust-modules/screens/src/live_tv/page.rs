@@ -165,9 +165,10 @@ impl LiveTvScreen {
         }
     }
 
-    /// The frame's grown rows from the cells on the move: the two most grown, a row once (focus
-    /// moving along a row keeps it tall).
-    fn grown_rows(&self) -> [(usize, u16); 2] {
+    /// The frame's grown rows from the cells on the move: the most grown, as many as rows are
+    /// shown (a key held down has three on the move at once), a row once (focus moving along a
+    /// row keeps it tall).
+    fn grown_rows(&self) -> [(usize, u16); model::ROWS_SHOWN] {
         let mut rows: Vec<(usize, u16)> = Vec::new();
         for (e, g) in &self.cell_grow {
             let Some((row, _)) = model::cell_of(*e) else { continue };
@@ -178,7 +179,11 @@ impl LiveTvScreen {
             }
         }
         rows.sort_by(|a, b| b.1.cmp(&a.1));
-        [rows.first().copied().unwrap_or((0, 0)), rows.get(1).copied().unwrap_or((0, 0))]
+        let mut out = [(0, 0); model::ROWS_SHOWN];
+        for (slot, r) in rows.iter().take(model::ROWS_SHOWN).enumerate() {
+            out[slot] = *r;
+        }
+        out
     }
 
     // ---- what the application reads and feeds ---------------------------------------------------
@@ -1188,7 +1193,7 @@ impl LiveTvScreen {
         if a.premiere && rect.w >= NEW_MIN_CELL_W {
             let words = msg::live_tv_badge_new();
             let tw = f.measure.width_str(words, theme::size::MICRO, true);
-            let b = Rect::new(rect.x + rect.w - 12.0 - dot - tw - 16.0, rect.y + 10.0, tw + 16.0, 28.0);
+            let b = Rect::new(rect.x + rect.w - 12.0 - dot - tw - 16.0, rect.y + 10.0 + dy, tw + 16.0, 28.0);
             p.rring(b, 6.0, 1.5, theme::with_a(ink2, 0.8));
             if let Ok(c) = CString::new(words) {
                 Label::new(c.as_ptr(), theme::size::MICRO, ink2).bold().h(HAlign::Center).v(VAlign::Middle).draw(p, b);
@@ -1210,7 +1215,7 @@ impl LiveTvScreen {
                 .draw(p, Rect::new(tx, rect.y + 52.0 + dy, w, 0.0));
         }
         if rec {
-            p.rrect(Rect::new(rect.x + rect.w - 14.0 - 12.0, rect.y + 20.0, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
+            p.rrect(Rect::new(rect.x + rect.w - 14.0 - 12.0, rect.y + 20.0 + dy, 12.0, 12.0), 6.0, 6.0, theme::DANGER);
         }
     }
 

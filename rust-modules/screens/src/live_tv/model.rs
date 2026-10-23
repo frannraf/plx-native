@@ -177,7 +177,7 @@ pub struct Frame {
     /// Rows grown taller, as the stock guide does for the focused one: `(row, per mille)`, the
     /// row focus is on growing to 1000 as the one it left shrinks to 0 (the page's springs). The
     /// rows below move down by what they grew ([`row_y`], [`row_h`]).
-    pub grown: [(usize, u16); 2],
+    pub grown: [(usize, u16); ROWS_SHOWN],
 }
 
 /// How much taller a grown row stands (px) at 1000 per mille.

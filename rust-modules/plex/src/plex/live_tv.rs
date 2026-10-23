@@ -452,7 +452,7 @@ impl Client {
         let tuned = parse::tune(&ok_body(outcome)?);
         match &tuned {
             Ok(t) => debug::parsed(&format!(
-                "tune parsed: subscription {}, item key {:?}, ratingKey {}, playable {}, {} conflict(s), {} program(s), capture window {}, item {}x{} {}/{}",
+                "tune parsed: subscription {}, item key {:?}, ratingKey {}, playable {}, {} conflict(s), {} program(s), capture window {}, item {}x{} {}/{}, streams {:?}",
                 if t.subscription_id.is_empty() { "missing" } else { "present" },
                 debug::path_shape(&t.item.key),
                 if t.item.rating_key.is_empty() { "missing" } else { "present" },
@@ -463,7 +463,8 @@ impl Client {
                 t.item.width,
                 t.item.height,
                 t.item.video_codec,
-                t.item.audio_codec
+                t.item.audio_codec,
+                t.item.streams
             )),
             Err(e) => debug::parsed(&format!("tune answer unreadable: {}", e.reason())),
         }

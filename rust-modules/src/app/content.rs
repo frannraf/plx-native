@@ -1075,6 +1075,10 @@ fn live_tv_requests(app: &mut App) {
                 plx_base::eventlog::log("livetv: the program on the channel playing moved on");
             }
         }
+    } else {
+        // No channel plays (STOP, the stream's end, a tune that failed): the guide is no longer
+        // kept fresh for one, and a record press has nothing to record.
+        app.bridge.live_tv_forget_watching();
     }
     if let Some(tuned) = app.bridge.live_tv_take_tuned() {
         // The landing answers the Watch last asked; it plays only over the screen that asked it.
@@ -1168,8 +1172,10 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
 fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) -> bool {
     // A trailer still playing would hold the engine the Load needs.
     halt_preview_now(&mut app.player.session, &mut app.adapters.player);
-    // No library item is playing: the player's Info card must not describe the last one.
+    // No library item is playing: the player's Info card must not describe the last one, nor its
+    // track menus offer the last one's subtitles and audio (and its chapters tab goes with them).
     app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
+    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(None));
     if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
         plx_base::eventlog::log("livetv: the route refused the live stream's declaration (tune released)");
         return false;

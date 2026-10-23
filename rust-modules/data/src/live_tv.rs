@@ -264,9 +264,13 @@ impl GuideCache {
         out
     }
     /// Is any day of channel `ch` covering `[from, to)` still loading or unasked, for the first
-    /// time? (A day being asked again after a failure reads as failed meanwhile: [`Day::failures`].)
+    /// time? (A day being asked again after a failure reads as failed meanwhile: [`Day::failures`];
+    /// one that answered once and is read again for freshness shows what it had — "no information"
+    /// when that was nothing — never "Loading…".)
     pub fn pending(&self, ch: usize, dates: &[String]) -> bool {
-        dates.iter().any(|d| self.get(ch, d).is_none_or(|day| matches!(day.phase, Phase::Idle | Phase::Loading) && day.failures == 0))
+        dates.iter().any(|d| {
+            self.get(ch, d).is_none_or(|day| matches!(day.phase, Phase::Idle | Phase::Loading) && day.failures == 0 && day.landed_at == 0)
+        })
     }
     /// Did every day of channel `ch` in `dates` fail (or fail and not yet answer again)?
     pub fn failed(&self, ch: usize, dates: &[String]) -> bool {

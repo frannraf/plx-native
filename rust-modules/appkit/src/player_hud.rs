@@ -1336,8 +1336,8 @@ pub fn ctrl_row_hit_rect() -> Rect {
 }
 
 /// One bottom tab's rect, matching the left-to-right layout [`draw_hud`] lays the pills out with.
-pub fn tab_hit_rect(idx: i32, has_chapters: bool, measure: &dyn plx_machine::machine::Measure) -> Option<Rect> {
-    let tabs = tab_labels(has_chapters);
+pub fn tab_hit_rect(idx: i32, has_chapters: bool, live: bool, measure: &dyn plx_machine::machine::Measure) -> Option<Rect> {
+    let tabs = tab_labels(has_chapters, live);
     let items = tab_items(tabs, measure);
     let (px, pw) = tab_row(&items).span(usize::try_from(idx).ok()?)?;
     Some(Rect::new(px, tab_y(), pw, BTN_S))
@@ -1345,10 +1345,12 @@ pub fn tab_hit_rect(idx: i32, has_chapters: bool, measure: &dyn plx_machine::mac
 
 /// The bottom tab pills' labels: Info always, Chapters only when the item has any; `None` is a
 /// tab the row does not carry.
-fn tab_labels(has_chapters: bool) -> [Option<&'static str>; HUD_TABS] {
+/// The bottom tabs: Info, and Chapters when the item has them. A live channel has neither — no
+/// library item for an Info card to describe or start over, no chapters.
+fn tab_labels(has_chapters: bool, live: bool) -> [Option<&'static str>; HUD_TABS] {
     [
-        Some(plx_platform::i18n::msg::widgets_player_info()),
-        has_chapters.then(plx_platform::i18n::msg::widgets_player_chapters),
+        (!live).then(plx_platform::i18n::msg::widgets_player_info),
+        (has_chapters && !live).then(plx_platform::i18n::msg::widgets_player_chapters),
     ]
 }
 
@@ -2043,7 +2045,7 @@ pub fn draw_hud(
     } // end `if transport`
 
     // bottom tabs as pills — Chapters only appears when the item actually has chapters
-    draw_tabs(&e, pc, crate::chapters_panel::has_chapters(meta), chrome, |i| hud_tab_state(transport, focus, tab, i), measure);
+    draw_tabs(&e, pc, crate::chapters_panel::has_chapters(meta), plx_media::route::is_live(ps), chrome, |i| hud_tab_state(transport, focus, tab, i), measure);
 }
 
 /// The bottom tab pills: ONE run from the scrubber's left edge ([`tab_row`]), the same one
@@ -2053,11 +2055,12 @@ fn draw_tabs(
     e: &Env,
     pc: Painter,
     has_chapters: bool,
+    live: bool,
     chrome: bool,
     state: impl Fn(i32) -> (bool, bool),
     measure: &dyn plx_machine::machine::Measure,
 ) {
-    let tabs = tab_labels(has_chapters);
+    let tabs = tab_labels(has_chapters, live);
     // tabs match the transport control buttons' height (BTN_S), centred vertically between the
     // play bar (scrubber, at SB_Y) and the bottom edge of the screen
     let ph = BTN_S; // = 64, same as the Subtitles/Audio buttons
@@ -2348,12 +2351,12 @@ mod tests {
     fn the_bottom_tabs_stand_one_sm_apart_and_are_drawn_where_they_are_hit() {
         use plx_machine::machine::Measure as _;
         let m = plx_ui::fixture::FixtureMeasure;
-        let hit: Vec<Rect> = (0..2).map(|i| tab_hit_rect(i, true, &m).unwrap()).collect();
+        let hit: Vec<Rect> = (0..2).map(|i| tab_hit_rect(i, true, false, &m).unwrap()).collect();
         assert_eq!(hit[0].x, SB_X);
         assert_eq!(hit[1].x - (hit[0].x + hit[0].w), theme::space::SM);
         // the same pills, painted
         let runs = plx_ui::draw_census::capture_runs(|| {
-            draw_tabs(&hud_env(), Painter::recording(), true, true, |_| (false, false), &m);
+            draw_tabs(&hud_env(), Painter::recording(), true, false, true, |_| (false, false), &m);
         });
         let labels: Vec<_> = runs.iter().filter(|r| [plx_platform::i18n::msg::widgets_player_info(), plx_platform::i18n::msg::widgets_player_chapters()].contains(&r.text.as_str())).collect();
         assert_eq!(labels.len(), 2, "{runs:?}");
@@ -2364,16 +2367,18 @@ mod tests {
         assert!(((labels[1].at.x - labels[0].at.x) - (hit[1].cx() - hit[0].cx())).abs() < 0.5);
         // Hidden case: with no chapters there is one pill, at the same place, and no second hit rect
         // (no double gap and no stray trailing one).
-        assert_eq!(tab_hit_rect(0, false, &m), Some(hit[0]));
-        assert_eq!(tab_hit_rect(1, false, &m), None);
-        assert_eq!(tab_hit_rect(-1, true, &m), None);
+        assert_eq!(tab_hit_rect(0, false, false, &m), Some(hit[0]));
+        assert_eq!(tab_hit_rect(1, false, false, &m), None);
+        assert_eq!(tab_hit_rect(-1, true, false, &m), None);
+        // a live channel has no tabs at all
+        assert_eq!(tab_hit_rect(0, true, true, &m), None);
         let one = plx_ui::draw_census::capture_runs(|| {
-            draw_tabs(&hud_env(), Painter::recording(), false, true, |_| (false, false), &m);
+            draw_tabs(&hud_env(), Painter::recording(), false, false, true, |_| (false, false), &m);
         });
         assert_eq!(one.iter().filter(|r| r.text == plx_platform::i18n::msg::widgets_player_chapters()).count(), 0);
         // chrome off draws (and measures) nothing
         let none = plx_ui::draw_census::capture_runs(|| {
-            draw_tabs(&hud_env(), Painter::recording(), true, false, |_| (false, false), &m);
+            draw_tabs(&hud_env(), Painter::recording(), true, false, false, |_| (false, false), &m);
         });
         assert!(none.is_empty());
     }

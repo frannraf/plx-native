@@ -663,7 +663,9 @@ impl LiveTvStore {
     /// Read the recordings lists again without saying so (a periodic refresh: the lists shown stay
     /// until the new ones land, and an empty page keeps its advice rather than "Loading…").
     pub fn refresh_dvr_quietly(&mut self) {
-        if self.sid.is_none() || self.queue.iter().any(|j| matches!(j, Job::Dvr)) || !self.dvr_phase.is_ready() {
+        // not before the lists were ever asked for, nor over a read on its way; after a read that
+        // failed, the next refresh is the retry
+        if self.sid.is_none() || self.queue.iter().any(|j| matches!(j, Job::Dvr)) || matches!(self.dvr_phase, Phase::Idle | Phase::Loading) {
             return;
         }
         self.queue.push_back(Job::Dvr);

@@ -567,5 +567,5 @@ fn a_stale_channel_day_is_read_again_while_its_programs_stay_on_screen() {
     assert!(g.expire(1_000 + 15 * 60, 15 * 60));
     assert_eq!(g.airings(0, NOON, NOON + 1).len(), 1, "its programs still show");
     assert_eq!(g.want([0].into_iter(), &dates).len(), 1, "and it is asked again");
-    assert!(g.pending(0, &dates));
+    assert!(!g.pending(0, &dates), "it answered once: not on its way to the page, so no Loading…");
 }

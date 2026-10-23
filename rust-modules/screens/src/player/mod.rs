@@ -941,7 +941,8 @@ impl PlayerScreen {
             }
             Key::Up | Key::Down => {
                 if edge == Edge::Down {
-                    self.key_updown(key, now);
+                    // a live channel has no tabs (no Info card, no chapters): the ring is two deep
+                    self.key_updown(key, now, !plx_media::route::is_live(ps));
                 }
                 Handled::Yes
             }
@@ -1009,9 +1010,9 @@ impl PlayerScreen {
         Self::ask(fx, PlayerReq::ArmControlRow);
     }
 
-    /// Port of `key_player_updown`: walk the HUD's ring (scrubber ↔ control row ↔ tabs), or reveal
-    /// a hidden transport and move nothing.
-    fn key_updown(&mut self, key: consts::Key, now: u32) {
+    /// Port of `key_player_updown`: walk the HUD's ring (scrubber ↔ control row ↔ tabs, the tabs
+    /// only while `tabs` — a live channel has none), or reveal a hidden transport and move nothing.
+    fn key_updown(&mut self, key: consts::Key, now: u32, tabs: bool) {
         let vis = self.hud.visible_at_press;
         let mut hide = false;
         if !vis {
@@ -1027,7 +1028,7 @@ impl PlayerScreen {
             }
         } else {
             match self.hud.nav.focus {
-                0 => self.hud.nav.focus = 2,
+                0 if tabs => self.hud.nav.focus = 2,
                 1 => self.hud.nav.focus = 0,
                 _ => {}
             }
@@ -1321,17 +1322,21 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Focusable<H> for PlayerScree
             len: row_len,
             elem: plx_ui::screen::ElemKind::Control,
         });
+        // a live channel has no tabs: no Info card and no chapters
+        let live = plx_media::route::is_live(H::session(cx));
         let has_ch = plx_appkit::chapters_panel::has_chapters(H::metadata(cx));
-        out.push(GroupSpec {
-            id: GROUP_TABS,
-            kind: GroupKind::Row { wrap: false },
-            seat: Seat::First,
-            reachable: AxisMask::BOTH,
-            edge: [EdgeRule::Screen; 4],
-            extent: player_hud::tab_hit_rect(0, has_ch, cx.measure).unwrap_or(Rect::FULL),
-            len: if has_ch { 2 } else { 1 },
-            elem: plx_ui::screen::ElemKind::Control,
-        });
+        if !live {
+            out.push(GroupSpec {
+                id: GROUP_TABS,
+                kind: GroupKind::Row { wrap: false },
+                seat: Seat::First,
+                reachable: AxisMask::BOTH,
+                edge: [EdgeRule::Screen; 4],
+                extent: player_hud::tab_hit_rect(0, has_ch, false, cx.measure).unwrap_or(Rect::FULL),
+                len: if has_ch { 2 } else { 1 },
+                elem: plx_ui::screen::ElemKind::Control,
+            });
+        }
         if matches!(
             self.busy,
             plx_appkit::player_hud::Busy::Readout(plx_ui::widgets::StatusKind::Failed, _)
@@ -1390,6 +1395,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Focusable<H> for PlayerScree
             e if (ELEM_TAB_BASE..ELEM_FAILURE_BASE).contains(&e) => player_hud::tab_hit_rect(
                 (e - ELEM_TAB_BASE) as i32,
                 plx_appkit::chapters_panel::has_chapters(H::metadata(cx)),
+                plx_media::route::is_live(H::session(cx)),
                 cx.measure,
             )?,
             e if (ELEM_FAILURE_BASE..ELEM_FAILURE_END).contains(&e) => {

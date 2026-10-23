@@ -498,6 +498,7 @@ fn tuned_item(m: &Value) -> TunedItem {
         height: video.map_or(0, |v| int(v, "height")),
         video_codec: video.map(|v| text(v, "codec")).unwrap_or_default(),
         audio_codec: audio.map(|a| text(a, "codec")).unwrap_or_default(),
+        streams: streams.iter().map(|s| (int(s, "streamType"), text(s, "codec"))).collect(),
     }
 }
 

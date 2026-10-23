@@ -334,6 +334,12 @@ impl Bridge {
         self.live_tv.watching = Some((asked.source.clone(), asked.row));
     }
 
+    /// No channel plays any more: nothing is watched from the guide (which is kept fresh only while
+    /// its page is up or a channel plays from it).
+    pub(crate) fn live_tv_forget_watching(&mut self) {
+        self.live_tv.watching = None;
+    }
+
     /// The Watch asked failed (the store says so): forget it. `Some(step)` once per failure.
     pub(crate) fn live_tv_take_failure(&mut self) -> Option<bool> {
         if self.live_tv.asked.is_some() && self.stores.live_tv.tune_failed() {

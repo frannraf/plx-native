@@ -538,9 +538,9 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
     let mut pending_lines: Option<u32> = None;
     // A provider variant whose CODECS name a video codec this player is not set up for (a cloud
     // channel plays as H.264/AAC: HEVC, AV1, VP9 or Dolby Vision would open and fail to decode).
-    let mut pending_other_codec = false;
+    let mut pending_codecs = VariantCodecs::Unsaid;
     let mut variant = None;
-    let mut candidates: Vec<(Variant, Option<u32>, bool)> = Vec::new();
+    let mut candidates: Vec<(Variant, Option<u32>, VariantCodecs)> = Vec::new();
 
     for (line_no, line) in lines.into_iter().skip(1) {
         if line.is_empty() {
@@ -565,7 +565,7 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
                     return Err(Error::MultipleVariants);
                 }
                 pending_bandwidth = Some(parse_variant_bandwidth(value, line_no)?);
-                pending_other_codec = shape == Shape::Provider && codecs_other_than_h264(value);
+                pending_codecs = if shape == Shape::Provider { variant_codecs(value) } else { VariantCodecs::Unsaid };
                 pending_lines = value
                     .split("RESOLUTION=")
                     .nth(1)
@@ -612,19 +612,23 @@ pub fn parse_master_as(shape: Shape, source: &Resource, text: &str) -> Result<Ma
             resource,
             bandwidth,
         };
-        candidates.push((found.clone(), pending_lines.take(), std::mem::take(&mut pending_other_codec)));
+        candidates.push((found.clone(), pending_lines.take(), std::mem::replace(&mut pending_codecs, VariantCodecs::Unsaid)));
         variant = Some(found);
     }
     if shape == Shape::Provider && candidates.len() > 1 {
         let fits = |lines: &Option<u32>| lines.is_none_or(|l| l <= PROVIDER_MAX_LINES);
+        let h264 = |c: &VariantCodecs| matches!(c, VariantCodecs::Unsaid | VariantCodecs::H264);
+        let bandwidth = |(v, _, _): &&(Variant, Option<u32>, VariantCodecs)| v.bandwidth;
         // the richest H.264 variant up to 1080 lines; else the leanest H.264 one; else (nothing
-        // says H.264) the leanest of all, and the demuxer's probe has the last word
+        // says H.264) the leanest with a picture, and the demuxer's probe has the last word; an
+        // entry with no video at all (a sound-only rung) last
         variant = candidates
             .iter()
-            .filter(|(_, lines, other)| fits(lines) && !other)
-            .max_by_key(|(v, _, _)| v.bandwidth)
-            .or_else(|| candidates.iter().filter(|(_, _, other)| !other).min_by_key(|(v, _, _)| v.bandwidth))
-            .or_else(|| candidates.iter().min_by_key(|(v, _, _)| v.bandwidth))
+            .filter(|(_, lines, c)| fits(lines) && h264(c))
+            .max_by_key(bandwidth)
+            .or_else(|| candidates.iter().filter(|(_, _, c)| h264(c)).min_by_key(bandwidth))
+            .or_else(|| candidates.iter().filter(|(_, _, c)| *c != VariantCodecs::NoVideo).min_by_key(bandwidth))
+            .or_else(|| candidates.iter().min_by_key(bandwidth))
             .map(|(v, _, _)| v.clone());
     }
 
@@ -1059,15 +1063,30 @@ fn tag_name(line: &str) -> &str {
     line.split_once(':').map_or(line, |(name, _)| name)
 }
 
-/// Does a variant's CODECS attribute name a video codec other than H.264 (`avc1`/`avc3`)? HEVC
-/// (`hvc1`/`hev1`), AV1 (`av01`), VP9 (`vp09`) and Dolby Vision (`dvh1`/`dvhe`) are; audio-only
-/// entries and a missing attribute are not.
-fn codecs_other_than_h264(stream_inf: &str) -> bool {
-    let Some(codecs) = attribute_items(stream_inf).into_iter().find_map(|a| a.trim().strip_prefix("CODECS=")) else { return false };
-    codecs.trim_matches('"').split(',').any(|c| {
-        let id = c.trim().split('.').next().unwrap_or("").to_ascii_lowercase();
-        matches!(id.as_str(), "hvc1" | "hev1" | "av01" | "vp09" | "vp08" | "dvh1" | "dvhe")
-    })
+/// What a variant's CODECS attribute says of its video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariantCodecs {
+    /// No CODECS attribute: nothing said, the probe decides.
+    Unsaid,
+    /// H.264 (`avc1`/`avc3`) is among them, whatever else is.
+    H264,
+    /// A video codec this player is not set up for and no H.264: HEVC (`hvc1`/`hev1`), AV1
+    /// (`av01`), VP9 (`vp09`/`vp08`) or Dolby Vision (`dvh1`/`dvhe`).
+    OtherVideo,
+    /// No video codec named at all: a sound-only rung (a master's lowest entry on some channels).
+    NoVideo,
+}
+
+fn variant_codecs(stream_inf: &str) -> VariantCodecs {
+    let Some(codecs) = attribute_items(stream_inf).into_iter().find_map(|a| a.trim().strip_prefix("CODECS=")) else { return VariantCodecs::Unsaid };
+    let ids: Vec<String> = codecs.trim_matches('"').split(',').map(|c| c.trim().split('.').next().unwrap_or("").to_ascii_lowercase()).collect();
+    if ids.iter().any(|id| matches!(id.as_str(), "avc1" | "avc3")) {
+        VariantCodecs::H264
+    } else if ids.iter().any(|id| matches!(id.as_str(), "hvc1" | "hev1" | "av01" | "vp09" | "vp08" | "dvh1" | "dvhe" | "mp4v")) {
+        VariantCodecs::OtherVideo
+    } else {
+        VariantCodecs::NoVideo
+    }
 }
 
 /// A key tag's METHOD ("NONE", "AES-128", "SAMPLE-AES"…), unquoted. Attributes are split outside
@@ -1285,6 +1304,21 @@ mod tests {
             "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"hev1.1.6.L93.90,mp4a.40.2\"\nhttps://cdn.example/v/b.m3u8\n",
         );
         assert_eq!(parse_master_as(Shape::Provider, &master, hevc_only).unwrap().variant.resource.path, "/v/b.m3u8", "nothing H.264: the leanest, and the probe decides");
+        // a sound-only rung (no video codec named) never wins over a picture, however lean
+        let sound_only = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=96000,CODECS=\"mp4a.40.2\"\nhttps://cdn.example/v/sound.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS=\"hvc1.1.6.L120.90,mp4a.40.2\"\nhttps://cdn.example/v/a.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS=\"hvc1.1.6.L93.90,mp4a.40.2\"\nhttps://cdn.example/v/b.m3u8\n",
+        );
+        assert_eq!(parse_master_as(Shape::Provider, &master, sound_only).unwrap().variant.resource.path, "/v/b.m3u8", "a sound-only rung is never the pick");
+        // a variant naming H.264 beside HEVC is an H.264 one: the richest, not the leanest
+        let both = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,hvc1.1.6.L120.90,mp4a.40.2\"\nhttps://cdn.example/v/720b.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,hvc1.1.6.L120.90,mp4a.40.2\"\nhttps://cdn.example/v/1080b.m3u8\n",
+        );
+        assert_eq!(parse_master_as(Shape::Provider, &master, both).unwrap().variant.resource.path, "/v/1080b.m3u8");
         let auth = InheritedAuth::capture(&master).unwrap();
         let child = auth.request_path(&parsed.variant.resource).unwrap();
         assert!(!child.contains("secret"), "the CDN never sees the credential: {child}");
