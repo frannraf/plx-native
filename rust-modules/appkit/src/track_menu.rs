@@ -1986,9 +1986,17 @@ impl TrackMenuState {
         let subs: &[metadata::Stream] = tracks(meta).map(|t| t.subs.as_slice()).unwrap_or(&[]);
         let offered = visible_subs(ps, meta);
         let names = plx_media::player::SHARED.track_names.lock().unwrap();
-        let mut model = sub_layout::sub_sections(subs, &offered, &names, &self.yours, show_timing);
+        let live = plx_media::route::is_live(ps);
+        // A live channel's captions are the broadcast's own language: a row under Subtitles, never
+        // behind Other languages (no audio track names the language "yours" lists are built from).
+        let yours: Vec<String> = if live {
+            self.yours.iter().cloned().chain(subs.iter().map(|s| s.lang_code.clone()).filter(|c| !c.is_empty())).collect()
+        } else {
+            self.yours.clone()
+        };
+        let mut model = sub_layout::sub_sections(subs, &offered, &names, &yours, show_timing);
         // A live channel's subtitles are its closed captions, on or off: no forced track to match.
-        if plx_media::route::is_live(ps) {
+        if live {
             for section in &mut model.sections {
                 section.rows.retain(|r| *r != SubRow::ForcedOnly);
             }

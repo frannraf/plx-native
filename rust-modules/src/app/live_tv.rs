@@ -413,6 +413,10 @@ fn view_of(store: &plx_data::stores::live_tv::LiveTvStore, want: Option<&Want>) 
 
 /// The media route's description of a landed tune: the stream, the tuned item the keepalive
 /// names, and the lines the player shows.
+/// Offer a live channel's caption streams in the Subtitles menu. Off until the captions can be
+/// shown (see [`live_playing_item`]).
+const LIVE_CAPTION_ROWS: bool = false;
+
 pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
     let (title, show_title, begins_at, ends_at) = match &t.airing {
         Some(a) => (a.title.clone(), a.show_title.clone(), a.begins_at, a.ends_at),
@@ -444,6 +448,13 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
 /// What the player's track menus read of a live channel: no audio to choose (the encode carries
 /// the broadcast's), and the broadcast's caption streams as subtitles — picking one has the server
 /// burn it in (`playback::live_captions_commit`). No library item: `rk` is empty.
+///
+/// **The caption rows are withheld for now** ([`LIVE_CAPTION_ROWS`]): measured on the set
+/// 2026-10-22, PMS took `subtitleStreamID=<the eia_608 stream>&subtitles=burn` on the live
+/// transcode (and `advancedSubtitles=burn` beside it) and drew nothing on a captioned broadcast,
+/// so a row that promised captions did nothing. The whole path stays (the tune parses them, the
+/// store keeps the choice, a pick re-tunes) for the day the captions are decoded here from the
+/// encode's A53 side data, which the stock client does itself.
 pub(crate) fn live_playing_item(t: &Tuned) -> plx_data::metadata::PlayingItem {
     plx_data::metadata::PlayingItem {
         sid: t.sid,
@@ -455,7 +466,7 @@ pub(crate) fn live_playing_item(t: &Tuned) -> plx_data::metadata::PlayingItem {
             .item
             .captions
             .iter()
-            .filter(|c| c.id > 0)
+            .filter(|c| c.id > 0 && LIVE_CAPTION_ROWS)
             .map(|c| {
                 // A tuner's closed captions come with no language (seen on the set: CEA-608 on a
                 // US broadcast): they are the broadcast's, English on this continent's CC1, and
