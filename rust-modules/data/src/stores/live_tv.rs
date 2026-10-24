@@ -58,7 +58,9 @@ pub enum Job {
     Providers,
     Channels { provider: String },
     Grid { provider: String, ch: usize, channel: Channel, date: String },
-    Dvr,
+    /// Read the recording rules and operations. `serial` ranks the read: the newest one asked is
+    /// the lists, an older one landing after it is history (`Landing::Dvr`).
+    Dvr { serial: u32 },
     Write(Write),
     /// Tune `channel` on DVR `dvr_key` and open its encode under `session`, with the broadcast's
     /// closed captions burned in when `captions`.
@@ -92,7 +94,7 @@ pub enum Landing {
     Providers(Result<Vec<EpgProvider>, LiveError>),
     Channels(Result<Vec<Channel>, LiveError>),
     Grid { ch: usize, date: String, result: Result<Vec<Airing>, LiveError> },
-    Dvr(Result<(Vec<Subscription>, Vec<Grab>), LiveError>),
+    Dvr { serial: u32, result: Result<(Vec<Subscription>, Vec<Grab>), LiveError> },
     Write { write: Write, result: Result<WriteDone, LiveError> },
     Tuned { serial: u32, result: Result<Tuned, LiveError> },
     Released,
@@ -250,7 +252,7 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
             let result = client.live_tv_grid(&provider, &channel, &date);
             Landing::Grid { ch, date, result }
         }
-        Job::Dvr => Landing::Dvr(client.dvr_subscriptions().and_then(|rules| client.dvr_scheduled().map(|s| (rules, s)))),
+        Job::Dvr { serial } => Landing::Dvr { serial, result: client.dvr_subscriptions().and_then(|rules| client.dvr_scheduled().map(|s| (rules, s))) },
         Job::Write(write) => {
             let result = match &write {
                 Write::Record { airing, kind } => record(client, airing, *kind),
@@ -370,6 +372,10 @@ pub struct LiveTvStore {
     channels: Vec<Channel>,
     guide: GuideCache,
     dvr_phase: Phase,
+    /// The rank of the last read of the lists asked for (`Job::Dvr`): more than one can be on
+    /// their way at once (a refresh, then a write's re-read), and only the newest one's answer is
+    /// the lists.
+    dvr_serial: u32,
     rules: Vec<Subscription>,
     scheduled: Vec<Grab>,
     notice: Option<WriteNotice>,
@@ -440,6 +446,7 @@ impl LiveTvStore {
             channels: Vec::new(),
             guide: GuideCache::default(),
             dvr_phase: Phase::Idle,
+            dvr_serial: 0,
             rules: Vec::new(),
             scheduled: Vec::new(),
             notice: None,
@@ -697,12 +704,25 @@ impl LiveTvStore {
     /// Read the recordings lists again without saying so (a periodic refresh: the lists shown stay
     /// until the new ones land, and an empty page keeps its advice rather than "Loading…").
     pub fn refresh_dvr_quietly(&mut self) {
-        // not before the lists were ever asked for, nor over a read on its way; after a read that
-        // failed, the next refresh is the retry
-        if self.sid.is_none() || self.queue.iter().any(|j| matches!(j, Job::Dvr)) || matches!(self.dvr_phase, Phase::Idle | Phase::Loading) {
+        // not before the lists were ever asked for; after a read that failed, the next refresh
+        // is the retry
+        if self.sid.is_none() || matches!(self.dvr_phase, Phase::Idle | Phase::Loading) {
             return;
         }
-        self.queue.push_back(Job::Dvr);
+        self.ask_dvr();
+    }
+
+    /// Queue a read of the recording lists, ranked newest: an older read still on its way lands
+    /// as history. One read waiting in the queue is enough (`false`: it will answer for this ask
+    /// too); one already on its way is not, since what it will answer may predate what was just
+    /// asked for (a write that landed).
+    fn ask_dvr(&mut self) -> bool {
+        if self.queue.iter().any(|j| matches!(j, Job::Dvr { .. })) {
+            return false;
+        }
+        self.dvr_serial = self.dvr_serial.wrapping_add(1);
+        self.queue.push_back(Job::Dvr { serial: self.dvr_serial });
+        true
     }
 
     /// The page no longer wants its Watch press (BACK while tuning, the page left). A tune that
@@ -886,13 +906,12 @@ impl LiveTvStore {
 
     /// Re-read the recording rules and operations.
     pub fn refresh_dvr(&mut self) {
-        if self.sid.is_none() || self.queue.iter().any(|j| matches!(j, Job::Dvr)) {
+        if self.sid.is_none() || !self.ask_dvr() {
             return;
         }
         if !self.dvr_phase.is_loading() {
             self.dvr_phase = Phase::Loading;
         }
-        self.queue.push_back(Job::Dvr);
         self.bump();
     }
 
@@ -981,7 +1000,7 @@ impl LiveTvStore {
                             self.channels_phase = Phase::Loading;
                             self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
                             self.dvr_phase = Phase::Loading;
-                            self.queue.push_back(Job::Dvr);
+                            self.ask_dvr();
                             // the guide's tab row also offers Plex's own channels
                             self.cloud_auth = CloudAuth::capture();
                             if let Some(auth) = self.cloud_auth.clone() {
@@ -1030,9 +1049,14 @@ impl LiveTvStore {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 plx_base::eventlog::log(&format!("livetv dbg: Plex channel stream: {shape}"));
             }
-            Landing::Dvr(r) => {
+            Landing::Dvr { serial, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                match r {
+                // An older read landing after a newer one was asked: what it answers may predate
+                // the write the newer one was asked for, and the newer one is the lists.
+                if serial != self.dvr_serial {
+                    return;
+                }
+                match result {
                     Ok((rules, scheduled)) => {
                         self.rules = rules;
                         self.scheduled = scheduled;
@@ -1114,10 +1138,9 @@ impl LiveTvStore {
                         self.notice = Some(WriteNotice { serial: self.notice_serial, ok: false, op, reason: e.reason(), conflicts: Vec::new() });
                     }
                 }
-                // what the server now records changed: read the lists again
-                if !self.queue.iter().any(|j| matches!(j, Job::Dvr)) {
-                    self.queue.push_back(Job::Dvr);
-                }
+                // what the server now records changed: read the lists again (a read already on
+                // its way may answer from before this write; the new one outranks it)
+                self.ask_dvr();
             }
         }
         self.bump();

@@ -68,16 +68,23 @@ fn ready(script: &Script, n: usize) -> LiveTvStore {
     s.pump();
     let jobs = script.take();
     let kinds: Vec<_> = jobs.iter().map(|(j, _)| std::mem::discriminant(j)).collect();
-    assert!(kinds.contains(&std::mem::discriminant(&Job::Dvr)));
+    assert!(kinds.contains(&std::mem::discriminant(&Job::Dvr { serial: 0 })));
     for (job, post) in jobs {
         match job {
             Job::Channels { .. } => post.post(Landing::Channels(Ok((0..n).map(channel).collect()))),
-            Job::Dvr => post.post(Landing::Dvr(Ok((vec![], vec![])))),
+            Job::Dvr { serial } => post.post(Landing::Dvr { serial, result: Ok((vec![], vec![])) }),
             other => panic!("unexpected {other:?}"),
         }
     }
     s.pump();
     s
+}
+
+/// The one DVR read among `jobs`, with the serial its answer must carry.
+fn dvr_job(jobs: Vec<(Job, Post)>) -> (u32, Post) {
+    let (job, post) = jobs.into_iter().find(|(j, _)| matches!(j, Job::Dvr { .. })).expect("a DVR read");
+    let Job::Dvr { serial } = job else { unreachable!() };
+    (serial, post)
 }
 
 const NOON: i64 = 1_760_011_200; // 2025-10-09T12:00:00Z
@@ -184,14 +191,90 @@ fn retry_reads_a_failed_dvr_list_again() {
     let mut s = ready(&script, 2);
     s.refresh_dvr();
     s.pump();
-    let (job, post) = script.take().remove(0);
-    assert!(matches!(job, Job::Dvr));
-    post.post(Landing::Dvr(Err(LiveError::Transport)));
+    let (serial, post) = dvr_job(script.take());
+    post.post(Landing::Dvr { serial, result: Err(LiveError::Transport) });
     s.pump();
     assert!(matches!(s.snapshot().dvr_phase, Phase::Failed(_)));
     s.retry_failed();
     s.pump();
-    assert!(script.take().iter().any(|(j, _)| matches!(j, Job::Dvr)), "Try again on the Recordings read-out reads the lists again");
+    assert!(script.take().iter().any(|(j, _)| matches!(j, Job::Dvr { .. })), "Try again on the Recordings read-out reads the lists again");
+}
+
+/// A read waiting in the queue answers for every ask until it starts: with the read budget full
+/// (grid reads on their way), a quiet refresh and then a write's re-read queue ONE read, under
+/// one rank, and its answer is the lists.
+#[test]
+fn one_queued_dvr_read_serves_every_ask_until_it_starts() {
+    let script = Script::default();
+    let mut s = ready(&script, IN_FLIGHT);
+    s.want_window(0..IN_FLIGHT, NOON, NOON + 3600);
+    s.pump();
+    let grids = script.take();
+    assert!(grids.len() == IN_FLIGHT && grids.iter().all(|(j, _)| matches!(j, Job::Grid { .. })), "{}", grids.len());
+    s.refresh_dvr_quietly();
+    s.pump();
+    assert!(script.take().is_empty(), "the budget is full: the read waits");
+    s.write(Write::CancelRule { id: "1".into() });
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).unwrap();
+    let Job::Write(write) = job else { unreachable!() };
+    post.post(Landing::Write { write, result: Ok(WriteDone::default()) });
+    s.pump();
+    assert!(script.take().is_empty(), "the write's re-read is the one already waiting");
+    for (job, post) in grids {
+        let Job::Grid { ch, date, .. } = job else { unreachable!() };
+        post.post(Landing::Grid { ch, date, result: Ok(vec![]) });
+    }
+    s.pump();
+    let jobs = script.take();
+    assert_eq!(jobs.iter().filter(|(j, _)| matches!(j, Job::Dvr { .. })).count(), 1, "one read, once there is room");
+    let (serial, post) = dvr_job(jobs);
+    post.post(Landing::Dvr { serial, result: Ok((vec![Subscription { id: "x".into(), ..Default::default() }], vec![])) });
+    s.pump();
+    assert_eq!(s.snapshot().rules[0].id, "x", "…and its answer is the lists");
+}
+
+/// Two reads of the lists on their way at once (a refresh, then the re-read a write asks for):
+/// the newer one is the lists, and the older one landing after it is history.
+#[test]
+fn an_older_dvr_read_landing_after_a_newer_one_is_history() {
+    let script = Script::default();
+    let mut s = ready(&script, 1);
+    s.refresh_dvr();
+    s.pump();
+    let (first, first_post) = dvr_job(script.take());
+    // a write lands while that read is on its way: the lists are asked for again, outranking it
+    s.write(Write::CancelRule { id: "1".into() });
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).unwrap();
+    let Job::Write(write) = job else { unreachable!() };
+    post.post(Landing::Write { write, result: Ok(WriteDone::default()) });
+    s.pump();
+    let (second, second_post) = dvr_job(script.take());
+    assert_ne!(second, first);
+    second_post.post(Landing::Dvr { serial: second, result: Ok((vec![Subscription { id: "new".into(), ..Default::default() }], vec![])) });
+    s.pump();
+    assert_eq!(s.snapshot().rules[0].id, "new");
+    first_post.post(Landing::Dvr { serial: first, result: Ok((vec![Subscription { id: "old".into(), ..Default::default() }], vec![])) });
+    s.pump();
+    assert_eq!(s.snapshot().rules[0].id, "new", "the older read does not put the lists back");
+    assert!(matches!(s.snapshot().dvr_phase, Phase::Ready));
+    // …nor does its failure mark the lists failed
+    s.refresh_dvr_quietly();
+    s.pump();
+    let (third, third_post) = dvr_job(script.take());
+    s.write(Write::CancelRule { id: "2".into() });
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).unwrap();
+    let Job::Write(write) = job else { unreachable!() };
+    post.post(Landing::Write { write, result: Ok(WriteDone::default()) });
+    s.pump();
+    let (fourth, fourth_post) = dvr_job(script.take());
+    fourth_post.post(Landing::Dvr { serial: fourth, result: Ok((vec![], vec![])) });
+    s.pump();
+    third_post.post(Landing::Dvr { serial: third, result: Err(LiveError::Transport) });
+    s.pump();
+    assert!(matches!(s.snapshot().dvr_phase, Phase::Ready), "{:?}", s.snapshot().dvr_phase);
 }
 
 #[test]
@@ -233,7 +316,7 @@ fn writes_run_one_at_a_time_in_press_order_and_end_in_notices_and_overlays() {
     assert_eq!(notice.op, WriteOp::RecordSeries);
     let jobs = script.take();
     assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Write(Write::StopGrab { .. }))), "the next write starts");
-    assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Dvr)), "the DVR lists are read again");
+    assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Dvr { .. })), "the DVR lists are read again");
     // a cancel clears the overlay
     for (job, post) in jobs {
         if let Job::Write(w) = job {
@@ -307,9 +390,8 @@ fn dvr_lists_land_into_the_snapshot() {
     let mut s = ready(&script, 1);
     s.refresh_dvr();
     s.pump();
-    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Dvr)).unwrap();
-    let _ = job;
-    post.post(Landing::Dvr(Ok((vec![Subscription { id: "7".into(), title: "Show".into(), ..Default::default() }], vec![]))));
+    let (serial, post) = dvr_job(script.take());
+    post.post(Landing::Dvr { serial, result: Ok((vec![Subscription { id: "7".into(), title: "Show".into(), ..Default::default() }], vec![])) });
     s.pump();
     assert_eq!(s.snapshot().rules[0].id, "7");
 }
@@ -447,7 +529,7 @@ fn a_reset_releases_an_untaken_tune_and_one_that_lands_after_it() {
     for (job, post) in script.take() {
         match job {
             Job::Channels { .. } => post.post(Landing::Channels(Ok((0..3).map(channel).collect()))),
-            Job::Dvr => post.post(Landing::Dvr(Ok((vec![], vec![])))),
+            Job::Dvr { serial } => post.post(Landing::Dvr { serial, result: Ok((vec![], vec![])) }),
             _ => {}
         }
     }
