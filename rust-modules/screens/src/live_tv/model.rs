@@ -431,6 +431,62 @@ pub enum RecEntry {
     Rule(Subscription),
 }
 
+/// A row's identity across reads of the lists: a recording by its operation key, a rule by its
+/// id — what the focus follows when a read moves the row ([`rec_reseat`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecId {
+    Grab(String),
+    Rule(String),
+}
+
+impl RecId {
+    /// A recording the server sent without an operation key names nothing: two such rows would
+    /// read as one.
+    fn is_empty(&self) -> bool {
+        match self {
+            RecId::Grab(key) | RecId::Rule(key) => key.is_empty(),
+        }
+    }
+}
+
+impl RecEntry {
+    pub fn id(&self) -> RecId {
+        match self {
+            RecEntry::Grab(g, _) => RecId::Grab(g.key.clone()),
+            RecEntry::Rule(s) => RecId::Rule(s.id.clone()),
+        }
+    }
+
+    /// Is this the row `id` names?
+    pub fn is(&self, id: &RecId) -> bool {
+        match (self, id) {
+            (RecEntry::Grab(g, _), RecId::Grab(key)) => &g.key == key,
+            (RecEntry::Rule(s), RecId::Rule(rule)) => &s.id == rule,
+            _ => false,
+        }
+    }
+}
+
+/// Where the row `id` names stands in `entries`, if it still does.
+pub fn rec_index_of(entries: &[RecEntry], id: &RecId) -> Option<usize> {
+    entries.iter().position(|e| e.is(id))
+}
+
+/// **Where a read of the lists moved the row the focus stands on**: `(from, to)`, the row's
+/// element now (`from`, the focused one) and in `entries`, the lists just read, when the row
+/// `anchor` names is still listed and its index changed — a recording scheduled above it, one
+/// that completed, a rule moved. `None` when focus is not on a row, the row left the list (the
+/// index then clamps as before), it stands where it stood, or it has no identity to follow.
+pub fn rec_reseat(anchor: Option<&RecId>, from: Option<u32>, entries: &[RecEntry]) -> Option<(u32, u32)> {
+    let (from, id) = from.zip(anchor)?;
+    rec_of(from)?;
+    if id.is_empty() {
+        return None;
+    }
+    let to = REC_BASE + rec_index_of(entries, id)? as u32;
+    (to != from).then_some((from, to))
+}
+
 /// The heading an upcoming recording is listed under: the ones recording now, then one per local
 /// day (its number of days since the epoch, local; one already begun but not yet recording counts
 /// as today).

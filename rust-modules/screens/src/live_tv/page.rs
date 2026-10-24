@@ -102,6 +102,15 @@ pub struct LiveTvScreen {
     frame: Frame,
     rec_top: usize,
     recs: Vec<RecEntry>,
+    /// The Recordings row the focus stands on, by its identity (set when focus lands on a row,
+    /// kept while the panel is open on it): what a read of the lists moves the focus with.
+    rec_anchor: Option<model::RecId>,
+    /// The focused Recordings row's element before the last read of the lists and after it, when
+    /// the read moved the row (a recording scheduled above it, one that completed): `reconcile`
+    /// sends the focus from the one to the other, a key in the meantime steps from the latter
+    /// (`standing`), and the landing clears it (`follow`). Recomputed from `rec_anchor` by every
+    /// read, so a second read before the engine moved the focus answers the same.
+    rec_reseat: Option<(u32, u32)>,
     panel: Option<Panel>,
     /// The element the panel was opened from (focus goes back there when it closes).
     panel_from: u32,
@@ -144,6 +153,8 @@ impl LiveTvScreen {
             frame: Frame::default(),
             rec_top: 0,
             recs: Vec::new(),
+            rec_anchor: None,
+            rec_reseat: None,
             panel: None,
             panel_from: model::HEAD_GUIDE,
             notice: None,
@@ -216,7 +227,21 @@ impl LiveTvScreen {
             self.tune_failure_shown = false;
         }
         self.fed = true;
-        self.recs = model::rec_entries(&view.snap);
+        // The row focus is on keeps its identity through the read (`rec_anchor`): a recording
+        // scheduled above it, or one that completed, moves its index, and the focus moves with
+        // it (`reconcile`); the panel open on it returns to it where it stands now.
+        let recs = model::rec_entries(&view.snap);
+        let standing = if self.panel.is_some() { Some(self.panel_from) } else { self.focus };
+        let moved = model::rec_reseat(self.rec_anchor.as_ref(), standing, &recs);
+        self.recs = recs;
+        if self.panel.is_some() {
+            if let Some((_, to)) = moved {
+                self.panel_from = to;
+            }
+            self.rec_reseat = None;
+        } else {
+            self.rec_reseat = moved;
+        }
         self.rec_top = self.rec_top.min(self.recs.len().saturating_sub(1));
         if view.snap.source != self.view.snap.source {
             // another tab's lineup: its own rows, from the top
@@ -227,8 +252,8 @@ impl LiveTvScreen {
         self.frame.row_top = self.frame.row_top.min(n.saturating_sub(1));
         self.view = view;
         // What landed can move the focused element (a heading added above a Recordings row, an
-        // airing filled in): keep it in view.
-        let focus = self.focus.and_then(model::rec_of).unwrap_or(self.rec_top);
+        // airing filled in): keep it in view, where it will stand once the focus has followed.
+        let focus = moved.map(|(_, to)| to).or(standing).and_then(model::rec_of).unwrap_or(self.rec_top);
         self.rec_top = model::rec_settle(&self.recs, self.rec_top, focus);
         plx_machine::idle::invalidate();
     }
@@ -316,6 +341,12 @@ impl LiveTvScreen {
         FocusKey { entry: self.entry, elem }
     }
 
+    /// `e`, or where the last read moved its row (`rec_reseat`) while the engine has not yet moved
+    /// the focus there: a key in that frame steps from the row's new place, not its old index.
+    fn standing(&self, e: u32) -> u32 {
+        self.rec_reseat.filter(|(from, _)| *from == e).map_or(e, |(_, to)| to)
+    }
+
     /// Ask the engine to seat `focus` as the page's own seat (the `Enter` that comes back is
     /// counted, so it is not mistaken for an arrival).
     fn seat_own<H: ContentLike>(&mut self, focus: FocusTarget<u32>, fx: &mut Effects<'_, H>) {
@@ -329,7 +360,7 @@ impl LiveTvScreen {
         if self.panel.is_some() {
             return;
         }
-        let Some(e) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem) else { return };
+        let Some(e) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| self.standing(k.elem)) else { return };
         let to = if model::cell_of(e).is_some() {
             if whole {
                 model::guide_page(&self.view, &self.frame, e, dir)
@@ -543,6 +574,14 @@ impl LiveTvScreen {
             return;
         }
         self.focus = Some(elem);
+        // Landed, wherever: the re-seat a read asked for is spent. A row landed on is the one the
+        // focus keeps through reads; the panel's actions keep the row the panel is about.
+        self.rec_reseat = None;
+        if let Some(i) = model::rec_of(elem) {
+            self.rec_anchor = self.recs.get(i).map(RecEntry::id);
+        } else if self.panel.is_none() {
+            self.rec_anchor = None;
+        }
         if model::cell_of(elem).is_some() {
             self.last_cell = Some(elem);
             if !self.cell_grow.iter().any(|(e, _)| *e == elem) {
@@ -1848,6 +1887,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         if model::cell_of(e).is_some() {
             return model::guide_neighbour(&self.view, &self.frame, e, dir).map_or(Step::Edge, to);
         }
+        let e = self.standing(e);
         if let Some(i) = model::rec_of(e) {
             return match dir {
                 Dir::Up if i > 0 => to(e - 1),
@@ -1935,6 +1975,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         if let Some(i) = model::rec_of(e) {
             if self.mode != Mode::Recordings || !self.has_content() {
                 return key(self.mode_pill());
+            }
+            // The row the focus was on moved under the last read: the focus follows it.
+            if let Some((_, to)) = self.rec_reseat.filter(|(from, _)| *from == e) {
+                return key(to);
             }
             return if i < self.recs.len() { want } else { key(model::REC_BASE + self.recs.len().saturating_sub(1) as u32) };
         }
@@ -2042,6 +2086,93 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plx_machine::machine::{FocusRead, InputOwner, PressRead, Tick};
+    use plx_plex::plex::live_tv::Grab;
+    use plx_ui::screen::{Focusable, Step};
+
+    /// A host with nothing to read: the Recordings page reads only what `input` fed it.
+    struct TestHost;
+    impl plx_machine::machine::Host for TestHost {
+        type Arg = crate::registry::SettingsPage;
+        type Fx = AppFx;
+        type Msg = crate::registry::AppMsg;
+        type Elem = u32;
+        type Views<'a> = ();
+        type Init = crate::registry::NoInit;
+        type Memory = crate::registry::PageMemory;
+    }
+
+    fn cx(focus: Option<u32>) -> Cx<'static, TestHost> {
+        Cx {
+            views: (),
+            tick: Tick::default(),
+            measure: &plx_ui::fixture::FixtureMeasure,
+            press: PressRead::default(),
+            focus: FocusRead { current: focus.map(|elem| FocusKey { entry: EntryId(0), elem }), ..Default::default() },
+            owner: InputOwner::Entry(EntryId(0)),
+        }
+    }
+
+    /// The store's picture with these recordings scheduled, soonest first, and a DVR that is
+    /// there.
+    fn lists(ids: &[&str]) -> LiveTvView {
+        let mut view = LiveTvView::default();
+        view.snap.availability = Availability::Available;
+        view.snap.dvr_phase = Phase::Ready;
+        view.snap.scheduled = ids.iter().enumerate().map(|(i, id)| Grab {
+            id: (*id).into(),
+            key: format!("/k/{id}"),
+            status: GrabStatus::Scheduled,
+            airing: Airing { begins_at: 1_760_011_200 + i as i64 * 3_600, ends_at: 1_760_011_200 + i as i64 * 3_600 + 1_800, ..Airing::default() },
+            ..Grab::default()
+        }).collect();
+        view
+    }
+
+    /// **A read of the lists keeps the focus on the row it was on.** The row's identity is
+    /// anchored when focus lands on it; a read that moves the row asks `reconcile` to move the
+    /// focus, a second read before that answers the same, a key in that frame steps from the
+    /// row's new place, and the landing spends the move. The panel open on a row returns to the
+    /// row where it stands after a read.
+    #[test]
+    fn a_read_of_the_lists_moves_the_focus_with_its_row_and_the_panel_with_its_row() {
+        let key = |elem| FocusKey { entry: EntryId(0), elem };
+        let mut page = LiveTvScreen::loading(EntryId(0));
+        page.mode = Mode::Recordings;
+        page.input(lists(&["a", "b", "c"]));
+        page.follow(model::REC_BASE + 1, true);
+        assert_eq!(page.rec_anchor, Some(model::RecId::Grab("/k/b".into())));
+        assert_eq!(page.rec_reseat, None);
+        // A recording scheduled before "b": its row moved down one.
+        page.input(lists(&["a", "x", "b", "c"]));
+        assert_eq!(page.rec_reseat, Some((model::REC_BASE + 1, model::REC_BASE + 2)));
+        let focus = Some(model::REC_BASE + 1);
+        assert_eq!(Focusable::<TestHost>::reconcile(&page, key(model::REC_BASE + 1), &cx(focus)).elem, model::REC_BASE + 2);
+        assert_eq!(Focusable::<TestHost>::reconcile(&page, key(model::REC_BASE), &cx(focus)).elem, model::REC_BASE, "other rows stand");
+        // A second read before the engine moved the focus: the same answer.
+        page.input(lists(&["a", "x", "b", "c"]));
+        assert_eq!(page.rec_reseat, Some((model::REC_BASE + 1, model::REC_BASE + 2)));
+        // A key in that frame steps from the row's new place.
+        assert!(matches!(Focusable::<TestHost>::neighbour(&page, key(model::REC_BASE + 1), Dir::Down, &cx(focus)), Step::Move(k) if k.elem == model::REC_BASE + 3));
+        // The landing spends the move.
+        page.follow(model::REC_BASE + 2, true);
+        assert_eq!(page.rec_reseat, None);
+        assert_eq!(page.rec_anchor, Some(model::RecId::Grab("/k/b".into())));
+        assert_eq!(Focusable::<TestHost>::reconcile(&page, key(model::REC_BASE + 2), &cx(Some(model::REC_BASE + 2))).elem, model::REC_BASE + 2);
+        // The panel open on "b": a read with "x" gone returns the panel to "b" where it stands.
+        page.panel = Some(Panel { target: Target::Grab(Grab::default()), actions: vec![Action::Close] });
+        page.panel_from = model::REC_BASE + 2;
+        page.follow(model::ACTION_BASE, false);
+        assert_eq!(page.rec_anchor, Some(model::RecId::Grab("/k/b".into())), "the panel keeps its row's anchor");
+        page.input(lists(&["a", "b", "c"]));
+        assert_eq!((page.panel_from, page.rec_reseat), (model::REC_BASE + 1, None));
+        // Focus leaving the rows with no panel drops the anchor; a read then moves nothing.
+        page.panel = None;
+        page.follow(model::HEAD_RECS, false);
+        assert_eq!(page.rec_anchor, None);
+        page.input(lists(&["z", "a", "b", "c"]));
+        assert_eq!(page.rec_reseat, None);
+    }
 
     #[test]
     fn a_call_sign_reads_as_the_station_without_its_digital_suffix() {

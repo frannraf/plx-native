@@ -276,6 +276,36 @@ fn a_long_list_scrolls_to_keep_the_focused_row_in_view() {
     assert_eq!(rec_follow(&e, top, 2), 2);
 }
 
+/// **A read of the lists keeps the focus on the row it was on**, by the row's identity: a recording
+/// scheduled above it or one that completed moves its index and the focus follows; a row that
+/// left the list, or one that stood still, asks for no move.
+#[test]
+fn a_read_of_the_lists_moves_the_focus_with_the_row_it_was_on() {
+    let g = |id: &str, begins: i64, status: GrabStatus| Grab { id: id.into(), key: format!("/k/{id}"), status, airing: airing(0, begins, 30, id), ..Grab::default() };
+    let rules = vec![Subscription { id: "a".into(), ..Subscription::default() }, Subscription { id: "b".into(), ..Subscription::default() }];
+    let before = rec_entries(&Snapshot { scheduled: vec![g("soon", NOON + 3_600, GrabStatus::Scheduled), g("later", NOON + 7_200, GrabStatus::Scheduled)], rules: rules.clone(), ..Snapshot::default() });
+    let ids: Vec<RecId> = before.iter().map(RecEntry::id).collect();
+    assert_eq!(ids, [RecId::Grab("/k/soon".into()), RecId::Grab("/k/later".into()), RecId::Rule("a".into()), RecId::Rule("b".into())]);
+    assert!(before[0].is(&ids[0]) && !before[0].is(&ids[1]) && !before[2].is(&RecId::Grab("a".into())), "a rule and a recording never share an identity");
+    // One started recording and one was scheduled before "later": the row moved down two.
+    let after = rec_entries(&Snapshot { scheduled: vec![g("now", NOON, GrabStatus::InProgress), g("sooner", NOON + 1_800, GrabStatus::Scheduled), g("soon", NOON + 3_600, GrabStatus::Scheduled), g("later", NOON + 7_200, GrabStatus::Scheduled)], rules: rules.clone(), ..Snapshot::default() });
+    assert_eq!(rec_index_of(&after, &ids[1]), Some(3));
+    assert_eq!(rec_reseat(Some(&ids[1]), Some(REC_BASE + 1), &after), Some((REC_BASE + 1, REC_BASE + 3)), "the focus follows 'later'");
+    assert_eq!(rec_reseat(Some(&ids[3]), Some(REC_BASE + 3), &after), Some((REC_BASE + 3, REC_BASE + 5)), "a rule, too");
+    // "soon" completed: the rows after it move up one; "soon" itself is gone, so its focus clamps as before.
+    let done = rec_entries(&Snapshot { scheduled: vec![g("soon", NOON + 3_600, GrabStatus::Complete), g("later", NOON + 7_200, GrabStatus::Scheduled)], rules, ..Snapshot::default() });
+    assert_eq!(rec_reseat(Some(&ids[1]), Some(REC_BASE + 1), &done), Some((REC_BASE + 1, REC_BASE)));
+    assert_eq!(rec_reseat(Some(&ids[0]), Some(REC_BASE), &done), None, "the row left the list");
+    assert_eq!(rec_reseat(Some(&ids[2]), Some(REC_BASE + 2), &before), None, "nothing moved");
+    assert_eq!(rec_reseat(Some(&ids[1]), Some(HEAD_RECS), &after), None, "focus off the rows");
+    assert_eq!(rec_reseat(None, Some(REC_BASE + 1), &after), None, "no row anchored");
+    assert_eq!(rec_reseat(Some(&ids[1]), None, &after), None);
+    // A recording the server sent without an operation key has no identity to follow.
+    let keyless = rec_entries(&Snapshot { scheduled: vec![Grab { id: "x".into(), status: GrabStatus::Scheduled, airing: airing(0, NOON, 30, "x"), ..Grab::default() }, g("later", NOON + 7_200, GrabStatus::Scheduled)], ..Snapshot::default() });
+    assert_eq!(keyless[0].id(), RecId::Grab(String::new()));
+    assert_eq!(rec_reseat(Some(&keyless[0].id()), Some(REC_BASE + 1), &keyless), None);
+}
+
 /// A list that shrinks under the focused row (a rule deleted with its recordings) shows what fits,
 /// from the top, never a blank page.
 #[test]
