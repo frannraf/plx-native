@@ -1,10 +1,12 @@
 //! **The Recommended page's hero: the focused card, large.** The official app lands a library on
 //! its Recommended tab with the focused title's backdrop behind the page and its title, year,
-//! runtime, rating and synopsis in the top-left; the rows sit under that block and the hero
-//! follows the focus as it moves along them. This is that block for [`super::recommended`]: the
-//! same art, logo, text and scrim parts the Home billboard is drawn with, held here as one
-//! paint-only component (never in the page's logical state: the page's canon is which card is
-//! focused, and this draws from it).
+//! runtime, rating, genres, synopsis and billed cast in the top-left; the rows sit under that
+//! block and the hero follows the focus as it moves along them. This is that block for
+//! [`super::recommended`]: the same art, logo, text and scrim parts the Home billboard is drawn
+//! with, held here as one paint-only component (never in the page's logical state: the page's
+//! canon is which card is focused, and this draws from it). The block's room is fixed, so what
+//! it reads is a fit ([`block_choice`]): the genres end the meta line as far as they fit, and the
+//! cast line stands under the synopsis where two lines of it and the cast both fit.
 //!
 //! The art follows the card focus names ([`FocusHero::bind`], on the tick and again right before
 //! the draw, so a press frame draws the card it landed on) by the Home billboard's rules: the new
@@ -32,8 +34,9 @@ use crate::registry::LibraryLike;
 
 /// The room the hero takes above the rows: the first row's heading rests this far under the grid's
 /// content line the Library page starts on. Room for the text ladder ([`hero_text_stack`]) and
-/// the air under it: a film's title and three synopsis lines, a film's logo and two, an episode's
-/// show logo, its own line and one; graded in the tests with the type sizes' line heights.
+/// the air under it: a film's title, three synopsis lines and its cast, a film's logo and two
+/// lines, an episode's show logo, its own line and one; graded in the tests with the type sizes'
+/// line heights.
 pub(super) const HERO_H: f32 = 316.0;
 /// Where the hero's block starts: the grid's content line (y 244, `page_header::BLOCK_H` under the
 /// header row's top); the official app's title stands near the same line under its tab row.
@@ -233,14 +236,15 @@ impl FocusHero {
     }
 
     /// The text block: the title (its logo when the server has one), an episode's own line, the
-    /// meta line and the synopsis, stacked down from [`TEXT_TOP`] and kept clear of the rows;
-    /// `dy` is the page's scroll, which carries the block off the top with the rows.
+    /// meta line (its genres on the end), the synopsis and the cast line, stacked down from
+    /// [`TEXT_TOP`] and kept clear of the rows ([`choice_for`]); `dy` is the page's scroll, which
+    /// carries the block off the top with the rows.
     pub(super) fn draw_text<H: LibraryLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, item: &PmsMovie, dy: f32) {
         // Scrolled off the top with the rows: the block always ends above the room's bottom.
         if ROOM_BOTTOM + dy <= 0.0 {
             return;
         }
-        let lines = HeroLines::of(item);
+        let lines = HeroLines::of(item, |text| !TextView::new(text, theme::size::BODY, theme::TEXT_SECONDARY).max_lines(1).truncates(COL_W));
         let rung = logo_rung();
         // The band is the drawn height: the logo's once it is up, in the synopsis column, else
         // the text's em, in the title's wider one. The lines under it move down once when a logo
@@ -249,23 +253,21 @@ impl FocusHero {
             .map_or((TITLE_TEXT_H, TITLE_TEXT_W), |(_, w, h)| (hero_logo::fit(rung, w, h, COL_W).1, COL_W));
         let sub_view = lines.sub.as_deref().map(|sub| TextView::new(sub, theme::size::BODY, theme::TEXT_PRIMARY).max_lines(1));
         let meta_view = TextView::new(&lines.meta, theme::size::BODY, theme::TEXT_SECONDARY).max_lines(1);
+        let cast_view = (!lines.cast.is_empty()).then(|| TextView::new(&lines.cast, theme::size::BODY, theme::TEXT_SECONDARY).max_lines(1));
         let sub_h = sub_view.as_ref().map(|v| v.measure_h(COL_W));
         let meta_h = meta_view.measure_h(COL_W);
-        // The synopsis takes what is left over, three lines at most, fewer when the block would
-        // reach the rows (a logo's band, an episode's extra line), none when not even one fits.
-        let mut synopsis = None;
-        for lines_max in (1..=plx_ui::HERO_SYN_MAXLINES).rev() {
-            if item.summary.is_empty() {
-                break;
-            }
+        let cast_h = cast_view.as_ref().map(|v| v.measure_h(COL_W));
+        // The synopsis and the cast line take what is left over: the synopsis's height at each
+        // line count once, then the choice.
+        let synopsis_at = |lines_max: usize| (lines_max > 0 && !item.summary.is_empty()).then(|| {
             let view = plx_ui::hero_synopsis(&item.summary, "").max_lines(lines_max);
             let h = view.measure_h(COL_W);
-            if hero_text_stack(title_h, sub_h, meta_h, Some(h)).bottom <= ROOM_BOTTOM {
-                synopsis = Some((view, h));
-                break;
-            }
-        }
-        let stack = hero_text_stack(title_h, sub_h, meta_h, synopsis.as_ref().map(|(_, h)| *h));
+            (view, h)
+        });
+        let synopsis_h: Vec<Option<f32>> = (0..=plx_ui::HERO_SYN_MAXLINES).map(|lines| synopsis_at(lines).map(|(_, h)| h)).collect();
+        let (lines_max, with_cast) = choice_for(title_h, sub_h, meta_h, &synopsis_h, cast_h);
+        let synopsis = synopsis_at(lines_max);
+        let stack = hero_text_stack(title_h, sub_h, meta_h, synopsis_h[lines_max], cast_h.filter(|_| with_cast));
         HeroLogo::new(item.sid.raw(), lines.logo_rk, lines.title, rung)
             .draw(p, Rect::new(MARGIN_X, stack.title_y + dy, title_w, title_h), f.measure);
         if let (Some(view), Some(y)) = (sub_view, stack.sub_y) {
@@ -273,6 +275,9 @@ impl FocusHero {
         }
         meta_view.draw(p, Rect::new(MARGIN_X, stack.meta_y + dy, COL_W, 0.0));
         if let (Some((view, _)), Some(y)) = (synopsis, stack.synopsis_y) {
+            view.draw(p, Rect::new(MARGIN_X, y + dy, COL_W, 0.0));
+        }
+        if let (Some(view), Some(y)) = (cast_view, stack.cast_y) {
             view.draw(p, Rect::new(MARGIN_X, y + dy, COL_W, 0.0));
         }
     }
@@ -286,24 +291,27 @@ fn blit(p: Painter, tex: Tex, alpha: f32) {
     p.tex(tex.0, Rect::new(0.0, 0.0, SCR_W, SCR_H).cover(tex.1, tex.2), 0.0, theme::with_a(theme::TINT_WHITE, alpha));
 }
 
-/// Where the hero's lines stand: the title's top, the episode line's and the synopsis's when
-/// there are any, the meta line's, and the block's bottom edge.
+/// Where the hero's lines stand: the title's top, the episode line's, the synopsis's and the cast
+/// line's when there are any, the meta line's, and the block's bottom edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct HeroTextStack {
     pub title_y: f32,
     pub sub_y: Option<f32>,
     pub meta_y: f32,
     pub synopsis_y: Option<f32>,
+    pub cast_y: Option<f32>,
     pub bottom: f32,
 }
 
-/// The ladder down from [`TEXT_TOP`]: title, `MD`, an episode's line, `SM`, meta, `SM`, synopsis.
-pub(super) fn hero_text_stack(title_h: f32, sub_h: Option<f32>, meta_h: f32, synopsis_h: Option<f32>) -> HeroTextStack {
+/// The ladder down from [`TEXT_TOP`]: title, `MD`, an episode's line, `SM`, meta, `SM`, synopsis,
+/// `SM`, cast.
+pub(super) fn hero_text_stack(title_h: f32, sub_h: Option<f32>, meta_h: f32, synopsis_h: Option<f32>, cast_h: Option<f32>) -> HeroTextStack {
     let items = [
         Item::new(title_h),
         sub_h.map_or(Item::absent(), Item::new),
         Item::new(meta_h).before(if sub_h.is_some() { theme::space::SM } else { theme::space::MD }),
         synopsis_h.map_or(Item::absent(), |h| Item::new(h).before(theme::space::SM)),
+        cast_h.map_or(Item::absent(), |h| Item::new(h).before(theme::space::SM)),
     ];
     let stack = VStack::new(&items, theme::space::MD, Anchor::Top(TEXT_TOP));
     let mut spans = stack.placed();
@@ -311,13 +319,49 @@ pub(super) fn hero_text_stack(title_h: f32, sub_h: Option<f32>, meta_h: f32, syn
     let sub = sub_h.map(|_| spans.next().expect("the episode line is present"));
     let meta = spans.next().expect("the meta line is always present");
     let synopsis = synopsis_h.map(|_| spans.next().expect("the synopsis is present"));
-    let bottom = synopsis.map_or(meta.y + meta.h, |s| s.y + s.h);
-    HeroTextStack { title_y: title.y, sub_y: sub.map(|s| s.y), meta_y: meta.y, synopsis_y: synopsis.map(|s| s.y), bottom }
+    let cast = cast_h.map(|_| spans.next().expect("the cast line is present"));
+    let bottom = cast.or(synopsis).map_or(meta.y + meta.h, |s| s.y + s.h);
+    HeroTextStack {
+        title_y: title.y,
+        sub_y: sub.map(|s| s.y),
+        meta_y: meta.y,
+        synopsis_y: synopsis.map(|s| s.y),
+        cast_y: cast.map(|s| s.y),
+        bottom,
+    }
+}
+
+/// **How many synopsis lines, and whether the cast line**, the room under the meta line takes:
+/// `(lines, with_cast)`, the first of these that `fits`, in this order. The synopsis keeps two
+/// lines before the cast line takes any room, and the cast line beats a third line; the cast line
+/// alone stands under a card with no synopsis. `lines_max` is the synopsis's cap (0 with no
+/// synopsis), `has_cast` whether there is a cast line to place.
+fn block_choice(fits: impl Fn(usize, bool) -> bool, lines_max: usize, has_cast: bool) -> (usize, bool) {
+    const ORDER: [(usize, bool); 8] =
+        [(3, true), (2, true), (3, false), (2, false), (1, true), (1, false), (0, true), (0, false)];
+    ORDER.into_iter()
+        .filter(|(lines, with_cast)| *lines <= lines_max && (has_cast || !with_cast))
+        .find(|(lines, with_cast)| fits(*lines, *with_cast))
+        .unwrap_or((0, false))
+}
+
+/// [`block_choice`] over the ladder, for a card's measured lines: `synopsis_h[n]` is the height of
+/// its synopsis at `n` lines (`None` past what it has, and at 0), `cast_h` its cast line's when it
+/// names one. A choice fits when the ladder ends above [`ROOM_BOTTOM`].
+fn choice_for(title_h: f32, sub_h: Option<f32>, meta_h: f32, synopsis_h: &[Option<f32>], cast_h: Option<f32>) -> (usize, bool) {
+    let lines_max = synopsis_h.iter().rposition(Option::is_some).unwrap_or(0);
+    block_choice(
+        |lines, with_cast| {
+            hero_text_stack(title_h, sub_h, meta_h, synopsis_h.get(lines).copied().flatten(), cast_h.filter(|_| with_cast)).bottom <= ROOM_BOTTOM
+        },
+        lines_max,
+        cast_h.is_some(),
+    )
 }
 
 /// The hero's words for a card: what the title band shows (an episode shows its show), the
-/// episode's own line, and the meta line the official app's hero reads (year, runtime, rating,
-/// then how much of a started title is left).
+/// episode's own line, the meta line the official app's hero reads (year, runtime, rating, how
+/// much of a started title is left, then its genres), and its billed cast.
 #[derive(Debug, PartialEq)]
 pub(super) struct HeroLines<'a> {
     pub title: &'a str,
@@ -326,10 +370,17 @@ pub(super) struct HeroLines<'a> {
     pub logo_rk: &'a str,
     pub sub: Option<String>,
     pub meta: String,
+    /// The billed names, comma-separated, as many as read whole on one line, each glued with
+    /// no-break spaces so a line never breaks inside a name (the detail hero's `people_text`
+    /// rule); empty when the server named none.
+    pub cast: String,
 }
 
 impl<'a> HeroLines<'a> {
-    pub(super) fn of(item: &'a PmsMovie) -> Self {
+    /// `fits` says whether a line reads whole in the column: the genres go on the meta line's end
+    /// as far as they fit, the rest of the facts never give way to them, and the cast line names
+    /// as many as fit.
+    pub(super) fn of(item: &'a PmsMovie, fits: impl Fn(&str) -> bool) -> Self {
         let episode = item.kind == 3;
         let title = if episode && !item.show_title.is_empty() { item.show_title.as_str() } else { item.title.as_str() };
         let logo_rk = if episode && !item.show_rk.is_empty() { item.show_rk.as_str() } else { item.rk.as_str() };
@@ -355,7 +406,16 @@ impl<'a> HeroLines<'a> {
         if item.resume_ms > 0 && dur_ms > item.resume_ms {
             parts.push(plx_ui::fmt::time_left(dur_ms - item.resume_ms));
         }
-        HeroLines { title, logo_rk, sub, meta: parts.join(" \u{b7} ") }
+        let facts = parts.join(" \u{b7} ");
+        let meta = (1..=item.genres.len()).rev().map(|n| {
+            let genres = item.genres[..n].join(", ");
+            if facts.is_empty() { genres } else { format!("{facts} \u{b7} {genres}") }
+        }).find(|line| fits(line)).unwrap_or(facts);
+        let cast = (1..=item.cast.len()).rev()
+            .map(|n| item.cast[..n].iter().map(|name| name.replace(' ', "\u{a0}")).collect::<Vec<_>>().join(", "))
+            .find(|line| fits(line))
+            .unwrap_or_default();
+        HeroLines { title, logo_rk, sub, meta, cast }
     }
 }
 
@@ -395,15 +455,69 @@ mod tests {
     #[test]
     fn a_film_reads_year_runtime_rating_and_what_is_left() {
         let film = movie();
-        let lines = HeroLines::of(&film);
+        let lines = HeroLines::of(&film, |_| true);
         assert_eq!(lines.title, "A Film");
         assert_eq!(lines.logo_rk, "m1");
         assert_eq!(lines.sub, None);
         assert_eq!(lines.meta, "2007 \u{b7} 1h 51m \u{b7} R");
+        assert_eq!(lines.cast, "");
         let started = PmsMovie { resume_ms: 40 * 60_000, ..movie() };
-        assert_eq!(HeroLines::of(&started).meta, "2007 \u{b7} 1h 51m \u{b7} R \u{b7} 1h 11m left");
+        assert_eq!(HeroLines::of(&started, |_| true).meta, "2007 \u{b7} 1h 51m \u{b7} R \u{b7} 1h 11m left");
         let bare = PmsMovie { year: 0, rating: String::new(), dur_ns: 0, ..movie() };
-        assert_eq!(HeroLines::of(&bare).meta, "");
+        assert_eq!(HeroLines::of(&bare, |_| true).meta, "");
+    }
+
+    /// The genres end the meta line as far as the column takes them, the other facts never give
+    /// way; the cast is one comma-separated line.
+    #[test]
+    fn the_genres_end_the_meta_line_as_far_as_they_fit_and_the_cast_is_one_line() {
+        let film = PmsMovie {
+            genres: vec!["Horror".into(), "Musical".into()],
+            cast: vec!["A Lead".into(), "B Lead".into(), "C Lead".into()],
+            ..movie()
+        };
+        let lines = HeroLines::of(&film, |_| true);
+        assert_eq!(lines.meta, "2007 \u{b7} 1h 51m \u{b7} R \u{b7} Horror, Musical");
+        assert_eq!(lines.cast, "A\u{a0}Lead, B\u{a0}Lead, C\u{a0}Lead", "names glued, so a line never breaks inside one");
+        // A narrow column: one genre, then none; the facts stay whole either way. The cast names
+        // as many as read whole, and none rather than a cut one.
+        let narrow = HeroLines::of(&film, |line| line.chars().count() <= 28);
+        assert_eq!(narrow.meta, "2007 \u{b7} 1h 51m \u{b7} R \u{b7} Horror");
+        assert_eq!(narrow.cast, "A\u{a0}Lead, B\u{a0}Lead, C\u{a0}Lead");
+        let narrower = HeroLines::of(&film, |line| line.chars().count() <= 20);
+        assert_eq!(narrower.meta, "2007 \u{b7} 1h 51m \u{b7} R");
+        assert_eq!(narrower.cast, "A\u{a0}Lead, B\u{a0}Lead");
+        let none = HeroLines::of(&film, |_| false);
+        assert_eq!((none.meta.as_str(), none.cast.as_str()), ("2007 \u{b7} 1h 51m \u{b7} R", ""));
+        // A card with genres and nothing else to say reads its genres alone, or nothing.
+        let bare = PmsMovie { year: 0, rating: String::new(), dur_ns: 0, ..film };
+        assert_eq!(HeroLines::of(&bare, |_| true).meta, "Horror, Musical");
+        assert_eq!(HeroLines::of(&bare, |_| false).meta, "");
+    }
+
+    /// The room under the meta line, in each of the hero's shapes: a text-titled film gets three
+    /// synopsis lines and its cast; a logo'd film two lines and no cast; an episode's own line
+    /// costs it the cast; a logo'd episode keeps one line.
+    #[test]
+    fn the_cast_line_takes_room_after_two_synopsis_lines_and_before_a_third() {
+        let (body, syn) = (line_h(theme::size::BODY), plx_ui::hero_syn_h(1));
+        let three_lines = [None, Some(syn), Some(2.0 * syn), Some(3.0 * syn)];
+        let choice = |title_h: f32, sub: bool| choice_for(title_h, sub.then_some(body), body, &three_lines, Some(body));
+        assert_eq!(choice(TITLE_TEXT_H, false), (3, true), "a text-titled film");
+        assert_eq!(choice(LOGO_H, false), (2, false), "a logo'd film");
+        assert_eq!(choice(TITLE_TEXT_H, true), (3, false), "a text-titled episode");
+        assert_eq!(choice(LOGO_H, true), (1, false), "a logo'd episode");
+        // A one-line synopsis, no synopsis, and no cast line, through the same door.
+        assert_eq!(choice_for(LOGO_H, Some(body), body, &[None, Some(syn)], Some(body)), (1, false));
+        assert_eq!(choice_for(LOGO_H, Some(body), body, &[None], Some(body)), (0, true), "a card without a synopsis stands its cast");
+        assert_eq!(choice_for(TITLE_TEXT_H, None, body, &three_lines, None), (3, false));
+        // The order itself: two lines before any cast, the cast before a third line, and a card
+        // without a synopsis stands its cast alone.
+        assert_eq!(block_choice(|lines, cast| lines + usize::from(cast) <= 3, 3, true), (2, true));
+        assert_eq!(block_choice(|lines, cast| lines <= 2 && !cast, 3, true), (2, false));
+        assert_eq!(block_choice(|_, _| true, 0, true), (0, true));
+        assert_eq!(block_choice(|_, _| true, 3, false), (3, false));
+        assert_eq!(block_choice(|_, _| false, 3, true), (0, false));
     }
 
     #[test]
@@ -417,43 +531,50 @@ mod tests {
             ep_index: 1,
             ..movie()
         };
-        let lines = HeroLines::of(&episode);
+        let lines = HeroLines::of(&episode, |_| true);
         assert_eq!(lines.title, "The Series");
         assert_eq!(lines.logo_rk, "s1");
         assert_eq!(lines.sub.as_deref(), Some("S1 \u{b7} E1 \u{b7} Pilot"));
         // An episode whose show is not named keeps its own title on the band; one whose show has
         // a name but no key keeps the name and looks its logo up by its own key.
         let orphan = PmsMovie { show_title: String::new(), ..episode.clone() };
-        assert_eq!(HeroLines::of(&orphan).title, "Pilot");
+        assert_eq!(HeroLines::of(&orphan, |_| true).title, "Pilot");
         let unkeyed = PmsMovie { show_rk: String::new(), ..episode };
-        assert_eq!((HeroLines::of(&unkeyed).title, HeroLines::of(&unkeyed).logo_rk), ("The Series", "m1"));
+        let lines = HeroLines::of(&unkeyed, |_| true);
+        assert_eq!((lines.title, lines.logo_rk), ("The Series", "m1"));
     }
 
     /// The ladder starts on the content line and, in each of its shapes, ends above the rows with
-    /// the synopsis lines the hero promises: a film's title and three lines, a film's logo and
-    /// two, an episode's title, own line and two, an episode's show logo, own line and one.
+    /// the lines the hero promises: a film's title, three synopsis lines and its cast, a film's
+    /// logo and two lines, an episode's title, own line and three, an episode's show logo, own
+    /// line and one.
     #[test]
     fn the_text_ladder_starts_on_the_content_line_and_ends_above_the_rows() {
         let (body, syn) = (line_h(theme::size::BODY), plx_ui::hero_syn_h(1));
-        let film = hero_text_stack(TITLE_TEXT_H, None, body, Some(3.0 * syn));
+        let film = hero_text_stack(TITLE_TEXT_H, None, body, Some(3.0 * syn), Some(body));
         assert_eq!(film.title_y, TEXT_TOP);
         assert_eq!(film.sub_y, None);
         assert!((film.meta_y - (TEXT_TOP + TITLE_TEXT_H + theme::space::MD)).abs() < 0.01);
         assert!((film.synopsis_y.unwrap() - (film.meta_y + body + theme::space::SM)).abs() < 0.01);
-        assert!((film.bottom - (film.synopsis_y.unwrap() + 3.0 * syn)).abs() < 0.01);
-        assert!(film.bottom <= ROOM_BOTTOM, "a film's three synopsis lines fit above the rows: {}", film.bottom);
-        let logo_film = hero_text_stack(LOGO_H, None, body, Some(2.0 * syn));
+        assert!((film.cast_y.unwrap() - (film.synopsis_y.unwrap() + 3.0 * syn + theme::space::SM)).abs() < 0.01);
+        assert!((film.bottom - (film.cast_y.unwrap() + body)).abs() < 0.01);
+        assert!(film.bottom <= ROOM_BOTTOM, "a film's three synopsis lines and its cast fit above the rows: {}", film.bottom);
+        let logo_film = hero_text_stack(LOGO_H, None, body, Some(2.0 * syn), None);
         assert!(logo_film.bottom <= ROOM_BOTTOM, "a film's logo and two lines fit: {}", logo_film.bottom);
-        let episode = hero_text_stack(TITLE_TEXT_H, Some(body), body, Some(2.0 * syn));
+        let episode = hero_text_stack(TITLE_TEXT_H, Some(body), body, Some(3.0 * syn), None);
         assert!((episode.sub_y.unwrap() - (TEXT_TOP + TITLE_TEXT_H + theme::space::MD)).abs() < 0.01);
         assert!((episode.meta_y - (episode.sub_y.unwrap() + body + theme::space::SM)).abs() < 0.01);
         assert!((episode.synopsis_y.unwrap() - (episode.meta_y + body + theme::space::SM)).abs() < 0.01);
-        assert!(episode.bottom <= ROOM_BOTTOM, "an episode's own line and two synopsis lines fit: {}", episode.bottom);
-        let logo_episode = hero_text_stack(LOGO_H, Some(body), body, Some(syn));
+        assert!((episode.bottom - (episode.synopsis_y.unwrap() + 3.0 * syn)).abs() < 0.01);
+        assert!(episode.bottom <= ROOM_BOTTOM, "an episode's own line and three synopsis lines fit: {}", episode.bottom);
+        let logo_episode = hero_text_stack(LOGO_H, Some(body), body, Some(syn), None);
         assert!(logo_episode.bottom <= ROOM_BOTTOM, "an episode's show logo, own line and one fit: {}", logo_episode.bottom);
-        // Without a synopsis the block ends under its meta line.
-        let terse = hero_text_stack(LOGO_H, Some(body), body, None);
+        // Without a synopsis the block ends under its meta line, or under its cast line.
+        let terse = hero_text_stack(LOGO_H, Some(body), body, None, None);
         assert!((terse.bottom - (terse.meta_y + body)).abs() < 0.01);
+        let cast_only = hero_text_stack(LOGO_H, None, body, None, Some(body));
+        assert_eq!(cast_only.synopsis_y, None);
+        assert!((cast_only.cast_y.unwrap() - (cast_only.meta_y + body + theme::space::SM)).abs() < 0.01);
     }
 
     /// Every logo draws the heroes' floor height, whatever its shape (a very wide mark shorter,

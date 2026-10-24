@@ -114,6 +114,7 @@ mod tests {
             aired: "2026-09-08".into(), child_count: i64::MAX,
             guid: Some([1; 12]), show_guid: Some([2; 12]),
             subtype: Some("movie".into()), smart: true, genre: Some("Drama".into()),
+            genres: vec!["Drama".into(), "Crime".into()], cast: vec!["A Lead".into(), "B Lead".into()],
             video_resolution: Some("4k".into()), hdr: true, audience_rating: Some(7.5),
             leaf_count: Some(10), viewed_leaf_count: Some(4), added_at: Some(i64::MAX),
         };

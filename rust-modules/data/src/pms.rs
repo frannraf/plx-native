@@ -150,6 +150,14 @@ pub struct PmsMovie {
     /// The first `Genre` tag, or `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
+    /// The first genre tags, `plx_plex::plex::HERO_GENRES_MAX` of them (`genre` is the first):
+    /// the Recommended hero's meta line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    /// The first billed names (`Role` tags), `plx_plex::plex::HERO_CAST_MAX` of them: the
+    /// Recommended hero's cast line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cast: Vec<String>,
     /// The first media's `videoResolution` (`4k`, `1080`, `720`, `sd` …), or `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_resolution: Option<String>,
@@ -413,6 +421,8 @@ fn fill_caption_facts(m: &mut PmsMovie, it: &plx_plex::plex::Metadata) {
     // The wire half is `Metadata::listing_facts`, the one rule the Watchlist's matched copies read too.
     let facts = it.listing_facts();
     m.genre = facts.genre;
+    m.genres = facts.genres;
+    m.cast = facts.cast;
     m.video_resolution = facts.video_resolution;
     m.hdr = facts.hdr;
     m.audience_rating = facts.audience_rating;
@@ -2087,7 +2097,8 @@ fn catalog_bytes(cat: &[Arc<PmsMovie>]) -> usize {
                 ]
                 .iter()
                 .map(|s| s.capacity())
-                .sum::<usize>());
+                .sum::<usize>()
+                + m.genres.iter().chain(&m.cast).map(|s| std::mem::size_of::<String>() + s.capacity()).sum::<usize>());
     }
     total
 }
@@ -4224,10 +4235,13 @@ mod caption_fact_tests {
     #[test]
     fn a_movie_carries_genre_resolution_hdr_score_and_added_at() {
         let m = row(r#"{"type":"movie","title":"M","ratingKey":"1","audienceRating":7.8,"addedAt":1700000000,
-            "Genre":[{"tag":"Drama"},{"tag":"Crime"}],
+            "Genre":[{"tag":"Drama"},{"tag":"Crime"},{"tag":"Thriller"}],
+            "Role":[{"tag":"A","role":"a"},{"tag":"B"},{"tag":" "},{"tag":"C"},{"tag":"D"}],
             "Media":[{"videoResolution":"4k","Part":[{"Stream":[
                 {"streamType":1,"colorTrc":"smpte2084"},{"streamType":2}]}]}]}"#);
         assert_eq!(m.genre.as_deref(), Some("Drama"), "the FIRST genre");
+        assert_eq!(m.genres, ["Drama", "Crime"], "the hero's genres, the first two");
+        assert_eq!(m.cast, ["A", "B", "C"], "the hero's cast: the first three billed NAMES, a blank tag skipped");
         assert_eq!(m.video_resolution.as_deref(), Some("4k"));
         assert!(m.hdr);
         assert_eq!(m.audience_rating, Some(7.8));
@@ -4240,6 +4254,7 @@ mod caption_fact_tests {
         let m = row(r#"{"type":"movie","title":"M","Media":[{"videoResolution":"1080",
             "Part":[{"Stream":[{"streamType":1,"colorTrc":"bt709"}]}]}]}"#);
         assert!(!m.hdr);
+        assert!(m.genres.is_empty() && m.cast.is_empty());
         assert_eq!((m.genre, m.audience_rating, m.added_at, m.subtype), (None, None, None, None));
     }
 

@@ -494,6 +494,12 @@ pub fn resolve_catalog_hex(known: Option<[u8; 12]>, fetch: impl FnOnce() -> Opti
     known.or_else(|| fetch().and_then(|g| catalog_hex_of_guid(&g)))
 }
 
+/// How many genre tags a listing's facts keep for a hero's meta line.
+pub const HERO_GENRES_MAX: usize = 2;
+/// How many billed names (`Role` tags, in the server's billing order) a listing's facts keep for a
+/// hero's cast line.
+pub const HERO_CAST_MAX: usize = 3;
+
 /// **What a listing row says of the title it is, for a caption**, lifted off the wire once
 /// ([`Metadata::listing_facts`]) with unknown left `None` / `false` rather than a zero a reader could
 /// mistake for a value. The catalog row (`data::pms::parse_item`) takes its caption facts from it,
@@ -503,6 +509,10 @@ pub fn resolve_catalog_hex(known: Option<[u8; 12]>, fetch: impl FnOnce() -> Opti
 pub struct ListingFacts {
     /// The FIRST genre tag.
     pub genre: Option<String>,
+    /// The first [`HERO_GENRES_MAX`] genre tags (`genre` is the first of them).
+    pub genres: Vec<String>,
+    /// The first [`HERO_CAST_MAX`] billed names.
+    pub cast: Vec<String>,
     /// `Media[0]`'s resolution class (`"4k"`, `"1080"`).
     pub video_resolution: Option<String>,
     /// A video stream of `Media[0]` is HDR ([`Stream::is_hdr`]).
@@ -528,6 +538,8 @@ impl Metadata {
         let leaf_count = count(self.leaf_count);
         ListingFacts {
             genre: self.genre.first().and_then(|g| some(&g.tag)),
+            genres: self.genre.iter().filter_map(|g| some(&g.tag)).take(HERO_GENRES_MAX).collect(),
+            cast: self.role.iter().filter_map(|r| some(&r.tag)).take(HERO_CAST_MAX).collect(),
             video_resolution: media.and_then(|x| some(&x.video_resolution)),
             hdr: media
                 .into_iter()
@@ -1239,10 +1251,13 @@ mod tests {
     #[test]
     fn a_listing_row_says_its_genre_video_ratings_length_and_counts() {
         let movie = listing(r#"{"type":"movie","ratingKey":"1","contentRating":"PG-13","audienceRating":7.8,"duration":6000000,
-            "Genre":[{"tag":"Drama"},{"tag":"Crime"}],
+            "Genre":[{"tag":"Drama"},{"tag":"Crime"},{"tag":"Thriller"}],
+            "Role":[{"tag":"A","role":"a"},{"tag":"B"},{"tag":""},{"tag":"C"},{"tag":"D"}],
             "Media":[{"videoResolution":"4k","Part":[{"Stream":[{"streamType":1,"colorTrc":"smpte2084"}]}]}]}"#);
         assert_eq!(movie, super::ListingFacts {
             genre: Some("Drama".into()),
+            genres: vec!["Drama".into(), "Crime".into()],
+            cast: vec!["A".into(), "B".into(), "C".into()],
             video_resolution: Some("4k".into()),
             hdr: true,
             content_rating: Some("PG-13".into()),
