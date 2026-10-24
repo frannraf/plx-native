@@ -88,7 +88,8 @@
 //!    (inline) radius with antialiased edges, so a page dot is an ~84-pixel blob and never a 64-pixel
 //!    scanline run; only a component scan sees them. COUNTER-ONLY reasons, which no pixel scan can
 //!    see and which the run report must list as such: [`Reason::HomeBackdrop`],
-//!    [`Reason::DetailBackdrop`], [`Reason::WorkingReadout`] and every other caption,
+//!    [`Reason::DetailBackdrop`], [`Reason::LibraryHeroBackdrop`], [`Reason::WorkingReadout`] and
+//!    every other caption,
 //!    [`Reason::HeroLogoText`] (thin strokes), anything under a scrim or glass, and a held image.
 //! 8. **Build the sentinel in CI** (the `site-video-sim` target) and run the plan's negative tests
 //!    against both oracles.
@@ -167,6 +168,9 @@ pub enum Reason {
     HomeBackdrop,
     /// The Detail page's backdrop art (path non-empty) has no texture yet.
     DetailBackdrop,
+    /// The Library Recommended page's hero backdrop (the focused card's art, path non-empty) has
+    /// no texture yet.
+    LibraryHeroBackdrop,
 }
 
 impl Reason {
@@ -190,6 +194,7 @@ impl Reason {
             Reason::HeroLogoAbsent => "hero-logo-absent",
             Reason::HomeBackdrop => "home-backdrop",
             Reason::DetailBackdrop => "detail-backdrop",
+            Reason::LibraryHeroBackdrop => "library-hero-backdrop",
         }
     }
 
@@ -221,7 +226,8 @@ impl Reason {
             | Reason::HeroLogoText
             | Reason::HeroLogoAbsent
             | Reason::HomeBackdrop
-            | Reason::DetailBackdrop => false,
+            | Reason::DetailBackdrop
+            | Reason::LibraryHeroBackdrop => false,
         }
     }
 }

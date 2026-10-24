@@ -3,6 +3,7 @@ mod identity;
 mod bookmark;
 mod layout;
 mod recommended;
+mod hero;
 pub use recommended::RecommendedScreen;
 mod lookahead;
 mod parts;

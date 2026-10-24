@@ -89,6 +89,7 @@ TEST_FILE = re.compile(r'(?:^|_)tests?\.rs$|_harness\.rs$')
 REQUIRED = [
     ('screens/src/home/mod.rs', 'HomeBackdrop'),
     ('screens/src/detail/mod.rs', 'DetailBackdrop'),
+    ('screens/src/library/hero.rs', 'LibraryHeroBackdrop'),
     ('ui/src/hero_logo.rs', 'HeroLogoText'),
     ('ui/src/hero_logo.rs', 'HeroLogoAbsent'),
     ('ui/src/widgets.rs', 'ProfileChip'),

@@ -131,6 +131,8 @@ mod imp {
         "lb.menu",
         "rc.clear",
         "rc.ground",
+        "rc.hero",
+        "rc.herotext",
         "rc.rows",
         "st.ground",
     ];

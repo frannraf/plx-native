@@ -2534,6 +2534,22 @@ pub fn hero_scrim(p: Painter, strength: f32, right: bool) {
     }
 }
 
+/// [`hero_scrim`] with its knee LIFTED to `knee`: the same wedge, the same feather above it, the
+/// same two closed forms at the corners, standing higher — for a hero whose copy starts above the
+/// billboards' anchors (the Library's Recommended page, whose block starts on the grid's content
+/// line, y 244, while the shared knee is at y 421). The left wedge only: no such hero has a
+/// right-aligned column. Call it where [`hero_scrim`] is called, inside the backdrop.
+pub fn hero_scrim_lifted(p: Painter, strength: f32, knee: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    let none = theme::scrim(hero_scrim_a(HERO_SCRIM_W, strength));
+    let edge = theme::scrim(hero_scrim_a(0.0, strength));
+    let feather = HERO_SCRIM_KNEE - HERO_SCRIM_TOP;
+    p.grad4(Rect::new(0.0, knee - feather, HERO_SCRIM_W, feather), [none, none, none, edge]);
+    p.grad4(Rect::new(0.0, knee, HERO_SCRIM_W, crate::consts::SCR_H - knee), [edge, none, none, edge]);
+}
+
 /// Is the one-pass hero ground armed? `/tmp/plxnative-heroground`, read once at boot.
 ///
 /// EXPERIMENT, not a default. The shipped path is the four blended quads, and it stays reachable

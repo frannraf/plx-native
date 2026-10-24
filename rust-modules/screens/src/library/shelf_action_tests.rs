@@ -242,7 +242,15 @@ fn a_collection_shelf_heading_is_a_linked_focus_stop_that_opens_the_collection()
     assert!(matches!(&pushed[0], crate::registry::ContentArg::Collection(id)
         if id.rk == "50001" && id.sec == 1 && id.tag == 0 && id.name == "Toy Story Collection"));
 
-    // Pointer: the heading registers a hover-focus stop on its drawn face.
+    // Pointer: the heading registers a hover-focus stop on its drawn face. The hero above the
+    // first shelf puts the second shelf's heading below the screen at rest; the focus move onto
+    // the heading scrolls the page to its rest, and the stop is read there.
+    let mut out = Vec::new();
+    let mut present = plx_machine::present::Present::new();
+    page.step(&ScreenEvent::FocusMoved { from: Some(card), to: page.key(heading), by: By::Dir }, &cx(&engine),
+        &mut Effects::new(&mut out, MachineId::Instance(InstanceId(21)), &mut present));
+    assert!(page.scroll_target > 0.0, "the heading's rest is down the page");
+    page.scroll.jump(page.scroll_target);
     page.relayout(engine.current(owner));
     let context = cx(&engine);
     let mut frame = DrawFrame::new(&context, plx_ui::Painter::root());

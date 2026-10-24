@@ -47,6 +47,7 @@ use plx_ui::widgets::Art;
 use plx_ui::xfade::Xfade;
 use plx_ui::{on_axis, Env, Rect, Spring, View};
 
+use super::hero::{FocusHero, HERO_H};
 use super::identity::{KeyRegion, KeyRegistry};
 use super::row_group;
 use crate::registry::{
@@ -58,10 +59,10 @@ use crate::registry::{
 /// Where the page's title stands: the same top the library's header row has.
 const CONTENT_TOP: f32 = plx_ui::page_header::TOP;
 /// The run's start under [`CONTENT_TOP`]: the first shelf's HEADING (drawn [`TITLE_DY`] above its
-/// row's origin) starts on the grid's content line, y 244 (`page_header::BLOCK_H` under the header
-/// row's top), clear of the title row's 148..204 and the air under it; the origin, and the cards
-/// under it, follow the heading.
-const HEAD_H: f32 = plx_ui::page_header::BLOCK_H + TITLE_DY;
+/// row's origin) starts [`HERO_H`] under the grid's content line, y 244 (`page_header::BLOCK_H`
+/// under the header row's top) — the hero of the focused card stands in between
+/// (`super::hero`); the origin, and the cards under it, follow the heading.
+const HEAD_H: f32 = plx_ui::page_header::BLOCK_H + HERO_H + TITLE_DY;
 /// Rows PageUp / PageDown move focus by.
 const PAGE_ROWS: usize = 2;
 /// The strip group the page's first row links up to (the shared top bar).
@@ -210,6 +211,9 @@ pub struct RecommendedScreen {
     header_row: plx_ui::page_header::SharedRow<HeaderRow>,
     /// The standing "Hold OK for options" hint over a card. Paint-only.
     hold_hint: plx_ui::hold_hint::HoldHint,
+    /// The focused card's hero over the rows (`super::hero`): its backdrop under the page and its
+    /// title, meta line and synopsis above the first row. Paint-only: drawn from the focus.
+    hero: FocusHero,
     /// The page was remounted over a memory (`restore`): its keys are the memory's, so no row can
     /// be taken to hold keys the registry has. The next build registers every row again.
     rows_stale: bool,
@@ -319,8 +323,14 @@ fn max_scroll(run: &ShelfRun) -> f32 {
     (HEAD_H + run.height() - (SCR_H - CONTENT_TOP) + MARGIN_Y).max(0.0)
 }
 
-/// The scroll that puts row `index` where the first row rests (heading under the title).
-fn reveal(run: &ShelfRun, index: usize) -> f32 { run.origin(index).clamp(0.0, max_scroll(run)) }
+/// The scroll that puts row `index` at its rest: the first row's heading under the hero; a later
+/// row's heading on the grid's content line, the hero's text and the rows passed scrolled off
+/// above it (as Home's rows take the screen from its billboard), so the rows still to come show
+/// under the one in hand. The backdrop stays: it is the page's ground, not part of the document.
+fn reveal(run: &ShelfRun, index: usize) -> f32 {
+    let head = if index == 0 { 0.0 } else { HERO_H };
+    (run.origin(index) + head).clamp(0.0, max_scroll(run))
+}
 
 /// The row focus stands on: the row that holds the focus key now, else the row the key was last
 /// placed in (`last_place`, the key registry's record). The second half is what keeps a row focused
@@ -353,6 +363,7 @@ impl RecommendedScreen {
             header_capsules: plx_ui::widgets::TabStrip::new(), header_pop: plx_ui::widgets::CtlPop::new(),
             header_row: plx_ui::page_header::SharedRow::new(),
             hold_hint: plx_ui::hold_hint::HoldHint::new(),
+            hero: FocusHero::new(),
             hold_sent: None, rows_stale: false,
             #[cfg(test)] shelf_visits: std::cell::Cell::new(0),
         }
@@ -413,6 +424,7 @@ impl RecommendedScreen {
             // Viewports of an epoch that is no longer current can never be looked up again.
             if self.epoch != epoch { self.viewports.retain(|old| Some(old.epoch) == epoch); }
             self.shelves.clear();
+            self.hero.clear();
             self.shelf_publication = None;
             self.section = identity.clone();
             self.epoch = epoch;
@@ -654,6 +666,15 @@ impl RecommendedScreen {
         let key = focus.filter(|key| key.entry == self.entry)?;
         let (row, col) = self.cell_of(key.elem)?;
         H::section_hubs(cx).shelves().get(row)?.items.get(col)
+    }
+
+    /// The card the hero shows: the card it is bound to (the focused card; the one it keeps while
+    /// focus is on the crumb or a linked heading, or a key is held along a row), found by its
+    /// identity among the published rows, so a row the store re-keyed still names it.
+    fn hero_item<'a, H: LibraryLike>(&self, cx: &Cx<'a, H>) -> Option<&'a plx_data::pms::PmsMovie> {
+        let (sid, rk) = self.hero.keyed()?;
+        H::section_hubs(cx).shelves().iter().flat_map(|shelf| shelf.items.iter())
+            .find(|item| item.sid.raw() == sid && item.rk == rk)
     }
 
     /// `(row, col)` of the card `elem` names.
@@ -929,6 +950,9 @@ impl RecommendedScreen {
     }
 
     fn step_event<H: LibraryLike>(&mut self, ev: &ScreenEvent<H>, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
+        if let ScreenEvent::Input(plx_machine::machine::InputEvent { at, kind: InputKind::Key { key, edge, .. }, .. }) = ev {
+            self.hero.note_key(*key, *edge, at.ms);
+        }
         match ev {
             ScreenEvent::Mount | ScreenEvent::StoreChanged(..) => self.sync(cx),
             ScreenEvent::RestoreMemory(PageMemory::Library(memory)) => { self.restore(memory); self.sync(cx); }
@@ -954,6 +978,8 @@ impl RecommendedScreen {
                 if self.live {
                     let dt = tick.dt();
                     let focused = cx.focus.current;
+                    self.hero.bind(self.focused_item(focused, cx), tick.ms);
+                    self.hero.step(dt);
                     let colours = self.focused_item(focused, cx).filter(|item| item.has_blur).map(|item| item.blur)
                         .or_else(|| (!self.ground_seeded).then(|| H::section_hubs(cx).shelves().first()
                             .and_then(|shelf| shelf.items.first()).filter(|item| item.has_blur).map(|item| item.blur)).flatten());
@@ -1213,10 +1239,21 @@ impl RecommendedScreen {
         plx_ui::profile::phase("rc.clear", || {
             plx_gfx::gfx::frame_clear(plx_ui::theme::CLEAR_RGB.0, plx_ui::theme::CLEAR_RGB.1, plx_ui::theme::CLEAR_RGB.2);
         });
-        plx_ui::profile::phase("rc.ground", || self.ground.draw(f.painter.alpha(f.page_alpha), Rect::FULL));
+        // The hero is bound at the draw as well as on the tick: a press frame draws the card the
+        // press landed on, not the one the last tick saw.
+        self.hero.bind(self.focused_item(f.focus.current, f.cx), f.cx.tick.ms);
+        // The ground shows only where the hero's picture does not cover it.
+        if self.hero.shown() < 0.995 {
+            plx_ui::profile::phase("rc.ground", || self.ground.draw(f.painter.alpha(f.page_alpha), Rect::FULL));
+        }
+        plx_ui::profile::phase("rc.hero", || self.hero.draw_art(f.painter.alpha(f.page_alpha)));
         let p = self.shelf_painter(f);
         let env = Env::inert();
         self.draw_title(f);
+        // The block scrolls off with the rows: it is the head of the document the rows are.
+        if let Some(item) = self.hero_item(f.cx) {
+            plx_ui::profile::phase("rc.herotext", || self.hero.draw_text(f, p, item, -self.scroll.pos));
+        }
         plx_ui::profile::phase("rc.rows", || {
             for index in self.shelf_window() {
                 #[cfg(test)] self.shelf_visits.set(self.shelf_visits.get() + 1);

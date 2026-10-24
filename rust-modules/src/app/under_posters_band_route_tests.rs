@@ -192,14 +192,18 @@ fn home_opens_the_band_its_setting_asks_for() {
     grade_shelf_bands(&mut w, "Home", "Continue Watching", "Recently Added", true);
 }
 
-/// Recommended: its first poster shelf is focused on arrival, a second one sits below it.
+/// Recommended: the hero of the focused card stands above the first poster shelf, which puts the
+/// second shelf's heading below the screen at rest; one Down scrolls the hero's text off and seats
+/// the second shelf on the grid's content line, the third shelf's heading under it.
 #[test]
 fn recommended_opens_the_band_its_setting_asks_for() {
     let mut w = World::recommended_pending("band-recommended");
     w.bridge.stores.browse.borrow_mut().seed_named_shelves_for_test(
-        0, &[("hub.movie.recent", "", "Recently Added"), ("hub.movie.top", "", "Top Rated")], 3);
+        0, &[("hub.movie.recent", "", "Recently Added"), ("hub.movie.top", "", "Top Rated"), ("hub.movie.trending", "", "Trending")], 3);
     w.frames(60);
-    grade_shelf_bands(&mut w, "Recommended", "Recently Added", "Top Rated", false);
+    w.press(super::Key::Down);
+    w.frames(60);
+    grade_shelf_bands(&mut w, "Recommended", "Top Rated", "Trending", false);
 }
 
 /// Detail: Related is the focused shelf (three Downs from the top), About the section below it.

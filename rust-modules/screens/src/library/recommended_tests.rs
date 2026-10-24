@@ -299,7 +299,31 @@ fn the_first_shelf_starts_at_the_grid_top_under_the_title_row() {
     let _guard = plx_base::testlock::serial();
     let fixture = Fixture::shelves(&["movie.inprogress.1"], 6);
     let page = fixture.screen();
-    assert_eq!(shelf_y(&page.run, 0, 0.0) - TITLE_DY, 244.0, "the first heading starts on the library page's grid top");
+    assert_eq!(shelf_y(&page.run, 0, 0.0) - TITLE_DY, 244.0 + HERO_H, "the first heading starts under the hero, HERO_H below the library page's grid top");
+}
+
+/// **A later row rests on the grid's content line, the hero's text scrolled off above it**, the way
+/// Home's rows take the screen from its billboard: the rows still to come show under the one in
+/// hand, not the rows passed. Up to the first row brings the hero back.
+#[test]
+fn a_later_row_rests_on_the_content_line_with_the_hero_scrolled_off() {
+    let _guard = plx_base::testlock::serial();
+    let fixture = Fixture::shelves(&["movie.inprogress.1", "movie.recentlyadded.1", "movie.recentlyreleased.1", "movie.topunwatched.1"], 6);
+    let mut page = fixture.screen();
+    let mut engine = FocusEngine::new();
+    let first = page.shelves[0].elems[0];
+    engine.set(OWNER, FocusKey { entry: ENTRY, elem: first }, Some(page.shelves[0].group), plx_ui::screen::By::Restore);
+    direction(&mut page, &mut engine, &fixture, Dir::Down);
+    assert_eq!(engine.current(OWNER).map(|k| k.elem), Some(page.shelves[1].elems[0]), "DOWN reaches the second row");
+    assert_eq!(shelf_y(&page.target_run, 1, page.scroll_target) - TITLE_DY, 244.0, "the second heading rests on the content line");
+    assert!(page.scroll_target >= crate::library::hero::TEXT_TOP + HERO_H,
+        "the hero's block, which ends above the first heading's rest, is scrolled off: {}", page.scroll_target);
+    direction(&mut page, &mut engine, &fixture, Dir::Down);
+    assert_eq!(shelf_y(&page.target_run, 2, page.scroll_target) - TITLE_DY, 244.0, "so does the third");
+    direction(&mut page, &mut engine, &fixture, Dir::Up);
+    direction(&mut page, &mut engine, &fixture, Dir::Up);
+    assert_eq!(page.scroll_target, 0.0, "UP to the first row brings the hero back");
+    assert_eq!(shelf_y(&page.target_run, 0, page.scroll_target) - TITLE_DY, 244.0 + HERO_H);
 }
 
 /// **The first shelf's heading never reaches into the title row.** The breadcrumb row is the header
@@ -327,7 +351,7 @@ fn the_first_shelf_heading_starts_clear_of_the_title_row() {
     // Clear of the row (204) AND its focus pill stood out by its outset, with air to spare.
     let pill_bottom = title_row_bottom + plx_ui::widgets::PILL_FOCUS_OUTSET;
     assert!(heading >= title_row_bottom + 24.0 && heading >= pill_bottom + 24.0, "the first heading's text starts at {heading}");
-    assert_eq!(heading, 244.0, "…on the grid's content line");
+    assert_eq!(heading, 244.0 + HERO_H, "…HERO_H under the grid's content line, where the hero stands");
 }
 
 /// **The crumb row is built once per key, not once per question.** The page asks for the row in its
