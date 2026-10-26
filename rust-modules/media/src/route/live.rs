@@ -311,14 +311,22 @@ pub fn live_shift_state() -> Option<(f64, f64, f64, f64)> {
 
 /// Can the live channel playing be paused and rewound: a DVR channel whose tuner reported a capture
 /// window of some depth, with its lease (its tuner) still held?
+///
+/// Asked by the player screen, whose session is the published copy: that copy carries no lease
+/// (`PlaybackSession::publication`), so the check never asks for one (it did, and LEFT/RIGHT never
+/// skipped on the set). The time-shift is the held lease's own — installed with it, gone with its
+/// release (a CH▲/CH▼ hands the tuner back) — so a live copy that is no Plex channel's can shift
+/// while there is a time-shift with capture enough.
 pub fn live_can_shift(ps: &PlaybackSession) -> bool {
-    let Some(lease) = super::decision::live_lease_ref(ps) else { return false };
-    if lease.provider {
+    can_shift(super::decision::live_info(ps), shift_lock().as_ref(), wall_s())
+}
+
+fn can_shift(info: Option<&LiveInfo>, shift: Option<&Shift>, now: f64) -> bool {
+    if info.is_none_or(|i| i.provider) {
         return false;
     }
     // the capture as it stands now: the tuner has recorded on since the window was last reported
-    let now = wall_s();
-    shift_lock().as_ref().filter(|s| s.session == lease.encoder_session).and_then(|s| s.window).is_some_and(|(w, seen)| {
+    shift.and_then(|s| s.window).is_some_and(|(w, seen)| {
         let (earliest, edge) = capture_span(&w, seen, now);
         edge - earliest >= SHIFT_MIN_DEPTH_S
     })
@@ -682,6 +690,31 @@ mod tests {
         assert_eq!(shift_target(1_900.0, 600.0, earliest, live), None, "past it: the edge");
         let w = CaptureWindow { time_stamp: 1_000.0, min_offset: 10.0, max_offset: 600.0 };
         assert_eq!(capture_span(&w, 50.0, 60.0), (1_010.0, 1_610.0), "the edge moves on with the clock");
+    }
+
+    /// **The player screen's copy of the session can shift** (device 2026-10-26: it carries no
+    /// lease, and a check that asked for one never let LEFT/RIGHT skip): a live DVR channel with a
+    /// capture of some depth can; a Plex channel, a playback that is no live one, a capture too
+    /// shallow, or no time-shift at all (its lease released) cannot.
+    #[test]
+    fn the_screens_copy_of_a_live_session_can_shift_once_the_capture_has_depth() {
+        let mut ps = PlaybackSession::IDLE;
+        let dvr = LiveRoute { subscription_id: "77".into(), url: "http://127.0.0.1:9/x.m3u8".into(), ..LiveRoute::default() };
+        assert!(install_live(&mut ps, dvr));
+        let copy = ps.publication();
+        let info = super::super::decision::live_info(&copy);
+        let w = CaptureWindow { time_stamp: 1_000.0, min_offset: 1.0, max_offset: 60.0 };
+        let shift = Shift { session: "s".into(), window: Some((w, 50.0)), clock: ShiftClock::at_edge(50.0, Some(1_060.0)) };
+        assert!(can_shift(info, Some(&shift), 50.0), "a minute of capture: it can");
+        let shallow = Shift { window: Some((CaptureWindow { max_offset: 5.0, ..w }, 50.0)), ..shift.clone() };
+        assert!(!can_shift(info, Some(&shallow), 50.0), "four seconds: not yet");
+        assert!(can_shift(info, Some(&shallow), 60.0), "…ten seconds on, the capture has grown");
+        assert!(!can_shift(info, None, 50.0), "no time-shift: its lease went");
+        assert!(!can_shift(None, Some(&shift), 50.0), "no live playback");
+        let plex = LiveInfo { provider: true, ..info.cloned().unwrap_or_default() };
+        assert!(!can_shift(Some(&plex), Some(&shift), 50.0), "a Plex channel");
+        release_live(&mut ps);
+        drain_live_releases();
     }
 
     /// **One reference for LIVE** (review 2026-10-26): from the live position, the shortest skip
