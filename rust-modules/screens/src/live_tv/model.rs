@@ -409,6 +409,16 @@ pub fn follow(view: &LiveTvView, frame: &Frame, elem: u32) -> Frame {
     f
 }
 
+/// The rows `depth` rows away from the guide's window of [`ROWS_SHOWN`] rows at `top` (of `n`),
+/// nearest first and, at each distance, the one past its foot before the one over its head: what
+/// the guide fetches ahead of a step or a page (its channel logos).
+pub fn rows_around(top: usize, n: usize, depth: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
+    depth.flat_map(move |d| {
+        let below = top + ROWS_SHOWN + d;
+        [(below < n).then_some(below), top.checked_sub(d + 1)].into_iter().flatten()
+    })
+}
+
 /// The guide the page wants read for `frame`: the rows shown and two either side, from three hours
 /// before the window (LEFT walks back there) but never before the half hour now is in (an airing
 /// that ended is nothing to focus), to three hours past its end (RIGHT finds the next airing

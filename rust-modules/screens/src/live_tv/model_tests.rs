@@ -385,3 +385,20 @@ fn moving_up_and_down_keeps_the_window_and_meets_off_air_channels_on_their_place
     let evening = Frame { win_start: NOON + 6 * 3_600, ..frame() };
     assert_eq!(guide_neighbour(&v, &evening, cell_elem(1, PLACEHOLDER), Dir::Up), Some(cell_elem(0, PLACEHOLDER)), "off the air in this window");
 }
+
+#[test]
+fn rows_around_the_window_come_nearest_first_below_before_above() {
+    let rows = |top, n, depth| rows_around(top, n, depth).collect::<Vec<_>>();
+    // a window of rows 10..14 of 40: the page below and the page above, one ring at a time
+    assert_eq!(rows(10, 40, 0..ROWS_SHOWN), [14, 9, 15, 8, 16, 7, 17, 6]);
+    // the next ring picks up where the first stopped
+    assert_eq!(rows(10, 40, ROWS_SHOWN..ROWS_SHOWN + 2), [18, 5, 19, 4]);
+    // at the top there is nothing above; at the foot nothing below
+    assert_eq!(rows(0, 40, 0..3), [4, 5, 6]);
+    assert_eq!(rows(36, 40, 0..3), [35, 34, 33]);
+    // a lineup shorter than the window has no rows around it
+    assert_eq!(rows(0, 3, 0..ROWS_SHOWN), Vec::<usize>::new());
+    // never a row twice, never one on screen
+    let all = rows(2, 9, 0..20);
+    assert_eq!(all, [6, 1, 7, 0, 8]);
+}

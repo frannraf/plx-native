@@ -1061,16 +1061,51 @@ impl LiveTvScreen {
         w
     }
 
+    /// Row `row`'s channel logo: the lineup's, else one its airings name; `""` when neither has one.
+    fn channel_thumb(&self, row: usize) -> &str {
+        match self.view.snap.channels.get(row) {
+            Some(ch) if !ch.thumb.is_empty() => ch.thumb.as_str(),
+            _ => self.view.row(row).and_then(|rw| rw.airings.iter().map(|a| a.channel_thumb.as_str()).find(|t| !t.is_empty())).unwrap_or(""),
+        }
+    }
+
+    /// **The channel logos of the rows just off the guide's window, fetched before they scroll in**
+    /// (a row stepped or paged into view drew its call sign while its logo was fetched, then
+    /// swapped it in: the owner's "jarring"). Two tiers, as Home's billboard prefetch: the rows a
+    /// page above and below the window are probed every frame (demand: resident, uploaded under
+    /// the frame's budget, kept from eviction), so a step or a page shows its logos at once; the
+    /// rows [`LOGO_AHEAD_ROWS`] beyond those are fetched one a frame, nearest first, once the
+    /// source is idle, so paging on finds them fetched. The same key the row's draw resolves.
+    ///
+    /// Called right after the guide's rows draw, never before: the source serves the newest
+    /// frame's requests in the order they were last asked, so a probe asked before a row on screen
+    /// re-asked for its logo would be fetched first.
+    fn prefetch_logos(&self) {
+        use plx_ui::tex::Warm;
+        if self.mode != Mode::Guide || !self.has_content() {
+            return;
+        }
+        let Some(srv) = self.srv() else { return };
+        let (top, n) = (self.frame.row_top, self.view.channel_count());
+        for row in model::rows_around(top, n, 0..model::ROWS_SHOWN) {
+            resolve_tex_wh_on(srv, self.channel_thumb(row), LOGO_REQ.0, LOGO_REQ.1, 1);
+        }
+        if !plx_ui::tex::source_idle() {
+            return;
+        }
+        for row in model::rows_around(top, n, model::ROWS_SHOWN..model::ROWS_SHOWN + LOGO_AHEAD_ROWS) {
+            if plx_ui::tex::warm_ahead_on(srv, self.channel_thumb(row), LOGO_REQ.0, LOGO_REQ.1, true) != Warm::Known {
+                return;
+            }
+        }
+    }
+
     /// A row's channel: its logo (else its call sign) over its number.
     fn draw_channel<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32, h: f32) {
         let r = Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, h);
         p.rrect(r, 10.0, 10.0, theme::with_a(INK_BLACK, 0.32));
         let logo_box = Rect::new(r.x + 18.0, y + 10.0, r.w - 36.0, r.h - 44.0);
-        let thumb = if ch.thumb.is_empty() {
-            self.view.row(row).and_then(|rw| rw.airings.iter().map(|a| a.channel_thumb.as_str()).find(|t| !t.is_empty())).unwrap_or("")
-        } else {
-            ch.thumb.as_str()
-        };
+        let thumb = self.channel_thumb(row);
         let mut logo = false;
         if let (Some(srv), false) = (self.srv(), thumb.is_empty()) {
             let (tex, tw, th) = resolve_tex_wh_on(srv, thumb, LOGO_REQ.0, LOGO_REQ.1, 1);
@@ -1588,6 +1623,10 @@ const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const ART_REQ: (i32, i32) = (1280, 720);
 const POSTER_REQ: (i32, i32) = (112, 168);
 const LOGO_REQ: (i32, i32) = (240, 112);
+/// How far past the page above and below the guide's window channel logos are fetched ahead
+/// ([`LiveTvScreen::prefetch_logos`]): two more pages each way, sixteen rows, within the source's
+/// lookahead set (`tex::AHEAD_SET_MAX`).
+const LOGO_AHEAD_ROWS: usize = 2 * model::ROWS_SHOWN;
 /// The backdrop's left fade: how wide.
 const ART_FADE_W: f32 = 620.0;
 /// One strip of the art's left fade, in whole pixels: 155 of them, no step over 1.3% (10 px strips
@@ -2040,7 +2079,10 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
         match self.readout() {
             Some(r) => self.draw_readout(f, p, r),
             None => match self.mode {
-                Mode::Guide => self.draw_guide(f, p),
+                Mode::Guide => {
+                    self.draw_guide(f, p);
+                    self.prefetch_logos();
+                }
                 Mode::Recordings => self.draw_recs(f, p),
             },
         }
