@@ -170,9 +170,10 @@ const EDGE_LAG_S: f64 = 8.0;
 /// from LIVE always lands behind it, and one on from there always comes back.
 pub const LIVE_SNAP_S: f64 = 3.0;
 
-/// The least capture a channel needs before it offers rewinding (a tune of a few seconds has
-/// nothing to rewind into).
-const SHIFT_MIN_DEPTH_S: f64 = 30.0;
+/// The least capture a channel needs before it offers rewinding: room for one skip back from the
+/// live position past the snap (a tune of a few seconds has nothing to rewind into). The capture
+/// grows one second a second from the tune (measured 2026-10-26), so this is a few seconds in.
+const SHIFT_MIN_DEPTH_S: f64 = EDGE_LAG_S + LIVE_SNAP_S + 1.0;
 
 /// **Where the picture of the live channel playing is**, as a moment of the channel in the
 /// server's capture time (epoch seconds, the clock its `timeStamp` counts): `base` at wall time
