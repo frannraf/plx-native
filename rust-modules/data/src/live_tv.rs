@@ -380,6 +380,10 @@ pub struct WriteNotice {
     pub reason: String,
     /// A create that answered conflicts: the rule exists and collides with these recordings.
     pub conflicts: Vec<String>,
+    /// A record: the rule it made (what "Prefer This" raises and "Cancel This" deletes), and the
+    /// program's title as the page names it.
+    pub rule: String,
+    pub title: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

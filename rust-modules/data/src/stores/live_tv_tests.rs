@@ -322,6 +322,7 @@ fn writes_run_one_at_a_time_in_press_order_and_end_in_notices_and_overlays() {
     let notice = s.snapshot().notice.unwrap();
     assert!(notice.ok);
     assert_eq!(notice.op, WriteOp::RecordSeries);
+    assert_eq!(notice.rule, "41", "the rule a conflict panel would prefer or cancel");
     let jobs = script.take();
     assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Write(Write::StopGrab { .. }))), "the next write starts");
     assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Dvr { .. })), "the DVR lists are read again");

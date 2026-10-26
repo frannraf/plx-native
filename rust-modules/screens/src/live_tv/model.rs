@@ -642,6 +642,10 @@ pub enum Action {
     DeleteRule,
     Favorite,
     Unfavorite,
+    /// A new recording that conflicts: raise its rule to the top (it wins the tuners)…
+    Prefer,
+    /// …or delete it.
+    CancelNew,
     Close,
 }
 
@@ -653,6 +657,9 @@ pub enum Target {
     Rule(Subscription),
     /// A guide row's channel: watch it, add it to the favorites or take it off.
     Channel { row: usize, channel: Channel },
+    /// A recording just made that collides with others (`conflicts`, their titles) for the
+    /// tuners: prefer it, cancel it, or leave it below them.
+    Conflict { rule: String, title: String, conflicts: Vec<String> },
 }
 
 /// The open panel: its target and its actions, in the order they are offered.
@@ -768,6 +775,9 @@ pub fn write_for(snap: &Snapshot, target: &Target, action: Action) -> Option<Wri
         (Target::Grab(g), Action::StopRecording | Action::CancelRecording) => Some(Write::StopGrab { key: g.key.clone() }),
         (Target::Rule(s), Action::DeleteRule) => Some(Write::CancelRule { id: s.id.clone() }),
         (Target::Rule(s), Action::MoveTop) => Some(Write::MoveRule { id: s.id.clone(), after: None }),
+        // a rule moved to the top of the priority list wins a tuner conflict (`docs/pms-api.md` §10.4)
+        (Target::Conflict { rule, .. }, Action::Prefer) => Some(Write::MoveRule { id: rule.clone(), after: None }),
+        (Target::Conflict { rule, .. }, Action::CancelNew) => Some(Write::CancelRule { id: rule.clone() }),
         (Target::Rule(s), Action::MoveBottom) => {
             let last = snap.rules.iter().rev().find(|r| r.id != s.id)?;
             Some(Write::MoveRule { id: s.id.clone(), after: Some(last.id.clone()) })

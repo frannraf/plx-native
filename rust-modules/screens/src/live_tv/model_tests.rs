@@ -455,3 +455,14 @@ fn rows_around_the_window_come_nearest_first_below_before_above() {
     let all = rows(2, 9, 0..20);
     assert_eq!(all, [6, 1, 7, 0, 8]);
 }
+
+/// **A recording that conflicts** is preferred by raising its rule to the top of the priority
+/// list (it then wins the tuners), or cancelled by deleting it; closing leaves it below the others.
+#[test]
+fn a_conflicting_recording_is_preferred_by_raising_its_rule_or_cancelled_by_deleting_it() {
+    let snap = Snapshot::default();
+    let t = Target::Conflict { rule: "42".into(), title: "T".into(), conflicts: vec!["Other".into()] };
+    assert_eq!(write_for(&snap, &t, Action::Prefer), Some(Write::MoveRule { id: "42".into(), after: None }));
+    assert_eq!(write_for(&snap, &t, Action::CancelNew), Some(Write::CancelRule { id: "42".into() }));
+    assert_eq!(write_for(&snap, &t, Action::Close), None);
+}

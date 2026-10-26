@@ -120,6 +120,8 @@ pub struct LiveTvScreen {
     panel_from: u32,
     /// The notice and the tick time it goes at (`None` until the next tick stamps it).
     notice: Option<(String, Option<u32>)>,
+    /// A recording just made that conflicts, waiting for the next tick to open its panel.
+    conflict: Option<Target>,
     notice_serial: Option<u32>,
     tune_failure_shown: bool,
     own_enters: u32,
@@ -162,6 +164,7 @@ impl LiveTvScreen {
             panel: None,
             panel_from: model::HEAD_GUIDE,
             notice: None,
+            conflict: None,
             notice_serial: None,
             tune_failure_shown: false,
             own_enters: 0,
@@ -224,7 +227,13 @@ impl LiveTvScreen {
         } else if serial.is_some() && serial != self.notice_serial {
             self.notice_serial = serial;
             if let Some(n) = &view.snap.notice {
-                self.notice = Some((notice_text(n), None));
+                // A recording that conflicts asks what to do, as the stock app's does; the rule
+                // exists either way (`docs/pms-api.md` §10.4).
+                if n.ok && !n.conflicts.is_empty() && !n.rule.is_empty() {
+                    self.conflict = Some(Target::Conflict { rule: n.rule.clone(), title: n.title.clone(), conflicts: n.conflicts.clone() });
+                } else {
+                    self.notice = Some((notice_text(n), None));
+                }
             }
         }
         if !matches!(view.snap.tune, TunePhase::Failed { .. }) {
@@ -429,6 +438,7 @@ impl LiveTvScreen {
             Target::Grab(g) => model::grab_actions(g),
             Target::Rule(s) => model::rule_actions(&self.view.snap, s),
             Target::Channel { channel, .. } => model::channel_actions(&self.view.snap, channel),
+            Target::Conflict { .. } => vec![Action::Prefer, Action::CancelNew, Action::Close],
         };
         self.panel = Some(Panel { target, actions });
         self.panel_from = from;
@@ -681,6 +691,13 @@ impl LiveTvScreen {
                 self.tune_failure_shown = true;
                 self.notice = Some((msg::live_tv_tune_failed(channel, reason), None));
                 self.route(LiveTvOut::DismissTuneFailure, fx);
+            }
+        }
+        // A conflicting recording's panel opens over whatever is up (the guide, the list).
+        if self.panel.is_none() {
+            if let Some(target) = self.conflict.take() {
+                let from = self.focus.filter(|e| *e < plx_ui::dispatch::STRIP_BASE).unwrap_or(self.mode_pill());
+                self.open_panel(from, target, fx);
             }
         }
         // The arrival follows the guide in when it lands, unless the reader moved first.
@@ -1560,7 +1577,7 @@ impl LiveTvScreen {
 
     fn draw_panel<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter, panel: &Panel) {
         p.rrect(Rect::FULL, 0.0, 0.0, theme::with_a([0.0, 0.0, 0.0, 1.0], 0.55));
-        let r = panel_rect(panel.actions.len());
+        let r = panel_rect(panel);
         p.rect(r, 24.0, theme::PANEL_TOP, theme::PANEL_BOT, 0.0);
         let title = match &panel.target {
             Target::Airing { airing, .. } => {
@@ -1571,6 +1588,7 @@ impl LiveTvScreen {
             }
             Target::Rule(s) => [&s.hint.show_title, &s.hint.title, &s.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_default(),
             Target::Channel { channel, .. } => channel.words(),
+            Target::Conflict { title, .. } => title.clone(),
         };
         TextView::new(&title, theme::size::HEADLINE, theme::TEXT_PRIMARY)
             .bold()
@@ -1578,8 +1596,15 @@ impl LiveTvScreen {
             .max_lines(1)
             .h(HAlign::Center)
             .draw(p, Rect::new(r.x + 32.0, r.y + 32.0, r.w - 64.0, 0.0));
+        if let Target::Conflict { conflicts, .. } = &panel.target {
+            TextView::new(&msg::live_tv_conflict_body(&conflicts.join(", ")), theme::size::LABEL, theme::TEXT_SECONDARY)
+                .with_measure(f.measure)
+                .max_lines(3)
+                .h(HAlign::Center)
+                .draw(p, Rect::new(r.x + 40.0, r.y + 32.0 + 52.0 + 16.0, r.w - 80.0, 0.0));
+        }
         for (i, action) in panel.actions.iter().enumerate() {
-            let rect = action_rect(panel.actions.len(), i);
+            let rect = action_rect(panel, i);
             let Ok(label) = CString::new(action_label(*action)) else { continue };
             let elem = model::ACTION_BASE + i as u32;
             Button::new(label.as_ptr(), theme::size::BODY, rect)
@@ -1603,15 +1628,23 @@ fn retry_rect() -> Rect {
     Rect::new((SCR_W - 280.0) * 0.5, plx_ui::widgets::StatusOverlay::FULL_ANCHOR_TOP + 80.0, 280.0, geom::HEAD_H)
 }
 
-fn panel_rect(n: usize) -> Rect {
-    let h = 32.0 + 52.0 + 24.0 + n as f32 * geom::ACTION_PITCH + 20.0;
+/// The words a panel says between its title and its actions (a conflict's), as room.
+fn panel_body_h(panel: &Panel) -> f32 {
+    if matches!(panel.target, Target::Conflict { .. }) { PANEL_BODY_H } else { 0.0 }
+}
+
+fn panel_rect(panel: &Panel) -> Rect {
+    let h = 32.0 + 52.0 + 24.0 + panel_body_h(panel) + panel.actions.len() as f32 * geom::ACTION_PITCH + 20.0;
     Rect::new((SCR_W - geom::PANEL_W) * 0.5, ((SCR_H - h) * 0.5).max(60.0), geom::PANEL_W, h)
 }
 
-fn action_rect(n: usize, i: usize) -> Rect {
-    let r = panel_rect(n);
-    Rect::new(r.x + 48.0, r.y + 32.0 + 52.0 + 24.0 + i as f32 * geom::ACTION_PITCH, r.w - 96.0, geom::ACTION_H)
+fn action_rect(panel: &Panel, i: usize) -> Rect {
+    let r = panel_rect(panel);
+    Rect::new(r.x + 48.0, r.y + 32.0 + 52.0 + 24.0 + panel_body_h(panel) + i as f32 * geom::ACTION_PITCH, r.w - 96.0, geom::ACTION_H)
 }
+
+/// A conflict's three lines of words.
+const PANEL_BODY_H: f32 = 132.0;
 
 fn action_label(a: Action) -> &'static str {
     match a {
@@ -1626,6 +1659,8 @@ fn action_label(a: Action) -> &'static str {
         Action::DeleteRule => msg::live_tv_action_delete_rule(),
         Action::Favorite => msg::live_tv_action_add_favorite(),
         Action::Unfavorite => msg::live_tv_action_remove_favorite(),
+        Action::Prefer => msg::live_tv_action_prefer(),
+        Action::CancelNew => msg::live_tv_action_cancel_new(),
         Action::Close => msg::live_tv_action_close(),
     }
 }
@@ -1920,7 +1955,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             elem: ElemKind::Control,
         };
         if let Some(panel) = &self.panel {
-            out.push(spec(PANEL, GroupKind::Column, panel.actions.len(), panel_rect(panel.actions.len())));
+            out.push(spec(PANEL, GroupKind::Column, panel.actions.len(), panel_rect(panel)));
             return;
         }
         out.push(spec(HEAD, GroupKind::Row { wrap: false }, 2, Rect::new(MARGIN_X, geom::HEAD_Y, 2.0 * geom::PILL_W + geom::PILL_GAP, geom::HEAD_H)));
@@ -2011,8 +2046,8 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         let e = *elem;
         let placed = |rect: Rect, index: usize| Placed { rect, rest_rect: rect, clip: Rect::FULL, index: Some(index as u32) };
         if let Some(i) = model::action_of(e) {
-            let n = self.panel.as_ref()?.actions.len();
-            return (i < n).then(|| placed(action_rect(n, i), i));
+            let panel = self.panel.as_ref()?;
+            return (i < panel.actions.len()).then(|| placed(action_rect(panel, i), i));
         }
         match e {
             model::HEAD_GUIDE => return Some(placed(head_rect(0), 0)),
@@ -2291,6 +2326,33 @@ mod tests {
         assert_eq!(page.rec_anchor, None);
         page.input(lists(&["z", "a", "b", "c"]));
         assert_eq!(page.rec_reseat, None);
+    }
+
+    /// **A recording that conflicts asks what to do** (its panel opens on the next tick) instead
+    /// of a notice; one that does not says so in a notice as before.
+    #[test]
+    fn a_recording_that_conflicts_asks_what_to_do_instead_of_a_notice() {
+        use plx_data::live_tv::WriteNotice;
+        let mut page = LiveTvScreen::loading(EntryId(0));
+        page.input(lists(&[]));
+        let notice = |serial, conflicts: Vec<String>| WriteNotice {
+            serial,
+            ok: true,
+            op: WriteOp::Record,
+            reason: String::new(),
+            conflicts,
+            rule: "42".into(),
+            title: "Show".into(),
+        };
+        let mut v = lists(&[]);
+        v.snap.notice = Some(notice(1, vec!["Other".into()]));
+        page.input(v);
+        assert!(page.notice().is_none());
+        assert!(matches!(&page.conflict, Some(Target::Conflict { rule, title, conflicts }) if rule == "42" && title == "Show" && conflicts.len() == 1));
+        let mut v = lists(&[]);
+        v.snap.notice = Some(notice(2, Vec::new()));
+        page.input(v);
+        assert!(page.notice().is_some(), "no conflict: the notice says it is scheduled");
     }
 
     #[test]

@@ -239,5 +239,20 @@
   "live_tv.notice.favorite_removed": {
     "value": "Removed from Favorites.",
     "description": "Live TV notice after a channel was taken off the favorite channels."
+  },
+  "live_tv.conflict.body": {
+    "value": "It conflicts with {titles}: there are not enough tuners for all of them. Prefer this recording, or cancel it.",
+    "args": {
+      "titles": "str"
+    },
+    "description": "Live TV panel after scheduling a recording that conflicts with others for the tuners; {titles} lists the other recordings' titles. Buttons follow: Prefer This, Cancel This, Close."
+  },
+  "live_tv.action.prefer": {
+    "value": "Prefer This",
+    "description": "Live TV conflict panel button: give the new recording priority over the ones it conflicts with."
+  },
+  "live_tv.action.cancel_new": {
+    "value": "Cancel This",
+    "description": "Live TV conflict panel button: cancel the recording just scheduled."
   }
 }

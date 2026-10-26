@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Ajouter aux favoris",
   "live_tv.action.remove_favorite": "Retirer des favoris",
   "live_tv.notice.favorite_added": "Ajoutée aux favoris.",
-  "live_tv.notice.favorite_removed": "Retirée des favoris."
+  "live_tv.notice.favorite_removed": "Retirée des favoris.",
+  "live_tv.conflict.body": "Il est en conflit avec {titles} : il n'y a pas assez de tuners pour tous. Donnez la priorité à cet enregistrement ou annulez-le.",
+  "live_tv.action.prefer": "Privilégier",
+  "live_tv.action.cancel_new": "Annuler celui-ci"
 }

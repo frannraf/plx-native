@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Дадаць у абраныя",
   "live_tv.action.remove_favorite": "Выдаліць з абраных",
   "live_tv.notice.favorite_added": "Дададзена ў абраныя.",
-  "live_tv.notice.favorite_removed": "Выдалена з абраных."
+  "live_tv.notice.favorite_removed": "Выдалена з абраных.",
+  "live_tv.conflict.body": "Яно перасякаецца з {titles}: цюнераў не хапае на ўсе. Дайце гэтаму запісу перавагу або скасуйце яго.",
+  "live_tv.action.prefer": "Аддаць перавагу",
+  "live_tv.action.cancel_new": "Скасаваць гэты"
 }

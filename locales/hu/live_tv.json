@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Hozzáadás a kedvencekhez",
   "live_tv.action.remove_favorite": "Eltávolítás a kedvencek közül",
   "live_tv.notice.favorite_added": "Hozzáadva a kedvencekhez.",
-  "live_tv.notice.favorite_removed": "Eltávolítva a kedvencek közül."
+  "live_tv.notice.favorite_removed": "Eltávolítva a kedvencek közül.",
+  "live_tv.conflict.body": "Ütközik ezzel: {titles}. Nincs elég tuner mindegyikhez. Részesítsd előnyben ezt a felvételt, vagy töröld.",
+  "live_tv.action.prefer": "Ez legyen előnyben",
+  "live_tv.action.cancel_new": "Ennek a törlése"
 }

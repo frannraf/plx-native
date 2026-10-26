@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Zu Favoriten hinzufügen",
   "live_tv.action.remove_favorite": "Aus Favoriten entfernen",
   "live_tv.notice.favorite_added": "Zu Favoriten hinzugefügt.",
-  "live_tv.notice.favorite_removed": "Aus Favoriten entfernt."
+  "live_tv.notice.favorite_removed": "Aus Favoriten entfernt.",
+  "live_tv.conflict.body": "Sie überschneidet sich mit {titles}: Es gibt nicht genug Tuner für alle. Bevorzuge diese Aufnahme oder brich sie ab.",
+  "live_tv.action.prefer": "Diese bevorzugen",
+  "live_tv.action.cancel_new": "Diese abbrechen"
 }

@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Adicionar aos favoritos",
   "live_tv.action.remove_favorite": "Remover dos favoritos",
   "live_tv.notice.favorite_added": "Adicionado aos favoritos.",
-  "live_tv.notice.favorite_removed": "Removido dos favoritos."
+  "live_tv.notice.favorite_removed": "Removido dos favoritos.",
+  "live_tv.conflict.body": "Coincide com {titles}: não há sintonizadores suficientes para todas. Dê prioridade a esta gravação ou cancele-a.",
+  "live_tv.action.prefer": "Dar prioridade",
+  "live_tv.action.cancel_new": "Cancelar esta"
 }

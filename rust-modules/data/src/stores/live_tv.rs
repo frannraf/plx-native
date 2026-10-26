@@ -1378,10 +1378,31 @@ impl LiveTvStore {
                         if let Some(list) = done.favorites {
                             self.land_favorites(list);
                         }
-                        self.notice = Some(WriteNotice { serial: self.notice_serial, ok: true, op, reason: String::new(), conflicts: done.conflicts });
+                        let title = match &write {
+                            Write::Record { airing, .. } if !airing.show_title.is_empty() => airing.show_title.clone(),
+                            Write::Record { airing, .. } => airing.title.clone(),
+                            _ => String::new(),
+                        };
+                        self.notice = Some(WriteNotice {
+                            serial: self.notice_serial,
+                            ok: true,
+                            op,
+                            reason: String::new(),
+                            conflicts: done.conflicts,
+                            rule: done.rule,
+                            title,
+                        });
                     }
                     Err(e) => {
-                        self.notice = Some(WriteNotice { serial: self.notice_serial, ok: false, op, reason: e.reason(), conflicts: Vec::new() });
+                        self.notice = Some(WriteNotice {
+                            serial: self.notice_serial,
+                            ok: false,
+                            op,
+                            reason: e.reason(),
+                            conflicts: Vec::new(),
+                            rule: String::new(),
+                            title: String::new(),
+                        });
                     }
                 }
                 // what the server now records changed: read the lists again (a read already on

@@ -54,5 +54,8 @@
   "live_tv.action.add_favorite": "Aggiungi ai preferiti",
   "live_tv.action.remove_favorite": "Rimuovi dai preferiti",
   "live_tv.notice.favorite_added": "Aggiunto ai preferiti.",
-  "live_tv.notice.favorite_removed": "Rimosso dai preferiti."
+  "live_tv.notice.favorite_removed": "Rimosso dai preferiti.",
+  "live_tv.conflict.body": "Si sovrappone a {titles}: non ci sono abbastanza sintonizzatori per tutte. Dai la precedenza a questa registrazione o annullala.",
+  "live_tv.action.prefer": "Dai precedenza",
+  "live_tv.action.cancel_new": "Annulla questa"
 }
