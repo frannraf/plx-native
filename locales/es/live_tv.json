@@ -65,5 +65,10 @@
   "live_tv.action.edit_options": "Editar opciones",
   "live_tv.action.save": "Guardar",
   "live_tv.action.cancel": "Cancelar",
-  "live_tv.notice.options_saved": "Opciones de grabación guardadas."
+  "live_tv.notice.options_saved": "Opciones de grabación guardadas.",
+  "live_tv.mode.whats_on": "En emisión",
+  "live_tv.whats_on.loading": "Cargando lo que se emite…",
+  "live_tv.whats_on.failed": "No se pudo cargar lo que se emite.",
+  "live_tv.whats_on.empty": "No hay nada que mostrar ahora mismo.",
+  "live_tv.whats_on.recent": "Canales recientes"
 }

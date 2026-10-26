@@ -65,5 +65,10 @@
   "live_tv.action.edit_options": "Змяніць параметры",
   "live_tv.action.save": "Захаваць",
   "live_tv.action.cancel": "Скасаваць",
-  "live_tv.notice.options_saved": "Параметры запісу захаваны."
+  "live_tv.notice.options_saved": "Параметры запісу захаваны.",
+  "live_tv.mode.whats_on": "Зараз у эфіры",
+  "live_tv.whats_on.loading": "Загрузка эфіру…",
+  "live_tv.whats_on.failed": "Не ўдалося загрузіць эфір.",
+  "live_tv.whats_on.empty": "Зараз няма чаго паказаць.",
+  "live_tv.whats_on.recent": "Нядаўнія каналы"
 }

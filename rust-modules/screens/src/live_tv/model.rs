@@ -11,6 +11,7 @@ use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
 use plx_plex::plex::live_tv::{Airing, Channel, Grab, Setting, SettingKind, Subscription};
+use plx_ui::consts::{MARGIN_X, SCR_W};
 use plx_ui::screen::Dir;
 use plx_ui::Rect;
 
@@ -28,6 +29,9 @@ pub const MAX_ROWS: usize = 2_048;
 /// The header's two mode pills.
 pub const HEAD_GUIDE: u32 = 0xE000_0000;
 pub const HEAD_RECS: u32 = 0xE000_0001;
+pub const HEAD_WHATSON: u32 = 0xE000_0002;
+/// A What's On card: `WO_BASE + (row << 12 | index)`.
+pub const WO_BASE: u32 = 0x9000_0000;
 /// The read-out's Try again.
 pub const RETRY: u32 = 0xE000_0010;
 /// A guide tab (the DVR, Plex Channels, a Plex genre): `TAB_BASE + index`.
@@ -64,6 +68,15 @@ pub fn channel_elem(row: usize) -> u32 {
 /// The row of a channel's key.
 pub fn channel_of(elem: u32) -> Option<usize> {
     (CHANNEL_BASE..CHANNEL_BASE + MAX_ROWS as u32).contains(&elem).then(|| (elem - CHANNEL_BASE) as usize)
+}
+
+pub fn wo_elem(row: usize, i: usize) -> u32 {
+    WO_BASE + ((row.min(0xFFF) as u32) << 12) + i.min(0xFFF) as u32
+}
+
+/// `(row, index)` of a What's On card's key.
+pub fn wo_of(elem: u32) -> Option<(usize, usize)> {
+    (WO_BASE..WO_BASE + 0x0100_0000).contains(&elem).then(|| ((((elem - WO_BASE) >> 12) & 0xFFF) as usize, ((elem - WO_BASE) & 0xFFF) as usize))
 }
 
 /// The setting row of an options-panel key.
@@ -325,6 +338,19 @@ pub mod geom {
     pub const REC_POSTER_W: f32 = REC_POSTER_H * 2.0 / 3.0;
     pub const RECS_BOTTOM: f32 = 1_020.0;
     pub const PANEL_W: f32 = 640.0;
+    /// What's On: where its rows start (below the corner picture when a channel plays on in it),
+    /// a row's heading, a card's width and its art (a program's poster, a channel's tile), the
+    /// two lines under it, the gaps, and the foot rows end above.
+    pub const WO_Y: f32 = 270.0;
+    pub const WO_Y_CORNER: f32 = 520.0;
+    pub const WO_HEAD_H: f32 = 52.0;
+    pub const WO_CARD_W: f32 = 200.0;
+    pub const WO_POSTER_H: f32 = 300.0;
+    pub const WO_TILE_H: f32 = 200.0;
+    pub const WO_TEXT_H: f32 = 76.0;
+    pub const WO_GAP: f32 = 24.0;
+    pub const WO_ROW_GAP: f32 = 24.0;
+    pub const WO_BOTTOM: f32 = 1_060.0;
     pub const ACTION_H: f32 = 64.0;
     pub const ACTION_PITCH: f32 = 76.0;
 }
@@ -534,6 +560,112 @@ pub fn want(view: &LiveTvView, frame: &Frame) -> Want {
     let to_row = (frame.row_top + ROWS_SHOWN + 2).min(n);
     let from = (frame.win_start - 3 * 3_600).max(floor_half(frame.now));
     Want { rows: from_row..to_row, from, to: frame.win_start + WINDOW_S + 3 * 3_600 }
+}
+
+// ---- What's On ----------------------------------------------------------------------------------
+
+/// One row of the What's On page as drawn: its heading, whether its cards are channels (logo
+/// tiles) or programs (posters), and its airings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WoRow {
+    pub title: String,
+    pub channels: bool,
+    pub items: Vec<Airing>,
+}
+
+/// **What's On's rows**: the server's hubs in its order; when the server sent no row of the
+/// channels watched lately, the ones watched here lead them (`recent_title` names it).
+pub fn wo_rows(snap: &Snapshot, recent_title: &str) -> Vec<WoRow> {
+    let mut rows: Vec<WoRow> = snap.hubs.iter().map(|h| WoRow { title: h.title.clone(), channels: h.of_channels(), items: h.items.clone() }).collect();
+    let recent = |s: &str| s.to_ascii_lowercase().contains("recent");
+    if !snap.hubs.iter().any(|h| recent(&h.identifier) || recent(&h.key)) && !snap.recent.is_empty() {
+        let items = snap
+            .recent
+            .iter()
+            .map(|c| Airing {
+                channel_identifier: c.identifier.clone(),
+                channel_vcn: c.vcn.clone(),
+                channel_title: c.title.clone(),
+                channel_thumb: c.thumb.clone(),
+                ..Airing::default()
+            })
+            .collect();
+        rows.insert(0, WoRow { title: recent_title.to_string(), channels: true, items });
+    }
+    rows
+}
+
+/// A row's art height: a channel's square tile, a program's portrait poster.
+pub fn wo_art_h(row: &WoRow) -> f32 {
+    if row.channels { geom::WO_TILE_H } else { geom::WO_POSTER_H }
+}
+
+/// A row's height: its heading, its cards' art, the two lines under them, the gap after.
+pub fn wo_row_h(row: &WoRow) -> f32 {
+    geom::WO_HEAD_H + wo_art_h(row) + geom::WO_TEXT_H + geom::WO_ROW_GAP
+}
+
+/// The y of row `r`'s heading with row `top` the first shown at `y0` (a row above `top` stands
+/// above `y0`, so a move's projection always has a source).
+pub fn wo_row_y(rows: &[WoRow], top: usize, r: usize, y0: f32) -> f32 {
+    if r >= top {
+        y0 + rows[top.min(rows.len())..r.min(rows.len())].iter().map(wo_row_h).sum::<f32>()
+    } else {
+        y0 - rows[r..top.min(rows.len())].iter().map(wo_row_h).sum::<f32>()
+    }
+}
+
+/// The first row to show so that row `r` stands whole on screen.
+pub fn wo_follow(rows: &[WoRow], top: usize, r: usize, y0: f32) -> usize {
+    let Some(row) = rows.get(r) else { return top };
+    let mut top = top.min(r);
+    while top < r && wo_row_y(rows, top, r, y0) + wo_row_h(row) > geom::WO_BOTTOM {
+        top += 1;
+    }
+    top
+}
+
+/// Cards a row shows across the screen.
+pub fn wo_per_screen() -> usize {
+    (((SCR_W - 2.0 * MARGIN_X + geom::WO_GAP) / (geom::WO_CARD_W + geom::WO_GAP)) as usize).max(1)
+}
+
+/// The first card a row shows so that card `i` stands whole on screen.
+pub fn wo_col_follow(first: usize, i: usize) -> usize {
+    let per = wo_per_screen();
+    if i < first {
+        i
+    } else if i >= first + per {
+        i + 1 - per
+    } else {
+        first
+    }
+}
+
+/// The rect of card `i` of row `r` (its art), the row's first card shown `first`.
+pub fn wo_card_rect(rows: &[WoRow], top: usize, first: usize, r: usize, i: usize, y0: f32) -> Option<Rect> {
+    let row = rows.get(r)?;
+    let x = MARGIN_X + (i as f32 - first as f32) * (geom::WO_CARD_W + geom::WO_GAP);
+    Some(Rect::new(x, wo_row_y(rows, top, r, y0) + geom::WO_HEAD_H, geom::WO_CARD_W, wo_art_h(row)))
+}
+
+/// Where a direction moves focus on What's On: along a row, or to the next row at the same place
+/// on screen (`firsts`: each row's first card shown).
+pub fn wo_neighbour(rows: &[WoRow], firsts: &[usize], elem: u32, dir: Dir) -> Option<u32> {
+    let (r, i) = wo_of(elem)?;
+    let len = rows.get(r)?.items.len();
+    let at = |t: usize| {
+        let n = rows[t].items.len();
+        let on_screen = i.saturating_sub(firsts.get(r).copied().unwrap_or(0));
+        let j = (firsts.get(t).copied().unwrap_or(0) + on_screen).min(n.saturating_sub(1));
+        (n > 0).then(|| wo_elem(t, j))
+    };
+    match dir {
+        Dir::Left => i.checked_sub(1).map(|j| wo_elem(r, j)),
+        Dir::Right => (i + 1 < len).then(|| wo_elem(r, i + 1)),
+        Dir::Up => r.checked_sub(1).and_then(at),
+        Dir::Down => (r + 1 < rows.len()).then(|| r + 1).and_then(at),
+    }
 }
 
 // ---- the Recordings list ------------------------------------------------------------------------

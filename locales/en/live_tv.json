@@ -292,5 +292,25 @@
   "live_tv.notice.options_saved": {
     "value": "Recording options saved.",
     "description": "Live TV notice after a recording rule's options were saved."
+  },
+  "live_tv.mode.whats_on": {
+    "value": "What's On",
+    "description": "Live TV page header pill: rows of what is on now and soon (the server's DVR), and the channels watched lately."
+  },
+  "live_tv.whats_on.loading": {
+    "value": "Loading what's on…",
+    "description": "Live TV What's On read-out while its rows are read from the server."
+  },
+  "live_tv.whats_on.failed": {
+    "value": "What's on could not be loaded.",
+    "description": "Live TV What's On read-out when the server did not answer; a Try Again button follows."
+  },
+  "live_tv.whats_on.empty": {
+    "value": "Nothing to show right now.",
+    "description": "Live TV What's On read-out when the server has no rows to show."
+  },
+  "live_tv.whats_on.recent": {
+    "value": "Recent Channels",
+    "description": "Live TV What's On row: the channels watched lately on this TV."
   }
 }

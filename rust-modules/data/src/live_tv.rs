@@ -10,7 +10,7 @@
 //! store waits rather than asking the server for a guide of 1970.
 
 use plx_plex::plex::live_tv::{
-    Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveStream, Setting, Subscription, TemplateChoice, TunedItem,
+    Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveHub, LiveStream, Setting, Subscription, TemplateChoice, TunedItem,
 };
 use plx_plex::plex::ServerId;
 use std::collections::HashMap;
@@ -508,6 +508,12 @@ pub struct Snapshot {
     pub favorite_cloud: bool,
     /// The recording options the page asked for, while its panel is open.
     pub options: Option<RecordOptions>,
+    /// The What's On page's hubs, in the server's order, and where their read stands.
+    pub hubs: Vec<LiveHub>,
+    pub hubs_phase: Phase,
+    /// The channels watched lately here, the latest first, as the lineups read so far name them
+    /// (the What's On page's row of them when the server sends none).
+    pub recent: Vec<Channel>,
 }
 
 impl Snapshot {

@@ -165,6 +165,23 @@ pub(super) fn grid_path(provider: &str, grid_key: &str, date: &str) -> Option<St
     })
 }
 
+/// `GET /{provider}/hubs/discover?…` — the What's On page's hubs, `count` items each, with the
+/// channels watched lately and the stations (the parameters the stock clients send).
+pub(super) fn hubs_path(provider: &str, count: i64) -> Option<String> {
+    is_provider(provider).then(|| {
+        QueryBuilder::new(format!("/{provider}/hubs/discover"))
+            .int("count", count)
+            .int("includeStations", 1)
+            .int("includeRecentChannels", 1)
+            .int("includeMeta", 1)
+            .int("includeExternalMetadata", 1)
+            .build()
+    })
+}
+
+/// Items asked of each What's On hub: a row of cards, as the stock page shows.
+pub const HUB_ITEMS: i64 = 16;
+
 pub(super) fn subscription_path(id: &str) -> Option<String> {
     is_id(id).then(|| format!("/media/subscriptions/{id}"))
 }
@@ -316,6 +333,29 @@ impl Client {
             debug::parsed(&format!("grid parsed: 0 airings from an answer of size {held}"));
         }
         Ok(airings)
+    }
+
+    /// **The What's On page's hubs** of the DVR's provider, [`HUB_ITEMS`] items each.
+    pub fn live_tv_hubs(&self, provider: &str) -> LiveResult<Vec<LiveHub>> {
+        let path = hubs_path(provider, HUB_ITEMS).ok_or(LiveError::Invalid)?;
+        let body = ok_body(self.json_value(Method::Get, &path))?;
+        let hubs = parse::hubs(&body);
+        // A release build's event log too: the endpoint is undocumented, and its shape is what the
+        // page is drawn from (hub types and counts, never a title or id).
+        plx_base::eventlog::log(&format!(
+            "livetv: What's On read: {} hub(s) {:?}",
+            hubs.len(),
+            hubs.iter()
+                .map(|h| format!(
+                    "{}:{} {} item(s), {} with times",
+                    h.identifier.rsplit('.').next().unwrap_or(""),
+                    h.kind,
+                    h.items.len(),
+                    h.items.iter().filter(|a| a.begins_at > 0).count()
+                ))
+                .collect::<Vec<_>>()
+        ));
+        Ok(hubs)
     }
 
     /// The four UltraBlur colours of an image (`url`: a PMS path or an absolute URL, as the guide's

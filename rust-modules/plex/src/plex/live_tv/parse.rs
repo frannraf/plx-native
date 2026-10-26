@@ -304,6 +304,43 @@ fn airings_of(items: Vec<&Value>) -> Vec<Airing> {
     out
 }
 
+/// `GET /{provider}/hubs/discover` → the What's On page's hubs, in the server's order. An item
+/// with a `Media` airing becomes that airing (the first with a span: a hub of programs on now
+/// lists the airing on now); one without becomes its channel (an airing with no times) when it
+/// names one. A hub with nothing in it is left out.
+pub(super) fn hubs(body: &Value) -> Vec<LiveHub> {
+    let Some(c) = container(body) else { return Vec::new() };
+    many(c, "Hub")
+        .into_iter()
+        .filter_map(|h| {
+            let mut items_in = many(h, "Metadata");
+            items_in.extend(many(h, "Video"));
+            items_in.extend(many(h, "Directory"));
+            let items: Vec<Airing> = items_in
+                .into_iter()
+                .filter_map(|m| {
+                    let meta = airing_meta(m);
+                    let aired = many(m, "Media").into_iter().map(|media| with_media(meta.clone(), media)).find(|a| a.begins_at > 0 && a.ends_at > a.begins_at);
+                    aired.or_else(|| {
+                        // a channel: its identity is the item's own
+                        let id = ["channelIdentifier", "identifier", "id"].iter().map(|k| text(m, k)).find(|v| !v.is_empty())?;
+                        let vcn = ["channelVcn", "vcn"].iter().map(|k| text(m, k)).find(|v| !v.is_empty()).unwrap_or_default();
+                        let thumb = ["channelThumb", "thumb"].iter().map(|k| text(m, k)).find(|v| !v.is_empty()).unwrap_or_default();
+                        Some(Airing { channel_identifier: id, channel_vcn: vcn, channel_title: text(m, "title"), channel_thumb: thumb, ..meta })
+                    })
+                })
+                .collect();
+            (!items.is_empty()).then(|| LiveHub {
+                key: text(h, "key"),
+                identifier: text(h, "hubIdentifier"),
+                title: text(h, "title"),
+                kind: text(h, "type"),
+                items,
+            })
+        })
+        .collect()
+}
+
 /// `GET /{provider}/grid?channelGridKey=&date=` → one channel's airings for one UTC day, sorted by
 /// start, one per start instant (PMS repeats an airing on two days' answers when it spans midnight;
 /// a merged cache dedups the same way). `channel` fills the channel identity when PMS leaves it out.

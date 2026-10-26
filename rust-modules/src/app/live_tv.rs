@@ -185,6 +185,15 @@ impl Bridge {
 
     /// A page request that is the store's (the strip, BACK and the chip are navigation).
     pub(crate) fn live_tv_request(&mut self, out: LiveTvOut) {
+        // a What's On card: its channel's row (the DVR's tab shown for it when the tab shown
+        // does not list it), then the guide's own Watch
+        if let LiveTvOut::WatchHub { identifier, airing } = out {
+            match self.stores.live_tv.row_of_identifier(&identifier) {
+                Some(row) => self.live_tv_ask(row, airing, false),
+                None => plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR"),
+            }
+            return;
+        }
         let store = &mut self.stores.live_tv;
         match out {
             LiveTvOut::Watch { row, airing } => self.live_tv_ask(row, airing, false),
@@ -193,6 +202,8 @@ impl Bridge {
             LiveTvOut::DismissTuneFailure => store.clear_tune_failure(),
             LiveTvOut::Write(w) => store.write(w),
             LiveTvOut::Options(of) => store.ask_options(of),
+            LiveTvOut::RefreshHubs => store.refresh_hubs(),
+            LiveTvOut::WatchHub { .. } => {}
             LiveTvOut::CloseOptions => store.close_options(),
             LiveTvOut::Favorite { row, on } => {
                 if !store.set_favorite(row, on) {
@@ -377,6 +388,11 @@ impl Bridge {
 
     /// Is `row` of the tab shown the channel last asked to be watched (the corner's, while one
     /// plays there)?
+    /// Is the channel a What's On card names (its lineup id) the one playing?
+    pub(crate) fn live_tv_is_watching_identifier(&self, identifier: &str) -> bool {
+        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of_identifier(identifier)
+    }
+
     pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {
         self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of(row)
     }

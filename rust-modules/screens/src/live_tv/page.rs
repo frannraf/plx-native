@@ -53,6 +53,8 @@ const NOTICE_MS: u32 = 5_000;
 pub enum Mode {
     #[default]
     Guide,
+    /// What is on now and soon, in rows (the server's hubs), and the channels watched lately.
+    WhatsOn,
     Recordings,
 }
 
@@ -79,6 +81,10 @@ pub enum LiveTvOut {
     Favorite { row: usize, on: bool },
     /// Read the recording options of a new recording or of a rule (the panel opened).
     Options(OptionsFor),
+    /// Watch the channel a What's On card names (by its lineup id), with the program on now.
+    WatchHub { identifier: String, airing: Option<Airing> },
+    /// What's On opened: read its rows again.
+    RefreshHubs,
     /// The recording-options panel closed without a write.
     CloseOptions,
     /// Try again on the failure read-out.
@@ -101,6 +107,9 @@ enum Readout {
     RecsLoading,
     RecsFailed,
     RecsEmpty,
+    HubsLoading,
+    HubsFailed,
+    HubsEmpty,
 }
 
 pub struct LiveTvScreen {
@@ -129,6 +138,11 @@ pub struct LiveTvScreen {
     conflict: Option<Target>,
     /// The recording-options panel, while open (its settings are the store's answer).
     opts: Option<Opts>,
+    /// What's On's rows as drawn (made from the store's hubs at each feed), the first row shown,
+    /// and each row's first card shown.
+    wo: Vec<model::WoRow>,
+    wo_top: usize,
+    wo_first: Vec<usize>,
     notice_serial: Option<u32>,
     tune_failure_shown: bool,
     own_enters: u32,
@@ -192,6 +206,9 @@ impl LiveTvScreen {
             notice: None,
             conflict: None,
             opts: None,
+            wo: Vec::new(),
+            wo_top: 0,
+            wo_first: Vec::new(),
             notice_serial: None,
             tune_failure_shown: false,
             own_enters: 0,
@@ -290,6 +307,9 @@ impl LiveTvScreen {
         }
         let n = view.channel_count();
         self.frame.row_top = self.frame.row_top.min(n.saturating_sub(1));
+        self.wo = model::wo_rows(&view.snap, msg::live_tv_whats_on_recent());
+        self.wo_first.resize(self.wo.len(), 0);
+        self.wo_top = self.wo_top.min(self.wo.len().saturating_sub(1));
         self.view = view;
         // What landed can move the focused element (a heading added above a Recordings row, an
         // airing filled in): keep it in view, where it will stand once the focus has followed.
@@ -337,6 +357,18 @@ impl LiveTvScreen {
             Availability::None => return Some(Readout::Unavailable),
             Availability::Available => {}
         }
+        // What's On is the server's DVR's too, whatever guide tab is selected; the channels watched
+        // here show while its rows are read.
+        if self.mode == Mode::WhatsOn {
+            if self.wo.is_empty() {
+                return Some(match &s.hubs_phase {
+                    Phase::Failed(_) => Readout::HubsFailed,
+                    Phase::Ready => Readout::HubsEmpty,
+                    _ => Readout::HubsLoading,
+                });
+            }
+            return None;
+        }
         // The Recordings are the server's, whatever guide tab is selected (its lineup may be
         // loading, failed or empty, and the tab row is not shown here to change it).
         if self.mode == Mode::Recordings {
@@ -364,7 +396,7 @@ impl LiveTvScreen {
     }
 
     fn shows_retry(&self) -> bool {
-        matches!(self.readout(), Some(Readout::Failed | Readout::RecsFailed))
+        matches!(self.readout(), Some(Readout::Failed | Readout::RecsFailed | Readout::HubsFailed))
     }
 
     fn has_content(&self) -> bool {
@@ -374,8 +406,34 @@ impl LiveTvScreen {
     fn mode_pill(&self) -> u32 {
         match self.mode {
             Mode::Guide => model::HEAD_GUIDE,
+            Mode::WhatsOn => model::HEAD_WHATSON,
             Mode::Recordings => model::HEAD_RECS,
         }
+    }
+
+    /// The element a mode's content seats focus on first: the program on now in the guide's first
+    /// row, What's On's first card, the Recordings' first row.
+    fn first_elem(&self) -> u32 {
+        match self.mode {
+            Mode::Guide => self.now_cell(),
+            Mode::WhatsOn => model::wo_elem(self.wo_top, self.wo_first.get(self.wo_top).copied().unwrap_or(0)),
+            Mode::Recordings => model::REC_BASE,
+        }
+    }
+
+    /// Where What's On's rows start: below the corner picture when a channel plays on in it.
+    fn wo_y0(&self) -> f32 {
+        if plx_media::player::video_window_is_mini() { geom::WO_Y_CORNER } else { geom::WO_Y }
+    }
+
+    /// The rect a What's On card's art is drawn at (scrolled off: where it would stand).
+    fn wo_rect(&self, elem: u32) -> Option<Rect> {
+        let (r, i) = model::wo_of(elem)?;
+        if i >= self.wo.get(r)?.items.len() {
+            return None;
+        }
+        let first = self.wo_first.get(r).copied().unwrap_or(0);
+        model::wo_card_rect(&self.wo, self.wo_top, first, r, i, self.wo_y0())
     }
 
     fn key(&self, elem: u32) -> FocusKey<u32> {
@@ -402,7 +460,9 @@ impl LiveTvScreen {
             return;
         }
         let Some(e) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| self.standing(k.elem)) else { return };
-        let to = if let Some(row) = model::channel_of(e) {
+        let to = if model::wo_of(e).is_some() {
+            model::wo_neighbour(&self.wo, &self.wo_first, e, dir)
+        } else if let Some(row) = model::channel_of(e) {
             if whole {
                 model::guide_page(&self.view, &self.frame, e, dir)
             } else {
@@ -455,6 +515,9 @@ impl LiveTvScreen {
         if mode == Mode::Recordings {
             self.rec_top = 0;
             self.route(LiveTvOut::RefreshDvr, fx);
+        }
+        if mode == Mode::WhatsOn {
+            self.route(LiveTvOut::RefreshHubs, fx);
         }
         fx.invalidate(Provenance::Input);
     }
@@ -745,9 +808,21 @@ impl LiveTvScreen {
         match elem {
             model::HEAD_GUIDE => self.set_mode(Mode::Guide, fx),
             model::HEAD_RECS => self.set_mode(Mode::Recordings, fx),
+            model::HEAD_WHATSON => self.set_mode(Mode::WhatsOn, fx),
             model::RETRY => self.route(LiveTvOut::Retry, fx),
             _ => {
-                if let Some(row) = model::channel_of(elem) {
+                if let Some((r, i)) = model::wo_of(elem) {
+                    // On now (or a channel): watch it; later: its record choices.
+                    let Some(a) = self.wo.get(r).and_then(|row| row.items.get(i)).cloned() else { return Handled::No };
+                    let now = self.frame.now;
+                    let on_now = now > 0 && a.begins_at > 0 && a.airs_at(now);
+                    if a.begins_at == 0 || on_now || (now > 0 && a.ends_at <= now) {
+                        let airing = on_now.then(|| a.clone());
+                        self.route(LiveTvOut::WatchHub { identifier: a.channel_identifier.clone(), airing }, fx);
+                    } else {
+                        self.open_panel(elem, Target::Airing { row: 0, airing: a }, fx);
+                    }
+                } else if let Some(row) = model::channel_of(elem) {
                     // a channel: its panel (watch it, add it to the favorites or take it off)
                     if let Some(channel) = self.view.snap.channels.get(row).cloned() {
                         self.open_panel(elem, Target::Channel { row, channel }, fx);
@@ -838,7 +913,7 @@ impl LiveTvScreen {
         let at = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem);
         match at {
             Some(e) if e >= plx_ui::dispatch::STRIP_BASE => self.route(LiveTvOut::Back, fx),
-            Some(e) if model::row_of(e).is_some() || model::rec_of(e).is_some() => {
+            Some(e) if model::row_of(e).is_some() || model::rec_of(e).is_some() || model::wo_of(e).is_some() => {
                 let pill = self.mode_pill();
                 self.seat_elem(pill, fx);
             }
@@ -858,6 +933,18 @@ impl LiveTvScreen {
             return;
         }
         self.focus = Some(elem);
+        // What's On scrolls its rows, and the focused row its cards, to keep the card in view
+        if let Some((r, i)) = model::wo_of(elem) {
+            if scroll {
+                let y0 = self.wo_y0();
+                self.wo_top = model::wo_follow(&self.wo, self.wo_top, r, y0);
+                if let Some(first) = self.wo_first.get_mut(r) {
+                    *first = model::wo_col_follow(*first, i);
+                }
+            }
+            plx_machine::idle::invalidate();
+            return;
+        }
         // the options panel's rows scroll to keep the focused one in view
         if let (Some(i), Some(o)) = (model::opt_of(elem), self.opts.as_mut()) {
             if i < o.top {
@@ -960,10 +1047,7 @@ impl LiveTvScreen {
         // The arrival follows the guide in when it lands, unless the reader moved first.
         if self.seat_pending && self.has_content() && self.own_enters == 0 {
             self.seat_pending = false;
-            let elem = match self.mode {
-                Mode::Guide => self.now_cell(),
-                Mode::Recordings => model::REC_BASE,
-            };
+            let elem = self.first_elem();
             self.seat_elem(elem, fx);
         }
     }
@@ -1076,9 +1160,13 @@ impl LiveTvScreen {
     }
 
     fn draw_head<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
-        for (i, (elem, label)) in [(model::HEAD_GUIDE, msg::live_tv_mode_guide()), (model::HEAD_RECS, msg::live_tv_mode_recordings())]
-            .into_iter()
-            .enumerate()
+        for (i, (elem, label)) in [
+            (model::HEAD_GUIDE, msg::live_tv_mode_guide()),
+            (model::HEAD_WHATSON, msg::live_tv_mode_whats_on()),
+            (model::HEAD_RECS, msg::live_tv_mode_recordings()),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let rect = head_rect(i);
             let Ok(text) = CString::new(label) else { continue };
@@ -1099,7 +1187,7 @@ impl LiveTvScreen {
         // In a dark pill beside the header's, so it reads over bright art, and short of the corner
         // picture when one plays there (it was drawn straight over the video).
         if let Some(line) = line {
-            let pills = head_rect(1);
+            let pills = head_rect(2);
             let x = pills.x + geom::PILL_W + theme::space::LG;
             let right = if plx_media::player::video_window_is_mini() {
                 plx_media::player::video_window()[0] as f32 - CORNER_GAP
@@ -1136,6 +1224,12 @@ impl LiveTvScreen {
             }
             Readout::RecsFailed => msg::live_tv_recordings_failed(),
             Readout::RecsEmpty => msg::live_tv_recordings_empty(),
+            Readout::HubsLoading => {
+                plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, "livetv-whats-on");
+                msg::live_tv_whats_on_loading()
+            }
+            Readout::HubsFailed => msg::live_tv_whats_on_failed(),
+            Readout::HubsEmpty => msg::live_tv_whats_on_empty(),
         };
         let Ok(c) = CString::new(text) else { return };
         let band = Rect::new(0.0, plx_ui::widgets::StatusOverlay::FULL_ANCHOR_TOP, SCR_W, theme::size::HEADLINE as f32);
@@ -1764,6 +1858,125 @@ impl LiveTvScreen {
         }
     }
 
+    /// What's On: each row's heading and its cards, the first row shown at the top.
+    fn draw_whats_on<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
+        let y0 = self.wo_y0();
+        let modal = self.panel.is_some() || self.opts.is_some();
+        for r in self.wo_top..self.wo.len() {
+            let row = &self.wo[r];
+            let y = model::wo_row_y(&self.wo, self.wo_top, r, y0);
+            if y + geom::WO_HEAD_H > geom::WO_BOTTOM {
+                break;
+            }
+            if let Ok(c) = CString::new(row.title.as_str()) {
+                Label::new(c.as_ptr(), theme::size::BODY, theme::TEXT_PRIMARY)
+                    .bold()
+                    .v(VAlign::Middle)
+                    .draw(p, Rect::new(MARGIN_X, y, SCR_W - 2.0 * MARGIN_X, geom::WO_HEAD_H));
+            }
+            let first = self.wo_first.get(r).copied().unwrap_or(0);
+            for (i, a) in row.items.iter().enumerate().skip(first) {
+                let elem = model::wo_elem(r, i);
+                let Some(rect) = self.wo_rect(elem) else { continue };
+                if rect.x + rect.w > SCR_W - MARGIN_X + 1.0 || rect.y + rect.h > geom::WO_BOTTOM {
+                    break;
+                }
+                let on = !modal && self.focused(f, elem);
+                self.draw_wo_card(f, p, rect, a, row.channels, on);
+                if !modal {
+                    f.stop(p, stop(self.key(elem), rect));
+                }
+            }
+        }
+    }
+
+    /// One What's On card: a program's poster (a channel's logo on a dark tile), LIVE and how far
+    /// along it is when it is on now, and under it the title and the time left (or its times, or
+    /// for a channel with nothing named on it, its number).
+    fn draw_wo_card<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, rect: Rect, a: &Airing, channels: bool, on: bool) {
+        let now = self.frame.now;
+        let live = now > 0 && a.begins_at > 0 && a.airs_at(now);
+        p.rrect(rect, 10.0, 10.0, theme::with_a(INK_BLACK, 0.55));
+        let srv = self.srv();
+        let mut drawn = false;
+        if !channels && !a.poster.is_empty() {
+            if let Some(srv) = srv {
+                let (tex, tw, th) = resolve_tex_wh_on(srv, &a.poster, WO_POSTER_REQ.0, WO_POSTER_REQ.1, 0);
+                if tex != 0 {
+                    p.tex_uv(tex, rect.cover_uv(tw, th, Crop::Centre), rect, 10.0, theme::TINT_WHITE);
+                    drawn = true;
+                } else if !plx_ui::tex::failed_on(srv, &a.poster, WO_POSTER_REQ.0, WO_POSTER_REQ.1, false) {
+                    plx_ui::placeholder::skeleton(p, plx_ui::placeholder::Reason::CardSkeleton, "livetv-wo-poster", rect, 10.0);
+                    drawn = true;
+                }
+            }
+        }
+        if !drawn {
+            // a channel (or a program with no poster): its logo, never cropped, else its name
+            let logo = if a.channel_thumb.is_empty() { a.thumb.as_str() } else { a.channel_thumb.as_str() };
+            let inner = Rect::new(rect.x + 24.0, rect.y + 24.0, rect.w - 48.0, rect.h - 48.0);
+            let mut shown = false;
+            if let (Some(srv), false) = (srv, logo.is_empty()) {
+                let (tex, tw, th) = resolve_tex_wh_on(srv, logo, LOGO_REQ.0, LOGO_REQ.1, 1);
+                if tex != 0 && tw > 0.0 && th > 0.0 {
+                    p.tex(tex, contain(inner, tw, th), 0.0, theme::TINT_WHITE);
+                    shown = true;
+                }
+            }
+            if !shown {
+                let name = station_id(&a.channel_title);
+                let name = if name.is_empty() { a.channel_vcn.as_str() } else { name };
+                TextView::new(name, theme::size::LABEL, theme::TEXT_PRIMARY)
+                    .bold()
+                    .with_measure(f.measure)
+                    .max_lines(1)
+                    .h(HAlign::Center)
+                    .draw(p, Rect::new(inner.x, inner.y + (inner.h - theme::size::LABEL as f32) * 0.5, inner.w, 0.0));
+            }
+        }
+        if live {
+            let words = msg::live_tv_hud_live();
+            let bw = f.measure.width_str(words, theme::size::MICRO, true) + 20.0;
+            let badge = Rect::new(rect.x + rect.w - 10.0 - bw, rect.y + 10.0, bw, 30.0);
+            p.rrect(badge, 6.0, 6.0, theme::DANGER);
+            if let Ok(c) = CString::new(words) {
+                Label::new(c.as_ptr(), theme::size::MICRO, theme::TEXT_PRIMARY).bold().h(HAlign::Center).v(VAlign::Middle).draw(p, badge);
+            }
+            let span = (a.ends_at - a.begins_at).max(1) as f32;
+            let aired = ((now - a.begins_at) as f32 / span).clamp(0.0, 1.0);
+            let track = Rect::new(rect.x + 12.0, rect.y + rect.h - 16.0, rect.w - 24.0, 6.0);
+            p.rrect(track, 3.0, 3.0, theme::with_a(theme::TEXT_PRIMARY, 0.25));
+            p.rrect(Rect::new(track.x, track.y, (track.w * aired).max(6.0), track.h), 3.0, 3.0, LEFT_RING);
+        }
+        if on {
+            p.rring(rect, 10.0, 4.0, theme::ACCENT);
+        }
+        let title = if a.begins_at > 0 {
+            if a.show_title.is_empty() { a.title.as_str() } else { a.show_title.as_str() }
+        } else {
+            a.channel_title.as_str()
+        };
+        let sub = if live {
+            left_words(a.ends_at - now)
+        } else if a.begins_at > 0 {
+            format!("{} \u{2013} {}", self.time_of(a.begins_at), self.time_of(a.ends_at))
+        } else {
+            a.channel_vcn.clone()
+        };
+        let ink = if on { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+        TextView::new(title, theme::size::LABEL, theme::TEXT_PRIMARY)
+            .bold()
+            .with_measure(f.measure)
+            .max_lines(1)
+            .h(HAlign::Center)
+            .draw(p, Rect::new(rect.x - 6.0, rect.y + rect.h + 10.0, rect.w + 12.0, 0.0));
+        TextView::new(&sub, theme::size::CAPTION, ink)
+            .with_measure(f.measure)
+            .max_lines(1)
+            .h(HAlign::Center)
+            .draw(p, Rect::new(rect.x - 6.0, rect.y + rect.h + 44.0, rect.w + 12.0, 0.0));
+    }
+
     /// A Recordings row's words: its title, the line under it, and the state it wears on the right.
     fn rec_words(&self, entry: &RecEntry) -> (String, String, Option<&'static str>) {
         match entry {
@@ -1979,6 +2192,8 @@ const INK_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 /// its transparency).
 const ART_REQ: (i32, i32) = (1280, 720);
 const POSTER_REQ: (i32, i32) = (112, 168);
+/// A What's On card's poster, at the card's size.
+const WO_POSTER_REQ: (i32, i32) = (200, 300);
 const LOGO_REQ: (i32, i32) = (240, 112);
 /// How far past the page above and below the guide's window channel logos are fetched ahead
 /// ([`LiveTvScreen::prefetch_logos`]): two more pages each way, sixteen rows, within the source's
@@ -2141,10 +2356,7 @@ impl<H: ContentLike> Machine<H> for LiveTvScreen {
                     // The container's mint: a page shown for the first time in this visit.
                     Enter::Fresh { .. } => {
                         if self.has_content() {
-                            let elem = match self.mode {
-                                Mode::Guide => self.now_cell(),
-                                Mode::Recordings => model::REC_BASE,
-                            };
+                            let elem = self.first_elem();
                             self.seat_elem(elem, fx);
                         } else {
                             self.seat_pending = true;
@@ -2236,7 +2448,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             out.push(spec(PANEL, GroupKind::Column, panel.actions.len(), panel_rect(panel)));
             return;
         }
-        out.push(spec(HEAD, GroupKind::Row { wrap: false }, 2, Rect::new(MARGIN_X, geom::HEAD_Y, 2.0 * geom::PILL_W + geom::PILL_GAP, geom::HEAD_H)));
+        out.push(spec(HEAD, GroupKind::Row { wrap: false }, 3, Rect::new(MARGIN_X, geom::HEAD_Y, 3.0 * geom::PILL_W + 2.0 * geom::PILL_GAP, geom::HEAD_H)));
         if self.tabs_shown() {
             let n = model::tab_sources(&self.view.snap).len();
             out.push(spec(TABS, GroupKind::Row { wrap: false }, n, Rect::new(MARGIN_X, geom::TABS_Y, SCR_W - 2.0 * MARGIN_X, geom::TABS_H)));
@@ -2259,6 +2471,15 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
                     self.recs.len(),
                     Rect::new(MARGIN_X, geom::RECS_Y, SCR_W - 2.0 * MARGIN_X, geom::RECS_BOTTOM - geom::RECS_Y),
                 )),
+                Mode::WhatsOn => {
+                    let y0 = self.wo_y0();
+                    out.push(spec(
+                        CONTENT,
+                        GroupKind::Free,
+                        self.wo.iter().map(|r| r.items.len()).sum(),
+                        Rect::new(MARGIN_X, y0, SCR_W - 2.0 * MARGIN_X, geom::WO_BOTTOM - y0),
+                    ))
+                }
             }
         }
     }
@@ -2272,11 +2493,12 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             return model::action_of(e).map(|_| PANEL);
         }
         match e {
-            model::HEAD_GUIDE | model::HEAD_RECS => Some(HEAD),
+            model::HEAD_GUIDE | model::HEAD_RECS | model::HEAD_WHATSON => Some(HEAD),
             model::RETRY => self.shows_retry().then_some(RETRY_GROUP),
             _ if model::tab_of(e).is_some() => self.tabs_shown().then_some(TABS),
             _ if model::row_of(e).is_some() => (self.mode == Mode::Guide && self.has_content()).then_some(CONTENT),
             _ if model::rec_of(e).is_some() => (self.mode == Mode::Recordings && self.has_content()).then_some(CONTENT),
+            _ if model::wo_of(e).is_some() => (self.mode == Mode::WhatsOn && self.has_content()).then_some(CONTENT),
             _ => None,
         }
     }
@@ -2302,9 +2524,11 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             };
         }
         match e {
-            model::HEAD_GUIDE if dir == Dir::Right => return to(model::HEAD_RECS),
-            model::HEAD_RECS if dir == Dir::Left => return to(model::HEAD_GUIDE),
-            model::HEAD_GUIDE | model::HEAD_RECS | model::RETRY => return Step::Edge,
+            model::HEAD_GUIDE if dir == Dir::Right => return to(model::HEAD_WHATSON),
+            model::HEAD_WHATSON if dir == Dir::Left => return to(model::HEAD_GUIDE),
+            model::HEAD_WHATSON if dir == Dir::Right => return to(model::HEAD_RECS),
+            model::HEAD_RECS if dir == Dir::Left => return to(model::HEAD_WHATSON),
+            model::HEAD_GUIDE | model::HEAD_RECS | model::HEAD_WHATSON | model::RETRY => return Step::Edge,
             _ => {}
         }
         if let Some(i) = model::tab_of(e) {
@@ -2314,6 +2538,9 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
                 Dir::Right if i + 1 < n => to(e + 1),
                 _ => Step::Edge,
             };
+        }
+        if model::wo_of(e).is_some() {
+            return model::wo_neighbour(&self.wo, &self.wo_first, e, dir).map_or(Step::Edge, to);
         }
         if let Some(row) = model::channel_of(e) {
             return model::channel_neighbour(&self.view, &self.frame, row, dir).map_or(Step::Edge, to);
@@ -2345,7 +2572,8 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         }
         match e {
             model::HEAD_GUIDE => return Some(placed(head_rect(0), 0)),
-            model::HEAD_RECS => return Some(placed(head_rect(1), 1)),
+            model::HEAD_WHATSON => return Some(placed(head_rect(1), 1)),
+            model::HEAD_RECS => return Some(placed(head_rect(2), 2)),
             model::RETRY => return Some(placed(retry_rect(), 0)),
             _ => {}
         }
@@ -2353,6 +2581,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             let at = *self.tab_rects(cx.measure).get(i)?;
             let s = self.tab_scroll.pos;
             return Some(placed(Rect::new(at.x - s, at.y, at.w, at.h), i));
+        }
+        if let Some((r, i)) = model::wo_of(e) {
+            let index = self.wo.iter().take(r).map(|row| row.items.len()).sum::<usize>() + i;
+            return self.wo_rect(e).map(|rect| placed(rect, index));
         }
         if let Some(row) = model::row_of(e) {
             return model::elem_rect(&self.view, &self.frame, e).map(|r| placed(r, row));
@@ -2390,13 +2622,22 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             return want;
         }
         match e {
-            model::HEAD_GUIDE | model::HEAD_RECS => return want,
+            model::HEAD_GUIDE | model::HEAD_RECS | model::HEAD_WHATSON => return want,
             model::RETRY => return if self.shows_retry() { want } else { key(self.mode_pill()) },
             _ => {}
         }
         if let Some(i) = model::tab_of(e) {
             let n = model::tab_sources(&self.view.snap).len();
             return if self.tabs_shown() && i < n { want } else { key(self.mode_pill()) };
+        }
+        if let Some((r, i)) = model::wo_of(e) {
+            if self.mode != Mode::WhatsOn || !self.has_content() {
+                return key(self.mode_pill());
+            }
+            // a read of the rows can shorten one (or drop it): the nearest card stands in
+            let r = r.min(self.wo.len().saturating_sub(1));
+            let n = self.wo.get(r).map_or(0, |row| row.items.len());
+            return if n == 0 { key(self.mode_pill()) } else { key(model::wo_elem(r, i.min(n - 1))) };
         }
         if let Some(row) = model::channel_of(e) {
             if self.mode != Mode::Guide || !self.has_content() {
@@ -2459,6 +2700,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
                     key(self.view.cell_at(fr.base, row, fr.now.max(fr.win_start)))
                 }
                 Mode::Recordings => key(model::REC_BASE + self.rec_top.min(self.recs.len().saturating_sub(1)) as u32),
+                Mode::WhatsOn => key(self.first_elem()),
             },
         }
     }
@@ -2496,6 +2738,7 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
                     self.prefetch_logos();
                 }
                 Mode::Recordings => self.draw_recs(f, p),
+                Mode::WhatsOn => self.draw_whats_on(f, p),
             },
         }
         if let Some(panel) = self.panel.clone() {

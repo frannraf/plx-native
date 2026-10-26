@@ -245,6 +245,28 @@ impl Airing {
     }
 }
 
+/// **One row of the What's On page**: a hub the server's EPG provider answers
+/// (`GET /{provider}/hubs/discover`) — what is on now, shows on now, movies, sports, the channels
+/// watched lately. Its items are airings in the hub's order: a program's airing (its times, its
+/// channel), or for a hub of channels the channel alone (an airing with no times, `begins_at` 0,
+/// its channel fields set) when the server names no program on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveHub {
+    pub key: String,
+    pub identifier: String,
+    pub title: String,
+    /// `type` as the server spells it (`mixed`, `channel`, …).
+    pub kind: String,
+    pub items: Vec<Airing>,
+}
+
+impl LiveHub {
+    /// A hub of channels rather than of programs (every item a channel, or the server says so).
+    pub fn of_channels(&self) -> bool {
+        self.kind == "channel" || self.kind == "station" || (!self.items.is_empty() && self.items.iter().all(|a| a.begins_at == 0))
+    }
+}
+
 /// What a recording rule records, the hint PMS keeps beside it (`Video` or `Directory`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionHint {

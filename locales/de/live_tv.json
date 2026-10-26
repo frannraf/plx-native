@@ -65,5 +65,10 @@
   "live_tv.action.edit_options": "Optionen bearbeiten",
   "live_tv.action.save": "Speichern",
   "live_tv.action.cancel": "Abbrechen",
-  "live_tv.notice.options_saved": "Aufnahmeoptionen gespeichert."
+  "live_tv.notice.options_saved": "Aufnahmeoptionen gespeichert.",
+  "live_tv.mode.whats_on": "Jetzt läuft",
+  "live_tv.whats_on.loading": "Wird geladen …",
+  "live_tv.whats_on.failed": "Das aktuelle Programm konnte nicht geladen werden.",
+  "live_tv.whats_on.empty": "Gerade gibt es nichts anzuzeigen.",
+  "live_tv.whats_on.recent": "Zuletzt gesehene Sender"
 }

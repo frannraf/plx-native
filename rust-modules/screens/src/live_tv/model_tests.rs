@@ -515,3 +515,64 @@ fn a_rule_offers_its_recording_options() {
     snap.rules = vec![rule.clone()];
     assert_eq!(rule_actions(&snap, &rule), vec![Action::EditOptions, Action::DeleteRule, Action::Close]);
 }
+
+fn hub(identifier: &str, kind: &str, n: usize, timed: bool) -> plx_plex::plex::live_tv::LiveHub {
+    plx_plex::plex::live_tv::LiveHub {
+        identifier: identifier.into(),
+        title: identifier.into(),
+        kind: kind.into(),
+        items: (0..n)
+            .map(|i| Airing {
+                begins_at: if timed { NOON } else { 0 },
+                ends_at: if timed { NOON + 1_800 } else { 0 },
+                channel_identifier: format!("c{i}"),
+                ..Airing::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// **What's On's rows are the server's hubs**, a hub of channels drawn as channel tiles; the
+/// channels watched here lead them only when the server sent no row of its own for them.
+#[test]
+fn whats_on_rows_are_the_servers_hubs_and_the_recent_channels_lead_when_it_sends_none() {
+    let mut snap = Snapshot { hubs: vec![hub("p.onNow", "mixed", 3, true)], ..Snapshot::default() };
+    assert_eq!(wo_rows(&snap, "Recent").len(), 1);
+    snap.recent = vec![Channel { identifier: "c9".into(), title: "Nine".into(), ..Default::default() }];
+    let rows = wo_rows(&snap, "Recent");
+    assert_eq!((rows.len(), rows[0].title.as_str(), rows[0].channels), (2, "Recent", true));
+    assert_eq!(rows[0].items[0].channel_identifier, "c9");
+    assert!(!rows[1].channels);
+    snap.hubs.insert(0, hub("p.recentChannels", "channel", 2, false));
+    let rows = wo_rows(&snap, "Recent");
+    assert_eq!(rows.len(), 2, "the server's own row of recent channels stands instead");
+    assert!(rows[0].channels);
+}
+
+/// **What's On moves along a row, and between rows at the same place on screen**; a row scrolls
+/// its cards and the page its rows to keep the focused card whole.
+#[test]
+fn whats_on_moves_along_rows_and_between_them_at_the_same_place_on_screen() {
+    let snap = Snapshot { hubs: vec![hub("a", "mixed", 20, true), hub("b", "channel", 3, false), hub("c", "mixed", 20, true)], ..Snapshot::default() };
+    let rows = wo_rows(&snap, "Recent");
+    let firsts = vec![5, 0, 0];
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(0, 7), Dir::Right), Some(wo_elem(0, 8)));
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(0, 19), Dir::Right), None);
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(0, 0), Dir::Left), None);
+    // card 7 is the third shown in row 0 (its first shown is 5): the third of row 1, clamped
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(0, 7), Dir::Down), Some(wo_elem(1, 2)));
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(1, 1), Dir::Down), Some(wo_elem(2, 1)));
+    assert_eq!(wo_neighbour(&rows, &firsts, wo_elem(0, 3), Dir::Up), None, "the header's link takes it");
+    assert_eq!(wo_of(wo_elem(2, 19)), Some((2, 19)));
+    assert!(wo_of(cell(0, NOON)).is_none() && cell_of(wo_elem(0, 0)).is_none() && rec_of(wo_elem(0, 0)).is_none());
+    let per = wo_per_screen();
+    assert_eq!(wo_col_follow(0, per), 1, "one past the screen's last card scrolls one");
+    assert_eq!(wo_col_follow(5, 2), 2);
+    assert_eq!(wo_col_follow(5, 6), 5);
+    // the third row is below the foot from the top: following it scrolls the rows
+    let top = wo_follow(&rows, 0, 2, geom::WO_Y);
+    assert!(top > 0 && wo_row_y(&rows, top, 2, geom::WO_Y) + wo_row_h(&rows[2]) <= geom::WO_BOTTOM);
+    let r = wo_card_rect(&rows, 0, 0, 1, 2, geom::WO_Y).expect("rect");
+    assert_eq!((r.w, r.h), (geom::WO_CARD_W, geom::WO_TILE_H), "a channel row's tile is square");
+}

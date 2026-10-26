@@ -867,3 +867,35 @@ fn recording_options_are_read_for_the_panel_and_its_write_records_with_them() {
     s.close_options();
     assert!(s.snapshot().options.is_none());
 }
+
+/// **What's On is read when it opens and kept fresh**: one read at a time, its rows kept when a
+/// later read fails; the channels watched lately are remembered, the latest first.
+#[test]
+fn whats_on_is_read_once_at_a_time_kept_through_a_failed_refresh_and_remembers_the_channels_watched() {
+    use plx_plex::plex::live_tv::LiveHub;
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    s.refresh_hubs();
+    s.refresh_hubs();
+    s.pump();
+    let reads: Vec<_> = script.take().into_iter().filter(|(j, _)| matches!(j, Job::Hubs { .. })).collect();
+    assert_eq!(reads.len(), 1, "one read answers both asks");
+    assert!(s.snapshot().hubs_phase.is_loading());
+    let (_, post) = reads.into_iter().next().unwrap();
+    post.post(Landing::Hubs(Ok(vec![LiveHub { title: "On Now".into(), items: vec![airing(0, NOON, "g", "s")], ..Default::default() }])));
+    s.pump();
+    assert_eq!(s.snapshot().hubs.len(), 1);
+    s.refresh_hubs();
+    s.pump();
+    let (_, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Hubs { .. })).unwrap();
+    post.post(Landing::Hubs(Err(LiveError::Transport)));
+    s.pump();
+    let snap = s.snapshot();
+    assert!(snap.hubs_phase.is_ready() && snap.hubs.len() == 1, "a failed refresh keeps what was shown");
+    // the channels tuned lately, the latest first, as the lineup names them
+    s.tune(2, None);
+    s.tune(0, None);
+    s.tune(2, None);
+    let recent: Vec<String> = s.snapshot().recent.iter().map(|c| c.identifier.clone()).collect();
+    assert_eq!(recent, ["c2", "c0"]);
+}

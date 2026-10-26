@@ -27,8 +27,8 @@ use crate::live_tv::{
     TunePhase, Tuned, WriteNotice, WriteOp,
 };
 use plx_plex::plex::live_tv::{
-    Airing, Channel, CloudTab, CreateSubscription, EditSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, Subscription,
-    TemplateChoice,
+    Airing, Channel, CloudTab, CreateSubscription, EditSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, LiveHub,
+    Subscription, TemplateChoice,
 };
 use plx_plex::plex::ServerId;
 use std::collections::{HashMap, VecDeque};
@@ -82,6 +82,8 @@ pub enum Job {
     Favorites { auth: CloudAuth },
     /// The recording options of a new recording (the program's template) or of a rule.
     Options { serial: u32, of: OptionsFor },
+    /// The What's On page's hubs of the DVR's provider.
+    Hubs { provider: String },
     /// The debug log's look at a Plex channel's stream (what the player would have to read).
     CloudProbe { channel: Channel, auth: CloudAuth },
     /// Watch a Plex channel: its stream's URL (and, in a debug build, its shape in the log).
@@ -123,6 +125,7 @@ pub enum Landing {
     /// The favorites, and the server's `machineIdentifier` (empty if not yet learned).
     Favorites { machine: String, result: Result<Vec<FavoriteChannel>, LiveError> },
     Options { serial: u32, result: Result<OptionsAnswer, LiveError> },
+    Hubs(Result<Vec<LiveHub>, LiveError>),
 }
 
 /// What a recording-options read found.
@@ -198,6 +201,13 @@ impl Runner for Spawn {
 /// use: what a recording scheduled from another device, or a schedule change, takes to show.
 pub const GUIDE_FRESH_S: i64 = 15 * 60;
 
+/// How long the What's On page's hubs are trusted while it is in use: what is on changes on the
+/// half hour, and a hub read at :29 is stale at :31, so they are read again this often.
+pub const HUBS_FRESH_S: i64 = 3 * 60;
+
+/// Channels the What's On page remembers as watched lately (the latest first).
+pub const RECENT_KEPT: usize = 12;
+
 /// Under test only an injected runner runs: a default-built store never reaches a server.
 #[cfg(any(test, feature = "test-support"))]
 struct Refuse;
@@ -240,6 +250,7 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
         }
         Job::CloudProbe { channel, auth } => Landing::CloudProbe(auth.client().cloud_stream_shape(&channel)),
         Job::Favorites { auth } => Landing::Favorites { machine: client.machine_id().to_string(), result: auth.client().favorite_channels() },
+        Job::Hubs { provider } => Landing::Hubs(client.live_tv_hubs(&provider)),
         Job::Options { serial, of } => {
             let result = match of {
                 OptionsFor::Record { airing, kind } => {
@@ -475,6 +486,12 @@ pub struct LiveTvStore {
     /// The recording options the page's panel shows, and the rank of the last ask.
     options: Option<RecordOptions>,
     options_serial: u32,
+    /// The What's On hubs, where their read stands, and when they last landed (epoch seconds).
+    hubs: Vec<LiveHub>,
+    hubs_phase: Phase,
+    hubs_at: i64,
+    /// The channels tuned lately, the latest first ([`RECENT_KEPT`]).
+    recent: Vec<ChannelKey>,
     generation: u32,
 }
 
@@ -539,6 +556,10 @@ impl LiveTvStore {
             tab_picked: false,
             options: None,
             options_serial: 0,
+            hubs: Vec::new(),
+            hubs_phase: Phase::Idle,
+            hubs_at: 0,
+            recent: Vec::new(),
             generation: 0,
         }
     }
@@ -616,6 +637,7 @@ impl LiveTvStore {
         self.cancel_tune();
         self.tune_serial = self.tune_serial.wrapping_add(1);
         self.tune_wanted = true;
+        self.note_recent(&channel);
         let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: tune #{} asked for channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
@@ -646,6 +668,7 @@ impl LiveTvStore {
         self.cancel_tune();
         self.tune_serial = self.tune_serial.wrapping_add(1);
         self.tune_wanted = true;
+        self.note_recent(&channel);
         let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: watch #{} of Plex channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
@@ -789,6 +812,10 @@ impl LiveTvStore {
     /// shown again.
     pub fn refresh_stale(&mut self) {
         let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        // What's On, once read, stays fresh while the guide is in use
+        if self.hubs_phase.is_ready() && now - self.hubs_at >= HUBS_FRESH_S {
+            self.refresh_hubs();
+        }
         if self.guide.expire(now, GUIDE_FRESH_S) {
             plx_base::eventlog::log("livetv: the guide shown is read again (older than its freshness)");
             self.rewant();
@@ -932,6 +959,10 @@ impl LiveTvStore {
         if matches!(self.favorites_phase, Phase::Failed(_)) {
             self.ask_favorites();
             self.refresh_favorites();
+        }
+        if matches!(self.hubs_phase, Phase::Failed(_)) {
+            self.hubs_phase = Phase::Idle;
+            self.refresh_hubs();
         }
         if matches!(self.dvr_phase, Phase::Failed(_)) {
             self.refresh_dvr();
@@ -1108,6 +1139,54 @@ impl LiveTvStore {
         };
         self.write(Write::Favorite { op, add: on, auth });
         true
+    }
+
+    // ---- What's On ---------------------------------------------------------------------------
+
+    /// Read the What's On page's hubs (the page opened, or they went stale). The ones held stay
+    /// on the page meanwhile; one read on its way answers for this ask too.
+    pub fn refresh_hubs(&mut self) {
+        let Some(provider) = self.provider.as_ref().map(|p| p.identifier.clone()) else { return };
+        if self.queue.iter().any(|j| matches!(j, Job::Hubs { .. })) {
+            return;
+        }
+        if !self.hubs_phase.is_ready() {
+            self.hubs_phase = Phase::Loading;
+        }
+        self.queue.push_front(Job::Hubs { provider });
+        self.bump();
+    }
+
+    /// A channel was asked to be watched: the latest of the channels watched lately.
+    fn note_recent(&mut self, ch: &Channel) {
+        let key = ChannelKey::of(ch);
+        self.recent.retain(|k| *k != key);
+        self.recent.insert(0, key);
+        self.recent.truncate(RECENT_KEPT);
+    }
+
+    /// The channel a lineup id names, in the lineup shown else the DVR's.
+    pub fn key_of_identifier(&self, identifier: &str) -> Option<ChannelKey> {
+        let named = |c: &&Channel| !identifier.is_empty() && c.identifier == identifier;
+        self.channels.iter().find(named).or_else(|| self.lineup_of(&Source::Dvr).0.iter().find(named)).map(ChannelKey::of)
+    }
+
+    /// The channel a What's On item names: in the lineup shown, else the DVR's (a hub of the
+    /// server's provider names its DVR's channels), by its lineup id.
+    pub fn row_of_identifier(&mut self, identifier: &str) -> Option<usize> {
+        if identifier.is_empty() {
+            return None;
+        }
+        if let Some(row) = self.channels.iter().position(|c| c.identifier == identifier) {
+            return Some(row);
+        }
+        // the DVR's lineup, shown for it: the item is one of its channels
+        if self.lineup_of(&Source::Dvr).0.iter().any(|c| c.identifier == identifier) {
+            self.tab_picked = true;
+            self.show_source(Source::Dvr);
+            return self.channels.iter().position(|c| c.identifier == identifier);
+        }
+        None
     }
 
     // ---- recording options -------------------------------------------------------------------
@@ -1352,6 +1431,19 @@ impl LiveTvStore {
                     }
                 }
             }
+            Landing::Hubs(result) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                match result {
+                    Ok(hubs) => {
+                        self.hubs = hubs;
+                        self.hubs_phase = Phase::Ready;
+                        self.hubs_at = if self.now > 0 { self.now } else { lt::wall_now() };
+                    }
+                    // what was shown stays (a refresh that failed); nothing shown says why
+                    Err(e) if !self.hubs_phase.is_ready() => self.hubs_phase = Phase::Failed(e.reason()),
+                    Err(e) => plx_base::eventlog::log(&format!("livetv: What's On read again failed: {}", e.reason())),
+                }
+            }
             Landing::Options { serial, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 if let Some(o) = self.options.as_mut().filter(|o| o.serial == serial) {
@@ -1564,6 +1656,17 @@ impl LiveTvStore {
             favorite_dvr: !self.machine.is_empty() && !self.provider_id().is_empty(),
             favorite_cloud: self.favorites.iter().any(|f| !f.on_server()),
             options: self.options.clone(),
+            hubs: self.hubs.clone(),
+            hubs_phase: self.hubs_phase.clone(),
+            recent: self
+                .recent
+                .iter()
+                .filter_map(|k| {
+                    let pool = if k.cloud { Source::Plex } else { Source::Dvr };
+                    let in_shown = self.channels.iter().find(|c| ChannelKey::of(c) == *k);
+                    in_shown.or_else(|| self.lineup_of(&pool).0.iter().find(|c| ChannelKey::of(c) == *k)).cloned()
+                })
+                .collect(),
         }
     }
 

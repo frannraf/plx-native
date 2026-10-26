@@ -8,6 +8,33 @@ fn json(s: &str) -> Value {
     serde_json::from_str(s).expect("fixture is valid JSON")
 }
 
+/// The What's On hubs: a hub of programs gives each its airing, a hub of channels each channel,
+/// an empty hub is left out, and the path asks what the stock clients ask.
+#[test]
+fn the_whats_on_hubs_read_programs_and_channels_and_skip_empty_ones() {
+    let body = serde_json::json!({"MediaContainer": {"Hub": [
+        {"title": "What's On Now", "hubIdentifier": "p.discover.onNow", "type": "mixed", "Metadata": [
+            {"title": "A Show", "grandparentTitle": "Show", "type": "episode", "Media": [{"beginsAt": 100, "endsAt": 200, "channelIdentifier": "c1", "channelVcn": "4.1"}]},
+            {"title": "No times", "type": "movie"}
+        ]},
+        {"title": "Recent Channels", "hubIdentifier": "p.recentChannels", "type": "channel", "Metadata": [
+            {"title": "KXYZ", "channelIdentifier": "c2", "vcn": "5.1", "thumb": "/logo.png"}
+        ]},
+        {"title": "Empty", "hubIdentifier": "p.empty", "Metadata": []}
+    ]}});
+    let hubs = super::parse::hubs(&body);
+    assert_eq!(hubs.len(), 2);
+    assert_eq!((hubs[0].items.len(), hubs[0].items[0].channel_identifier.as_str(), hubs[0].items[0].begins_at), (1, "c1", 100), "an item without an airing or a channel is left out");
+    assert!(!hubs[0].of_channels());
+    let ch = &hubs[1].items[0];
+    assert_eq!((ch.channel_identifier.as_str(), ch.channel_vcn.as_str(), ch.channel_thumb.as_str(), ch.begins_at), ("c2", "5.1", "/logo.png", 0));
+    assert!(hubs[1].of_channels());
+    let path = super::hubs_path("tv.plex.providers.epg.cloud:2", 16).expect("path");
+    assert!(path.starts_with("/tv.plex.providers.epg.cloud:2/hubs/discover?count=16"), "{path}");
+    assert!(path.contains("includeRecentChannels=1") && path.contains("includeStations=1"), "{path}");
+    assert!(super::hubs_path("../x", 16).is_none());
+}
+
 #[test]
 fn providers_keep_only_epg_providers_with_their_dvr_key_and_features() {
     let p = parse::providers(&json(PROVIDERS));

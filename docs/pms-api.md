@@ -1670,6 +1670,18 @@ order, and every entry this app does not change is written back exactly as it ca
   server, logs which matched (`livetv: favorites name …`), and writes new entries in the form the
   account's existing entries use (the lineup `id` when there are none).
 
+### 10.9 What's On — `GET /{provider}/hubs/discover`
+
+Undocumented in the bundled spec; the stock clients and a community client read it with
+`count={n}&includeStations=1&includeRecentChannels=1&includeMeta=1&includeExternalMetadata=1`
+(`Client::live_tv_hubs`, `HUB_ITEMS` per hub). `MediaContainer.Hub[]`: `title`, `hubIdentifier`,
+`key`, `type`, and `Metadata[]` items shaped as the grid's (§10.3): a program with its `Media`
+airing on a channel. A hub of channels (the recent channels; its `type` `channel`) may name a
+channel without a program. The page draws the server's hubs in its order; when none of them is a
+row of recent channels, the channels watched on this TV lead them. **Not yet measured:** the exact
+shape of the recent-channels and stations hubs; the event log says what each hub held
+(`livetv: What's On read: …`, kinds and counts only).
+
 ## Paging, observed
 
 Observed on PMS 1.43.4 with a small library, by read-only GETs. Only the endpoints in the table were

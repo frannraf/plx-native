@@ -1124,6 +1124,13 @@ fn live_tv_requests(app: &mut App) {
                 }
                 super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
             }
+            LiveTvOut::WatchHub { identifier, .. } if corner => {
+                if app.bridge.live_tv_is_watching_identifier(identifier) {
+                    super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
+                    continue;
+                }
+                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+            }
             _ => {}
         }
         match request {
@@ -1168,6 +1175,8 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
         LiveTvOut::Options(plx_data::live_tv::OptionsFor::Record { .. }) => "the recording options".into(),
         LiveTvOut::Options(plx_data::live_tv::OptionsFor::Rule { .. }) => "a rule's options".into(),
         LiveTvOut::CloseOptions => "close the options".into(),
+        LiveTvOut::WatchHub { airing, .. } => format!("watch a What's On card ({})", if airing.is_some() { "on now" } else { "a channel" }),
+        LiveTvOut::RefreshHubs => "What's On".into(),
         LiveTvOut::Retry => "retry".into(),
         LiveTvOut::RefreshDvr => "the recordings lists".into(),
     }

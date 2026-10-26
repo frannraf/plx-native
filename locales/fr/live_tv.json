@@ -65,5 +65,10 @@
   "live_tv.action.edit_options": "Modifier les options",
   "live_tv.action.save": "Enregistrer",
   "live_tv.action.cancel": "Annuler",
-  "live_tv.notice.options_saved": "Options d'enregistrement enregistrées."
+  "live_tv.notice.options_saved": "Options d'enregistrement enregistrées.",
+  "live_tv.mode.whats_on": "À l'antenne",
+  "live_tv.whats_on.loading": "Chargement des programmes…",
+  "live_tv.whats_on.failed": "Impossible de charger les programmes en cours.",
+  "live_tv.whats_on.empty": "Rien à afficher pour le moment.",
+  "live_tv.whats_on.recent": "Chaînes récentes"
 }
