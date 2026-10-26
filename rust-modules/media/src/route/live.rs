@@ -274,6 +274,13 @@ fn shift_lock() -> std::sync::MutexGuard<'static, Option<Shift>> {
 fn note_window(session: &str, w: CaptureWindow) {
     let now = wall_s();
     if let Some(s) = shift_lock().as_mut().filter(|s| s.session == session) {
+        if s.window.is_none() {
+            crate::player::log(&format!(
+                "livetv: capture window: {:.0} s deep, its edge {:+.0} s from this TV's clock",
+                w.depth(),
+                w.live_edge() - now
+            ));
+        }
         s.window = Some((w, now));
         s.clock.anchor(capture_span(&w, now, now).1, now);
     }
@@ -451,7 +458,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         Shift { session: route.encoder_session.clone(), window, clock: ShiftClock::at_edge(now, edge) }
     });
     crate::player::log(&format!(
-        "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, captions {}, keepalive every {}s",
+        "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, captions {}, capture {}, keepalive every {}s",
         route.video_codec,
         route.audio_codec,
         route.width,
@@ -459,6 +466,7 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
         route.fps,
         if route.subscription_id.is_empty() { "none" } else { "held" },
         if route.subtitle_stream_id > 0 { "burned in" } else { "off" },
+        route.capture.map_or_else(|| "not in the tune's answer".to_string(), |w| format!("{:.0} s deep", w.depth())),
         KEEPALIVE_S
     ));
     if !route.provider {

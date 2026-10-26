@@ -96,6 +96,30 @@ pub(crate) fn parsed(what: &str) {
     }
 }
 
+/// Where a live session's capture window came from, once per transcode session and in a release
+/// build's log too (pause and rewind cannot work without it, and where a server keeps it is not yet
+/// measured): the transcode list, or nowhere — then with the [`shape`]s of the timeline answer and
+/// of the transcode list, keys and protocol values only.
+pub(crate) fn note_capture_source(session: &str, found: bool, timeline: Option<&Value>, sessions: Option<&Value>) {
+    static NOTED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    {
+        let mut g = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if *g == session {
+            return;
+        }
+        session.clone_into(&mut g);
+    }
+    if found {
+        plx_base::eventlog::log("livetv: the capture window comes from the transcode list (not the timeline answer)");
+    } else {
+        plx_base::eventlog::log(&format!(
+            "livetv: no capture window; timeline answer {}; transcode list {}",
+            timeline.map_or_else(|| "unreadable".to_string(), shape),
+            sessions.map_or_else(|| "unread".to_string(), shape)
+        ));
+    }
+}
+
 /// How many answers `op` has had in this process (1 for the first).
 fn count(op: &'static str) -> u32 {
     static COUNTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];

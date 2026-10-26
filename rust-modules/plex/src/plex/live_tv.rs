@@ -685,8 +685,26 @@ impl Client {
         let q = self.playback_identity(q);
         match self.body_2xx_post(&q.build()) {
             None => (false, None),
-            Some(body) => (true, serde_json::from_slice::<Value>(&body).ok().and_then(|v| parse::timeline_capture(&v))),
+            Some(body) => {
+                let answer = serde_json::from_slice::<Value>(&body).ok();
+                let window = answer.as_ref().and_then(parse::timeline_capture).or_else(|| self.transcode_capture(session, answer.as_ref()));
+                (true, window)
+            }
         }
+    }
+
+    /// The capture window of transcode `session` from the server's list of transcodes, for a
+    /// timeline answer (`timeline`) that carried none. Where a server keeps it is not yet
+    /// measured: the first time for a session the event log says where it was found, or, when it
+    /// was not, the shapes of both answers ([`debug::note_capture_source`]).
+    fn transcode_capture(&self, session: &str, timeline: Option<&Value>) -> Option<CaptureWindow> {
+        let sessions = match self.json_value(Method::Get, "/transcode/sessions") {
+            ValueOutcome::Response { status, body } if (200..300).contains(&status) => body,
+            _ => None,
+        };
+        let window = sessions.as_ref().and_then(|v| parse::transcode_capture(v, session));
+        debug::note_capture_source(session, window.is_some(), timeline, sessions.as_ref());
+        window
     }
 }
 

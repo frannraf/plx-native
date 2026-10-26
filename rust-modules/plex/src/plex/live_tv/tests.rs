@@ -51,6 +51,22 @@ fn a_timeline_answer_names_the_tuners_capture_window() {
     assert!(super::parse::timeline_capture(&serde_json::json!({"MediaContainer": {"size": 0}})).is_none());
 }
 
+/// The server's transcode list names a live session's capture window under its own key (a server
+/// whose timeline answer carries none).
+#[test]
+fn the_transcode_list_names_a_sessions_capture_window_by_its_key() {
+    let list = serde_json::json!({"MediaContainer": {"size": 2, "TranscodeSession": [
+        {"key": "/transcode/sessions/other", "timeStamp": 1.0, "maxOffsetAvailable": 9.0},
+        {"key": "/transcode/sessions/mine", "timeStamp": "1000.5", "minOffsetAvailable": 0, "maxOffsetAvailable": "42.25"}
+    ]}});
+    let w = super::parse::transcode_capture(&list, "mine").expect("window");
+    assert_eq!((w.time_stamp, w.max_offset), (1000.5, 42.25));
+    assert!(super::parse::transcode_capture(&list, "gone").is_none());
+    assert!(super::parse::transcode_capture(&list, "").is_none());
+    let bare = serde_json::json!({"MediaContainer": {"TranscodeSession": {"key": "/transcode/sessions/mine", "videoDecision": "transcode"}}});
+    assert!(super::parse::transcode_capture(&bare, "mine").is_none(), "a session with no window");
+}
+
 #[test]
 fn providers_keep_only_epg_providers_with_their_dvr_key_and_features() {
     let p = parse::providers(&json(PROVIDERS));

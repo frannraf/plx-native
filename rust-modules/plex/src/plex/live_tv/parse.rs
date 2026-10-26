@@ -602,7 +602,19 @@ fn tuned_item(m: &Value) -> TunedItem {
 
 /// A `TranscodeSession`'s capture window, if it carries one.
 pub(super) fn capture_of(v: &Value) -> Option<CaptureWindow> {
-    let ts = first(v, &["TranscodeSession"])?;
+    window_of(first(v, &["TranscodeSession"])?)
+}
+
+/// `GET /transcode/sessions` → the capture window of transcode session `session` (the one keyed
+/// `/transcode/sessions/{session}`), for a server whose timeline answer carries none.
+pub(super) fn transcode_capture(body: &Value, session: &str) -> Option<CaptureWindow> {
+    let c = container(body)?;
+    let ts = many(c, "TranscodeSession").into_iter().find(|t| !session.is_empty() && text(t, "key").rsplit('/').next() == Some(session))?;
+    window_of(ts)
+}
+
+/// A `TranscodeSession`'s capture window, when it carries one.
+fn window_of(ts: &Value) -> Option<CaptureWindow> {
     if ts.get("timeStamp").is_none() && ts.get("maxOffsetAvailable").is_none() {
         return None;
     }
