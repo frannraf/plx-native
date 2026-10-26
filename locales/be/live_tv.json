@@ -57,5 +57,13 @@
   "live_tv.notice.favorite_removed": "Выдалена з абраных.",
   "live_tv.conflict.body": "Яно перасякаецца з {titles}: цюнераў не хапае на ўсе. Дайце гэтаму запісу перавагу або скасуйце яго.",
   "live_tv.action.prefer": "Аддаць перавагу",
-  "live_tv.action.cancel_new": "Скасаваць гэты"
+  "live_tv.action.cancel_new": "Скасаваць гэты",
+  "live_tv.options.title": "Параметры запісу",
+  "live_tv.options.library": "Захоўваецца ў {name}",
+  "live_tv.options.loading": "Загрузка параметраў…",
+  "live_tv.options.failed": "Не ўдалося загрузіць параметры: {reason}",
+  "live_tv.action.edit_options": "Змяніць параметры",
+  "live_tv.action.save": "Захаваць",
+  "live_tv.action.cancel": "Скасаваць",
+  "live_tv.notice.options_saved": "Параметры запісу захаваны."
 }

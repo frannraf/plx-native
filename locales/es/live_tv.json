@@ -57,5 +57,13 @@
   "live_tv.notice.favorite_removed": "Quitado de favoritos.",
   "live_tv.conflict.body": "Coincide con {titles}: no hay sintonizadores suficientes para todas. Da prioridad a esta grabación o cancélala.",
   "live_tv.action.prefer": "Dar prioridad",
-  "live_tv.action.cancel_new": "Cancelar esta"
+  "live_tv.action.cancel_new": "Cancelar esta",
+  "live_tv.options.title": "Opciones de grabación",
+  "live_tv.options.library": "Se guarda en {name}",
+  "live_tv.options.loading": "Cargando las opciones…",
+  "live_tv.options.failed": "No se pudieron cargar las opciones: {reason}",
+  "live_tv.action.edit_options": "Editar opciones",
+  "live_tv.action.save": "Guardar",
+  "live_tv.action.cancel": "Cancelar",
+  "live_tv.notice.options_saved": "Opciones de grabación guardadas."
 }

@@ -57,5 +57,13 @@
   "live_tv.notice.favorite_removed": "Aus Favoriten entfernt.",
   "live_tv.conflict.body": "Sie überschneidet sich mit {titles}: Es gibt nicht genug Tuner für alle. Bevorzuge diese Aufnahme oder brich sie ab.",
   "live_tv.action.prefer": "Diese bevorzugen",
-  "live_tv.action.cancel_new": "Diese abbrechen"
+  "live_tv.action.cancel_new": "Diese abbrechen",
+  "live_tv.options.title": "Aufnahmeoptionen",
+  "live_tv.options.library": "Gespeichert in {name}",
+  "live_tv.options.loading": "Optionen werden geladen …",
+  "live_tv.options.failed": "Die Optionen konnten nicht geladen werden: {reason}",
+  "live_tv.action.edit_options": "Optionen bearbeiten",
+  "live_tv.action.save": "Speichern",
+  "live_tv.action.cancel": "Abbrechen",
+  "live_tv.notice.options_saved": "Aufnahmeoptionen gespeichert."
 }

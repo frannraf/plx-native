@@ -57,5 +57,13 @@
   "live_tv.notice.favorite_removed": "Rimosso dai preferiti.",
   "live_tv.conflict.body": "Si sovrappone a {titles}: non ci sono abbastanza sintonizzatori per tutte. Dai la precedenza a questa registrazione o annullala.",
   "live_tv.action.prefer": "Dai precedenza",
-  "live_tv.action.cancel_new": "Annulla questa"
+  "live_tv.action.cancel_new": "Annulla questa",
+  "live_tv.options.title": "Opzioni di registrazione",
+  "live_tv.options.library": "Salvato in {name}",
+  "live_tv.options.loading": "Caricamento delle opzioni…",
+  "live_tv.options.failed": "Impossibile caricare le opzioni: {reason}",
+  "live_tv.action.edit_options": "Modifica opzioni",
+  "live_tv.action.save": "Salva",
+  "live_tv.action.cancel": "Annulla",
+  "live_tv.notice.options_saved": "Opzioni di registrazione salvate."
 }

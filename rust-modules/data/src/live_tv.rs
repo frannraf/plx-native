@@ -9,7 +9,9 @@
 //! without a battery clock can read 1970 until NTP has run; [`plausible_now`] says so, and the
 //! store waits rather than asking the server for a guide of 1970.
 
-use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveStream, Subscription, TunedItem};
+use plx_plex::plex::live_tv::{
+    Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveStream, Setting, Subscription, TemplateChoice, TunedItem,
+};
 use plx_plex::plex::ServerId;
 use std::collections::HashMap;
 
@@ -368,6 +370,46 @@ pub enum RecordKind {
     Series,
 }
 
+/// What the recording-options panel is about: a new recording of an airing (the program's
+/// template, its defaults), or a rule's edit (its settings as they stand).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionsFor {
+    Record { airing: Airing, kind: RecordKind },
+    Rule { id: String },
+}
+
+/// **The recording options asked for**, as the server answers them: the template entry a new
+/// recording is made from, or the rule an edit changes. The page edits the settings' values and
+/// writes the result ([`crate::stores::live_tv::Write::RecordWith`] / `EditRule`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordOptions {
+    /// Bumps per ask: an answer for an earlier ask is not this panel's.
+    pub serial: u32,
+    pub of: OptionsFor,
+    pub phase: Phase,
+    pub choice: Option<TemplateChoice>,
+    pub rule: Option<Subscription>,
+}
+
+impl RecordOptions {
+    /// The settings the panel shows and edits.
+    pub fn settings(&self) -> &[Setting] {
+        match (&self.choice, &self.rule) {
+            (Some(c), _) => &c.settings,
+            (None, Some(r)) => &r.settings,
+            _ => &[],
+        }
+    }
+    /// The library the recordings go to, as the server names it.
+    pub fn library(&self) -> &str {
+        match (&self.choice, &self.rule) {
+            (Some(c), _) => &c.section_title,
+            (None, Some(r)) => &r.section_title,
+            _ => "",
+        }
+    }
+}
+
 /// The last write's outcome, for the page to say what happened (a short notice).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteNotice {
@@ -395,6 +437,7 @@ pub enum WriteOp {
     MoveRule,
     FavoriteAdded,
     FavoriteRemoved,
+    EditRule,
 }
 
 /// A channel tuned and turned into a stream: everything the application needs to play it (the
@@ -463,6 +506,8 @@ pub struct Snapshot {
     /// other)?
     pub favorite_dvr: bool,
     pub favorite_cloud: bool,
+    /// The recording options the page asked for, while its panel is open.
+    pub options: Option<RecordOptions>,
 }
 
 impl Snapshot {

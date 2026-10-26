@@ -290,7 +290,7 @@ fn the_recordings_list_runs_recordings_first_then_rules_in_priority_order() {
     assert_eq!(write_for(&snap, &first, Action::MoveTop), Some(Write::MoveRule { id: "b".into(), after: None }));
     let last = Target::Rule(snap.rules[0].clone());
     assert_eq!(write_for(&snap, &last, Action::MoveBottom), Some(Write::MoveRule { id: "a".into(), after: Some("b".into()) }));
-    assert_eq!(rule_actions(&snap, &snap.rules[0]), vec![Action::MoveBottom, Action::DeleteRule, Action::Close]);
+    assert_eq!(rule_actions(&snap, &snap.rules[0]), vec![Action::MoveBottom, Action::EditOptions, Action::DeleteRule, Action::Close]);
     assert_eq!(grab_actions(&snap.scheduled[1]), vec![Action::StopRecording, Action::Close]);
     assert_eq!(grab_actions(&snap.scheduled[0]), vec![Action::CancelRecording, Action::Close]);
 }
@@ -465,4 +465,53 @@ fn a_conflicting_recording_is_preferred_by_raising_its_rule_or_cancelled_by_dele
     assert_eq!(write_for(&snap, &t, Action::Prefer), Some(Write::MoveRule { id: "42".into(), after: None }));
     assert_eq!(write_for(&snap, &t, Action::CancelNew), Some(Write::CancelRule { id: "42".into() }));
     assert_eq!(write_for(&snap, &t, Action::Close), None);
+}
+
+fn setting(id: &str, kind: plx_plex::plex::live_tv::SettingKind, value: &str, options: &[(&str, &str)]) -> plx_plex::plex::live_tv::Setting {
+    plx_plex::plex::live_tv::Setting {
+        id: id.into(),
+        label: id.into(),
+        kind,
+        value: value.into(),
+        options: options.iter().map(|(v, l)| plx_plex::plex::live_tv::SettingOption { value: (*v).into(), label: (*l).into() }).collect(),
+        ..Default::default()
+    }
+}
+
+/// **The options panel shows the visible settings, everyday ones first**, and each kind of value
+/// steps its own way: an option list round, a switch in the server's spelling, a number never
+/// below 0, a text not at all; the edits apply by setting id and leave the others as they were.
+#[test]
+fn recording_options_show_the_visible_settings_and_step_each_kind_of_value() {
+    use plx_plex::plex::live_tv::SettingKind;
+    let mut hidden = setting("hidden", SettingKind::Text, "x", &[]);
+    hidden.hidden = true;
+    let mut only_new = setting("onlyNewAirings", SettingKind::Bool, "0", &[]);
+    only_new.advanced = true;
+    let padding = setting("startOffsetMinutes", SettingKind::Int, "0", &[("0", "None"), ("5", "5 minutes"), ("10", "10 minutes")]);
+    let keep = setting("keep", SettingKind::Int, "3", &[]);
+    let all = vec![hidden, only_new.clone(), padding.clone(), keep.clone()];
+    let shown: Vec<&str> = shown_settings(&all).iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(shown, ["startOffsetMinutes", "keep", "onlyNewAirings"], "hidden left out, advanced last");
+    assert_eq!(step_value(&padding, "0", 1), "5");
+    assert_eq!(step_value(&padding, "10", 1), "0", "round");
+    assert_eq!(step_value(&padding, "0", -1), "10");
+    assert_eq!(step_value(&padding, "7", 1), "0", "a value not offered steps to the first");
+    assert_eq!(step_value(&only_new, "0", 1), "1");
+    assert_eq!(step_value(&only_new, "true", 1), "false", "the server's spelling kept");
+    assert_eq!(step_value(&keep, "3", -1), "2");
+    assert_eq!(step_value(&keep, "0", -1), "0", "never below 0");
+    let text = setting("name", SettingKind::Text, "abc", &[]);
+    assert_eq!(step_value(&text, "abc", 1), "abc");
+    let edited = with_edits(&all, &[("keep".into(), "5".into())]);
+    assert_eq!(edited.iter().map(|s| s.value.as_str()).collect::<Vec<_>>(), ["x", "0", "0", "5"]);
+}
+
+/// A rule's panel offers its recording options.
+#[test]
+fn a_rule_offers_its_recording_options() {
+    let mut snap = Snapshot::default();
+    let rule = Subscription { id: "7".into(), ..Default::default() };
+    snap.rules = vec![rule.clone()];
+    assert_eq!(rule_actions(&snap, &rule), vec![Action::EditOptions, Action::DeleteRule, Action::Close]);
 }

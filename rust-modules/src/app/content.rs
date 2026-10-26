@@ -1163,6 +1163,11 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
         LiveTvOut::Write(Write::MoveRule { after, .. }) => format!("move a rule ({})", if after.is_some() { "bottom" } else { "top" }),
         LiveTvOut::Write(Write::Favorite { add, .. }) => format!("{} the favorites", if *add { "add to" } else { "take off" }),
         LiveTvOut::Favorite { row, on } => format!("{} the favorites, row {row}", if *on { "add to" } else { "take off" }),
+        LiveTvOut::Write(Write::RecordWith { kind, .. }) => format!("record with options ({})", if *kind == RecordKind::Series { "series" } else { "this" }),
+        LiveTvOut::Write(Write::EditRule { .. }) => "save a rule's options".into(),
+        LiveTvOut::Options(plx_data::live_tv::OptionsFor::Record { .. }) => "the recording options".into(),
+        LiveTvOut::Options(plx_data::live_tv::OptionsFor::Rule { .. }) => "a rule's options".into(),
+        LiveTvOut::CloseOptions => "close the options".into(),
         LiveTvOut::Retry => "retry".into(),
         LiveTvOut::RefreshDvr => "the recordings lists".into(),
     }

@@ -57,5 +57,13 @@
   "live_tv.notice.favorite_removed": "Retirée des favoris.",
   "live_tv.conflict.body": "Il est en conflit avec {titles} : il n'y a pas assez de tuners pour tous. Donnez la priorité à cet enregistrement ou annulez-le.",
   "live_tv.action.prefer": "Privilégier",
-  "live_tv.action.cancel_new": "Annuler celui-ci"
+  "live_tv.action.cancel_new": "Annuler celui-ci",
+  "live_tv.options.title": "Options d'enregistrement",
+  "live_tv.options.library": "Enregistré dans {name}",
+  "live_tv.options.loading": "Chargement des options…",
+  "live_tv.options.failed": "Impossible de charger les options : {reason}",
+  "live_tv.action.edit_options": "Modifier les options",
+  "live_tv.action.save": "Enregistrer",
+  "live_tv.action.cancel": "Annuler",
+  "live_tv.notice.options_saved": "Options d'enregistrement enregistrées."
 }

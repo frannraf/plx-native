@@ -10,7 +10,7 @@
 use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
-use plx_plex::plex::live_tv::{Airing, Channel, Grab, Subscription};
+use plx_plex::plex::live_tv::{Airing, Channel, Grab, Setting, SettingKind, Subscription};
 use plx_ui::screen::Dir;
 use plx_ui::Rect;
 
@@ -37,6 +37,10 @@ pub const REC_BASE: u32 = 0xD000_0000;
 /// A guide row's channel (its logo, left of its programs): `CHANNEL_BASE + row`. OK on it opens
 /// the channel's panel (watch it, add it to the favorites or take it off).
 pub const CHANNEL_BASE: u32 = 0xB000_0000;
+/// The recording-options panel: a setting's row (`OPT_BASE + index`), then its two buttons.
+pub const OPT_BASE: u32 = 0xA000_0000;
+pub const OPT_GO: u32 = 0xA000_FF00;
+pub const OPT_CANCEL: u32 = 0xA000_FF01;
 /// An action of the open panel: `ACTION_BASE + index`.
 pub const ACTION_BASE: u32 = 0xF000_0000;
 const ROW_SHIFT: u32 = 20;
@@ -60,6 +64,65 @@ pub fn channel_elem(row: usize) -> u32 {
 /// The row of a channel's key.
 pub fn channel_of(elem: u32) -> Option<usize> {
     (CHANNEL_BASE..CHANNEL_BASE + MAX_ROWS as u32).contains(&elem).then(|| (elem - CHANNEL_BASE) as usize)
+}
+
+/// The setting row of an options-panel key.
+pub fn opt_of(elem: u32) -> Option<usize> {
+    (OPT_BASE..OPT_BASE + 0x100).contains(&elem).then(|| (elem - OPT_BASE) as usize)
+}
+
+/// Is it one of the options panel's keys (a setting's row or a button)?
+pub fn is_opt(elem: u32) -> bool {
+    opt_of(elem).is_some() || elem == OPT_GO || elem == OPT_CANCEL
+}
+
+/// The settings an options panel shows, in its order: the visible ones (a hidden setting is sent
+/// back as it is, never shown), the everyday ones first and the advanced after them.
+pub fn shown_settings(settings: &[Setting]) -> Vec<&Setting> {
+    let visible = settings.iter().filter(|s| !s.hidden);
+    visible.clone().filter(|s| !s.advanced).chain(visible.filter(|s| s.advanced)).collect()
+}
+
+/// Is a switch's value on (`1`, `true`)?
+pub fn switch_on(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "True")
+}
+
+/// A setting's next value one step `by` (±1) along: an enumerated one's next option (round), a
+/// switch flipped (in the spelling the server used), a number up or down (never below 0); a text
+/// stays as it is.
+pub fn step_value(s: &Setting, value: &str, by: i32) -> String {
+    if !s.options.is_empty() {
+        let n = s.options.len() as i64;
+        let at = s.options.iter().position(|o| o.value == value).map_or(0, |i| i as i64);
+        let next = if s.options.iter().any(|o| o.value == value) { (at + i64::from(by)).rem_euclid(n) } else { 0 };
+        return s.options[next as usize].value.clone();
+    }
+    match s.kind {
+        SettingKind::Bool => {
+            let on = switch_on(value);
+            let words = value.trim().eq_ignore_ascii_case("true") || value.trim().eq_ignore_ascii_case("false");
+            match (on, words) {
+                (true, true) => "false".into(),
+                (false, true) => "true".into(),
+                (true, false) => "0".into(),
+                (false, false) => "1".into(),
+            }
+        }
+        SettingKind::Int => (value.trim().parse::<i64>().unwrap_or(0) + i64::from(by)).max(0).to_string(),
+        SettingKind::Text => value.to_string(),
+    }
+}
+
+/// `settings` with the panel's edits (setting id → value) applied.
+pub fn with_edits(settings: &[Setting], edits: &[(String, String)]) -> Vec<Setting> {
+    settings
+        .iter()
+        .map(|s| match edits.iter().find(|(id, _)| *id == s.id) {
+            Some((_, v)) => Setting { value: v.clone(), ..s.clone() },
+            None => s.clone(),
+        })
+        .collect()
 }
 
 /// The guide row a key stands in: a program's, a placeholder's or a channel's.
@@ -646,6 +709,8 @@ pub enum Action {
     Prefer,
     /// …or delete it.
     CancelNew,
+    /// A rule's recording options.
+    EditOptions,
     Close,
 }
 
@@ -747,6 +812,7 @@ pub fn rule_actions(snap: &Snapshot, s: &Subscription) -> Vec<Action> {
             out.push(Action::MoveBottom);
         }
     }
+    out.push(Action::EditOptions);
     out.push(Action::DeleteRule);
     out.push(Action::Close);
     out

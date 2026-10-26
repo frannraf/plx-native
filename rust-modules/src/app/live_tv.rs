@@ -192,6 +192,8 @@ impl Bridge {
             LiveTvOut::CancelTune => self.live_tv_cancel_tune(),
             LiveTvOut::DismissTuneFailure => store.clear_tune_failure(),
             LiveTvOut::Write(w) => store.write(w),
+            LiveTvOut::Options(of) => store.ask_options(of),
+            LiveTvOut::CloseOptions => store.close_options(),
             LiveTvOut::Favorite { row, on } => {
                 if !store.set_favorite(row, on) {
                     plx_base::eventlog::log("livetv: that favorite cannot be changed from here");

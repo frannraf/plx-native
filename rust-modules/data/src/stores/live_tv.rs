@@ -23,11 +23,12 @@
 //! against the server that tuned it, and never played.
 
 use crate::live_tv::{
-    self as lt, Availability, ChannelKey, CloudAuth, GuideCache, Overlay, Phase, RecordKind, Snapshot, Source, TunePhase, Tuned, WriteNotice,
-    WriteOp,
+    self as lt, Availability, ChannelKey, CloudAuth, GuideCache, OptionsFor, Overlay, Phase, RecordKind, RecordOptions, Snapshot, Source,
+    TunePhase, Tuned, WriteNotice, WriteOp,
 };
 use plx_plex::plex::live_tv::{
-    Airing, Channel, CloudTab, CreateSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, Subscription,
+    Airing, Channel, CloudTab, CreateSubscription, EditSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, Subscription,
+    TemplateChoice,
 };
 use plx_plex::plex::ServerId;
 use std::collections::{HashMap, VecDeque};
@@ -79,6 +80,8 @@ pub enum Job {
     CloudGrid { channel: Channel, date: String, auth: CloudAuth },
     /// The account's favorite channels (plex.tv), and the server's identity they name its DVR by.
     Favorites { auth: CloudAuth },
+    /// The recording options of a new recording (the program's template) or of a rule.
+    Options { serial: u32, of: OptionsFor },
     /// The debug log's look at a Plex channel's stream (what the player would have to read).
     CloudProbe { channel: Channel, auth: CloudAuth },
     /// Watch a Plex channel: its stream's URL (and, in a debug build, its shape in the log).
@@ -95,6 +98,11 @@ pub enum Write {
     /// Add a channel to the account's favorites, or take it off (`add`), applied to the list as
     /// plex.tv holds it when the change goes out.
     Favorite { op: FavoriteOp, add: bool, auth: CloudAuth },
+    /// Record `airing` from the template entry `choice`, its settings as the options panel left
+    /// them.
+    RecordWith { airing: Airing, kind: RecordKind, choice: TemplateChoice },
+    /// Save a rule's settings as the options panel left them.
+    EditRule { id: String, edit: EditSubscription },
 }
 
 /// A job's answer.
@@ -114,6 +122,14 @@ pub enum Landing {
     CloudProbe(String),
     /// The favorites, and the server's `machineIdentifier` (empty if not yet learned).
     Favorites { machine: String, result: Result<Vec<FavoriteChannel>, LiveError> },
+    Options { serial: u32, result: Result<OptionsAnswer, LiveError> },
+}
+
+/// What a recording-options read found.
+#[derive(Debug)]
+pub enum OptionsAnswer {
+    Choice(TemplateChoice),
+    Rule(Subscription),
 }
 
 /// What a successful write did.
@@ -224,6 +240,15 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
         }
         Job::CloudProbe { channel, auth } => Landing::CloudProbe(auth.client().cloud_stream_shape(&channel)),
         Job::Favorites { auth } => Landing::Favorites { machine: client.machine_id().to_string(), result: auth.client().favorite_channels() },
+        Job::Options { serial, of } => {
+            let result = match of {
+                OptionsFor::Record { airing, kind } => {
+                    client.dvr_template(&airing.guid).and_then(|choices| pick_choice(choices, kind)).map(OptionsAnswer::Choice)
+                }
+                OptionsFor::Rule { id } => client.dvr_subscription(&id).map(OptionsAnswer::Rule),
+            };
+            Landing::Options { serial, result }
+        }
         Job::CloudTune { serial, channel, label, airing, auth } => {
             let client = auth.client();
             let shape = client.cloud_stream_shape(&channel);
@@ -276,6 +301,8 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
                 Write::Favorite { op, auth, .. } => {
                     auth.client().edit_favorite_channels(op).map(|list| WriteDone { favorites: Some(list), ..WriteDone::default() })
                 }
+                Write::RecordWith { choice, .. } => create(client, choice),
+                Write::EditRule { id, edit } => client.dvr_edit(id, edit).map(|_| WriteDone::default()),
             };
             Landing::Write { write, result }
         }
@@ -351,18 +378,27 @@ fn release(client: &plx_plex::plex::Client, subscription_id: &str, session: &str
     }
 }
 
-/// A record: read the template for the airing's program, take the choice that matches `kind`
-/// (episode/movie rule, or series rule), and create it with the template's own defaults.
-fn record(client: &plx_plex::plex::Client, airing: &Airing, kind: RecordKind) -> Result<WriteDone, LiveError> {
-    let choices = client.dvr_template(&airing.guid)?;
-    let want = |t: &plx_plex::plex::live_tv::TemplateChoice| match kind {
+/// The template entry that records `kind`: an episode's or a movie's own rule, or the series'.
+fn pick_choice(choices: Vec<TemplateChoice>, kind: RecordKind) -> Result<TemplateChoice, LiveError> {
+    let want = |t: &TemplateChoice| match kind {
         RecordKind::Series => t.kind == 2,
         RecordKind::This => t.kind == 1 || t.kind == 4,
     };
-    let choice = choices.iter().find(|t| want(t)).ok_or(LiveError::Server { status: 0, message: "The server offers no such recording for this program.".into() })?;
+    let choice = choices.into_iter().find(want).ok_or(LiveError::Server { status: 0, message: "The server offers no such recording for this program.".into() })?;
     if choice.target_section.is_empty() {
         return Err(LiveError::Server { status: 0, message: "There is no library to record into.".into() });
     }
+    Ok(choice)
+}
+
+/// A record with the template's own defaults (the player's record button): read the template for
+/// the airing's program, take the entry that matches `kind`, and create it.
+fn record(client: &plx_plex::plex::Client, airing: &Airing, kind: RecordKind) -> Result<WriteDone, LiveError> {
+    create(client, &pick_choice(client.dvr_template(&airing.guid)?, kind)?)
+}
+
+/// Create a rule from a template entry, its settings as they stand.
+fn create(client: &plx_plex::plex::Client, choice: &TemplateChoice) -> Result<WriteDone, LiveError> {
     let made = client.dvr_create(&CreateSubscription::from_choice(choice))?;
     Ok(WriteDone {
         rule: made.subscription_id,
@@ -436,6 +472,9 @@ pub struct LiveTvStore {
     machine: String,
     /// A tab was picked on the page: the guide no longer opens on the favorites by itself.
     tab_picked: bool,
+    /// The recording options the page's panel shows, and the rank of the last ask.
+    options: Option<RecordOptions>,
+    options_serial: u32,
     generation: u32,
 }
 
@@ -498,6 +537,8 @@ impl LiveTvStore {
             favorites_phase: Phase::Idle,
             machine: String::new(),
             tab_picked: false,
+            options: None,
+            options_serial: 0,
             generation: 0,
         }
     }
@@ -1069,6 +1110,28 @@ impl LiveTvStore {
         true
     }
 
+    // ---- recording options -------------------------------------------------------------------
+
+    /// Read the recording options of a new recording or of a rule, for the page's panel. An
+    /// earlier ask's answer is not this one's.
+    pub fn ask_options(&mut self, of: OptionsFor) {
+        if self.sid.is_none() {
+            return;
+        }
+        self.options_serial = self.options_serial.wrapping_add(1);
+        let serial = self.options_serial;
+        self.options = Some(RecordOptions { serial, of: of.clone(), phase: Phase::Loading, choice: None, rule: None });
+        self.queue.push_front(Job::Options { serial, of });
+        self.bump();
+    }
+
+    /// The options panel closed.
+    pub fn close_options(&mut self) {
+        if self.options.take().is_some() {
+            self.bump();
+        }
+    }
+
     /// Is channel row `ch` of the lineup shown one of Plex's own (a stream: no tuner to wait for)?
     pub fn row_is_cloud(&self, ch: usize) -> bool {
         self.channels.get(ch).is_some_and(|c| c.cloud)
@@ -1154,6 +1217,10 @@ impl LiveTvStore {
         if self.write_running.as_ref() == Some(&w) || self.write_queue.contains(&w) {
             plx_base::eventlog::log("livetv: the same DVR change is already on its way");
             return;
+        }
+        // the options panel's own write: the panel is done
+        if matches!(w, Write::RecordWith { .. } | Write::EditRule { .. }) {
+            self.options = None;
         }
         self.write_queue.push_back(w);
         self.bump();
@@ -1285,6 +1352,16 @@ impl LiveTvStore {
                     }
                 }
             }
+            Landing::Options { serial, result } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if let Some(o) = self.options.as_mut().filter(|o| o.serial == serial) {
+                    match result {
+                        Ok(OptionsAnswer::Choice(c)) => (o.choice, o.phase) = (Some(c), Phase::Ready),
+                        Ok(OptionsAnswer::Rule(r)) => (o.rule, o.phase) = (Some(r), Phase::Ready),
+                        Err(e) => o.phase = Phase::Failed(e.reason()),
+                    }
+                }
+            }
             Landing::CloudProbe(shape) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 plx_base::eventlog::log(&format!("livetv dbg: Plex channel stream: {shape}"));
@@ -1350,8 +1427,9 @@ impl LiveTvStore {
                 self.write_running = None;
                 self.notice_serial = self.notice_serial.wrapping_add(1);
                 let op = match &write {
-                    Write::Record { kind: RecordKind::This, .. } => WriteOp::Record,
-                    Write::Record { kind: RecordKind::Series, .. } => WriteOp::RecordSeries,
+                    Write::Record { kind: RecordKind::This, .. } | Write::RecordWith { kind: RecordKind::This, .. } => WriteOp::Record,
+                    Write::Record { kind: RecordKind::Series, .. } | Write::RecordWith { kind: RecordKind::Series, .. } => WriteOp::RecordSeries,
+                    Write::EditRule { .. } => WriteOp::EditRule,
                     Write::CancelRule { .. } => WriteOp::CancelRule,
                     Write::StopGrab { .. } => WriteOp::StopRecording,
                     Write::MoveRule { .. } => WriteOp::MoveRule,
@@ -1362,25 +1440,26 @@ impl LiveTvStore {
                 match result {
                     Ok(done) => {
                         match &write {
-                            Write::Record { airing, kind: RecordKind::This } => {
+                            Write::Record { airing, kind: RecordKind::This } | Write::RecordWith { airing, kind: RecordKind::This, .. } => {
                                 self.guide.overlay(&Overlay::Episode { guid: airing.guid.clone(), rule: done.rule.clone() })
                             }
-                            Write::Record { airing, kind: RecordKind::Series } => self.guide.overlay(&Overlay::Series {
-                                show_guid: airing.grandparent_guid.clone(),
-                                rule: done.rule.clone(),
-                            }),
+                            Write::Record { airing, kind: RecordKind::Series } | Write::RecordWith { airing, kind: RecordKind::Series, .. } => {
+                                self.guide.overlay(&Overlay::Series { show_guid: airing.grandparent_guid.clone(), rule: done.rule.clone() })
+                            }
                             Write::CancelRule { id } => {
                                 self.guide.overlay(&Overlay::Removed { rule: id.clone() });
                                 self.rules.retain(|r| &r.id != id);
                             }
-                            Write::StopGrab { .. } | Write::MoveRule { .. } | Write::Favorite { .. } => {}
+                            Write::StopGrab { .. } | Write::MoveRule { .. } | Write::Favorite { .. } | Write::EditRule { .. } => {}
                         }
                         if let Some(list) = done.favorites {
                             self.land_favorites(list);
                         }
                         let title = match &write {
-                            Write::Record { airing, .. } if !airing.show_title.is_empty() => airing.show_title.clone(),
-                            Write::Record { airing, .. } => airing.title.clone(),
+                            Write::Record { airing, .. } | Write::RecordWith { airing, .. } if !airing.show_title.is_empty() => {
+                                airing.show_title.clone()
+                            }
+                            Write::Record { airing, .. } | Write::RecordWith { airing, .. } => airing.title.clone(),
                             _ => String::new(),
                         };
                         self.notice = Some(WriteNotice {
@@ -1484,6 +1563,7 @@ impl LiveTvStore {
             favorites_phase: self.favorites_phase.clone(),
             favorite_dvr: !self.machine.is_empty() && !self.provider_id().is_empty(),
             favorite_cloud: self.favorites.iter().any(|f| !f.on_server()),
+            options: self.options.clone(),
         }
     }
 

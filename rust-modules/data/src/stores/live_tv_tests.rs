@@ -810,3 +810,60 @@ fn adding_a_favorite_writes_this_servers_entry_and_its_answer_is_the_list() {
     assert!(matches!(job, Job::Write(Write::Favorite { op: FavoriteOp::Remove(ref gone), add: false, .. }) if gone.len() == 1));
     assert!(!s.set_favorite(2, false), "not a favorite: nothing to take off");
 }
+
+/// **Recording options are read for the panel that asked**: a new recording's from the program's
+/// template (the entry its kind records), a rule's from the rule; an earlier ask's answer is not
+/// the panel's; the panel's write closes it, overlays the guide as a record does, and an edit
+/// says it was saved.
+#[test]
+fn recording_options_are_read_for_the_panel_and_its_write_records_with_them() {
+    use crate::live_tv::OptionsFor;
+    use plx_plex::plex::live_tv::{EditSubscription, TemplateChoice};
+    let script = Script::default();
+    let mut s = ready(&script, 1);
+    let a = airing(0, NOON, "plex://episode/e1", "plex://show/s1");
+    s.ask_options(OptionsFor::Record { airing: a.clone(), kind: RecordKind::Series });
+    s.pump();
+    let (job, first) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Options { .. })).expect("the options are read");
+    let Job::Options { serial: old, .. } = job else { unreachable!() };
+    assert!(s.snapshot().options.is_some_and(|o| o.phase.is_loading()));
+    // asked again before the first answer: the first answer is history
+    s.ask_options(OptionsFor::Record { airing: a.clone(), kind: RecordKind::Series });
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Options { .. })).unwrap();
+    let Job::Options { serial, .. } = job else { unreachable!() };
+    first.post(Landing::Options { serial: old, result: Err(LiveError::Transport) });
+    s.pump();
+    assert!(s.snapshot().options.is_some_and(|o| o.phase.is_loading()), "an earlier ask's answer is not the panel's");
+    let choice = TemplateChoice { kind: 2, parameters: "hints%5Bx%5D=1".into(), target_section: "4".into(), section_title: "DVR".into(), ..Default::default() };
+    post.post(Landing::Options { serial, result: Ok(OptionsAnswer::Choice(choice.clone())) });
+    s.pump();
+    let o = s.snapshot().options.expect("open");
+    assert!(o.phase.is_ready());
+    assert_eq!(o.library(), "DVR");
+    // the panel's Record: the options close, the write runs, the guide is marked
+    s.write(Write::RecordWith { airing: a.clone(), kind: RecordKind::Series, choice: choice.clone() });
+    assert!(s.snapshot().options.is_none());
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).unwrap();
+    let Job::Write(w) = job else { unreachable!() };
+    post.post(Landing::Write { write: w, result: Ok(WriteDone { rule: "51".into(), ..WriteDone::default() }) });
+    s.pump();
+    assert_eq!(s.snapshot().notice.map(|n| (n.op, n.rule)), Some((WriteOp::RecordSeries, "51".to_string())));
+    // a rule's options: read from the rule, saved as an edit
+    s.ask_options(OptionsFor::Rule { id: "51".into() });
+    s.pump();
+    let (job, _) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Options { .. })).unwrap();
+    assert!(matches!(job, Job::Options { of: OptionsFor::Rule { ref id }, .. } if id == "51"));
+    s.write(Write::EditRule { id: "51".into(), edit: EditSubscription::default() });
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).unwrap();
+    let Job::Write(w) = job else { unreachable!() };
+    post.post(Landing::Write { write: w, result: Ok(WriteDone::default()) });
+    s.pump();
+    assert_eq!(s.snapshot().notice.map(|n| n.op), Some(WriteOp::EditRule));
+    // closed without a write
+    s.ask_options(OptionsFor::Rule { id: "51".into() });
+    s.close_options();
+    assert!(s.snapshot().options.is_none());
+}

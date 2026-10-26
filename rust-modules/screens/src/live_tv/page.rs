@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 use std::ffi::CString;
 
-use plx_data::live_tv::{Availability, Phase, Source, TunePhase, WriteOp};
+use plx_data::live_tv::{Availability, OptionsFor, Phase, RecordKind, Source, TunePhase, WriteOp};
 use plx_data::stores::live_tv::Write;
 use plx_machine::machine::{
     By, Canon, Cx, Delivery, Edge, Effects, Enter, EntryId, FocusKey, FocusTarget, Fx, GroupId, Handled, InputEvent,
@@ -44,6 +44,7 @@ pub const HEAD: GroupId = GroupId(1);
 pub const PANEL: GroupId = GroupId(2);
 pub const RETRY_GROUP: GroupId = GroupId(3);
 pub const TABS: GroupId = GroupId(4);
+pub const OPTIONS: GroupId = GroupId(5);
 
 /// How long a notice stays up, ms of the tick clock.
 const NOTICE_MS: u32 = 5_000;
@@ -76,6 +77,10 @@ pub enum LiveTvOut {
     Write(Write),
     /// Add channel row `row` to the account's favorites (`on`), or take it off.
     Favorite { row: usize, on: bool },
+    /// Read the recording options of a new recording or of a rule (the panel opened).
+    Options(OptionsFor),
+    /// The recording-options panel closed without a write.
+    CloseOptions,
     /// Try again on the failure read-out.
     Retry,
     /// The Recordings mode opened: read the lists again.
@@ -122,6 +127,8 @@ pub struct LiveTvScreen {
     notice: Option<(String, Option<u32>)>,
     /// A recording just made that conflicts, waiting for the next tick to open its panel.
     conflict: Option<Target>,
+    /// The recording-options panel, while open (its settings are the store's answer).
+    opts: Option<Opts>,
     notice_serial: Option<u32>,
     tune_failure_shown: bool,
     own_enters: u32,
@@ -146,6 +153,25 @@ pub struct LiveTvScreen {
     cell_grow: Vec<(u32, plx_ui::Spring)>,
 }
 
+/// **The recording-options panel** (Record, Record Series, a rule's Edit Options): the store's
+/// answer is its settings; this is what the viewer changed (setting id → value), the first row
+/// shown, the answer it last seated focus for, and where focus goes back to.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Opts {
+    edits: Vec<(String, String)>,
+    top: usize,
+    seated: Option<u32>,
+    from: u32,
+}
+
+/// Setting rows the options panel shows at once (it scrolls past them).
+const OPT_ROWS: usize = 7;
+/// The options panel's read-out, as the placeholder census names it.
+const OPTIONS_NOTE: &str = "livetv-options";
+const OPT_W: f32 = 1_000.0;
+const OPT_ROW_H: f32 = 60.0;
+const OPT_PITCH: f32 = 66.0;
+
 impl LiveTvScreen {
     /// The heartbeat word, byte-identical to the route word (`app/words.rs`).
     pub const WORD: &'static str = "livetv";
@@ -165,6 +191,7 @@ impl LiveTvScreen {
             panel_from: model::HEAD_GUIDE,
             notice: None,
             conflict: None,
+            opts: None,
             notice_serial: None,
             tune_failure_shown: false,
             own_enters: 0,
@@ -460,6 +487,12 @@ impl LiveTvScreen {
         self.close_panel(fx);
         match (action, &panel.target) {
             (Action::Close, _) => {}
+            // a recording is made from its options, the server's defaults first (OK twice records)
+            (Action::Record | Action::RecordSeries, Target::Airing { airing, .. }) => {
+                let kind = if action == Action::Record { RecordKind::This } else { RecordKind::Series };
+                self.open_options(OptionsFor::Record { airing: airing.clone(), kind }, fx);
+            }
+            (Action::EditOptions, Target::Rule(s)) => self.open_options(OptionsFor::Rule { id: s.id.clone() }, fx),
             (Action::Watch, Target::Airing { row, airing }) => {
                 self.route(LiveTvOut::Watch { row: *row, airing: Some(airing.clone()) }, fx)
             }
@@ -478,8 +511,209 @@ impl LiveTvScreen {
         }
     }
 
+    // ---- the recording-options panel -------------------------------------------------------
+
+    /// Open the options panel for `of` (its settings follow from the store).
+    fn open_options<H: ContentLike>(&mut self, of: OptionsFor, fx: &mut Effects<'_, H>) {
+        let from = self.panel_from;
+        self.opts = Some(Opts { from, ..Opts::default() });
+        self.route(LiveTvOut::Options(of), fx);
+        self.seat_elem(model::OPT_CANCEL, fx);
+    }
+
+    /// Close the options panel without a write; focus goes back where it came from.
+    fn close_options<H: ContentLike>(&mut self, fx: &mut Effects<'_, H>) {
+        if let Some(o) = self.opts.take() {
+            self.route(LiveTvOut::CloseOptions, fx);
+            self.seat_elem(o.from, fx);
+        }
+    }
+
+    /// The store's options, when they are the open panel's and answered.
+    fn options_ready(&self) -> Option<&plx_data::live_tv::RecordOptions> {
+        self.opts.as_ref()?;
+        self.view.snap.options.as_ref().filter(|o| o.phase.is_ready())
+    }
+
+    /// The setting rows the open panel shows, in order.
+    fn opt_settings(&self) -> Vec<&plx_plex::plex::live_tv::Setting> {
+        self.options_ready().map(|o| model::shown_settings(o.settings())).unwrap_or_default()
+    }
+
+    /// Setting row `i`'s value now: the viewer's edit, else the server's.
+    fn opt_value(&self, i: usize) -> Option<String> {
+        let s = *self.opt_settings().get(i)?;
+        let edited = self.opts.as_ref()?.edits.iter().find(|(id, _)| *id == s.id).map(|(_, v)| v.clone());
+        Some(edited.unwrap_or_else(|| s.value.clone()))
+    }
+
+    /// The panel's keys in focus order: the setting rows, then Record (or Save), then Cancel.
+    fn opt_elems(&self) -> Vec<u32> {
+        let ready = self.options_ready().is_some();
+        let rows = (0..self.opt_settings().len()).map(|i| model::OPT_BASE + i as u32);
+        rows.chain(ready.then_some(model::OPT_GO)).chain(std::iter::once(model::OPT_CANCEL)).collect()
+    }
+
+    /// Step setting row `i` to its next value (`by` ±1).
+    fn opt_step(&mut self, i: usize, by: i32) {
+        let Some(s) = self.opt_settings().get(i).map(|s| (*s).clone()) else { return };
+        let Some(now) = self.opt_value(i) else { return };
+        let next = model::step_value(&s, &now, by);
+        if let Some(o) = self.opts.as_mut() {
+            o.edits.retain(|(id, _)| *id != s.id);
+            o.edits.push((s.id.clone(), next));
+        }
+        plx_machine::idle::invalidate();
+    }
+
+    /// Record (or Save) with the settings as the panel left them.
+    fn opt_commit<H: ContentLike>(&mut self, fx: &mut Effects<'_, H>) {
+        let (Some(o), Some(opts)) = (self.options_ready().cloned(), self.opts.clone()) else { return };
+        let write = match (&o.of, o.choice, o.rule) {
+            (OptionsFor::Record { airing, kind }, Some(mut choice), _) => {
+                choice.settings = model::with_edits(&choice.settings, &opts.edits);
+                Write::RecordWith { airing: airing.clone(), kind: *kind, choice }
+            }
+            (OptionsFor::Rule { id }, _, Some(mut rule)) => {
+                rule.settings = model::with_edits(&rule.settings, &opts.edits);
+                Write::EditRule { id: id.clone(), edit: plx_plex::plex::live_tv::EditSubscription::from_subscription(&rule) }
+            }
+            _ => return,
+        };
+        self.opts = None;
+        self.route(LiveTvOut::Write(write), fx);
+        self.seat_elem(opts.from, fx);
+    }
+
+    /// The options panel's rect: its title, a line for the library, the rows shown, the buttons.
+    fn opts_rect(&self) -> Rect {
+        let rows = self.opt_settings().len().clamp(1, OPT_ROWS) as f32;
+        let h = 32.0 + 52.0 + 44.0 + 24.0 + rows * OPT_PITCH + 16.0 + 2.0 * geom::ACTION_PITCH + 20.0;
+        Rect::new((SCR_W - OPT_W) * 0.5, ((SCR_H - h) * 0.5).max(40.0), OPT_W, h)
+    }
+
+    /// Where an options-panel key is drawn (a row scrolled off is placed where it would stand).
+    fn opt_rect(&self, elem: u32) -> Option<Rect> {
+        let r = self.opts_rect();
+        let top = self.opts.as_ref().map_or(0, |o| o.top);
+        let rows_y = r.y + 32.0 + 52.0 + 44.0 + 24.0;
+        let shown = self.opt_settings().len().clamp(1, OPT_ROWS) as f32;
+        let buttons_y = rows_y + shown * OPT_PITCH + 16.0;
+        match elem {
+            model::OPT_GO => Some(Rect::new(r.x + 48.0, buttons_y, r.w - 96.0, geom::ACTION_H)),
+            model::OPT_CANCEL => Some(Rect::new(r.x + 48.0, buttons_y + geom::ACTION_PITCH, r.w - 96.0, geom::ACTION_H)),
+            _ => {
+                let i = model::opt_of(elem)?;
+                Some(Rect::new(r.x + 32.0, rows_y + (i as f32 - top as f32) * OPT_PITCH, r.w - 64.0, OPT_ROW_H))
+            }
+        }
+    }
+
+    fn draw_options<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
+        p.rrect(Rect::FULL, 0.0, 0.0, theme::with_a([0.0, 0.0, 0.0, 1.0], 0.6));
+        let r = self.opts_rect();
+        p.rect(r, 24.0, theme::PANEL_TOP, theme::PANEL_BOT, 0.0);
+        let snap_opts = self.view.snap.options.as_ref();
+        let title = match snap_opts.map(|o| &o.of) {
+            Some(OptionsFor::Record { airing, .. }) => if airing.show_title.is_empty() { airing.title.clone() } else { airing.show_title.clone() },
+            Some(OptionsFor::Rule { id }) => self
+                .view
+                .snap
+                .rules
+                .iter()
+                .find(|s| &s.id == id)
+                .map(|s| [&s.hint.show_title, &s.hint.title, &s.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_default())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        TextView::new(&title, theme::size::HEADLINE, theme::TEXT_PRIMARY)
+            .bold()
+            .with_measure(f.measure)
+            .max_lines(1)
+            .h(HAlign::Center)
+            .draw(p, Rect::new(r.x + 32.0, r.y + 32.0, r.w - 64.0, 0.0));
+        // still on its way: a read-out standing in for the settings
+        if !snap_opts.is_some_and(|o| matches!(o.phase, Phase::Ready | Phase::Failed(_))) {
+            plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, OPTIONS_NOTE);
+        }
+        let sub = match snap_opts.map(|o| (&o.phase, o.library())) {
+            Some((Phase::Ready, lib)) if !lib.is_empty() => format!("{} \u{b7} {}", msg::live_tv_options_title(), msg::live_tv_options_library(lib)),
+            Some((Phase::Failed(why), _)) => msg::live_tv_options_failed(why),
+            Some((Phase::Ready, _)) => msg::live_tv_options_title().to_string(),
+            _ => msg::live_tv_options_loading().to_string(),
+        };
+        TextView::new(&sub, theme::size::LABEL, theme::TEXT_SECONDARY)
+            .with_measure(f.measure)
+            .max_lines(1)
+            .h(HAlign::Center)
+            .draw(p, Rect::new(r.x + 32.0, r.y + 32.0 + 56.0, r.w - 64.0, 0.0));
+        let settings = self.opt_settings();
+        let top = self.opts.as_ref().map_or(0, |o| o.top);
+        for (i, s) in settings.iter().enumerate().skip(top).take(OPT_ROWS) {
+            let elem = model::OPT_BASE + i as u32;
+            let Some(row) = self.opt_rect(elem) else { continue };
+            let on = self.focused(f, elem);
+            let (fill, ink, ink2) = if on {
+                (theme::ACCENT, theme::ACCENT_INK, theme::ACCENT_INK)
+            } else {
+                (theme::with_a(theme::TEXT_PRIMARY, 0.06), theme::TEXT_PRIMARY, theme::TEXT_SECONDARY)
+            };
+            p.rrect(row, 12.0, 12.0, fill);
+            let value = self.opt_value(i).unwrap_or_default();
+            let words = if !s.options.is_empty() {
+                s.options.iter().find(|o| o.value == value).map_or(value.clone(), |o| o.label.clone())
+            } else if s.kind == plx_plex::plex::live_tv::SettingKind::Bool {
+                if model::switch_on(&value) { msg::widgets_toggle_on() } else { msg::widgets_toggle_off() }.to_string()
+            } else {
+                value.clone()
+            };
+            // a value that can change says so when focused: ‹ value ›
+            let words = if on && (s.kind != plx_plex::plex::live_tv::SettingKind::Text || !s.options.is_empty()) {
+                format!("\u{2039}  {words}  \u{203a}")
+            } else {
+                words
+            };
+            let vw = f.measure.width_str(&words, theme::size::LABEL, true).min(row.w * 0.5);
+            TextView::new(&s.label, theme::size::LABEL, ink)
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(row.x + 24.0, row.y + (row.h - f.measure.line_h(theme::size::LABEL)) * 0.5, row.w - vw - 72.0, 0.0));
+            TextView::new(&words, theme::size::LABEL, if on { ink } else { ink2 })
+                .bold()
+                .with_measure(f.measure)
+                .max_lines(1)
+                .draw(p, Rect::new(row.x + row.w - 24.0 - vw, row.y + (row.h - f.measure.line_h(theme::size::LABEL)) * 0.5, vw, 0.0));
+            f.stop(p, stop(self.key(elem), row));
+        }
+        let go = match snap_opts.map(|o| &o.of) {
+            Some(OptionsFor::Rule { .. }) => msg::live_tv_action_save(),
+            _ => msg::live_tv_action_record(),
+        };
+        let ready = self.options_ready().is_some();
+        for (elem, label) in [(model::OPT_GO, go), (model::OPT_CANCEL, msg::live_tv_action_cancel())] {
+            if elem == model::OPT_GO && !ready {
+                continue;
+            }
+            let (Some(rect), Ok(text)) = (self.opt_rect(elem), CString::new(label)) else { continue };
+            Button::new(text.as_ptr(), theme::size::BODY, rect).focused(self.focused(f, elem)).ground(ControlGround::Keyed).draw(&Env::inert(), p);
+            f.stop(p, stop(self.key(elem), rect));
+        }
+    }
+
     /// A non-strip element activated (OK, or a pointer press).
     fn activate<H: ContentLike>(&mut self, elem: u32, fx: &mut Effects<'_, H>) -> Handled {
+        if self.opts.is_some() {
+            match elem {
+                model::OPT_GO => self.opt_commit(fx),
+                model::OPT_CANCEL => self.close_options(fx),
+                e => {
+                    if let Some(i) = model::opt_of(e) {
+                        self.opt_step(i, 1);
+                    }
+                }
+            }
+            return Handled::Yes;
+        }
         if self.panel.is_some() && model::action_of(elem).is_none() {
             return Handled::Yes;
         }
@@ -589,6 +823,10 @@ impl LiveTvScreen {
     /// BACK: the panel closes, a tune is cancelled, the content gives way to the header, the
     /// header to the strip, and from the strip the page leaves.
     fn back<H: ContentLike>(&mut self, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
+        if self.opts.is_some() {
+            self.close_options(fx);
+            return Handled::Yes;
+        }
         if self.panel.is_some() {
             self.close_panel(fx);
             return Handled::Yes;
@@ -620,6 +858,16 @@ impl LiveTvScreen {
             return;
         }
         self.focus = Some(elem);
+        // the options panel's rows scroll to keep the focused one in view
+        if let (Some(i), Some(o)) = (model::opt_of(elem), self.opts.as_mut()) {
+            if i < o.top {
+                o.top = i;
+            } else if i >= o.top + OPT_ROWS {
+                o.top = i + 1 - OPT_ROWS;
+            }
+            plx_machine::idle::invalidate();
+            return;
+        }
         // Landed, wherever: the re-seat a read asked for is spent. A row landed on is the one the
         // focus keeps through reads; the panel's actions keep the row the panel is about.
         self.rec_reseat = None;
@@ -691,6 +939,15 @@ impl LiveTvScreen {
                 self.tune_failure_shown = true;
                 self.notice = Some((msg::live_tv_tune_failed(channel, reason), None));
                 self.route(LiveTvOut::DismissTuneFailure, fx);
+            }
+        }
+        // The options answered: focus goes to Record (OK twice records with the server's defaults).
+        let answered = self.options_ready().map(|o| o.serial);
+        if let (Some(serial), Some(o)) = (answered, self.opts.as_mut()) {
+            if o.seated != Some(serial) {
+                o.seated = Some(serial);
+                o.top = 0;
+                self.seat_elem(model::OPT_GO, fx);
             }
         }
         // A conflicting recording's panel opens over whatever is up (the guide, the list).
@@ -1660,6 +1917,7 @@ fn action_label(a: Action) -> &'static str {
         Action::Favorite => msg::live_tv_action_add_favorite(),
         Action::Unfavorite => msg::live_tv_action_remove_favorite(),
         Action::Prefer => msg::live_tv_action_prefer(),
+        Action::EditOptions => msg::live_tv_action_edit_options(),
         Action::CancelNew => msg::live_tv_action_cancel_new(),
         Action::Close => msg::live_tv_action_close(),
     }
@@ -1823,6 +2081,7 @@ fn notice_text(n: &plx_data::live_tv::WriteNotice) -> String {
         WriteOp::MoveRule => msg::live_tv_notice_moved().to_string(),
         WriteOp::FavoriteAdded => msg::live_tv_notice_favorite_added().to_string(),
         WriteOp::FavoriteRemoved => msg::live_tv_notice_favorite_removed().to_string(),
+        WriteOp::EditRule => msg::live_tv_notice_options_saved().to_string(),
     }
 }
 
@@ -1917,6 +2176,17 @@ impl<H: ContentLike> Machine<H> for LiveTvScreen {
             ScreenEvent::Input(InputEvent { kind: InputKind::Key { key: Key::Back, edge: Edge::Down, .. }, .. }) => {
                 self.back(cx, fx)
             }
+            // LEFT/RIGHT on an option's row change its value (the panel's group hands them back
+            // at its edge)
+            ScreenEvent::Input(InputEvent { kind: InputKind::Key { key: key @ (Key::Left | Key::Right), edge: Edge::Down, at_edge: true, .. }, .. })
+                if self.opts.is_some() =>
+            {
+                if let Some(i) = cx.focus.current.filter(|k| k.entry == self.entry).and_then(|k| model::opt_of(k.elem)) {
+                    self.opt_step(i, if *key == Key::Left { -1 } else { 1 });
+                    fx.invalidate(Provenance::Input);
+                }
+                Handled::Yes
+            }
             // CH▲/CH▼ and PageUp/Down page the guide (four rows) and the Recordings list; the Magic
             // Remote's wheel steps a row per tick. The D-pad is one row per press, and a lineup of
             // several hundred channels is a long way one at a time.
@@ -1954,6 +2224,14 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             len,
             elem: ElemKind::Control,
         };
+        if self.opts.is_some() {
+            // modal; LEFT/RIGHT at its edge come back to the page (an option's value)
+            out.push(GroupSpec {
+                edge: [EdgeRule::Stop, EdgeRule::Stop, EdgeRule::Screen, EdgeRule::Screen],
+                ..spec(OPTIONS, GroupKind::Column, self.opt_elems().len(), self.opts_rect())
+            });
+            return;
+        }
         if let Some(panel) = &self.panel {
             out.push(spec(PANEL, GroupKind::Column, panel.actions.len(), panel_rect(panel)));
             return;
@@ -1987,6 +2265,9 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
 
     fn group_of(&self, elem: &u32, _cx: &Cx<'_, H>) -> Option<GroupId> {
         let e = *elem;
+        if self.opts.is_some() {
+            return self.opt_elems().contains(&e).then_some(OPTIONS);
+        }
         if self.panel.is_some() {
             return model::action_of(e).map(|_| PANEL);
         }
@@ -2003,6 +2284,15 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
     fn neighbour(&self, key: FocusKey<u32>, dir: Dir, _cx: &Cx<'_, H>) -> Step<u32> {
         let e = key.elem;
         let to = |elem: u32| Step::Move(FocusKey { entry: key.entry, elem });
+        if model::is_opt(e) {
+            let order = self.opt_elems();
+            let Some(i) = order.iter().position(|x| *x == e) else { return Step::Edge };
+            return match dir {
+                Dir::Up if i > 0 => to(order[i - 1]),
+                Dir::Down if i + 1 < order.len() => to(order[i + 1]),
+                _ => Step::Edge,
+            };
+        }
         if let Some(i) = model::action_of(e) {
             let n = self.panel.as_ref().map_or(0, |p| p.actions.len());
             return match dir {
@@ -2045,6 +2335,10 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
     fn place(&self, elem: &u32, cx: &Cx<'_, H>, _at: At) -> Option<Placed> {
         let e = *elem;
         let placed = |rect: Rect, index: usize| Placed { rect, rest_rect: rect, clip: Rect::FULL, index: Some(index as u32) };
+        if model::is_opt(e) {
+            let index = self.opt_elems().iter().position(|x| *x == e)?;
+            return self.opt_rect(e).map(|r| placed(r, index));
+        }
         if let Some(i) = model::action_of(e) {
             let panel = self.panel.as_ref()?;
             return (i < panel.actions.len()).then(|| placed(action_rect(panel, i), i));
@@ -2079,6 +2373,11 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             return want;
         }
         let key = |elem| FocusKey { entry: self.entry, elem };
+        // The options panel is modal: anything else lands on its last key (Cancel, or Record).
+        if self.opts.is_some() {
+            let order = self.opt_elems();
+            return if order.contains(&e) { want } else { key(if order.contains(&model::OPT_GO) { model::OPT_GO } else { model::OPT_CANCEL }) };
+        }
         // An open panel is modal for the pointer too: a hover on the strip or the dimmed guide
         // behind it lands back on the panel.
         if let Some(panel) = &self.panel {
@@ -2139,6 +2438,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
     fn seat(&self, group: GroupId, from: Placed, _cx: &Cx<'_, H>) -> FocusKey<u32> {
         let key = |elem| FocusKey { entry: self.entry, elem };
         match group {
+            OPTIONS => key(if self.options_ready().is_some() { model::OPT_GO } else { model::OPT_CANCEL }),
             PANEL => key(model::ACTION_BASE),
             RETRY_GROUP => key(model::RETRY),
             HEAD => key(self.mode_pill()),
@@ -2201,6 +2501,9 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
         if let Some(panel) = self.panel.clone() {
             self.draw_panel(f, p, &panel);
         }
+        if self.opts.is_some() {
+            self.draw_options(f, p);
+        }
     }
     fn render(&self) -> RenderStrategy {
         RenderStrategy::Page
@@ -2212,7 +2515,7 @@ impl<H: ContentLike> Screen<H> for LiveTvScreen {
         HitSource::Engine
     }
     fn links(&self, out: &mut Vec<Link>) {
-        if self.panel.is_some() {
+        if self.panel.is_some() || self.opts.is_some() {
             return;
         }
         let strip = plx_ui::containers::tabs::STRIP;
