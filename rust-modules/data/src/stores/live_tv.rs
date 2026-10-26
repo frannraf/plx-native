@@ -23,9 +23,12 @@
 //! against the server that tuned it, and never played.
 
 use crate::live_tv::{
-    self as lt, Availability, CloudAuth, GuideCache, Overlay, Phase, RecordKind, Snapshot, Source, TunePhase, Tuned, WriteNotice, WriteOp,
+    self as lt, Availability, ChannelKey, CloudAuth, GuideCache, Overlay, Phase, RecordKind, Snapshot, Source, TunePhase, Tuned, WriteNotice,
+    WriteOp,
 };
-use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, CreateSubscription, EpgProvider, Grab, LiveError, Subscription};
+use plx_plex::plex::live_tv::{
+    Airing, Channel, CloudTab, CreateSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, Subscription,
+};
 use plx_plex::plex::ServerId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,7 +60,8 @@ pub fn drain_releases() {
 pub enum Job {
     Providers,
     Channels { provider: String },
-    Grid { provider: String, ch: usize, channel: Channel, date: String },
+    /// One DVR channel's programs for one UTC day.
+    Grid { provider: String, channel: Channel, date: String },
     /// Read the recording rules and operations. `serial` ranks the read: the newest one asked is
     /// the lists, an older one landing after it is history (`Landing::Dvr`).
     Dvr { serial: u32 },
@@ -72,7 +76,9 @@ pub enum Job {
     /// Plex's own channels: their genre tabs; a lineup (all of them, or one tab); one channel-day.
     CloudTabs { auth: CloudAuth },
     CloudChannels { source: Source, auth: CloudAuth },
-    CloudGrid { source: Source, ch: usize, channel: Channel, date: String, auth: CloudAuth },
+    CloudGrid { channel: Channel, date: String, auth: CloudAuth },
+    /// The account's favorite channels (plex.tv), and the server's identity they name its DVR by.
+    Favorites { auth: CloudAuth },
     /// The debug log's look at a Plex channel's stream (what the player would have to read).
     CloudProbe { channel: Channel, auth: CloudAuth },
     /// Watch a Plex channel: its stream's URL (and, in a debug build, its shape in the log).
@@ -86,6 +92,9 @@ pub enum Write {
     CancelRule { id: String },
     StopGrab { key: String },
     MoveRule { id: String, after: Option<String> },
+    /// Add a channel to the account's favorites, or take it off (`add`), applied to the list as
+    /// plex.tv holds it when the change goes out.
+    Favorite { op: FavoriteOp, add: bool, auth: CloudAuth },
 }
 
 /// A job's answer.
@@ -93,7 +102,8 @@ pub enum Write {
 pub enum Landing {
     Providers(Result<Vec<EpgProvider>, LiveError>),
     Channels(Result<Vec<Channel>, LiveError>),
-    Grid { ch: usize, date: String, result: Result<Vec<Airing>, LiveError> },
+    /// One channel-day of the guide, from the server or Plex's provider alike.
+    Grid { key: ChannelKey, date: String, result: Result<Vec<Airing>, LiveError> },
     Dvr { serial: u32, result: Result<(Vec<Subscription>, Vec<Grab>), LiveError> },
     Write { write: Write, result: Result<WriteDone, LiveError> },
     Tuned { serial: u32, result: Result<Tuned, LiveError> },
@@ -101,8 +111,9 @@ pub enum Landing {
     Blur { art: String, result: Result<[[f32; 3]; 4], LiveError> },
     CloudTabs(Result<Vec<CloudTab>, LiveError>),
     CloudChannels { source: Source, result: Result<Vec<Channel>, LiveError> },
-    CloudGrid { source: Source, ch: usize, date: String, result: Result<Vec<Airing>, LiveError> },
     CloudProbe(String),
+    /// The favorites, and the server's `machineIdentifier` (empty if not yet learned).
+    Favorites { machine: String, result: Result<Vec<FavoriteChannel>, LiveError> },
 }
 
 /// What a successful write did.
@@ -112,6 +123,8 @@ pub struct WriteDone {
     pub rule: String,
     /// A record that answered conflicts: what it collides with (titles).
     pub conflicts: Vec<String>,
+    /// A favorites change: the list it wrote.
+    pub favorites: Option<Vec<FavoriteChannel>>,
 }
 
 /// Where a job's worker posts its landing; stamped with the store epoch it was issued under.
@@ -205,11 +218,12 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
             let result = auth.client().cloud_channels(source.genre());
             Landing::CloudChannels { source, result }
         }
-        Job::CloudGrid { source, ch, channel, date, auth } => {
+        Job::CloudGrid { channel, date, auth } => {
             let result = auth.client().cloud_grid(&channel, &date);
-            Landing::CloudGrid { source, ch, date, result }
+            Landing::Grid { key: ChannelKey::of(&channel), date, result }
         }
         Job::CloudProbe { channel, auth } => Landing::CloudProbe(auth.client().cloud_stream_shape(&channel)),
+        Job::Favorites { auth } => Landing::Favorites { machine: client.machine_id().to_string(), result: auth.client().favorite_channels() },
         Job::CloudTune { serial, channel, label, airing, auth } => {
             let client = auth.client();
             let shape = client.cloud_stream_shape(&channel);
@@ -248,9 +262,9 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
         }
         Job::Providers => Landing::Providers(client.live_tv_providers()),
         Job::Channels { provider } => Landing::Channels(client.live_tv_channels(&provider)),
-        Job::Grid { provider, ch, channel, date } => {
+        Job::Grid { provider, channel, date } => {
             let result = client.live_tv_grid(&provider, &channel, &date);
-            Landing::Grid { ch, date, result }
+            Landing::Grid { key: ChannelKey::of(&channel), date, result }
         }
         Job::Dvr { serial } => Landing::Dvr { serial, result: client.dvr_subscriptions().and_then(|rules| client.dvr_scheduled().map(|s| (rules, s))) },
         Job::Write(write) => {
@@ -259,6 +273,9 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
                 Write::CancelRule { id } => client.dvr_delete(id).map(|_| WriteDone::default()),
                 Write::StopGrab { key } => client.dvr_cancel_grab(key).map(|_| WriteDone::default()),
                 Write::MoveRule { id, after } => client.dvr_move(id, after.as_deref()).map(|_| WriteDone::default()),
+                Write::Favorite { op, auth, .. } => {
+                    auth.client().edit_favorite_channels(op).map(|list| WriteDone { favorites: Some(list), ..WriteDone::default() })
+                }
             };
             Landing::Write { write, result }
         }
@@ -350,6 +367,7 @@ fn record(client: &plx_plex::plex::Client, airing: &Airing, kind: RecordKind) ->
     Ok(WriteDone {
         rule: made.subscription_id,
         conflicts: made.conflicts.iter().map(|c| if c.airing.title.is_empty() { "another recording".to_string() } else { c.airing.title.clone() }).collect(),
+        favorites: None,
     })
 }
 
@@ -370,6 +388,7 @@ pub struct LiveTvStore {
     provider: Option<EpgProvider>,
     channels_phase: Phase,
     channels: Vec<Channel>,
+    /// Every tab's channel-days, by channel: a channel shown in two tabs is read once.
     guide: GuideCache,
     dvr_phase: Phase,
     /// The rank of the last read of the lists asked for (`Job::Dvr`): more than one can be on
@@ -403,22 +422,28 @@ pub struct LiveTvStore {
     /// art was first asked in, for forgetting the oldest past [`MAX_BLURS`].
     blurs: HashMap<String, Option<[[f32; 3]; 4]>>,
     blur_order: VecDeque<String>,
-    /// Which lineup `channels`/`channels_phase`/`guide` are (the guide tab shown); the others a
-    /// page has shown are put aside with their caches, and their answers still land there.
+    /// Which lineup `channels`/`channels_phase` are (the guide tab shown); the others a page has
+    /// shown are put aside, and their answers still land there.
     source: Source,
     stash: HashMap<Source, Lineup>,
     /// Plex's own channels: their genre tabs, and who their reads act for.
     cloud_tabs: Vec<CloudTab>,
     cloud_auth: Option<CloudAuth>,
+    /// The account's favorite channels, in its order, and where their read stands.
+    favorites: Vec<FavoriteChannel>,
+    favorites_phase: Phase,
+    /// The server's machineIdentifier, as a favorite names its DVR (learned with the favorites).
+    machine: String,
+    /// A tab was picked on the page: the guide no longer opens on the favorites by itself.
+    tab_picked: bool,
     generation: u32,
 }
 
-/// A lineup put aside (a guide tab not shown).
+/// A lineup put aside (a guide tab not shown). Its channels' days stay in the one cache.
 #[derive(Default)]
 struct Lineup {
     phase: Phase,
     channels: Vec<Channel>,
-    guide: GuideCache,
 }
 
 impl Default for LiveTvStore {
@@ -469,6 +494,10 @@ impl LiveTvStore {
             stash: HashMap::new(),
             cloud_tabs: Vec::new(),
             cloud_auth: None,
+            favorites: Vec::new(),
+            favorites_phase: Phase::Idle,
+            machine: String::new(),
+            tab_picked: false,
             generation: 0,
         }
     }
@@ -534,7 +563,8 @@ impl LiveTvStore {
     /// press: its tune, if it lands, is released. `false` when nothing can be tuned (no lineup,
     /// a provider without a DVR).
     pub fn tune(&mut self, ch: usize, airing: Option<Airing>) -> bool {
-        if self.source.is_cloud() {
+        // A Plex channel plays its stream, whatever tab lists it (the favorites mix both kinds).
+        if self.channels.get(ch).is_some_and(|c| c.cloud) {
             return self.watch_cloud(ch, airing);
         }
         let Some(dvr_key) = self.provider.as_ref().filter(|p| p.tunable()).map(|p| p.dvr_key.clone()) else { return false };
@@ -588,34 +618,49 @@ impl LiveTvStore {
         &self.source
     }
 
-    /// Show `source`'s lineup (a guide tab). The lineup shown goes aside with its cache; one never
-    /// read (or that failed) is asked for. Plex's own channels need the profile's plex.tv identity.
+    /// The page picked tab `source`: shown, and from now on the guide stays on the tab picked.
     pub fn select_source(&mut self, source: Source) {
+        self.tab_picked = true;
+        self.show_source(source);
+    }
+
+    /// The guide opens on the account's favorites, as the stock app's does, until a tab is
+    /// picked: the application asks when the page is shown, and a landing asks again while no
+    /// window was shown yet (the favorites answering after the lineup).
+    pub fn land_on_favorites(&mut self) {
+        if !self.tab_picked && self.source == Source::Dvr && !self.favorites_lineup().is_empty() {
+            plx_base::eventlog::log("livetv: the guide opens on the favorites");
+            self.show_source(Source::Favorites);
+        }
+    }
+
+    /// Show `source`'s lineup (a guide tab). The lineup shown goes aside; one never read (or that
+    /// failed) is asked for. Plex's own channels and the favorites need the profile's plex.tv
+    /// identity.
+    fn show_source(&mut self, source: Source) {
         if source == self.source {
             return;
         }
-        if source.is_cloud() && self.cloud_auth.is_none() {
+        if source.needs_account() && self.cloud_auth.is_none() {
             self.cloud_auth = CloudAuth::capture();
             if self.cloud_auth.is_none() {
                 plx_base::eventlog::log("livetv: Plex channels need a plex.tv sign-in");
                 return;
             }
         }
-        let shown = Lineup {
-            phase: std::mem::take(&mut self.channels_phase),
-            channels: std::mem::take(&mut self.channels),
-            guide: std::mem::take(&mut self.guide),
-        };
+        let shown = Lineup { phase: std::mem::take(&mut self.channels_phase), channels: std::mem::take(&mut self.channels) };
         let left = std::mem::replace(&mut self.source, source.clone());
         self.stash.insert(left, shown);
         let next = self.stash.remove(&source).unwrap_or_default();
-        (self.channels_phase, self.channels, self.guide) = (next.phase, next.channels, next.guide);
+        (self.channels_phase, self.channels) = (next.phase, next.channels);
         plx_base::eventlog::log(&format!("livetv: guide tab {}", match &self.source {
+            Source::Favorites => "the favorites",
             Source::Dvr => "the DVR",
             Source::Plex => "Plex Channels",
             Source::PlexTab(_) => "a Plex genre",
         }));
-        if matches!(self.channels_phase, Phase::Idle | Phase::Failed(_)) {
+        // the favorites' lineup is made, not read: made again from what is known now
+        if matches!(self.channels_phase, Phase::Idle | Phase::Failed(_)) || self.source == Source::Favorites {
             self.ask_lineup();
         } else {
             self.rewant();
@@ -632,6 +677,14 @@ impl LiveTvStore {
     /// Ask for the shown source's lineup.
     fn ask_lineup(&mut self) {
         match self.source.clone() {
+            // made here from the favorites and the lineups they name, read in their own time
+            Source::Favorites => {
+                if matches!(self.favorites_phase, Phase::Idle | Phase::Failed(_)) {
+                    self.ask_favorites();
+                }
+                self.ensure_plex_lineup();
+                self.refresh_favorites();
+            }
             Source::Dvr => {
                 if let Some(p) = &self.provider {
                     self.channels_phase = Phase::Loading;
@@ -653,48 +706,48 @@ impl LiveTvStore {
             Ok(c) => (Phase::Ready, c),
             Err(e) => (Phase::Failed(e.reason()), Vec::new()),
         };
+        // The cache keeps what it holds for these channels: it is keyed by channel, not by row.
+        // A lineup not shown is kept aside even if never shown: the favorites are made from it.
         if source == self.source {
             if phase.is_ready() {
                 self.channels = channels;
-                self.guide.clear();
             }
             self.channels_phase = phase;
             self.rewant();
-        } else if let Some(l) = self.stash.get_mut(&source) {
+        } else {
+            let l = self.stash.entry(source).or_default();
             if phase.is_ready() {
                 l.channels = channels;
-                l.guide.clear();
             }
             l.phase = phase;
         }
+        self.refresh_favorites();
+        if self.window.is_none() {
+            self.land_on_favorites();
+        }
     }
 
-    /// A guide-day answer for `source`: onto the cache shown, or the one put aside.
-    fn land_day(&mut self, source: &Source, ch: usize, date: &str, result: Result<Vec<Airing>, LiveError>) {
+    /// A channel-day's answer, into the one cache.
+    fn land_day(&mut self, key: &ChannelKey, date: &str, result: Result<Vec<Airing>, LiveError>) {
         // Which it was, for the log: a day the server has nothing for reads "No information" in the
         // guide, a day it did not answer for reads as failed (and is asked again in a minute).
+        let row = self.channels.iter().position(|c| ChannelKey::of(c) == *key);
+        let row = row.map_or_else(|| "a channel of another tab".to_string(), |r| format!("row {r}"));
         match &result {
-            Ok(a) if a.is_empty() => plx_base::eventlog::log(&format!("livetv: row {ch} has no programs for {date}")),
-            Err(e) => plx_base::eventlog::log(&format!("livetv: row {ch}'s programs for {date} did not load: {}", e.reason())),
+            Ok(a) if a.is_empty() => plx_base::eventlog::log(&format!("livetv: {row} has no programs for {date}")),
+            Err(e) => plx_base::eventlog::log(&format!("livetv: {row}'s programs for {date} did not load: {}", e.reason())),
             Ok(_) => {}
         }
         let result = result.map_err(|e| e.reason());
         let now = if self.now > 0 { self.now } else { lt::wall_now() };
-        if *source == self.source {
-            self.guide.land(ch, date, result, now);
-        } else if let Some(l) = self.stash.get_mut(source) {
-            l.guide.land(ch, date, result, now);
-        }
+        self.guide.land(key, date, result, now);
     }
 
     /// Once a minute while the guide is in use: days read [`GUIDE_FRESH_S`] ago are read again,
-    /// the shown ones now (their programs stay on screen meanwhile), a stashed tab's when it is
+    /// the shown window's now (their programs stay on screen meanwhile), another tab's when it is
     /// shown again.
     pub fn refresh_stale(&mut self) {
         let now = if self.now > 0 { self.now } else { lt::wall_now() };
-        for l in self.stash.values_mut() {
-            l.guide.expire(now, GUIDE_FRESH_S);
-        }
         if self.guide.expire(now, GUIDE_FRESH_S) {
             plx_base::eventlog::log("livetv: the guide shown is read again (older than its freshness)");
             self.rewant();
@@ -796,38 +849,36 @@ impl LiveTvStore {
     }
 
     /// The guide window a page shows: channel rows `rows` between `from` and `to` (epoch seconds).
-    /// Asks for every channel-day it does not hold, nearest rows first.
+    /// Asks for every channel-day it does not hold, nearest rows first: a DVR channel's from the
+    /// server, a Plex channel's from Plex's provider (a tab of favorites holds both).
     pub fn want_window(&mut self, rows: std::ops::Range<usize>, from: i64, to: i64) {
         self.window = Some((rows.clone(), from, to));
-        enum From {
-            Dvr(String),
-            Cloud(Source, CloudAuth),
-        }
-        let from_where = match (&self.source, &self.provider, &self.cloud_auth) {
-            (Source::Dvr, Some(p), _) => From::Dvr(p.identifier.clone()),
-            (Source::Dvr, None, _) => return,
-            (source, _, Some(auth)) => From::Cloud(source.clone(), auth.clone()),
-            (_, _, None) => return,
-        };
         if !self.channels_phase.is_ready() || to <= from {
             return;
         }
         let rows = rows.start.min(self.channels.len())..rows.end.min(self.channels.len());
+        // only the channels whose guide can be read now: a DVR's with its provider known, a Plex
+        // channel's with a plex.tv identity
+        let readable = |c: &&Channel| if c.cloud { self.cloud_auth.is_some() } else { self.provider.is_some() };
+        let channels: Vec<Channel> = self.channels[rows].iter().filter(readable).cloned().collect();
+        let keys: Vec<ChannelKey> = channels.iter().map(ChannelKey::of).collect();
         let dates = lt::days_covering(from, to);
-        let need = self.guide.want(rows, &dates);
+        let need = self.guide.want(keys.iter(), &dates);
         if need.is_empty() {
             return;
         }
         // The window the page shows NOW goes first: its days jump the queue, in row order. A day
         // still queued from an earlier window stays queued (it is cheap, and the page may scroll
         // back); a day only ever asks once, because `want` returns unasked days alone.
-        for (ch, date) in need.into_iter().rev() {
-            self.guide.set_loading(ch, &date);
-            let channel = self.channels[ch].clone();
-            self.queue.push_front(match &from_where {
-                From::Dvr(provider) => Job::Grid { provider: provider.clone(), ch, channel, date },
-                From::Cloud(source, auth) => Job::CloudGrid { source: source.clone(), ch, channel, date, auth: auth.clone() },
-            });
+        for (key, date) in need.into_iter().rev() {
+            let Some(channel) = keys.iter().position(|k| *k == key).map(|i| channels[i].clone()) else { continue };
+            let job = match (channel.cloud, &self.provider, &self.cloud_auth) {
+                (true, _, Some(auth)) => Job::CloudGrid { channel, date: date.clone(), auth: auth.clone() },
+                (false, Some(p), _) => Job::Grid { provider: p.identifier.clone(), channel, date: date.clone() },
+                _ => continue,
+            };
+            self.guide.set_loading(&key, &date);
+            self.queue.push_front(job);
         }
         self.guide.evict();
         self.bump();
@@ -837,6 +888,10 @@ impl LiveTvStore {
     pub fn retry_failed(&mut self) {
         self.guide.reset_failed();
         self.rewant();
+        if matches!(self.favorites_phase, Phase::Failed(_)) {
+            self.ask_favorites();
+            self.refresh_favorites();
+        }
         if matches!(self.dvr_phase, Phase::Failed(_)) {
             self.refresh_dvr();
         }
@@ -857,9 +912,182 @@ impl LiveTvStore {
         }
     }
 
+    // ---- the favorites ---------------------------------------------------------------------------
+
+    /// Read the account's favorites (they need its plex.tv identity).
+    fn ask_favorites(&mut self) {
+        if let Some(auth) = self.cloud_auth.clone() {
+            self.favorites_phase = Phase::Loading;
+            self.queue.push_back(Job::Favorites { auth });
+        }
+    }
+
+    /// The lineup of `source` as read so far: the one shown, else the one aside.
+    fn lineup_of(&self, source: &Source) -> (&[Channel], Phase) {
+        if *source == self.source {
+            return (&self.channels, self.channels_phase.clone());
+        }
+        self.stash.get(source).map_or((&[], Phase::Idle), |l| (&l.channels, l.phase.clone()))
+    }
+
+    /// The DVR's EPG provider, as a favorite names it (`""` when unknown).
+    fn provider_id(&self) -> &str {
+        self.provider.as_ref().map_or("", |p| p.identifier.as_str())
+    }
+
+    /// Does favorite `f` name channel `ch` ([`lt::favorite_names`], with this server's identity)?
+    fn names(&self, f: &FavoriteChannel, ch: &Channel) -> bool {
+        lt::favorite_names(f, ch, &self.machine, self.provider_id())
+    }
+
+    /// The channel a favorite names, among the lineups read: a DVR one in the DVR's, one of Plex's
+    /// in theirs (or the genre tab shown).
+    fn channel_named(&self, f: &FavoriteChannel) -> Option<&Channel> {
+        let pools: Vec<&[Channel]> = if f.on_server() {
+            vec![self.lineup_of(&Source::Dvr).0]
+        } else {
+            vec![self.lineup_of(&Source::Plex).0, if self.source.is_cloud() { self.channels.as_slice() } else { &[] }]
+        };
+        pools.into_iter().flatten().find(|c| self.names(f, c))
+    }
+
+    /// The favorites as a lineup: each the channel it names, in the account's order, once.
+    fn favorites_lineup(&self) -> Vec<Channel> {
+        let mut out: Vec<Channel> = Vec::new();
+        for f in &self.favorites {
+            if let Some(ch) = self.channel_named(f) {
+                if !out.iter().any(|c| ChannelKey::of(c) == ChannelKey::of(ch)) {
+                    out.push(ch.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Where the favorites' lineup stands: loading until the favorites and the lineups they name
+    /// have answered (a lineup that failed leaves its channels out rather than holding the rest).
+    fn favorites_lineup_phase(&self) -> Phase {
+        match &self.favorites_phase {
+            Phase::Failed(why) => return Phase::Failed(why.clone()),
+            Phase::Ready => {}
+            _ => return Phase::Loading,
+        }
+        let waiting = |s: &Source| matches!(self.lineup_of(s).1, Phase::Idle | Phase::Loading);
+        let dvr = self.favorites.iter().any(FavoriteChannel::on_server) && self.provider.is_some() && waiting(&Source::Dvr);
+        let plex = self.favorites.iter().any(|f| !f.on_server()) && self.cloud_auth.is_some() && waiting(&Source::Plex);
+        if dvr || plex { Phase::Loading } else { Phase::Ready }
+    }
+
+    /// A favorite of Plex's channels needs their lineup to be found in: read it aside, once.
+    fn ensure_plex_lineup(&mut self) {
+        if !self.favorites.iter().any(|f| !f.on_server()) || self.source == Source::Plex || self.stash.contains_key(&Source::Plex) {
+            return;
+        }
+        if let Some(auth) = self.cloud_auth.clone() {
+            self.stash.insert(Source::Plex, Lineup { phase: Phase::Loading, channels: Vec::new() });
+            self.queue.push_back(Job::CloudChannels { source: Source::Plex, auth });
+        }
+    }
+
+    /// The Favorites tab shown: its lineup made again from what is known now.
+    fn refresh_favorites(&mut self) {
+        if self.source != Source::Favorites {
+            return;
+        }
+        let channels = self.favorites_lineup();
+        let phase = self.favorites_lineup_phase();
+        if channels != self.channels || phase != self.channels_phase {
+            self.channels = channels;
+            self.channels_phase = phase;
+            self.rewant();
+            self.bump();
+        }
+    }
+
+    /// The account's favorites landed (a read, or the list a change wrote).
+    fn land_favorites(&mut self, list: Vec<FavoriteChannel>) {
+        self.favorites = list;
+        self.favorites_phase = Phase::Ready;
+        let named: Vec<&Channel> = self.favorites.iter().filter_map(|f| self.channel_named(f)).collect();
+        let by = |pick: fn(&FavoriteChannel, &Channel) -> bool| {
+            self.favorites.iter().filter(|f| self.channel_named(f).is_some_and(|c| pick(f, c))).count()
+        };
+        // what matched and how, for the log: the account's list is written by the stock clients,
+        // and how they name a channel is learned from it (no id or name is printed)
+        plx_base::eventlog::log(&format!(
+            "livetv: favorites name {} channel(s) of {} entr{} (by lineup id {}, by grid key {}, by number {})",
+            named.len(),
+            self.favorites.len(),
+            if self.favorites.len() == 1 { "y" } else { "ies" },
+            by(|f, c| f.id == c.identifier),
+            by(|f, c| f.id != c.identifier && f.id == c.grid_key),
+            by(|f, c| f.id != c.identifier && f.id != c.grid_key),
+        ));
+        self.ensure_plex_lineup();
+        self.refresh_favorites();
+        if self.window.is_none() {
+            self.land_on_favorites();
+        }
+    }
+
+    /// The entry that adds `ch` to the favorites, in the form the account's list already uses: a
+    /// DVR channel by this server's identity, one of Plex's like the account's other Plex entries;
+    /// the id its lineup id unless the list's entries are grid keys. `None` when the form is not
+    /// known (the server's identity not learned, no Plex entry to follow).
+    fn favorite_entry(&self, ch: &Channel) -> Option<FavoriteChannel> {
+        let source = if ch.cloud {
+            self.favorites.iter().find(|f| !f.on_server()).map(|f| f.source.clone())?
+        } else {
+            if self.machine.is_empty() || self.provider_id().is_empty() {
+                return None;
+            }
+            format!("server://{}/{}", self.machine, self.provider_id())
+        };
+        let by_grid = self.favorites.iter().any(|f| {
+            f.on_server() != ch.cloud && self.channel_named(f).is_some_and(|c| c.grid_key != c.identifier && f.id == c.grid_key)
+        });
+        let id = if by_grid { &ch.grid_key } else { &ch.identifier };
+        let title = if ch.title.is_empty() { &ch.call_sign } else { &ch.title };
+        Some(FavoriteChannel::new(&source, id, title, &ch.thumb, &ch.vcn))
+    }
+
+    /// Add channel row `ch` of the lineup shown to the favorites (`on`), or take it off. `false`
+    /// when there is nothing to do (no plex.tv identity, the entry's form unknown, not a favorite).
+    pub fn set_favorite(&mut self, ch: usize, on: bool) -> bool {
+        let (Some(channel), Some(auth)) = (self.channels.get(ch).cloned(), self.cloud_auth.clone()) else { return false };
+        let op = if on {
+            let Some(entry) = self.favorite_entry(&channel) else { return false };
+            FavoriteOp::Add(entry)
+        } else {
+            let gone: Vec<FavoriteChannel> = self.favorites.iter().filter(|f| self.names(f, &channel)).cloned().collect();
+            if gone.is_empty() {
+                return false;
+            }
+            FavoriteOp::Remove(gone)
+        };
+        self.write(Write::Favorite { op, add: on, auth });
+        true
+    }
+
+    /// Is channel row `ch` of the lineup shown one of Plex's own (a stream: no tuner to wait for)?
+    pub fn row_is_cloud(&self, ch: usize) -> bool {
+        self.channels.get(ch).is_some_and(|c| c.cloud)
+    }
+
+    /// The cache's key of channel row `ch` of the lineup shown: the channel's identity whatever
+    /// tab lists it.
+    pub fn key_of(&self, ch: usize) -> Option<ChannelKey> {
+        self.channels.get(ch).map(ChannelKey::of)
+    }
+
+    /// The row channel `key` stands in, in the lineup shown.
+    pub fn row_of_key(&self, key: &ChannelKey) -> Option<usize> {
+        self.channels.iter().position(|c| ChannelKey::of(c) == *key)
+    }
+
     /// The airings of channel row `ch` in `[from, to)`, from the cache.
     pub fn airings(&self, ch: usize, from: i64, to: i64) -> Vec<Airing> {
-        self.guide.airings(ch, from, to)
+        self.key_of(ch).map(|k| self.guide.airings(&k, from, to)).unwrap_or_default()
     }
 
     /// How many channel rows the lineup shown has (the live player's CH▲/CH▼ wrap around them).
@@ -875,17 +1103,17 @@ impl LiveTvStore {
     /// The airing on now on channel row `ch`, from the guide cache (the player's record disc).
     pub fn on_now(&self, ch: usize) -> Option<Airing> {
         let now = if self.now > 0 { self.now } else { lt::wall_now() };
-        self.guide.airings(ch, now, now + 1).into_iter().find(|a| a.airs_at(now))
+        self.airings(ch, now, now + 1).into_iter().find(|a| a.airs_at(now))
     }
 
     /// Is channel row `ch` still loading for `[from, to)`?
     pub fn row_pending(&self, ch: usize, from: i64, to: i64) -> bool {
-        self.guide.pending(ch, &lt::days_covering(from, to))
+        self.key_of(ch).is_none_or(|k| self.guide.pending(&k, &lt::days_covering(from, to)))
     }
 
     /// Did every day of channel row `ch` for `[from, to)` fail?
     pub fn row_failed(&self, ch: usize, from: i64, to: i64) -> bool {
-        self.guide.failed(ch, &lt::days_covering(from, to))
+        self.key_of(ch).is_some_and(|k| self.guide.failed(&k, &lt::days_covering(from, to)))
     }
 
     /// The page's hero shows `art`: ask its UltraBlur colours, once (the page tints itself with
@@ -1001,11 +1229,13 @@ impl LiveTvStore {
                             self.queue.push_front(Job::Channels { provider: p.identifier.clone() });
                             self.dvr_phase = Phase::Loading;
                             self.ask_dvr();
-                            // the guide's tab row also offers Plex's own channels
+                            // the guide's tab row also offers Plex's own channels, and the
+                            // account's favorites
                             self.cloud_auth = CloudAuth::capture();
                             if let Some(auth) = self.cloud_auth.clone() {
                                 self.queue.push_back(Job::CloudTabs { auth });
                             }
+                            self.ask_favorites();
                         }
                     }
                     Err(LiveError::Status(403)) => {
@@ -1023,9 +1253,9 @@ impl LiveTvStore {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.land_lineup(Source::Dvr, r);
             }
-            Landing::Grid { ch, date, result } => {
+            Landing::Grid { key, date, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.land_day(&Source::Dvr, ch, &date, result);
+                self.land_day(&key, &date, result);
             }
             Landing::CloudChannels { source, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -1034,15 +1264,25 @@ impl LiveTvStore {
                 }
                 self.land_lineup(source, result);
             }
-            Landing::CloudGrid { source, ch, date, result } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                self.land_day(&source, ch, &date, result);
-            }
             Landing::CloudTabs(r) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 match r {
                     Ok(tabs) => self.cloud_tabs = tabs,
                     Err(e) => plx_base::eventlog::log(&format!("livetv: Plex channels tabs failed: {}", e.reason())),
+                }
+            }
+            Landing::Favorites { machine, result } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if !machine.is_empty() {
+                    self.machine = machine;
+                }
+                match result {
+                    Ok(list) => self.land_favorites(list),
+                    Err(e) => {
+                        plx_base::eventlog::log(&format!("livetv: favorites read failed: {}", e.reason()));
+                        self.favorites_phase = Phase::Failed(e.reason());
+                        self.refresh_favorites();
+                    }
                 }
             }
             Landing::CloudProbe(shape) => {
@@ -1115,7 +1355,10 @@ impl LiveTvStore {
                     Write::CancelRule { .. } => WriteOp::CancelRule,
                     Write::StopGrab { .. } => WriteOp::StopRecording,
                     Write::MoveRule { .. } => WriteOp::MoveRule,
+                    Write::Favorite { add: true, .. } => WriteOp::FavoriteAdded,
+                    Write::Favorite { add: false, .. } => WriteOp::FavoriteRemoved,
                 };
+                let favorites = matches!(write, Write::Favorite { .. });
                 match result {
                     Ok(done) => {
                         match &write {
@@ -1130,7 +1373,10 @@ impl LiveTvStore {
                                 self.guide.overlay(&Overlay::Removed { rule: id.clone() });
                                 self.rules.retain(|r| &r.id != id);
                             }
-                            Write::StopGrab { .. } | Write::MoveRule { .. } => {}
+                            Write::StopGrab { .. } | Write::MoveRule { .. } | Write::Favorite { .. } => {}
+                        }
+                        if let Some(list) = done.favorites {
+                            self.land_favorites(list);
                         }
                         self.notice = Some(WriteNotice { serial: self.notice_serial, ok: true, op, reason: String::new(), conflicts: done.conflicts });
                     }
@@ -1140,7 +1386,9 @@ impl LiveTvStore {
                 }
                 // what the server now records changed: read the lists again (a read already on
                 // its way may answer from before this write; the new one outranks it)
-                self.ask_dvr();
+                if !favorites {
+                    self.ask_dvr();
+                }
             }
         }
         self.bump();
@@ -1211,6 +1459,10 @@ impl LiveTvStore {
             blurs: self.blurs.iter().filter_map(|(art, c)| c.map(|c| (art.clone(), c))).collect(),
             source: self.source.clone(),
             cloud_tabs: self.cloud_tabs.clone(),
+            favorites: self.favorites.iter().filter_map(|f| self.channel_named(f)).map(ChannelKey::of).collect(),
+            favorites_phase: self.favorites_phase.clone(),
+            favorite_dvr: !self.machine.is_empty() && !self.provider_id().is_empty(),
+            favorite_cloud: self.favorites.iter().any(|f| !f.on_server()),
         }
     }
 

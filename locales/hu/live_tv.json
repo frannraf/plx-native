@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Nincs ütemezett felvétel. Válassz egy műsort a Műsorújságban, és nyomd meg az OK gombot a rögzítéshez.",
   "live_tv.hud.live": "ÉLŐ",
   "live_tv.rule.series": "Sorozat",
-  "live_tv.rule.single": "Egyszeri"
+  "live_tv.rule.single": "Egyszeri",
+  "live_tv.tab.favorites": "Kedvencek",
+  "live_tv.state.no_favorites": "Még nincs kedvenc csatorna. Lépj balra egy csatorna logójára, és nyomd meg az OK gombot a hozzáadáshoz.",
+  "live_tv.action.add_favorite": "Hozzáadás a kedvencekhez",
+  "live_tv.action.remove_favorite": "Eltávolítás a kedvencek közül",
+  "live_tv.notice.favorite_added": "Hozzáadva a kedvencekhez.",
+  "live_tv.notice.favorite_removed": "Eltávolítva a kedvencek közül."
 }

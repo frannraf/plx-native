@@ -74,6 +74,8 @@ pub enum LiveTvOut {
     Source(Source),
     /// A DVR change.
     Write(Write),
+    /// Add channel row `row` to the account's favorites (`on`), or take it off.
+    Favorite { row: usize, on: bool },
     /// Try again on the failure read-out.
     Retry,
     /// The Recordings mode opened: read the lists again.
@@ -89,6 +91,8 @@ enum Readout {
     NoChannels,
     /// A Plex Channels category with no channels in it.
     NoTabChannels,
+    /// The Favorites tab, with no favorite channel this server or Plex offers.
+    NoFavorites,
     RecsLoading,
     RecsFailed,
     RecsEmpty,
@@ -182,7 +186,7 @@ impl LiveTvScreen {
     fn grown_rows(&self) -> [(usize, u16); model::ROWS_SHOWN] {
         let mut rows: Vec<(usize, u16)> = Vec::new();
         for (e, g) in &self.cell_grow {
-            let Some((row, _)) = model::cell_of(*e) else { continue };
+            let Some(row) = model::row_of(*e) else { continue };
             let mille = (g.pos.clamp(0.0, 1.0) * 1000.0) as u16;
             match rows.iter_mut().find(|(r, _)| *r == row) {
                 Some((_, m)) => *m = (*m).max(mille),
@@ -312,6 +316,7 @@ impl LiveTvScreen {
         match &s.channels_phase {
             Phase::Failed(_) => return Some(Readout::Failed),
             Phase::Idle | Phase::Loading => return Some(Readout::Loading),
+            Phase::Ready if s.channels.is_empty() && s.source == Source::Favorites => return Some(Readout::NoFavorites),
             Phase::Ready if s.channels.is_empty() && s.source.is_cloud() => return Some(Readout::NoTabChannels),
             Phase::Ready if s.channels.is_empty() => return Some(Readout::NoChannels),
             Phase::Ready => {}
@@ -361,7 +366,13 @@ impl LiveTvScreen {
             return;
         }
         let Some(e) = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| self.standing(k.elem)) else { return };
-        let to = if model::cell_of(e).is_some() {
+        let to = if let Some(row) = model::channel_of(e) {
+            if whole {
+                model::guide_page(&self.view, &self.frame, e, dir)
+            } else {
+                model::channel_neighbour(&self.view, &self.frame, row, dir)
+            }
+        } else if model::cell_of(e).is_some() {
             if whole {
                 model::guide_page(&self.view, &self.frame, e, dir)
             } else {
@@ -417,6 +428,7 @@ impl LiveTvScreen {
             Target::Airing { airing, .. } => model::airing_actions(&self.view.snap, airing),
             Target::Grab(g) => model::grab_actions(g),
             Target::Rule(s) => model::rule_actions(&self.view.snap, s),
+            Target::Channel { channel, .. } => model::channel_actions(&self.view.snap, channel),
         };
         self.panel = Some(Panel { target, actions });
         self.panel_from = from;
@@ -440,6 +452,13 @@ impl LiveTvScreen {
             (Action::Close, _) => {}
             (Action::Watch, Target::Airing { row, airing }) => {
                 self.route(LiveTvOut::Watch { row: *row, airing: Some(airing.clone()) }, fx)
+            }
+            (Action::Watch, Target::Channel { row, .. }) => {
+                let airing = self.on_now(*row).cloned();
+                self.route(LiveTvOut::Watch { row: *row, airing }, fx)
+            }
+            (Action::Favorite | Action::Unfavorite, Target::Channel { row, .. }) => {
+                self.route(LiveTvOut::Favorite { row: *row, on: action == Action::Favorite }, fx)
             }
             (action, target) => {
                 if let Some(w) = model::write_for(&self.view.snap, target, action) {
@@ -484,23 +503,29 @@ impl LiveTvScreen {
             model::HEAD_RECS => self.set_mode(Mode::Recordings, fx),
             model::RETRY => self.route(LiveTvOut::Retry, fx),
             _ => {
-                if let Some((row, slot)) = model::cell_of(elem) {
+                if let Some(row) = model::channel_of(elem) {
+                    // a channel: its panel (watch it, add it to the favorites or take it off)
+                    if let Some(channel) = self.view.snap.channels.get(row).cloned() {
+                        self.open_panel(elem, Target::Channel { row, channel }, fx);
+                    }
+                } else if let Some((row, slot)) = model::cell_of(elem) {
+                    let watchable = self.watchable(row);
                     if slot == model::PLACEHOLDER {
                         // a row with no guide: OK watches the channel itself
-                        if self.view.snap.can_watch() {
+                        if watchable {
                             self.route(LiveTvOut::Watch { row, airing: None }, fx);
                         }
                     } else if let Some((_, airing)) = self.view.airing(self.frame.base, elem) {
                         // A show on now plays at once (recording it is the player's to offer); a
                         // later one opens its record choices.
-                        if self.view.snap.can_watch() && self.frame.now > 0 && airing.airs_at(self.frame.now) {
+                        if watchable && self.frame.now > 0 && airing.airs_at(self.frame.now) {
                             let airing = airing.clone();
                             self.route(LiveTvOut::Watch { row, airing: Some(airing) }, fx);
-                        } else if self.view.snap.can_watch() && self.frame.now > 0 && airing.ends_at <= self.frame.now {
+                        } else if watchable && self.frame.now > 0 && airing.ends_at <= self.frame.now {
                             // one that already ended (still drawn at the window's left): nothing to
                             // record, so OK watches its channel, on now
                             self.route(LiveTvOut::Watch { row, airing: None }, fx);
-                        } else if self.view.snap.source.is_cloud() {
+                        } else if self.view.snap.channels.get(row).is_some_and(|c| c.cloud) {
                             // a Plex channel's later program: nothing to record it with
                         } else {
                             let target = Target::Airing { row, airing: airing.clone() };
@@ -520,6 +545,17 @@ impl LiveTvScreen {
             }
         }
         Handled::Yes
+    }
+
+    /// Can channel row `row` be watched (a DVR's with a tuner behind it, one of Plex's always)?
+    fn watchable(&self, row: usize) -> bool {
+        self.view.snap.channels.get(row).is_some_and(|c| self.view.snap.can_watch(c))
+    }
+
+    /// The program on now in row `row`, as the guide holds it.
+    fn on_now(&self, row: usize) -> Option<&Airing> {
+        let now = self.frame.now;
+        self.view.row(row).and_then(|r| r.airings.iter().find(|a| now > 0 && a.airs_at(now)))
     }
 
     /// A press on the shared strip: the other tabs and the chip are requests; the Live TV pill is
@@ -554,7 +590,7 @@ impl LiveTvScreen {
         let at = cx.focus.current.filter(|k| k.entry == self.entry).map(|k| k.elem);
         match at {
             Some(e) if e >= plx_ui::dispatch::STRIP_BASE => self.route(LiveTvOut::Back, fx),
-            Some(e) if model::cell_of(e).is_some() || model::rec_of(e).is_some() => {
+            Some(e) if model::row_of(e).is_some() || model::rec_of(e).is_some() => {
                 let pill = self.mode_pill();
                 self.seat_elem(pill, fx);
             }
@@ -582,7 +618,7 @@ impl LiveTvScreen {
         } else if self.panel.is_none() {
             self.rec_anchor = None;
         }
-        if model::cell_of(elem).is_some() {
+        if model::row_of(elem).is_some() {
             self.last_cell = Some(elem);
             if !self.cell_grow.iter().any(|(e, _)| *e == elem) {
                 self.cell_grow.push((elem, plx_ui::Spring::at(0.0)));
@@ -592,7 +628,7 @@ impl LiveTvScreen {
             plx_machine::idle::invalidate();
             return;
         }
-        if model::cell_of(elem).is_some() {
+        if model::row_of(elem).is_some() {
             self.frame = model::follow(&self.view, &self.frame, elem);
         } else if let Some(i) = model::rec_of(elem) {
             self.rec_top = model::rec_follow(&self.recs, self.rec_top, i);
@@ -658,18 +694,24 @@ impl LiveTvScreen {
         }
     }
 
-    /// Is the tab row up? In the Guide, once Plex's own channels answered (with only the DVR
-    /// there is nothing to switch to).
+    /// Is the tab row up? In the Guide, once there is another tab than the DVR's (the
+    /// favorites, Plex's own channels): with only the DVR there is nothing to switch to.
     fn tabs_shown(&self) -> bool {
         self.mode == Mode::Guide
             && self.view.snap.availability == Availability::Available
-            && !self.view.snap.cloud_tabs.is_empty()
+            && model::tab_sources(&self.view.snap).len() > 1
             && self.panel.is_none()
+    }
+
+    /// Which tab the wider gap and its rule follow: Plex Channels (the genres after it are its own).
+    fn tab_split(sources: &[Source]) -> Option<usize> {
+        sources.iter().position(|s| *s == Source::Plex)
     }
 
     /// Tab `i`'s words.
     fn tab_label(&self, source: &Source) -> String {
         match source {
+            Source::Favorites => msg::live_tv_tab_favorites().to_string(),
             Source::Dvr => self
                 .view
                 .snap
@@ -687,13 +729,15 @@ impl LiveTvScreen {
     /// Plex Channels (the genres that follow are its own).
     fn tab_rects(&self, measure: &dyn plx_machine::machine::Measure) -> Vec<Rect> {
         let mut x = MARGIN_X;
-        model::tab_sources(&self.view.snap)
+        let sources = model::tab_sources(&self.view.snap);
+        let split = Self::tab_split(&sources);
+        sources
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let w = measure.width_str(&self.tab_label(s), theme::size::BODY, true) + 2.0 * TAB_PAD;
                 let r = Rect::new(x, geom::TABS_Y, w, geom::TABS_H);
-                x += w + if i == 1 { TAB_SPLIT } else { TAB_GAP };
+                x += w + if Some(i) == split { TAB_SPLIT } else { TAB_GAP };
                 r
             })
             .collect()
@@ -719,6 +763,7 @@ impl LiveTvScreen {
     /// as focus arrives and shrinks away as it leaves (its spring, [`Self::tab_grow`]).
     fn draw_tabs<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
         let sources = model::tab_sources(&self.view.snap);
+        let split = Self::tab_split(&sources);
         let rects = self.tab_rects(f.measure);
         let scroll = self.tab_scroll.pos;
         let shown = Rect::new(MARGIN_X - TAB_PAD, geom::TABS_Y - 8.0, SCR_W - 2.0 * MARGIN_X + 2.0 * TAB_PAD, geom::TABS_H + 20.0);
@@ -738,7 +783,7 @@ impl LiveTvScreen {
             if *source == self.view.snap.source && g < 0.5 {
                 clip.rrect(Rect::new(r.cx() - r.w * 0.3, r.y + r.h + 4.0, r.w * 0.6, 4.0), 2.0, 2.0, theme::with_a(theme::TEXT_PRIMARY, 1.0 - 2.0 * g));
             }
-            if i == 1 {
+            if Some(i) == split {
                 clip.rrect(Rect::new(r.x + r.w + TAB_SPLIT * 0.5 - 1.0, r.y + 12.0, 2.0, r.h - 24.0), 1.0, 1.0, theme::TEXT_SEPARATOR);
             }
             // A tab scrolled out of the row catches no pointer (one in the gutter did, and pulled
@@ -810,6 +855,7 @@ impl LiveTvScreen {
             Readout::Failed => msg::live_tv_state_failed(),
             Readout::NoChannels => msg::live_tv_state_no_channels(),
             Readout::NoTabChannels => msg::live_tv_state_no_tab_channels(),
+            Readout::NoFavorites => msg::live_tv_state_no_favorites(),
             Readout::RecsLoading => {
                 plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::WorkingReadout, "livetv-recordings");
                 msg::live_tv_recordings_loading()
@@ -857,6 +903,11 @@ impl LiveTvScreen {
     /// shown), with its row.
     fn hero(&self) -> Option<(usize, &Airing)> {
         let (from, to) = (self.frame.win_start, self.frame.win_start + model::WINDOW_S);
+        // a channel focused: what is on it now
+        if let Some(row) = self.last_cell.and_then(model::channel_of).filter(|r| *r < self.view.channel_count()) {
+            let t = self.frame.now.max(self.frame.win_start);
+            return self.view.airing(self.frame.base, self.view.cell_at(self.frame.base, row, t));
+        }
         let focus = self.last_cell.filter(|e| self.view.holds(self.frame.base, *e, from, to)).unwrap_or_else(|| self.now_cell());
         self.view.airing(self.frame.base, focus)
     }
@@ -1100,10 +1151,20 @@ impl LiveTvScreen {
         }
     }
 
-    /// A row's channel: its logo (else its call sign) over its number.
-    fn draw_channel<H: ContentLike>(&self, f: &DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32, h: f32) {
+    /// A row's channel: its logo (else its call sign) over its number. Focused (LEFT past the
+    /// row's first program), it wears a ring: a white fill would swallow a white logo.
+    fn draw_channel<H: ContentLike>(&self, f: &mut DrawFrame<'_, '_, H>, p: Painter, row: usize, ch: &Channel, y: f32, h: f32) {
         let r = Rect::new(geom::CHANNEL_X, y, geom::CHANNEL_W, h);
-        p.rrect(r, 10.0, 10.0, theme::with_a(INK_BLACK, 0.32));
+        let elem = model::channel_elem(row);
+        let panel_up = self.panel.is_some();
+        let on = !panel_up && self.focused(f, elem);
+        p.rrect(r, 10.0, 10.0, theme::with_a(INK_BLACK, if on { 0.5 } else { 0.32 }));
+        if on {
+            p.rring(r, 10.0, 4.0, theme::ACCENT);
+        }
+        if !panel_up {
+            f.stop(p, stop(self.key(elem), r));
+        }
         let logo_box = Rect::new(r.x + 18.0, y + 10.0, r.w - 36.0, r.h - 44.0);
         let thumb = self.channel_thumb(row);
         let mut logo = false;
@@ -1509,6 +1570,7 @@ impl LiveTvScreen {
                 if g.airing.show_title.is_empty() { g.airing.title.clone() } else { g.airing.show_title.clone() }
             }
             Target::Rule(s) => [&s.hint.show_title, &s.hint.title, &s.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_default(),
+            Target::Channel { channel, .. } => channel.words(),
         };
         TextView::new(&title, theme::size::HEADLINE, theme::TEXT_PRIMARY)
             .bold()
@@ -1562,6 +1624,8 @@ fn action_label(a: Action) -> &'static str {
         Action::MoveTop => msg::live_tv_action_move_top(),
         Action::MoveBottom => msg::live_tv_action_move_bottom(),
         Action::DeleteRule => msg::live_tv_action_delete_rule(),
+        Action::Favorite => msg::live_tv_action_add_favorite(),
+        Action::Unfavorite => msg::live_tv_action_remove_favorite(),
         Action::Close => msg::live_tv_action_close(),
     }
 }
@@ -1722,6 +1786,8 @@ fn notice_text(n: &plx_data::live_tv::WriteNotice) -> String {
         WriteOp::CancelRule => msg::live_tv_notice_cancelled().to_string(),
         WriteOp::StopRecording => msg::live_tv_notice_stopped().to_string(),
         WriteOp::MoveRule => msg::live_tv_notice_moved().to_string(),
+        WriteOp::FavoriteAdded => msg::live_tv_notice_favorite_added().to_string(),
+        WriteOp::FavoriteRemoved => msg::live_tv_notice_favorite_removed().to_string(),
     }
 }
 
@@ -1871,7 +1937,8 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
                     CONTENT,
                     GroupKind::Free,
                     self.view.channel_count(),
-                    Rect::new(geom::GRID_X, geom::ROWS_Y, geom::GRID_W, model::ROWS_SHOWN as f32 * geom::ROW_PITCH),
+                    // the channels' column too (LEFT past a row's first program)
+                    Rect::new(geom::CHANNEL_X, geom::ROWS_Y, geom::GRID_X + geom::GRID_W - geom::CHANNEL_X, model::ROWS_SHOWN as f32 * geom::ROW_PITCH),
                 )),
                 Mode::Recordings => out.push(spec(
                     CONTENT,
@@ -1892,7 +1959,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             model::HEAD_GUIDE | model::HEAD_RECS => Some(HEAD),
             model::RETRY => self.shows_retry().then_some(RETRY_GROUP),
             _ if model::tab_of(e).is_some() => self.tabs_shown().then_some(TABS),
-            _ if model::cell_of(e).is_some() => (self.mode == Mode::Guide && self.has_content()).then_some(CONTENT),
+            _ if model::row_of(e).is_some() => (self.mode == Mode::Guide && self.has_content()).then_some(CONTENT),
             _ if model::rec_of(e).is_some() => (self.mode == Mode::Recordings && self.has_content()).then_some(CONTENT),
             _ => None,
         }
@@ -1922,6 +1989,9 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
                 Dir::Right if i + 1 < n => to(e + 1),
                 _ => Step::Edge,
             };
+        }
+        if let Some(row) = model::channel_of(e) {
+            return model::channel_neighbour(&self.view, &self.frame, row, dir).map_or(Step::Edge, to);
         }
         if model::cell_of(e).is_some() {
             return model::guide_neighbour(&self.view, &self.frame, e, dir).map_or(Step::Edge, to);
@@ -1955,7 +2025,7 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
             let s = self.tab_scroll.pos;
             return Some(placed(Rect::new(at.x - s, at.y, at.w, at.h), i));
         }
-        if let Some((row, _)) = model::cell_of(e) {
+        if let Some(row) = model::row_of(e) {
             return model::elem_rect(&self.view, &self.frame, e).map(|r| placed(r, row));
         }
         if let Some(i) = model::rec_of(e) {
@@ -1993,6 +2063,13 @@ impl<H: ContentLike> Focusable<H> for LiveTvScreen {
         if let Some(i) = model::tab_of(e) {
             let n = model::tab_sources(&self.view.snap).len();
             return if self.tabs_shown() && i < n { want } else { key(self.mode_pill()) };
+        }
+        if let Some(row) = model::channel_of(e) {
+            if self.mode != Mode::Guide || !self.has_content() {
+                return key(self.mode_pill());
+            }
+            let n = self.view.channel_count();
+            return if row < n { want } else { key(model::channel_elem(n.saturating_sub(1))) };
         }
         if let Some((row, slot)) = model::cell_of(e) {
             if self.mode != Mode::Guide || !self.has_content() {

@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Nessuna registrazione programmata. Scegli un programma nella Guida e premi OK per registrarlo.",
   "live_tv.hud.live": "IN DIRETTA",
   "live_tv.rule.series": "Serie",
-  "live_tv.rule.single": "Singola"
+  "live_tv.rule.single": "Singola",
+  "live_tv.tab.favorites": "Preferiti",
+  "live_tv.state.no_favorites": "Ancora nessun canale preferito. Spostati a sinistra sul logo di un canale e premi OK per aggiungerlo.",
+  "live_tv.action.add_favorite": "Aggiungi ai preferiti",
+  "live_tv.action.remove_favorite": "Rimuovi dai preferiti",
+  "live_tv.notice.favorite_added": "Aggiunto ai preferiti.",
+  "live_tv.notice.favorite_removed": "Rimosso dai preferiti."
 }

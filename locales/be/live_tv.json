@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Запісаў не запланавана. Выберыце перадачу ў Тэлегідзе і націсніце OK, каб запісаць яе.",
   "live_tv.hud.live": "ЭФІР",
   "live_tv.rule.series": "Серыял",
-  "live_tv.rule.single": "Адзінкавы"
+  "live_tv.rule.single": "Адзінкавы",
+  "live_tv.tab.favorites": "Абраныя",
+  "live_tv.state.no_favorites": "Абраных каналаў пакуль няма. Перайдзіце налева на лагатып канала і націсніце OK, каб дадаць яго.",
+  "live_tv.action.add_favorite": "Дадаць у абраныя",
+  "live_tv.action.remove_favorite": "Выдаліць з абраных",
+  "live_tv.notice.favorite_added": "Дададзена ў абраныя.",
+  "live_tv.notice.favorite_removed": "Выдалена з абраных."
 }

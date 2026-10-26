@@ -80,6 +80,14 @@ fn ready(script: &Script, n: usize) -> LiveTvStore {
     s
 }
 
+/// A guide read's channel and date, as its answer names them.
+fn grid_of(job: &Job) -> (ChannelKey, String) {
+    match job {
+        Job::Grid { channel, date, .. } | Job::CloudGrid { channel, date, .. } => (ChannelKey::of(channel), date.clone()),
+        other => panic!("not a guide read: {other:?}"),
+    }
+}
+
 /// The one DVR read among `jobs`, with the serial its answer must carry.
 fn dvr_job(jobs: Vec<(Job, Post)>) -> (u32, Post) {
     let (job, post) = jobs.into_iter().find(|(j, _)| matches!(j, Job::Dvr { .. })).expect("a DVR read");
@@ -141,15 +149,15 @@ fn a_window_asks_each_channel_day_once_nearest_first_and_spans_utc_midnight() {
     s.pump();
     let jobs = script.take();
     assert_eq!(jobs.len(), IN_FLIGHT, "no more than the read budget at once");
-    let first: Vec<(usize, String)> = jobs.iter().map(|(j, _)| match j { Job::Grid { ch, date, .. } => (*ch, date.clone()), _ => panic!() }).collect();
-    assert_eq!(first[0], (2, "2025-10-09".into()));
-    assert_eq!(first[1], (2, "2025-10-10".into()));
+    let first: Vec<(ChannelKey, String)> = jobs.iter().map(|(j, _)| grid_of(j)).collect();
+    let c2 = ChannelKey::of(&channel(2));
+    assert_eq!(first[0], (c2.clone(), "2025-10-09".into()));
+    assert_eq!(first[1], (c2, "2025-10-10".into()));
     // the same window again asks for nothing new
     s.want_window(2..5, from, from + 9000);
     for (job, post) in jobs {
-        if let Job::Grid { ch, date, .. } = job {
-            post.post(Landing::Grid { ch, date, result: Ok(vec![airing(ch, from, "g", "s")]) });
-        }
+        let (key, date) = grid_of(&job);
+        post.post(Landing::Grid { key, date, result: Ok(vec![airing(2, from, "g", "s")]) });
     }
     s.pump();
     let rest = script.take();
@@ -166,8 +174,8 @@ fn a_failed_day_is_not_asked_again_until_retry() {
     s.want_window(0..1, NOON, NOON + 3600);
     s.pump();
     let (job, post) = script.take().remove(0);
-    let Job::Grid { ch, date, .. } = job else { panic!() };
-    post.post(Landing::Grid { ch, date, result: Err(LiveError::Transport) });
+    let (key, date) = grid_of(&job);
+    post.post(Landing::Grid { key, date, result: Err(LiveError::Transport) });
     s.pump();
     assert!(s.row_failed(0, NOON, NOON + 3600));
     s.want_window(0..1, NOON, NOON + 3600);
@@ -179,8 +187,8 @@ fn a_failed_day_is_not_asked_again_until_retry() {
     let (job, post) = script.take().remove(0);
     // …and while that second read is on its way the row still reads as failed, not "Loading…"
     assert!(s.row_failed(0, NOON, NOON + 3600) && !s.row_pending(0, NOON, NOON + 3600), "a retried day keeps its failed look until it answers");
-    let Job::Grid { ch, date, .. } = job else { panic!() };
-    post.post(Landing::Grid { ch, date, result: Ok(vec![airing(0, NOON, "g", "s")]) });
+    let (key, date) = grid_of(&job);
+    post.post(Landing::Grid { key, date, result: Ok(vec![airing(0, NOON, "g", "s")]) });
     s.pump();
     assert!(!s.row_failed(0, NOON, NOON + 3600), "an answer clears it");
 }
@@ -222,8 +230,8 @@ fn one_queued_dvr_read_serves_every_ask_until_it_starts() {
     s.pump();
     assert!(script.take().is_empty(), "the write's re-read is the one already waiting");
     for (job, post) in grids {
-        let Job::Grid { ch, date, .. } = job else { unreachable!() };
-        post.post(Landing::Grid { ch, date, result: Ok(vec![]) });
+        let (key, date) = grid_of(&job);
+        post.post(Landing::Grid { key, date, result: Ok(vec![]) });
     }
     s.pump();
     let jobs = script.take();
@@ -285,7 +293,7 @@ fn the_cache_evicts_the_least_recently_wanted_days() {
         s.want_window(row..row + 2, NOON, NOON + 3600);
     }
     assert!(s.guide().len() <= crate::live_tv::DAYS_KEPT + 2, "{}", s.guide().len());
-    assert!(s.guide().get(198, "2025-10-09").is_some(), "the latest window is kept");
+    assert!(s.guide().get(&ChannelKey::of(&channel(198)), "2025-10-09").is_some(), "the latest window is kept");
 }
 
 #[test]
@@ -295,8 +303,8 @@ fn writes_run_one_at_a_time_in_press_order_and_end_in_notices_and_overlays() {
     s.want_window(0..1, NOON, NOON + 3600);
     s.pump();
     let (job, post) = script.take().remove(0);
-    let Job::Grid { ch, date, .. } = job else { panic!() };
-    post.post(Landing::Grid { ch, date, result: Ok(vec![airing(0, NOON, "plex://episode/e1", "plex://show/s1")]) });
+    let (key, date) = grid_of(&job);
+    post.post(Landing::Grid { key, date, result: Ok(vec![airing(0, NOON, "plex://episode/e1", "plex://show/s1")]) });
     s.pump();
     let a = s.airings(0, NOON, NOON + 3600).remove(0);
     s.write(Write::Record { airing: a.clone(), kind: RecordKind::Series });
@@ -307,7 +315,7 @@ fn writes_run_one_at_a_time_in_press_order_and_end_in_notices_and_overlays() {
     let (job, post) = jobs.into_iter().next().unwrap();
     assert!(matches!(job, Job::Write(Write::Record { kind: RecordKind::Series, .. })));
     assert_eq!(s.snapshot().writes_in_flight, 2);
-    post.post(Landing::Write { write: Write::Record { airing: a.clone(), kind: RecordKind::Series }, result: Ok(WriteDone { rule: "41".into(), conflicts: vec![] }) });
+    post.post(Landing::Write { write: Write::Record { airing: a.clone(), kind: RecordKind::Series }, result: Ok(WriteDone { rule: "41".into(), ..WriteDone::default() }) });
     s.pump();
     let marked = s.airings(0, NOON, NOON + 3600).remove(0);
     assert_eq!(marked.show_subscription_id, "41", "the series rule overlays the guide at once");
@@ -359,8 +367,9 @@ fn a_reset_drops_late_answers_and_keeps_the_generation_moving_forward() {
     s.reset();
     assert!(s.generation() > gen);
     for (job, post) in late {
-        if let Job::Grid { ch, date, .. } = job {
-            post.post(Landing::Grid { ch, date, result: Ok(vec![airing(ch, NOON, "g", "s")]) });
+        if matches!(job, Job::Grid { .. }) {
+            let (key, date) = grid_of(&job);
+            post.post(Landing::Grid { key, date, result: Ok(vec![airing(0, NOON, "g", "s")]) });
         }
     }
     s.pump();
@@ -643,11 +652,160 @@ fn a_stale_channel_day_is_read_again_while_its_programs_stay_on_screen() {
     use crate::live_tv::GuideCache;
     let mut g = GuideCache::default();
     let dates = vec!["2026-10-22".to_string()];
-    assert_eq!(g.want([0].into_iter(), &dates).len(), 1);
-    g.land(0, "2026-10-22", Ok(vec![airing(0, NOON, "g", "s")]), 1_000);
+    let c0 = ChannelKey::of(&channel(0));
+    assert_eq!(g.want([&c0].into_iter(), &dates).len(), 1);
+    g.land(&c0, "2026-10-22", Ok(vec![airing(0, NOON, "g", "s")]), 1_000);
     assert!(!g.expire(1_000 + 14 * 60, 15 * 60), "read lately: left alone");
     assert!(g.expire(1_000 + 15 * 60, 15 * 60));
-    assert_eq!(g.airings(0, NOON, NOON + 1).len(), 1, "its programs still show");
-    assert_eq!(g.want([0].into_iter(), &dates).len(), 1, "and it is asked again");
-    assert!(!g.pending(0, &dates), "it answered once: not on its way to the page, so no Loading…");
+    assert_eq!(g.airings(&c0, NOON, NOON + 1).len(), 1, "its programs still show");
+    assert_eq!(g.want([&c0].into_iter(), &dates).len(), 1, "and it is asked again");
+    assert!(!g.pending(&c0, &dates), "it answered once: not on its way to the page, so no Loading…");
+}
+
+/// **A channel's days are the channel's, not a row's**: the same Plex channel in another tab (a
+/// genre, the favorites) is not read again, and shows its programs at once in its new row.
+#[test]
+fn a_channel_is_read_once_whichever_tab_or_row_shows_it() {
+    use crate::live_tv::{CloudAuth, Source};
+    let cloud = |n: usize| Channel { cloud: true, part_key: format!("/library/parts/{n}.m3u8"), ..channel(n) };
+    let script = Script::default();
+    let mut s = ready(&script, 2);
+    s.set_cloud_auth(CloudAuth { client_id: "cid".into(), credential: "secret".into() });
+    s.select_source(Source::Plex);
+    s.pump();
+    let (_, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::CloudChannels { .. })).expect("the Plex lineup");
+    post.post(Landing::CloudChannels { source: Source::Plex, result: Ok((0..3).map(cloud).collect()) });
+    s.pump();
+    s.want_window(0..3, NOON, NOON + 3600);
+    s.pump();
+    let reads = script.take();
+    assert!(reads.len() == 3 && reads.iter().all(|(j, _)| matches!(j, Job::CloudGrid { .. })), "a Plex channel's guide is Plex's: {}", reads.len());
+    for (job, post) in reads {
+        let (key, date) = grid_of(&job);
+        post.post(Landing::Grid { key, date, result: Ok(vec![airing(0, NOON, "g", "s")]) });
+    }
+    s.pump();
+    // a genre tab that lists channel 2 first: nothing to read for it, and its programs show
+    s.select_source(Source::PlexTab("news".into()));
+    s.pump();
+    let (_, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::CloudChannels { .. })).expect("the genre's lineup");
+    post.post(Landing::CloudChannels { source: Source::PlexTab("news".into()), result: Ok(vec![cloud(2), cloud(7)]) });
+    s.pump();
+    s.want_window(0..2, NOON, NOON + 3600);
+    s.pump();
+    let reads: Vec<ChannelKey> = script.take().iter().map(|(j, _)| grid_of(j).0).collect();
+    assert_eq!(reads, vec![ChannelKey::of(&cloud(7))], "only the channel not yet read is asked");
+    assert_eq!(s.airings(0, NOON, NOON + 3600).len(), 1, "the row of channel 2 shows its programs at once");
+    assert!(!s.row_pending(0, NOON, NOON + 3600));
+    // …and the DVR's own rows keep theirs too: a DVR channel and a Plex channel never share a key
+    assert_ne!(ChannelKey::of(&channel(2)), ChannelKey::of(&cloud(2)));
+}
+
+const MACHINE: &str = "m1";
+
+fn favorite(source: &str, id: &str, vcn: &str) -> plx_plex::plex::live_tv::FavoriteChannel {
+    plx_plex::plex::live_tv::FavoriteChannel::new(source, id, "", "", vcn)
+}
+
+fn dvr_source() -> String {
+    format!("server://{MACHINE}/{}", provider().identifier)
+}
+
+/// **A favorite names its channel** by where it is and its id: a DVR channel through this
+/// server's identity (lineup id, grid key, else its number), one of Plex's own by an entry that
+/// is not a server's.
+#[test]
+fn a_favorite_names_a_dvr_channel_through_this_servers_identity_and_a_plex_one_otherwise() {
+    use crate::live_tv::favorite_names;
+    let p = provider().identifier;
+    let ch = Channel { grid_key: "g7".into(), ..channel(7) };
+    assert!(favorite_names(&favorite(&dvr_source(), "c7", ""), &ch, MACHINE, &p), "by lineup id");
+    assert!(favorite_names(&favorite(&dvr_source(), "g7", ""), &ch, MACHINE, &p), "by grid key");
+    assert!(favorite_names(&favorite(&dvr_source(), "other", "7.1"), &ch, MACHINE, &p), "by number when the id is neither");
+    assert!(!favorite_names(&favorite("server://m2/x", "c7", ""), &ch, MACHINE, &p), "another server's");
+    assert!(!favorite_names(&favorite("tv.plex.provider.epg", "c7", ""), &ch, MACHINE, &p), "a Plex entry never names a DVR channel");
+    let plex = Channel { cloud: true, ..channel(7) };
+    assert!(favorite_names(&favorite("tv.plex.provider.epg", "c7", ""), &plex, MACHINE, &p));
+    assert!(!favorite_names(&favorite(&dvr_source(), "c7", ""), &plex, MACHINE, &p));
+    assert!(favorite_names(&favorite(&dvr_source(), "c7", ""), &ch, "", ""), "an identity not yet learned matches any");
+}
+
+/// Lands the favorites read the store asked for.
+fn land_favorites(script: &Script, s: &mut LiveTvStore, list: Vec<plx_plex::plex::live_tv::FavoriteChannel>) {
+    s.pump();
+    let (_, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Favorites { .. })).expect("the favorites are read");
+    post.post(Landing::Favorites { machine: MACHINE.into(), result: Ok(list) });
+    s.pump();
+}
+
+/// **The Favorites tab is the account's list made into a lineup**: the channels it names, DVR
+/// and Plex alike, in the account's order, with Plex's lineup read aside for the Plex ones. The
+/// guide opens on it while no tab was picked and nothing was shown yet.
+#[test]
+fn the_favorites_tab_lists_the_named_channels_in_the_accounts_order_and_the_guide_opens_on_it() {
+    use crate::live_tv::{CloudAuth, Source};
+    let cloud = |n: usize| Channel { cloud: true, part_key: format!("/library/parts/{n}.m3u8"), ..channel(n) };
+    let script = Script::default();
+    let mut s = ready(&script, 4);
+    s.set_cloud_auth(CloudAuth { client_id: "cid".into(), credential: "secret".into() });
+    s.ask_favorites();
+    land_favorites(&script, &mut s, vec![
+        favorite("tv.plex.provider.epg", "c9", ""),
+        favorite(&dvr_source(), "c2", ""),
+        favorite(&dvr_source(), "nowhere", ""),
+        favorite(&dvr_source(), "c0", ""),
+    ]);
+    // nothing was shown yet and no tab picked: the guide opens on the favorites
+    let snap = s.snapshot();
+    assert_eq!(snap.source, Source::Favorites);
+    assert!(snap.channels_phase.is_loading(), "Plex's lineup is still being read for the Plex favorite");
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::CloudChannels { .. })).expect("Plex's lineup, read aside");
+    assert!(matches!(job, Job::CloudChannels { source: Source::Plex, .. }));
+    post.post(Landing::CloudChannels { source: Source::Plex, result: Ok((8..11).map(cloud).collect()) });
+    s.pump();
+    let snap = s.snapshot();
+    assert!(snap.channels_phase.is_ready());
+    assert_eq!(snap.channels.iter().map(|c| c.identifier.as_str()).collect::<Vec<_>>(), ["c9", "c2", "c0"], "the account's order; an entry naming nothing is left out");
+    assert!(snap.channels[0].cloud && !snap.channels[1].cloud);
+    assert!(snap.is_favorite(&channel(2)) && !snap.is_favorite(&channel(1)));
+    assert!(snap.favorite_dvr && snap.favorite_cloud);
+    // a tab picked is kept: the guide no longer moves to the favorites by itself
+    s.select_source(Source::Dvr);
+    s.land_on_favorites();
+    assert_eq!(s.snapshot().source, Source::Dvr);
+}
+
+/// **Adding a channel writes the account's form of entry**, through the write queue, and the list
+/// it wrote is the favorites at once; the DVR's lists are not read again for it.
+#[test]
+fn adding_a_favorite_writes_this_servers_entry_and_its_answer_is_the_list() {
+    use crate::live_tv::{CloudAuth, Source};
+    let script = Script::default();
+    let mut s = ready(&script, 3);
+    // the page shows the DVR's guide: a favorite added there does not move the guide off it
+    s.want_window(0..3, NOON, NOON + 3600);
+    s.set_cloud_auth(CloudAuth { client_id: "cid".into(), credential: "secret".into() });
+    s.ask_favorites();
+    land_favorites(&script, &mut s, vec![]);
+    assert_eq!(s.snapshot().source, Source::Dvr, "no favorites: the guide stays on the DVR");
+    assert!(!s.snapshot().is_favorite(&channel(1)));
+    assert!(s.set_favorite(1, true));
+    s.pump();
+    let (job, post) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).expect("the change goes out");
+    let Job::Write(Write::Favorite { op: FavoriteOp::Add(entry), add: true, .. }) = &job else { panic!("{job:?}") };
+    assert_eq!((entry.source.as_str(), entry.id.as_str(), entry.vcn.as_str()), (dvr_source().as_str(), "c1", "1.1"));
+    let Job::Write(write) = job else { unreachable!() };
+    let written = vec![favorite(&dvr_source(), "c1", "1.1")];
+    post.post(Landing::Write { write, result: Ok(WriteDone { favorites: Some(written), ..WriteDone::default() }) });
+    s.pump();
+    let snap = s.snapshot();
+    assert!(snap.is_favorite(&channel(1)));
+    assert_eq!(snap.notice.map(|n| n.op), Some(WriteOp::FavoriteAdded));
+    assert!(!script.take().iter().any(|(j, _)| matches!(j, Job::Dvr { .. })), "a favorites change is not a DVR change");
+    // taking it off removes every entry that names it
+    assert!(s.set_favorite(1, false));
+    s.pump();
+    let (job, _) = script.take().into_iter().find(|(j, _)| matches!(j, Job::Write(_))).expect("the change goes out");
+    assert!(matches!(job, Job::Write(Write::Favorite { op: FavoriteOp::Remove(ref gone), add: false, .. }) if gone.len() == 1));
+    assert!(!s.set_favorite(2, false), "not a favorite: nothing to take off");
 }

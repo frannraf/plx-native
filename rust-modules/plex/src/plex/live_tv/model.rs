@@ -47,6 +47,10 @@ pub struct Channel {
     pub part_key: String,
     /// The channel needs DRM (Widevine), which this app does not have.
     pub drm: bool,
+    /// One of Plex's own channels, from the cloud provider's lineup: its guide is read from the
+    /// provider and it plays the provider's stream. `false`: a server DVR's channel, whose guide
+    /// the server answers and which is tuned. Set by the lineup that listed it, never inferred.
+    pub cloud: bool,
 }
 
 impl Channel {
@@ -104,6 +108,77 @@ pub struct CloudTab {
     /// What `?genre=` takes.
     pub identifier: String,
     pub title: String,
+}
+
+/// **One of the account's favorite channels**, as Plex keeps them for every client
+/// (`GET https://epg.provider.plex.tv/settings/favoriteChannels`): where the channel lives
+/// (`source`; a server DVR's channel as `server://{machineIdentifier}/{provider}`) and its id
+/// there, with the title, logo and number it was saved with. The list is the account's, shared
+/// with the stock clients: it is read and written whole, in its order, and `raw` (the entry as the
+/// provider sent it) is what goes back, so fields this app does not read survive an edit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FavoriteChannel {
+    pub source: String,
+    pub id: String,
+    pub title: String,
+    pub thumb: String,
+    pub vcn: String,
+    /// The entry's JSON as it is written back.
+    pub raw: String,
+}
+
+impl FavoriteChannel {
+    /// A new entry, in the shape the stock clients write: `source`, `id`, then the words and logo
+    /// it is listed with (empty ones left out).
+    pub fn new(source: &str, id: &str, title: &str, thumb: &str, vcn: &str) -> Self {
+        let mut o = serde_json::Map::new();
+        o.insert("source".into(), source.into());
+        o.insert("id".into(), id.into());
+        for (k, v) in [("title", title), ("thumb", thumb), ("vcn", vcn)] {
+            if !v.is_empty() {
+                o.insert(k.into(), v.into());
+            }
+        }
+        FavoriteChannel {
+            source: source.into(),
+            id: id.into(),
+            title: title.into(),
+            thumb: thumb.into(),
+            vcn: vcn.into(),
+            raw: serde_json::Value::Object(o).to_string(),
+        }
+    }
+
+    /// The same entry as `other`: the provider names an entry by where and what it is.
+    pub fn same(&self, other: &FavoriteChannel) -> bool {
+        self.source == other.source && self.id == other.id
+    }
+
+    /// Does it name a server DVR's channel (`server://…`)? Else one of Plex's own.
+    pub fn on_server(&self) -> bool {
+        self.source.starts_with("server://")
+    }
+}
+
+/// A change to the favorites, applied to the list as the provider holds it when the change is
+/// written (another device may have changed it meanwhile).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FavoriteOp {
+    /// Append it, unless the list already holds it.
+    Add(FavoriteChannel),
+    /// Drop these entries (every one that names the channel).
+    Remove(Vec<FavoriteChannel>),
+}
+
+impl FavoriteOp {
+    /// The list after this change.
+    pub fn apply(&self, list: &[FavoriteChannel]) -> Vec<FavoriteChannel> {
+        match self {
+            FavoriteOp::Add(f) if list.iter().any(|g| g.same(f)) => list.to_vec(),
+            FavoriteOp::Add(f) => list.iter().cloned().chain(std::iter::once(f.clone())).collect(),
+            FavoriteOp::Remove(gone) => list.iter().filter(|g| !gone.iter().any(|f| f.same(g))).cloned().collect(),
+        }
+    }
 }
 
 /// One airing: a program on a channel between two wall-clock instants (`Media.beginsAt` /

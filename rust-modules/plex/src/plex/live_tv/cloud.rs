@@ -19,7 +19,7 @@
 use serde_json::Value;
 
 use super::parse;
-use super::{Airing, Channel, CloudTab, LiveError, LiveResult};
+use super::{Airing, Channel, CloudTab, FavoriteChannel, FavoriteOp, LiveError, LiveResult};
 use crate::plex::account::AccountClient;
 use crate::plex::client::QueryBuilder;
 
@@ -28,6 +28,9 @@ pub const BASE: &str = "https://epg.provider.plex.tv";
 
 /// The protocol version community clients send; older ones are answered with older shapes.
 const PROVIDER_VERSION: &str = "X-Plex-Provider-Version: 7.2";
+
+/// The account's favorite channels, every client's: read whole, written whole.
+const FAVORITES: &str = "/settings/favoriteChannels";
 
 impl AccountClient {
     /// One GET to the provider, its JSON or the error a non-2xx / unreadable answer is.
@@ -46,6 +49,59 @@ impl AccountClient {
         }
     }
 
+    /// One PUT of a JSON body to the provider. `Ok` on any 2xx.
+    fn cloud_put(&self, path: &str, body: &[u8]) -> LiveResult<()> {
+        let url = format!("{BASE}{path}");
+        let mut headers = self.headers();
+        headers.push(PROVIDER_VERSION.to_string());
+        // the provider refuses a body it is not told is JSON (a community client saw HTTP 400)
+        headers.push("Content-Type: application/json".to_string());
+        let resp = plx_net::net::request_evidence(&url, &headers, "PUT", Some(body), plx_net::net::API, false, None, None);
+        let status = match resp {
+            Ok(r) => r.status,
+            Err(f) => f.status.ok_or(LiveError::Transport)?,
+        };
+        plx_base::eventlog::log(&format!("livetv: favorite channels saved -> HTTP {status}"));
+        if (200..300).contains(&status) { Ok(()) } else { Err(LiveError::Status(i32::from(status))) }
+    }
+
+    /// **The account's favorite channels**, in the account's order (shared with the stock
+    /// clients, whose guide opens on them).
+    pub fn favorite_channels(&self) -> LiveResult<Vec<FavoriteChannel>> {
+        let list = parse::favorites(&self.cloud_get(FAVORITES)?);
+        let on_server = list.iter().filter(|f| f.on_server()).count();
+        let mut sources: Vec<&str> = list.iter().map(|f| f.source.as_str()).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        // A release build's event log too: what the list's ids look like is what matching it to a
+        // lineup needs to know, and a shape names no channel.
+        plx_base::eventlog::log(&format!(
+            "livetv: favorites read: {} entr{}, {on_server} on a server, {} source(s), ids {:?}",
+            list.len(),
+            if list.len() == 1 { "y" } else { "ies" },
+            sources.len(),
+            list.iter().map(|f| super::debug::id_shape(&f.id)).collect::<Vec<_>>()
+        ));
+        Ok(list)
+    }
+
+    /// Change the account's favorites: the list as the provider holds it now, `op` applied, written
+    /// back whole (every other entry as it came). Answers the list written. A debug build writes
+    /// only under the owner's live switch, as every Live TV change ([`super::guard`]).
+    pub fn edit_favorite_channels(&self, op: &FavoriteOp) -> LiveResult<Vec<FavoriteChannel>> {
+        if !super::guard::allow("favorite channels", "") {
+            return Err(LiveError::Refused);
+        }
+        let now = self.favorite_channels()?;
+        let next = op.apply(&now);
+        if next == now {
+            return Ok(now);
+        }
+        let body = format!("[{}]", next.iter().map(|f| f.raw.as_str()).collect::<Vec<_>>().join(","));
+        self.cloud_put(FAVORITES, body.as_bytes())?;
+        Ok(next)
+    }
+
     /// The genre tabs of Plex's channels.
     pub fn cloud_tabs(&self) -> LiveResult<Vec<CloudTab>> {
         let tabs = parse::cloud_tabs(&self.cloud_get("/")?);
@@ -62,7 +118,11 @@ impl AccountClient {
         };
         let all = parse::channels(&self.cloud_get(&path)?);
         let total = all.len();
-        let playable: Vec<Channel> = all.into_iter().filter(|c| !c.drm && !c.part_key.is_empty()).collect();
+        let playable: Vec<Channel> = all
+            .into_iter()
+            .filter(|c| !c.drm && !c.part_key.is_empty())
+            .map(|c| Channel { cloud: true, ..c })
+            .collect();
         super::debug::parsed(&format!(
             "cloud lineup parsed: {total} channel(s), {} playable, {} with a grid key",
             playable.len(),
@@ -210,6 +270,32 @@ mod tests {
         let chans = parse::channels(&body);
         assert_eq!(chans[0].part_key, "/library/parts/a-1.m3u8");
         assert!(!chans[0].drm && chans[1].drm);
+    }
+
+    /// The favorites read as the provider answers them, `id` or `key`, and an edit keeps every
+    /// other entry byte for byte (fields this app does not read included).
+    #[test]
+    fn favorites_parse_and_an_edit_keeps_the_other_entries_as_they_came() {
+        let body = serde_json::json!({"MediaContainer": {"size": 3, "FavoriteChannel": [
+            {"source": "server://KXYZ/tv.plex.providers.epg.cloud:2", "id": "a-1", "title": "One", "vcn": "4.1", "extra": {"x": 1}},
+            {"source": "tv.plex.provider.epg", "key": "b-2", "title": "Two"},
+            {"source": "server://KXYZ/p", "title": "no id"}
+        ]}});
+        let list = parse::favorites(&body);
+        assert_eq!(list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["a-1", "b-2"]);
+        assert!(list[0].on_server() && !list[1].on_server());
+        assert!(list[0].raw.contains("\"extra\""), "the entry's own fields ride along: {}", list[0].raw);
+        let added = FavoriteChannel::new("server://KXYZ/tv.plex.providers.epg.cloud:2", "c-3", "Three", "", "5.1");
+        let next = FavoriteOp::Add(added.clone()).apply(&list);
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[..2], list[..], "the others unchanged, in order");
+        assert_eq!(FavoriteOp::Add(added.clone()).apply(&next), next, "added once");
+        let back: serde_json::Value = serde_json::from_str(&added.raw).expect("json");
+        assert_eq!(back, serde_json::json!({"source": "server://KXYZ/tv.plex.providers.epg.cloud:2", "id": "c-3", "title": "Three", "vcn": "5.1"}));
+        let less = FavoriteOp::Remove(vec![list[0].clone()]).apply(&next);
+        assert_eq!(less.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["b-2", "c-3"]);
+        // a bare array is read too
+        assert_eq!(parse::favorites(&serde_json::json!([{"source": "s", "id": "z"}])).len(), 1);
     }
 
     #[test]

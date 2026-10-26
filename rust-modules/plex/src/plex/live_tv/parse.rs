@@ -165,6 +165,33 @@ pub(super) fn channels(body: &Value) -> Vec<Channel> {
                 hd: flag(ch, "isHd") || flag(ch, "hd"),
                 part_key: many(ch, "Media").into_iter().flat_map(|m| many(m, "Part")).map(|p| text(p, "key")).find(|k| !k.is_empty()).unwrap_or_default(),
                 drm: flag(ch, "drm") || many(ch, "Media").into_iter().any(|m| flag(m, "drm") || many(m, "Part").into_iter().any(|p| flag(p, "drm"))),
+                cloud: false,
+            })
+        })
+        .collect()
+}
+
+/// The account's favorite channels: `MediaContainer.FavoriteChannel[]` (or a bare array of
+/// entries). An entry with no id names nothing and is skipped; `raw` keeps each as it came.
+pub(super) fn favorites(body: &Value) -> Vec<FavoriteChannel> {
+    let items: Vec<&Value> = match body {
+        Value::Array(a) => a.iter().filter(|i| i.is_object()).collect(),
+        _ => container(body).map(|c| many(c, "FavoriteChannel")).unwrap_or_default(),
+    };
+    items
+        .into_iter()
+        .filter_map(|f| {
+            let id = match text(f, "id") {
+                id if id.is_empty() => text(f, "key"),
+                id => id,
+            };
+            (!id.is_empty()).then(|| FavoriteChannel {
+                source: text(f, "source"),
+                id,
+                title: text(f, "title"),
+                thumb: text(f, "thumb"),
+                vcn: text(f, "vcn"),
+                raw: f.to_string(),
             })
         })
         .collect()

@@ -1651,6 +1651,25 @@ of plex.tv, not a server's) and `X-Plex-Provider-Version: 7.2` (`plex::live_tv::
   any key tag refuses those channels. Their target duration may differ (6 s seen beside 7 s).
 - An ad break's segments 301-redirect to the ad server's own `.ts` files on another host.
 
+### 10.8 The account's favorite channels — `https://epg.provider.plex.tv/settings/favoriteChannels`
+
+Not a PMS either: Plex's cloud provider again, with the account's plex.tv identity and the same
+`X-Plex-Provider-Version` header (`plex::live_tv::cloud`). The list is the ACCOUNT's, shared with
+the stock clients (their guide opens on its Favorites tab), so it is read and written whole and in
+order, and every entry this app does not change is written back exactly as it came.
+
+- `GET` → `MediaContainer.FavoriteChannel[]`: `source`, `id` (one community client also reads
+  `key`), `title`, `thumb`, `vcn`. A server DVR's channel has `source` =
+  `server://{machineIdentifier}/{provider identifier}`; an entry for one of Plex's own channels has
+  some other source (its exact form is not yet seen).
+- `PUT` with a JSON array of the entries as the body, `Content-Type: application/json` (without it
+  a community client saw HTTP 400). The app re-reads the list right before a change and writes
+  that list with the one change applied (another device may have changed it meanwhile).
+- **Not yet measured:** which channel field a DVR entry's `id` holds (the lineup `id`, its
+  `gridKey`, or something else). The app matches either, else the entry's `vcn` on the same
+  server, logs which matched (`livetv: favorites name …`), and writes new entries in the form the
+  account's existing entries use (the lineup `id` when there are none).
+
 ## Paging, observed
 
 Observed on PMS 1.43.4 with a small library, by read-only GETs. Only the endpoints in the table were

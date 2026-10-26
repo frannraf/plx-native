@@ -16,7 +16,7 @@
 //! * **Watch.** The store tunes off the frame; a landed stream is taken once
 //!   ([`Bridge::live_tv_take_tuned`]) and installed into the media route, whose lease releases the
 //!   tuner when the playback ends however it ends.
-use plx_data::live_tv::{Availability, RecordKind, Tuned};
+use plx_data::live_tv::{Availability, ChannelKey, RecordKind, Tuned};
 use plx_data::stores::live_tv::Write;
 use plx_screens::live_tv::model::{LiveTvView, RowAirings, Want};
 use plx_screens::live_tv::page::{LiveTvOut, LiveTvScreen};
@@ -33,10 +33,10 @@ pub(crate) struct Feed {
     tried: Vec<plx_plex::plex::ServerId>,
     /// When a failed providers read is asked again (the app's logical clock, ms).
     retry_at: Option<u32>,
-    /// The channel playing (full screen or in the guide's corner), as its tab and row: the player's
+    /// The channel playing (full screen or in the guide's corner), as its identity: the player's
     /// record disc records what is on it, OK on it brings the corner's picture back, CH▲/CH▼ step
-    /// from it. Set when its tune lands and plays, not when it is asked.
-    watching: Option<(plx_data::live_tv::Source, usize)>,
+    /// from it, in whichever tab shows it. Set when its tune lands and plays, not when it is asked.
+    watching: Option<ChannelKey>,
     /// The tune asked of the store and not yet landed.
     asked: Option<Asked>,
     /// A tune waiting for a tuner to come back first: a DVR has none to spare (seen on the TV:
@@ -48,12 +48,13 @@ pub(crate) struct Feed {
     freshened: Option<i64>,
 }
 
-/// A Watch asked for: its tab and row, and whether the live player's CH▲/CH▼ asked it (its landing
-/// plays over the player, where a guide press's plays only over the guide).
+/// A Watch asked for: its tab and row, the channel there, and whether the live player's CH▲/CH▼
+/// asked it (its landing plays over the player, where a guide press's plays only over the guide).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Asked {
     pub source: plx_data::live_tv::Source,
     pub row: usize,
+    pub key: Option<ChannelKey>,
     pub step: bool,
 }
 
@@ -151,6 +152,9 @@ impl Bridge {
             self.live_tv.generation = None;
             self.live_tv.want = None;
             self.stores.live_tv.refresh_dvr();
+            // the guide opens on the account's favorites, as the stock app's does, until a tab is
+            // picked
+            self.stores.live_tv.land_on_favorites();
         }
         if let Some(art) = page.hero_art() {
             self.stores.live_tv.want_blur(&art);
@@ -188,6 +192,11 @@ impl Bridge {
             LiveTvOut::CancelTune => self.live_tv_cancel_tune(),
             LiveTvOut::DismissTuneFailure => store.clear_tune_failure(),
             LiveTvOut::Write(w) => store.write(w),
+            LiveTvOut::Favorite { row, on } => {
+                if !store.set_favorite(row, on) {
+                    plx_base::eventlog::log("livetv: that favorite cannot be changed from here");
+                }
+            }
             LiveTvOut::Retry => store.retry_failed(),
             LiveTvOut::RefreshDvr => store.refresh_dvr(),
             LiveTvOut::Tab(_) | LiveTvOut::Account | LiveTvOut::Back => {}
@@ -202,11 +211,11 @@ impl Bridge {
         if plx_media::route::record_asked() || self.live_tv_step_busy() {
             return;
         }
-        let Some((source, row)) = self.live_tv.watching.clone() else { return };
-        if &source != self.stores.live_tv.source() {
-            plx_base::eventlog::log("livetv: record from the player: the guide shows another tab");
+        let Some(key) = self.live_tv.watching.clone() else { return };
+        let Some(row) = self.stores.live_tv.row_of_key(&key) else {
+            plx_base::eventlog::log("livetv: record from the player: the guide's tab does not list that channel");
             return;
-        }
+        };
         let Some(airing) = self.stores.live_tv.on_now(row) else {
             plx_base::eventlog::log("livetv: record from the player: nothing on now on that row");
             return;
@@ -222,8 +231,9 @@ impl Bridge {
     /// Plex's channels takes no tuner and goes at once.
     fn live_tv_ask(&mut self, row: usize, airing: Option<plx_plex::plex::live_tv::Airing>, step: bool) {
         let store = &mut self.stores.live_tv;
-        let asked = Asked { source: store.source().clone(), row, step };
-        if !asked.source.is_cloud() && (plx_media::route::live_releasing() || store.tuners_settling()) {
+        let asked = Asked { source: store.source().clone(), row, key: store.key_of(row), step };
+        // one of Plex's channels takes no tuner (whatever tab lists it)
+        if !store.row_is_cloud(row) && (plx_media::route::live_releasing() || store.tuners_settling()) {
             plx_base::eventlog::log(&format!("livetv: row {row} waits for a tuner to come back"));
             store.cancel_tune();
             // …shown as tuning meanwhile, so the press is answered and BACK can take it back
@@ -266,19 +276,20 @@ impl Bridge {
     /// guide shows (a channel watched from another tab has no neighbours here).
     pub(crate) fn live_tv_step_target(&self, step: i32) -> Option<usize> {
         let store = &self.stores.live_tv;
+        // from the step under way, else the channel playing where the tab shown lists it
         let from = match (&self.live_tv.pending, &self.live_tv.asked, &self.live_tv.watching) {
-            (Some((a, _)), _, _) if a.step => (a.source.clone(), a.row),
-            (_, Some(a), _) if a.step => (a.source.clone(), a.row),
-            (_, _, Some(w)) => w.clone(),
-            _ => return None,
-        };
+            (Some((a, _)), _, _) if a.step => (&a.source == store.source()).then_some(a.row),
+            (_, Some(a), _) if a.step => (&a.source == store.source()).then_some(a.row),
+            (_, _, Some(key)) => store.row_of_key(key),
+            _ => None,
+        }?;
         let n = store.channel_count();
         // a step of 0 is the same channel tuned again (closed captions on or off)
-        if n == 0 || (step != 0 && n < 2) || &from.0 != store.source() {
+        if n == 0 || (step != 0 && n < 2) {
             return None;
         }
-        let next = (from.1 as i64 + i64::from(step)).rem_euclid(n as i64) as usize;
-        plx_base::eventlog::log(&format!("livetv: channel step {step:+} from row {} to row {next}", from.1));
+        let next = (from as i64 + i64::from(step)).rem_euclid(n as i64) as usize;
+        plx_base::eventlog::log(&format!("livetv: channel step {step:+} from row {from} to row {next}"));
         Some(next)
     }
 
@@ -297,11 +308,9 @@ impl Bridge {
             return None;
         }
         self.live_tv.rolled_at = Some(generation);
-        let (source, row) = self.live_tv.watching.as_ref()?;
-        if source != self.stores.live_tv.source() {
-            return None;
-        }
-        self.stores.live_tv.on_now(*row)
+        let key = self.live_tv.watching.as_ref()?;
+        let row = self.stores.live_tv.row_of_key(key)?;
+        self.stores.live_tv.on_now(row)
     }
 
     /// How the channel row `row` of the tab shown is named ("4.1 KXYZ"), for the player's lines.
@@ -342,7 +351,7 @@ impl Bridge {
 
     /// The landed tune plays: it is the channel watched now.
     pub(crate) fn live_tv_now_watching(&mut self, asked: &Asked) {
-        self.live_tv.watching = Some((asked.source.clone(), asked.row));
+        self.live_tv.watching = asked.key.clone();
     }
 
     /// No channel plays any more: nothing is watched from the guide (which is kept fresh only while
@@ -367,7 +376,7 @@ impl Bridge {
     /// Is `row` of the tab shown the channel last asked to be watched (the corner's, while one
     /// plays there)?
     pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {
-        self.live_tv.watching.as_ref().is_some_and(|(source, r)| *r == row && source == self.stores.live_tv.source())
+        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of(row)
     }
 
     /// Forget a Watch press still on its way (the app is going to the background).

@@ -215,5 +215,29 @@
   "live_tv.rule.single": {
     "value": "Single",
     "description": "Kind of a recording rule in the Recordings list: records one program."
+  },
+  "live_tv.tab.favorites": {
+    "value": "Favorites",
+    "description": "First tab in the Live TV guide's tab row: the account's favorite channels (the same list the official Plex apps show)."
+  },
+  "live_tv.state.no_favorites": {
+    "value": "No favorite channels yet. Move left onto a channel's logo and press OK to add it.",
+    "description": "Live TV page read-out on the Favorites tab when the account has no favorite channel this server or Plex offers."
+  },
+  "live_tv.action.add_favorite": {
+    "value": "Add to Favorites",
+    "description": "Live TV channel panel button: add this channel to the account's favorite channels."
+  },
+  "live_tv.action.remove_favorite": {
+    "value": "Remove from Favorites",
+    "description": "Live TV channel panel button: take this channel off the account's favorite channels."
+  },
+  "live_tv.notice.favorite_added": {
+    "value": "Added to Favorites.",
+    "description": "Live TV notice after a channel was added to the favorite channels."
+  },
+  "live_tv.notice.favorite_removed": {
+    "value": "Removed from Favorites.",
+    "description": "Live TV notice after a channel was taken off the favorite channels."
   }
 }

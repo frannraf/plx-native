@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Aucun enregistrement n’est programmé. Choisissez une émission dans le Guide et appuyez sur OK pour l’enregistrer.",
   "live_tv.hud.live": "EN DIRECT",
   "live_tv.rule.series": "Série",
-  "live_tv.rule.single": "Unique"
+  "live_tv.rule.single": "Unique",
+  "live_tv.tab.favorites": "Favoris",
+  "live_tv.state.no_favorites": "Aucune chaîne favorite pour l'instant. Allez à gauche sur le logo d'une chaîne et appuyez sur OK pour l'ajouter.",
+  "live_tv.action.add_favorite": "Ajouter aux favoris",
+  "live_tv.action.remove_favorite": "Retirer des favoris",
+  "live_tv.notice.favorite_added": "Ajoutée aux favoris.",
+  "live_tv.notice.favorite_removed": "Retirée des favoris."
 }

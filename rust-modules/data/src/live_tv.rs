@@ -9,7 +9,7 @@
 //! without a battery clock can read 1970 until NTP has run; [`plausible_now`] says so, and the
 //! store waits rather than asking the server for a guide of 1970.
 
-use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, EpgProvider, Grab, LiveStream, Subscription, TunedItem};
+use plx_plex::plex::live_tv::{Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveStream, Subscription, TunedItem};
 use plx_plex::plex::ServerId;
 use std::collections::HashMap;
 
@@ -69,10 +69,13 @@ impl Phase {
     }
 }
 
-/// Which lineup the guide shows (a guide tab): the server's DVR, all of Plex's own channels, or
-/// one genre tab of them (its [`CloudTab::identifier`]).
+/// Which lineup the guide shows (a guide tab): the account's favorite channels, the server's
+/// DVR, all of Plex's own channels, or one genre tab of them (its [`CloudTab::identifier`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Source {
+    /// The account's favorites, shared with the stock clients: DVR channels and Plex channels
+    /// both, in the account's order.
+    Favorites,
     #[default]
     Dvr,
     Plex,
@@ -80,8 +83,13 @@ pub enum Source {
 }
 
 impl Source {
-    /// A lineup of Plex's own channels: played from the provider, never tuned.
+    /// A lineup of Plex's own channels only: played from the provider, never tuned. (The
+    /// favorites mix both kinds: each channel says which it is, [`Channel::cloud`].)
     pub fn is_cloud(&self) -> bool {
+        matches!(self, Source::Plex | Source::PlexTab(_))
+    }
+    /// Is it read with the profile's plex.tv identity (Plex's channels, the account's favorites)?
+    pub fn needs_account(&self) -> bool {
         !matches!(self, Source::Dvr)
     }
     /// The `?genre=` its lineup is read with.
@@ -144,21 +152,39 @@ pub struct Day {
     pub landed_at: i64,
 }
 
-/// The guide's day cache: one entry per `(channel index, UTC date)`, bounded by [`DAYS_KEPT`]
-/// with the least recently wanted evicted first. A day a window still wants is never evicted.
+/// **A channel as the guide's cache knows it**: where its guide is read from (Plex's cloud
+/// provider, or the server's DVR) and its grid key. A row number names a channel only within one
+/// lineup (a tab, the favorites); this names it in all of them, so one channel's days are read
+/// once whichever tab shows it, and a lineup read again keeps what was cached for its channels.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChannelKey {
+    pub cloud: bool,
+    pub grid: String,
+}
+
+impl ChannelKey {
+    pub fn of(ch: &Channel) -> Self {
+        let grid = if ch.grid_key.is_empty() { &ch.identifier } else { &ch.grid_key };
+        ChannelKey { cloud: ch.cloud, grid: grid.clone() }
+    }
+}
+
+/// The guide's day cache: one entry per `(channel, UTC date)`, bounded by [`DAYS_KEPT`] with the
+/// least recently wanted evicted first. A day a window still wants is never evicted.
 #[derive(Clone, Debug, Default)]
 pub struct GuideCache {
-    days: HashMap<(usize, String), Day>,
+    days: HashMap<(ChannelKey, String), Day>,
     clock: u64,
 }
 
-/// Channel-days the guide keeps: with ~20-50 airings a day that is a few thousand airings, the
-/// order of what one official client keeps (about 2000).
-pub const DAYS_KEPT: usize = 96;
+/// Channel-days the guide keeps, every tab's together: with ~20-50 airings a day that is a few
+/// thousand airings, the order of what one official client keeps (about 2000), and room for the
+/// window of the tab shown and of the one left.
+pub const DAYS_KEPT: usize = 128;
 
 impl GuideCache {
-    pub fn get(&self, ch: usize, date: &str) -> Option<&Day> {
-        self.days.get(&(ch, date.to_string()))
+    pub fn get(&self, ch: &ChannelKey, date: &str) -> Option<&Day> {
+        self.days.get(&(ch.clone(), date.to_string()))
     }
     pub fn len(&self) -> usize {
         self.days.len()
@@ -166,18 +192,19 @@ impl GuideCache {
     pub fn is_empty(&self) -> bool {
         self.days.is_empty()
     }
-    /// Mark every `(channel, date)` of a window wanted; return the ones never asked for, in row
-    /// order. A failed day is not asked again until [`GuideCache::reset_failed`] (the page's
-    /// Retry), so a dead server is not hammered by every scroll.
-    pub fn want(&mut self, rows: impl Iterator<Item = usize>, dates: &[String]) -> Vec<(usize, String)> {
+    /// Mark every `(channel, date)` of a window wanted; return the ones never asked for, in the
+    /// order the channels came. A failed day is not asked again until
+    /// [`GuideCache::reset_failed`] (the page's Retry), so a dead server is not hammered by every
+    /// scroll.
+    pub fn want<'a>(&mut self, channels: impl Iterator<Item = &'a ChannelKey>, dates: &[String]) -> Vec<(ChannelKey, String)> {
         self.clock += 1;
         let mut need = Vec::new();
-        for ch in rows {
+        for ch in channels {
             for d in dates {
-                let day = self.days.entry((ch, d.clone())).or_default();
+                let day = self.days.entry((ch.clone(), d.clone())).or_default();
                 day.wanted_at = self.clock;
                 if matches!(day.phase, Phase::Idle) {
-                    need.push((ch, d.clone()));
+                    need.push((ch.clone(), d.clone()));
                 }
             }
         }
@@ -195,14 +222,14 @@ impl GuideCache {
             }
         }
     }
-    pub fn set_loading(&mut self, ch: usize, date: &str) {
-        if let Some(d) = self.days.get_mut(&(ch, date.to_string())) {
+    pub fn set_loading(&mut self, ch: &ChannelKey, date: &str) {
+        if let Some(d) = self.days.get_mut(&(ch.clone(), date.to_string())) {
             d.phase = Phase::Loading;
         }
     }
     /// A fetch landed (at `now`, epoch seconds). A day evicted meanwhile is not resurrected.
-    pub fn land(&mut self, ch: usize, date: &str, result: Result<Vec<Airing>, String>, now: i64) {
-        if let Some(d) = self.days.get_mut(&(ch, date.to_string())) {
+    pub fn land(&mut self, ch: &ChannelKey, date: &str, result: Result<Vec<Airing>, String>, now: i64) {
+        if let Some(d) = self.days.get_mut(&(ch.clone(), date.to_string())) {
             match result {
                 Ok(a) => {
                     d.airings = a;
@@ -238,7 +265,7 @@ impl GuideCache {
         if self.days.len() <= DAYS_KEPT {
             return;
         }
-        let mut order: Vec<((usize, String), u64)> = self.days.iter().map(|(k, d)| (k.clone(), d.wanted_at)).collect();
+        let mut order: Vec<((ChannelKey, String), u64)> = self.days.iter().map(|(k, d)| (k.clone(), d.wanted_at)).collect();
         order.sort_by_key(|(_, at)| *at);
         let excess = self.days.len() - DAYS_KEPT;
         for (k, at) in order.into_iter().take(excess) {
@@ -249,12 +276,12 @@ impl GuideCache {
     }
     /// Every airing of channel `ch` overlapping `[from, to)`, across its cached days, sorted and
     /// de-duplicated (an airing across UTC midnight is in both days).
-    pub fn airings(&self, ch: usize, from: i64, to: i64) -> Vec<Airing> {
+    pub fn airings(&self, ch: &ChannelKey, from: i64, to: i64) -> Vec<Airing> {
         // A day being read again (expired, or failed and retried) still shows what it had.
         let mut out: Vec<Airing> = self
             .days
             .iter()
-            .filter(|((c, _), d)| *c == ch && (d.phase.is_ready() || !d.airings.is_empty()))
+            .filter(|((c, _), d)| c == ch && (d.phase.is_ready() || !d.airings.is_empty()))
             .flat_map(|(_, d)| d.airings.iter())
             .filter(|a| a.ends_at > from && a.begins_at < to)
             .cloned()
@@ -267,13 +294,13 @@ impl GuideCache {
     /// time? (A day being asked again after a failure reads as failed meanwhile: [`Day::failures`];
     /// one that answered once and is read again for freshness shows what it had — "no information"
     /// when that was nothing — never "Loading…".)
-    pub fn pending(&self, ch: usize, dates: &[String]) -> bool {
+    pub fn pending(&self, ch: &ChannelKey, dates: &[String]) -> bool {
         dates.iter().any(|d| {
             self.get(ch, d).is_none_or(|day| matches!(day.phase, Phase::Idle | Phase::Loading) && day.failures == 0 && day.landed_at == 0)
         })
     }
     /// Did every day of channel `ch` in `dates` fail (or fail and not yet answer again)?
-    pub fn failed(&self, ch: usize, dates: &[String]) -> bool {
+    pub fn failed(&self, ch: &ChannelKey, dates: &[String]) -> bool {
         !dates.is_empty()
             && dates.iter().all(|d| self.get(ch, d).is_some_and(|day| matches!(day.phase, Phase::Failed(_)) || (day.failures > 0 && !day.phase.is_ready())))
     }
@@ -304,6 +331,24 @@ impl GuideCache {
     pub fn clear(&mut self) {
         self.days.clear();
     }
+}
+
+/// **Does favorite `f` name channel `ch`?** A DVR channel by a `server://{machine}/{provider}`
+/// entry of this server (`machine`: its machineIdentifier; `provider`: its DVR's EPG provider;
+/// either unknown matches any) whose id is the channel's lineup id or grid key, else (an entry
+/// whose id is neither, as the account was saved by another client) its number; one of Plex's own
+/// channels by an entry that is not a server's, by id or grid key.
+pub fn favorite_names(f: &FavoriteChannel, ch: &Channel, machine: &str, provider: &str) -> bool {
+    let by_id = !f.id.is_empty() && (f.id == ch.identifier || f.id == ch.grid_key);
+    if ch.cloud {
+        return !f.on_server() && by_id;
+    }
+    let Some(rest) = f.source.strip_prefix("server://") else { return false };
+    let (m, p) = rest.split_once('/').unwrap_or((rest, ""));
+    if (!machine.is_empty() && m != machine) || (!provider.is_empty() && !p.is_empty() && p != provider) {
+        return false;
+    }
+    by_id || (!f.vcn.is_empty() && f.vcn == ch.vcn)
 }
 
 /// A recording change the guide shows before (and whether or not) the grid is read again.
@@ -344,6 +389,8 @@ pub enum WriteOp {
     CancelRule,
     StopRecording,
     MoveRule,
+    FavoriteAdded,
+    FavoriteRemoved,
 }
 
 /// A channel tuned and turned into a stream: everything the application needs to play it (the
@@ -403,12 +450,30 @@ pub struct Snapshot {
     pub source: Source,
     /// The genre tabs of Plex's own channels (empty until read, or with no plex.tv identity).
     pub cloud_tabs: Vec<CloudTab>,
+    /// The account's favorites that name a channel of a lineup read here, in the account's order.
+    pub favorites: Vec<ChannelKey>,
+    /// Where the favorites' read stands (`Ready`: the Favorites tab can be offered).
+    pub favorites_phase: Phase,
+    /// Can a DVR channel, and one of Plex's own, be added to the favorites (the entry's form is
+    /// known: this server's identity for the one, an entry the account already holds for the
+    /// other)?
+    pub favorite_dvr: bool,
+    pub favorite_cloud: bool,
 }
 
 impl Snapshot {
-    /// Can a channel of the lineup shown be watched? A DVR's only with a tuner behind it; Plex's
-    /// own channels always (they are streams).
-    pub fn can_watch(&self) -> bool {
-        self.source.is_cloud() || self.provider.as_ref().is_some_and(|p| p.tunable())
+    /// Can channel `ch` be watched? A DVR's only with a tuner behind it; Plex's own channels
+    /// always (they are streams).
+    pub fn can_watch(&self, ch: &Channel) -> bool {
+        ch.cloud || self.provider.as_ref().is_some_and(|p| p.tunable())
+    }
+    /// Is channel `ch` one of the account's favorites?
+    pub fn is_favorite(&self, ch: &Channel) -> bool {
+        let key = ChannelKey::of(ch);
+        self.favorites.contains(&key)
+    }
+    /// Can channel `ch` be added to (or taken off) the favorites from here?
+    pub fn can_favorite(&self, ch: &Channel) -> bool {
+        self.favorites_phase.is_ready() && (self.is_favorite(ch) || if ch.cloud { self.favorite_cloud } else { self.favorite_dvr })
     }
 }

@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Não há gravações agendadas. Escolha um programa no Guia e prima OK para o gravar.",
   "live_tv.hud.live": "EM DIRETO",
   "live_tv.rule.series": "Série",
-  "live_tv.rule.single": "Individual"
+  "live_tv.rule.single": "Individual",
+  "live_tv.tab.favorites": "Favoritos",
+  "live_tv.state.no_favorites": "Ainda não há canais favoritos. Vá para a esquerda até ao logótipo de um canal e prima OK para o adicionar.",
+  "live_tv.action.add_favorite": "Adicionar aos favoritos",
+  "live_tv.action.remove_favorite": "Remover dos favoritos",
+  "live_tv.notice.favorite_added": "Adicionado aos favoritos.",
+  "live_tv.notice.favorite_removed": "Removido dos favoritos."
 }

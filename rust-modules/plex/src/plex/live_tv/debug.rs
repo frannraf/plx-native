@@ -210,6 +210,30 @@ fn is_word(s: &str) -> bool {
 }
 
 /// A path with every segment that is not a plain lowercase word replaced by `#`, and its query cut.
+/// An id's shape, never its content: its length and the kinds of character in it ("24 hex",
+/// "36 hex-dash", "12 digit-dot", "40 alnum-dash"), what tells a channel's lineup id from its grid
+/// key or its number when a list names one of them.
+pub(crate) fn id_shape(s: &str) -> String {
+    let b = s.as_bytes();
+    let has = |f: fn(&u8) -> bool| b.iter().any(f);
+    let kind = if b.is_empty() {
+        "empty"
+    } else if b.iter().all(u8::is_ascii_digit) {
+        "digit"
+    } else if b.iter().all(|c| c.is_ascii_digit() || *c == b'.') {
+        "digit-dot"
+    } else if b.iter().all(u8::is_ascii_hexdigit) {
+        "hex"
+    } else if b.iter().all(|c| c.is_ascii_hexdigit() || *c == b'-') {
+        "hex-dash"
+    } else if b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_') {
+        if has(|c| *c == b'-' || *c == b'_') { "alnum-dash" } else { "alnum" }
+    } else {
+        "other"
+    };
+    format!("{} {kind}", b.len())
+}
+
 pub(crate) fn path_shape(s: &str) -> String {
     let (path, query) = match s.split_once('?') {
         Some((p, _)) => (p, "?…"),
@@ -225,6 +249,14 @@ pub(crate) fn path_shape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_shape_names_its_length_and_its_kind_only() {
+        assert_eq!(id_shape("5e20b730f2f8d5003d739db7"), "24 hex");
+        assert_eq!(id_shape("4.1"), "3 digit-dot");
+        assert_eq!(id_shape("ab-12_cd"), "8 alnum-dash");
+        assert_eq!(id_shape(""), "0 empty");
+    }
 
     #[test]
     fn a_shape_keeps_the_structure_and_none_of_the_content() {

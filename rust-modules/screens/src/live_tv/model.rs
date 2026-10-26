@@ -10,7 +10,7 @@
 use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
-use plx_plex::plex::live_tv::{Airing, Grab, Subscription};
+use plx_plex::plex::live_tv::{Airing, Channel, Grab, Subscription};
 use plx_ui::screen::Dir;
 use plx_ui::Rect;
 
@@ -34,6 +34,9 @@ pub const RETRY: u32 = 0xE000_0010;
 pub const TAB_BASE: u32 = 0xC000_0000;
 /// A Recordings-list row: `REC_BASE + index`.
 pub const REC_BASE: u32 = 0xD000_0000;
+/// A guide row's channel (its logo, left of its programs): `CHANNEL_BASE + row`. OK on it opens
+/// the channel's panel (watch it, add it to the favorites or take it off).
+pub const CHANNEL_BASE: u32 = 0xB000_0000;
 /// An action of the open panel: `ACTION_BASE + index`.
 pub const ACTION_BASE: u32 = 0xF000_0000;
 const ROW_SHIFT: u32 = 20;
@@ -50,6 +53,20 @@ pub fn cell_of(elem: u32) -> Option<(usize, u32)> {
     (elem < 0x8000_0000).then_some(((elem >> ROW_SHIFT) as usize, elem & SLOT_MASK))
 }
 
+pub fn channel_elem(row: usize) -> u32 {
+    CHANNEL_BASE + row.min(MAX_ROWS - 1) as u32
+}
+
+/// The row of a channel's key.
+pub fn channel_of(elem: u32) -> Option<usize> {
+    (CHANNEL_BASE..CHANNEL_BASE + MAX_ROWS as u32).contains(&elem).then(|| (elem - CHANNEL_BASE) as usize)
+}
+
+/// The guide row a key stands in: a program's, a placeholder's or a channel's.
+pub fn row_of(elem: u32) -> Option<usize> {
+    cell_of(elem).map(|(row, _)| row).or_else(|| channel_of(elem))
+}
+
 pub fn rec_of(elem: u32) -> Option<usize> {
     (REC_BASE..REC_BASE + 0x0100_0000).contains(&elem).then(|| (elem - REC_BASE) as usize)
 }
@@ -58,11 +75,15 @@ pub fn tab_of(elem: u32) -> Option<usize> {
     (TAB_BASE..TAB_BASE + 0x100).contains(&elem).then(|| (elem - TAB_BASE) as usize)
 }
 
-/// The guide's tabs, in order: the server's DVR, then (once Plex's own channels answered) all of
-/// them and each of their genres. `None` labels are the page's to word (the DVR's name, "Plex
-/// Channels").
+/// The guide's tabs, in order: the account's favorites (once read, while it has any or they are
+/// shown), the server's DVR, then (once Plex's own channels answered) all of them and each of
+/// their genres. The page words them (the DVR's name, "Favorites", "Plex Channels").
 pub fn tab_sources(snap: &Snapshot) -> Vec<Source> {
-    let mut out = vec![Source::Dvr];
+    let mut out = Vec::new();
+    if snap.favorites_phase.is_ready() && (!snap.favorites.is_empty() || snap.source == Source::Favorites) {
+        out.push(Source::Favorites);
+    }
+    out.push(Source::Dvr);
     if !snap.cloud_tabs.is_empty() {
         out.push(Source::Plex);
         out.extend(snap.cloud_tabs.iter().map(|t| Source::PlexTab(t.identifier.clone())));
@@ -286,6 +307,9 @@ pub fn row_y(frame: &Frame, row: usize) -> f32 {
 /// The rect a guide key is drawn at, where it would be drawn even when scrolled off (a row above
 /// or below, a time left or right of the window), so a move's projection always has a source.
 pub fn elem_rect(view: &LiveTvView, frame: &Frame, elem: u32) -> Option<Rect> {
+    if let Some(row) = channel_of(elem) {
+        return (row < view.channel_count()).then(|| Rect::new(geom::CHANNEL_X, row_y(frame, row), geom::CHANNEL_W, row_h(frame, row)));
+    }
     let (row, slot) = cell_of(elem)?;
     let y = row_y(frame, row);
     if slot == PLACEHOLDER {
@@ -326,15 +350,18 @@ pub fn guide_neighbour(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) ->
             Some(cell_in_window(view, frame, target, anchor_time(view, frame, elem)))
         }
         Dir::Left | Dir::Right => {
+            // LEFT past the first program (one on now; the guide does not scroll into the past)
+            // is the row's channel
+            let channel = Some(channel_elem(row));
             if slot == PLACEHOLDER {
-                return None;
+                return if dir == Dir::Left { channel } else { None };
             }
             let airings = &view.row(row)?.airings;
             let i = airings.iter().position(|a| slot_of(frame.base, a.begins_at) == slot)?;
             let next = if dir == Dir::Left {
-                let prev = airings.get(i.checked_sub(1)?)?;
+                let Some(prev) = i.checked_sub(1).and_then(|p| airings.get(p)) else { return channel };
                 if prev.ends_at <= floor_half(frame.now) {
-                    return None;
+                    return channel;
                 }
                 prev
             } else {
@@ -342,6 +369,17 @@ pub fn guide_neighbour(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) ->
             };
             Some(cell_elem(row, slot_of(frame.base, next.begins_at)))
         }
+    }
+}
+
+/// Where a direction moves focus from row `row`'s channel: UP/DOWN to the next row's channel,
+/// RIGHT into the row at the program on now (the window's first time). LEFT is the guide's edge.
+pub fn channel_neighbour(view: &LiveTvView, frame: &Frame, row: usize, dir: Dir) -> Option<u32> {
+    match dir {
+        Dir::Up => row.checked_sub(1).map(channel_elem),
+        Dir::Down => (row + 1 < view.channel_count()).then(|| channel_elem(row + 1)),
+        Dir::Right => Some(cell_in_window(view, frame, row, frame.now.max(frame.win_start))),
+        Dir::Left => None,
     }
 }
 
@@ -369,7 +407,7 @@ pub fn cell_in_window(view: &LiveTvView, frame: &Frame, row: usize, t: i64) -> u
 /// or down, the last row at either end, at the time the focused cell keeps; `None` when already
 /// at that end. A row with nothing in the window lands on its placeholder, as a step does.
 pub fn guide_page(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) -> Option<u32> {
-    let (row, _) = cell_of(elem)?;
+    let row = row_of(elem)?;
     let n = view.channel_count();
     let target = match dir {
         Dir::Up => row.checked_sub(ROWS_SHOWN).unwrap_or(0),
@@ -379,6 +417,10 @@ pub fn guide_page(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) -> Opti
     if target == row {
         return None;
     }
+    // a channel pages down the channels
+    if channel_of(elem).is_some() {
+        return Some(channel_elem(target));
+    }
     Some(cell_in_window(view, frame, target, anchor_time(view, frame, elem)))
 }
 
@@ -386,7 +428,7 @@ pub fn guide_page(view: &LiveTvView, frame: &Frame, elem: u32, dir: Dir) -> Opti
 /// and the window never starts before the half hour now is in.
 pub fn follow(view: &LiveTvView, frame: &Frame, elem: u32) -> Frame {
     let mut f = *frame;
-    let Some((row, _)) = cell_of(elem) else { return f };
+    let Some(row) = row_of(elem) else { return f };
     if row < f.row_top {
         f.row_top = row;
     } else if row >= f.row_top + ROWS_SHOWN {
@@ -598,6 +640,8 @@ pub enum Action {
     MoveTop,
     MoveBottom,
     DeleteRule,
+    Favorite,
+    Unfavorite,
     Close,
 }
 
@@ -607,6 +651,8 @@ pub enum Target {
     Airing { row: usize, airing: Airing },
     Grab(Grab),
     Rule(Subscription),
+    /// A guide row's channel: watch it, add it to the favorites or take it off.
+    Channel { row: usize, channel: Channel },
 }
 
 /// The open panel: its target and its actions, in the order they are offered.
@@ -654,6 +700,20 @@ pub fn airing_actions(snap: &Snapshot, a: &Airing) -> Vec<Action> {
         if !a.show_subscription_id.is_empty() {
             out.push(Action::CancelSeries);
         }
+    }
+    out.push(Action::Close);
+    out
+}
+
+/// The actions a channel offers: watch it (when it can be), add it to the favorites or take it off
+/// (when the account's list can say so).
+pub fn channel_actions(snap: &Snapshot, ch: &Channel) -> Vec<Action> {
+    let mut out = Vec::new();
+    if snap.can_watch(ch) {
+        out.push(Action::Watch);
+    }
+    if snap.can_favorite(ch) {
+        out.push(if snap.is_favorite(ch) { Action::Unfavorite } else { Action::Favorite });
     }
     out.push(Action::Close);
     out

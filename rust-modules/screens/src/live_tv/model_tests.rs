@@ -96,14 +96,67 @@ fn up_and_down_keep_the_time_the_focused_cell_starts_on_screen() {
 }
 
 #[test]
-fn left_stops_at_the_airing_on_now_and_right_walks_the_row() {
+fn left_stops_at_the_airing_on_now_then_the_channel_and_right_walks_the_row() {
     let v = view(3);
     let f = frame();
     assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Right), Some(cell(0, NOON + 1_800)));
     assert_eq!(guide_neighbour(&v, &f, cell(0, NOON + 1_800), Dir::Left), Some(cell(0, NOON)));
-    // 11:30-12:00 ended before now's half hour: no further left
-    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Left), None);
+    // 11:30-12:00 ended before now's half hour: no program further left, the row's channel is
+    assert_eq!(guide_neighbour(&v, &f, cell(0, NOON), Dir::Left), Some(channel_elem(0)));
+    assert_eq!(guide_neighbour(&v, &f, cell_elem(2, PLACEHOLDER), Dir::Left), Some(channel_elem(2)));
     assert_eq!(guide_neighbour(&v, &f, cell_elem(2, PLACEHOLDER), Dir::Right), None);
+}
+
+/// **A row's channel is a stop of its own**: UP/DOWN walk the channels, RIGHT goes back into the
+/// row at the program on now, a page moves a page of channels, and its key is clear of the
+/// others.
+#[test]
+fn the_channel_column_walks_the_channels_and_right_enters_the_row_on_now() {
+    let v = view(9);
+    let f = frame();
+    assert_eq!(channel_neighbour(&v, &f, 0, Dir::Up), None);
+    assert_eq!(channel_neighbour(&v, &f, 0, Dir::Down), Some(channel_elem(1)));
+    assert_eq!(channel_neighbour(&v, &f, 8, Dir::Down), None);
+    assert_eq!(channel_neighbour(&v, &f, 0, Dir::Left), None);
+    assert_eq!(channel_neighbour(&v, &f, 1, Dir::Right), Some(cell(1, NOON)), "the hour-long program on now");
+    assert_eq!(channel_neighbour(&v, &f, 2, Dir::Right), Some(cell_elem(2, PLACEHOLDER)));
+    assert_eq!(guide_page(&v, &f, channel_elem(1), Dir::Down), Some(channel_elem(1 + ROWS_SHOWN)));
+    assert_eq!(guide_page(&v, &f, channel_elem(7), Dir::Down), Some(channel_elem(8)));
+    assert_eq!(row_of(channel_elem(5)), Some(5));
+    assert_eq!(row_of(cell(5, NOON)), Some(5));
+    assert_eq!(channel_of(cell(5, NOON)), None);
+    let e = channel_elem(MAX_ROWS - 1);
+    assert!(cell_of(e).is_none() && rec_of(e).is_none() && tab_of(e).is_none() && action_of(e).is_none());
+    // following a channel scrolls its row into view, the window where it was
+    let moved = follow(&v, &f, channel_elem(6));
+    assert_eq!((moved.row_top, moved.win_start), (6 + 1 - ROWS_SHOWN, f.win_start));
+    assert!(elem_rect(&v, &f, channel_elem(0)).is_some_and(|r| r.x == geom::CHANNEL_X));
+}
+
+/// **The Favorites tab leads the tab row** once the account's favorites were read and name a
+/// channel (or it is the tab shown); the DVR's follows, then Plex's channels and their genres.
+#[test]
+fn the_favorites_tab_leads_once_the_account_has_favorites() {
+    use plx_data::live_tv::{ChannelKey, Source};
+    let mut snap = view(3).snap;
+    assert_eq!(tab_sources(&snap), vec![Source::Dvr]);
+    snap.favorites_phase = Phase::Ready;
+    assert_eq!(tab_sources(&snap), vec![Source::Dvr], "no favorite names a channel: no tab");
+    snap.favorites = vec![ChannelKey::of(&snap.channels[1])];
+    snap.cloud_tabs = vec![plx_plex::plex::live_tv::CloudTab { identifier: "news".into(), title: "News".into() }];
+    assert_eq!(tab_sources(&snap), vec![Source::Favorites, Source::Dvr, Source::Plex, Source::PlexTab("news".into())]);
+    snap.favorites.clear();
+    snap.source = Source::Favorites;
+    assert_eq!(tab_sources(&snap)[0], Source::Favorites, "the last favorite taken off: the tab stays while shown");
+    // the channel panel offers what the account's list allows
+    snap.favorite_dvr = true;
+    let ch = snap.channels[0].clone();
+    assert_eq!(channel_actions(&snap, &ch), vec![Action::Watch, Action::Favorite, Action::Close]);
+    snap.favorites = vec![ChannelKey::of(&ch)];
+    assert_eq!(channel_actions(&snap, &ch), vec![Action::Watch, Action::Unfavorite, Action::Close]);
+    snap.favorites.clear();
+    snap.favorite_dvr = false;
+    assert_eq!(channel_actions(&snap, &ch), vec![Action::Watch, Action::Close], "the entry's form unknown: nothing to add with");
 }
 
 #[test]

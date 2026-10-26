@@ -48,5 +48,11 @@
   "live_tv.recordings.none_scheduled": "Keine Aufnahmen geplant. Wähle im Programm eine Sendung und drücke OK, um sie aufzunehmen.",
   "live_tv.hud.live": "LIVE",
   "live_tv.rule.series": "Serie",
-  "live_tv.rule.single": "Einzeln"
+  "live_tv.rule.single": "Einzeln",
+  "live_tv.tab.favorites": "Favoriten",
+  "live_tv.state.no_favorites": "Noch keine Lieblingssender. Gehe nach links auf das Logo eines Senders und drücke OK, um ihn hinzuzufügen.",
+  "live_tv.action.add_favorite": "Zu Favoriten hinzufügen",
+  "live_tv.action.remove_favorite": "Aus Favoriten entfernen",
+  "live_tv.notice.favorite_added": "Zu Favoriten hinzugefügt.",
+  "live_tv.notice.favorite_removed": "Aus Favoriten entfernt."
 }
