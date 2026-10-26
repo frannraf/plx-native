@@ -595,16 +595,24 @@ pub fn wo_rows(snap: &Snapshot, recent_title: &str) -> Vec<WoRow> {
     rows
 }
 
-/// A channel card's name: the station, without the number a hub's channel title leads with
-/// ("4.1 KXYZDT" → "KXYZ"; the number is the line under it).
-pub fn wo_channel_name(a: &Airing) -> &str {
+/// A channel card's name: the station as the guide names it, without the number a hub's channel
+/// title leads with ("4.1 KXYZDT (NET)" → "KXYZ (NET)"; the number is the line under it).
+pub fn wo_channel_name(a: &Airing) -> std::borrow::Cow<'_, str> {
     let title = a.channel_title.trim();
     let sign = match title.strip_prefix(a.channel_vcn.as_str()) {
         Some(rest) if !a.channel_vcn.is_empty() && rest.starts_with(char::is_whitespace) => rest.trim_start(),
         _ => title,
     };
-    let name = station_id(sign);
-    if name.is_empty() { title } else { name }
+    // the call sign is the first word; a network after it stays (a title still led by another
+    // number is kept whole)
+    let numbered = sign.starts_with(|c: char| c.is_ascii_digit());
+    let (call, rest) = if numbered { (sign, "") } else { sign.split_once(char::is_whitespace).unwrap_or((sign, "")) };
+    let station = station_id(call);
+    match (station.is_empty(), rest.trim()) {
+        (true, _) => title.into(),
+        (false, "") => station.into(),
+        (false, rest) => format!("{station} {rest}").into(),
+    }
 }
 
 /// A row's art height: a channel's square tile, a program's portrait poster.

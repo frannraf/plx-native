@@ -1947,7 +1947,7 @@ impl LiveTvScreen {
             }
             if !shown {
                 let name = model::wo_channel_name(a);
-                let name = if name.is_empty() { a.channel_vcn.as_str() } else { name };
+                let name = if name.is_empty() { a.channel_vcn.as_str() } else { &name };
                 TextView::new(name, theme::size::LABEL, theme::TEXT_PRIMARY)
                     .bold()
                     .with_measure(f.measure)
@@ -1973,10 +1973,11 @@ impl LiveTvScreen {
         if on {
             p.rring(rect, 10.0, 4.0, theme::ACCENT);
         }
+        let station = if a.begins_at > 0 { Cow::Borrowed("") } else { model::wo_channel_name(a) };
         let title = if a.begins_at > 0 {
             if a.show_title.is_empty() { a.title.as_str() } else { a.show_title.as_str() }
         } else {
-            model::wo_channel_name(a)
+            &station
         };
         let sub = if live {
             left_words(a.ends_at - now)

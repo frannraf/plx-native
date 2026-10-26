@@ -584,4 +584,5 @@ fn a_whats_on_channel_card_names_the_station_without_its_number() {
     assert_eq!(wo_channel_name(&ch("4.1", "4.10 KXYZDT")), "4.10 KXYZ", "another number is not this one");
     assert_eq!(wo_channel_name(&ch("", "KXYZDT2")), "KXYZ");
     assert_eq!(wo_channel_name(&ch("7.1", "")), "");
+    assert_eq!(wo_channel_name(&ch("4.1", "4.1 KXYZDT (NET)")), "KXYZ (NET)", "a network after the call sign stays");
 }
