@@ -1680,9 +1680,15 @@ Undocumented in the bundled spec; the stock clients and a community client read 
 `key`, `type`, and `Metadata[]` items shaped as the grid's (§10.3): a program with its `Media`
 airing on a channel. A hub of channels (the recent channels; its `type` `channel`) may name a
 channel without a program. The page draws the server's hubs in its order; when none of them is a
-row of recent channels, the channels watched on this TV lead them. **Not yet measured:** the exact
-shape of the recent-channels and stations hubs; the event log says what each hub held
-(`livetv: What's On read: …`, kinds and counts only).
+row of channels, the channels watched on this TV lead them. **Measured 2026-10-26** (a DVR with
+an OTA tuner, `count=16`): eleven hubs, in this order and with these `hubIdentifier`:`type` pairs —
+`channels`:`channels` (the recent channels, eight items with no airing times: channel items, titled
+"{vcn} {call sign}"), then programs on now — `whatsonnow`:`mixed`, `onrightnow`:`mixed`,
+`moviesonnow`:`movie`, `kidsonnow`:`episode`, `newsonnow`:`episode` — and later —
+`premierstonight`:`episode`, `whatsonlater`:`mixed`, `upcomingsports`:`episode`,
+`upcomingmovies`:`movie`, `kidsonlater`:`episode`; every program item carried its airing's times.
+A hub holds at most `count` items. The event log says what each hub held (`livetv: What's On
+read: …`, kinds and counts only).
 
 ## Paging, observed
 

@@ -23,8 +23,8 @@ pub use flight::{
 };
 pub use live::{
     capture_span, drain_live_releases, install_live, is_live, is_recordable_live, live_airing, live_can_shift, live_lease_held, live_releasing, live_shift_state,
-    live_shift_url, note_live_paused, note_live_shift, record_asked, release_live, release_live_tuner, roll_live_program, set_live_context, set_record_asked,
-    shift_target, LiveInfo, LiveRoute, ShiftClock, KEEPALIVE_S, LIVE_SNAP_S,
+    live_shift_clock, live_shift_url, note_live_paused, note_live_shift, record_asked, release_live, release_live_tuner, restore_live_shift_clock,
+    roll_live_program, set_live_context, set_record_asked, shift_target, LiveInfo, LiveRoute, ShiftClock, KEEPALIVE_S, LIVE_SNAP_S,
 };
 pub use plan::*;
 pub use prefs::*;

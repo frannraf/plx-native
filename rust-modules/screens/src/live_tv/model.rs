@@ -10,7 +10,7 @@
 use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
-use plx_plex::plex::live_tv::{Airing, Channel, Grab, Setting, SettingKind, Subscription};
+use plx_plex::plex::live_tv::{station_id, Airing, Channel, Grab, Setting, SettingKind, Subscription};
 use plx_ui::consts::{MARGIN_X, SCR_W};
 use plx_ui::screen::Dir;
 use plx_ui::Rect;
@@ -573,12 +573,12 @@ pub struct WoRow {
     pub items: Vec<Airing>,
 }
 
-/// **What's On's rows**: the server's hubs in its order; when the server sent no row of the
-/// channels watched lately, the ones watched here lead them (`recent_title` names it).
+/// **What's On's rows**: the server's hubs in its order; when the server sent no row of
+/// channels (its recent channels' hub, measured as `channels`), the ones watched here lead them
+/// (`recent_title` names it).
 pub fn wo_rows(snap: &Snapshot, recent_title: &str) -> Vec<WoRow> {
     let mut rows: Vec<WoRow> = snap.hubs.iter().map(|h| WoRow { title: h.title.clone(), channels: h.of_channels(), items: h.items.clone() }).collect();
-    let recent = |s: &str| s.to_ascii_lowercase().contains("recent");
-    if !snap.hubs.iter().any(|h| recent(&h.identifier) || recent(&h.key)) && !snap.recent.is_empty() {
+    if !snap.hubs.iter().any(|h| h.of_channels()) && !snap.recent.is_empty() {
         let items = snap
             .recent
             .iter()
@@ -593,6 +593,18 @@ pub fn wo_rows(snap: &Snapshot, recent_title: &str) -> Vec<WoRow> {
         rows.insert(0, WoRow { title: recent_title.to_string(), channels: true, items });
     }
     rows
+}
+
+/// A channel card's name: the station, without the number a hub's channel title leads with
+/// ("4.1 KXYZDT" → "KXYZ"; the number is the line under it).
+pub fn wo_channel_name(a: &Airing) -> &str {
+    let title = a.channel_title.trim();
+    let sign = match title.strip_prefix(a.channel_vcn.as_str()) {
+        Some(rest) if !a.channel_vcn.is_empty() && rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => title,
+    };
+    let name = station_id(sign);
+    if name.is_empty() { title } else { name }
 }
 
 /// A row's art height: a channel's square tile, a program's portrait poster.

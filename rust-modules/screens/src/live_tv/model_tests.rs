@@ -544,7 +544,7 @@ fn whats_on_rows_are_the_servers_hubs_and_the_recent_channels_lead_when_it_sends
     assert_eq!((rows.len(), rows[0].title.as_str(), rows[0].channels), (2, "Recent", true));
     assert_eq!(rows[0].items[0].channel_identifier, "c9");
     assert!(!rows[1].channels);
-    snap.hubs.insert(0, hub("p.recentChannels", "channel", 2, false));
+    snap.hubs.insert(0, hub("channels", "channels", 2, false));
     let rows = wo_rows(&snap, "Recent");
     assert_eq!(rows.len(), 2, "the server's own row of recent channels stands instead");
     assert!(rows[0].channels);
@@ -575,4 +575,13 @@ fn whats_on_moves_along_rows_and_between_them_at_the_same_place_on_screen() {
     assert!(top > 0 && wo_row_y(&rows, top, 2, geom::WO_Y) + wo_row_h(&rows[2]) <= geom::WO_BOTTOM);
     let r = wo_card_rect(&rows, 0, 0, 1, 2, geom::WO_Y).expect("rect");
     assert_eq!((r.w, r.h), (geom::WO_CARD_W, geom::WO_TILE_H), "a channel row's tile is square");
+}
+
+#[test]
+fn a_whats_on_channel_card_names_the_station_without_its_number() {
+    let ch = |vcn: &str, title: &str| Airing { channel_vcn: vcn.into(), channel_title: title.into(), ..Airing::default() };
+    assert_eq!(wo_channel_name(&ch("4.1", "4.1 KXYZDT")), "KXYZ");
+    assert_eq!(wo_channel_name(&ch("4.1", "4.10 KXYZDT")), "4.10 KXYZ", "another number is not this one");
+    assert_eq!(wo_channel_name(&ch("", "KXYZDT2")), "KXYZ");
+    assert_eq!(wo_channel_name(&ch("7.1", "")), "");
 }

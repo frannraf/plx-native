@@ -1174,14 +1174,23 @@ impl LiveTvStore {
         self.recent.truncate(RECENT_KEPT);
     }
 
-    /// The channel a lineup id names, in the lineup shown else the DVR's.
+    /// The lineups not shown a channel named by its lineup id is looked for in, in order: the
+    /// DVR's (a hub of the server's provider names its DVR's channels), then Plex's own (a channel
+    /// watched lately may be one of theirs).
+    const NAMED_IN: [Source; 2] = [Source::Dvr, Source::Plex];
+
+    /// The channel a lineup id names, in the lineup shown else [`Self::NAMED_IN`].
     pub fn key_of_identifier(&self, identifier: &str) -> Option<ChannelKey> {
         let named = |c: &&Channel| !identifier.is_empty() && c.identifier == identifier;
-        self.channels.iter().find(named).or_else(|| self.lineup_of(&Source::Dvr).0.iter().find(named)).map(ChannelKey::of)
+        self.channels
+            .iter()
+            .find(named)
+            .or_else(|| Self::NAMED_IN.iter().find_map(|source| self.lineup_of(source).0.iter().find(named)))
+            .map(ChannelKey::of)
     }
 
-    /// The channel a What's On item names: in the lineup shown, else the DVR's (a hub of the
-    /// server's provider names its DVR's channels), by its lineup id.
+    /// The channel a What's On item names, by its lineup id: in the lineup shown, else in one of
+    /// [`Self::NAMED_IN`], shown for it.
     pub fn row_of_identifier(&mut self, identifier: &str) -> Option<usize> {
         if identifier.is_empty() {
             return None;
@@ -1189,13 +1198,10 @@ impl LiveTvStore {
         if let Some(row) = self.channels.iter().position(|c| c.identifier == identifier) {
             return Some(row);
         }
-        // the DVR's lineup, shown for it: the item is one of its channels
-        if self.lineup_of(&Source::Dvr).0.iter().any(|c| c.identifier == identifier) {
-            self.tab_picked = true;
-            self.show_source(Source::Dvr);
-            return self.channels.iter().position(|c| c.identifier == identifier);
-        }
-        None
+        let source = Self::NAMED_IN.into_iter().find(|source| self.lineup_of(source).0.iter().any(|c| c.identifier == identifier))?;
+        self.tab_picked = true;
+        self.show_source(source);
+        self.channels.iter().position(|c| c.identifier == identifier)
     }
 
     // ---- recording options -------------------------------------------------------------------

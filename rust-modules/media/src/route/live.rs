@@ -160,24 +160,27 @@ impl Drop for LiveLease {
 
 // ---- pause and rewind (time-shift) -------------------------------------------------------------
 
-/// How far behind the wall clock a live stream plays at its edge (the encode's segments and the
-/// player's buffer): where the shift clock puts a playback started at the live edge. An estimate;
-/// it only moves the "behind live" read-out by its amount.
+/// How far behind the capture's edge a live stream plays at its edge (the encode's segments and
+/// the player's buffer): the **live position**, where the shift clock puts a playback started at
+/// the live edge. An estimate; every "behind" is measured from this same point, so it cancels out.
 const EDGE_LAG_S: f64 = 8.0;
 
-/// A target this close to the live edge (or past it) plays the live edge itself, and a picture this
-/// close to it reads LIVE.
-pub const LIVE_SNAP_S: f64 = 15.0;
+/// A target this close to the live position (or past it) plays the live edge itself, and a
+/// picture this close to it reads LIVE. Under the shortest Skip interval (5 s), so one press back
+/// from LIVE always lands behind it, and one on from there always comes back.
+pub const LIVE_SNAP_S: f64 = 3.0;
 
 /// The least capture a channel needs before it offers rewinding (a tune of a few seconds has
 /// nothing to rewind into).
 const SHIFT_MIN_DEPTH_S: f64 = 30.0;
 
-/// **Where the picture of the live channel playing is**, as a moment of the channel (epoch
-/// seconds): `base` at wall time `at`, advancing with the wall clock while playing and standing
-/// still while paused. Reset at every tune ([`install_live`], the live edge) and every shift
-/// ([`note_live_shift`], its target). A clock, not the demuxer's timestamps: a live encode's
-/// presentation times say nothing about the broadcast's wall time.
+/// **Where the picture of the live channel playing is**, as a moment of the channel in the
+/// server's capture time (epoch seconds, the clock its `timeStamp` counts): `base` at wall time
+/// `at`, advancing with the wall clock while playing and standing still while paused. Reset at
+/// every tune ([`install_live`], the live edge) and every shift ([`note_live_shift`], its target).
+/// A clock, not the demuxer's timestamps: a live encode's presentation times say nothing about the
+/// broadcast's time. Never the TV's own clock either: a server whose clock differs would read as
+/// behind (or ahead of) its own edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShiftClock {
     pub base: f64,
@@ -186,14 +189,33 @@ pub struct ShiftClock {
     pub paused_since: Option<f64>,
     /// Started at the live edge (no shift since, or a shift back to it).
     pub live: bool,
+    /// `base` is in the capture's time: a clock started at the edge before any capture window was
+    /// reported counts from the TV's clock until one is ([`ShiftClock::anchor`]).
+    pub anchored: bool,
 }
 
 impl ShiftClock {
-    pub fn at_edge(now: f64) -> Self {
-        ShiftClock { base: now - EDGE_LAG_S, at: now, paused_total: 0.0, paused_since: None, live: true }
+    /// Started at the live edge at wall time `now`, the capture's edge then at `edge` (`None`: no
+    /// window reported yet, the TV's clock stands in for it until one is).
+    pub fn at_edge(now: f64, edge: Option<f64>) -> Self {
+        let base = edge.unwrap_or(now) - EDGE_LAG_S;
+        ShiftClock { base, at: now, paused_total: 0.0, paused_since: None, live: true, anchored: edge.is_some() }
     }
     pub fn at(target: f64, now: f64) -> Self {
-        ShiftClock { base: target, at: now, paused_total: 0.0, paused_since: None, live: false }
+        ShiftClock { base: target, at: now, paused_total: 0.0, paused_since: None, live: false, anchored: true }
+    }
+    /// The capture's edge is `edge` at wall time `now`: a clock started at the edge before it was
+    /// known counts from it now. It started at the live position of its own `at`, and the edge
+    /// moves on with the clock, so pauses since stay counted.
+    pub fn anchor(&mut self, edge: f64, now: f64) {
+        if !self.anchored {
+            self.base = edge - (now - self.at).max(0.0) - EDGE_LAG_S;
+            self.anchored = true;
+        }
+    }
+    /// Playing at the live edge, never paused since: the picture is the live position itself.
+    pub fn at_live(&self) -> bool {
+        self.live && self.paused_total <= 0.0 && self.paused_since.is_none()
     }
     /// The moment of the channel on screen at wall time `now`.
     pub fn position(&self, now: f64) -> f64 {
@@ -218,56 +240,65 @@ pub fn capture_span(w: &CaptureWindow, seen: f64, now: f64) -> (f64, f64) {
     (w.time_stamp + w.min_offset, w.live_edge() + (now - seen).max(0.0))
 }
 
-/// **Where a skip of `delta` seconds from `position` lands** within `(earliest, edge)`: a moment
-/// to play from, or `None` for the live edge (a target within [`LIVE_SNAP_S`] of it, or past it).
-pub fn shift_target(position: f64, delta: f64, earliest: f64, edge: f64) -> Option<f64> {
+/// **Where a skip of `delta` seconds from `position` lands** within the capture (its `earliest`
+/// moment, and `live`: the live position, its edge less [`EDGE_LAG_S`]): a moment to play from, or
+/// `None` for the live edge (a target within [`LIVE_SNAP_S`] of the live position, or past it).
+pub fn shift_target(position: f64, delta: f64, earliest: f64, live: f64) -> Option<f64> {
     let t = (position + delta).max(earliest + 1.0);
-    (t < edge - LIVE_SNAP_S).then_some(t)
+    (t < live - LIVE_SNAP_S).then_some(t)
 }
 
-/// The capture window of the live playback, the wall time it was seen, and the transcode session
-/// it is for (a late keepalive of a channel left never writes over the next one's).
-static WINDOW: Mutex<Option<(String, CaptureWindow, f64)>> = Mutex::new(None);
-/// The shift clock of the live playback, and its transcode session.
-static CLOCK: Mutex<Option<(String, ShiftClock)>> = Mutex::new(None);
+/// The live playback's time-shift: its transcode session, the capture window last reported for it
+/// and the wall time that was seen, and the clock of its picture. One lock, so a window and the
+/// clock it anchors never belong to two playbacks.
+#[derive(Clone, Debug)]
+struct Shift {
+    session: String,
+    window: Option<(CaptureWindow, f64)>,
+    clock: ShiftClock,
+}
+
+/// The time-shift of the live playback: installed with its tune, gone with its lease. A late
+/// keepalive of a channel left finds another session here (or none) and writes nothing.
+static SHIFT: Mutex<Option<Shift>> = Mutex::new(None);
 
 fn wall_s() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
+fn shift_lock() -> std::sync::MutexGuard<'static, Option<Shift>> {
+    SHIFT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A keepalive's report of the capture window, for the playback of `session` only.
 fn note_window(session: &str, w: CaptureWindow) {
-    let mut g = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
-    match g.as_ref() {
-        // only the playback's own session (a new tune installs its own first)
-        Some((s, _, _)) if s != session => {}
-        _ => *g = Some((session.to_string(), w, wall_s())),
+    let now = wall_s();
+    if let Some(s) = shift_lock().as_mut().filter(|s| s.session == session) {
+        s.window = Some((w, now));
+        s.clock.anchor(capture_span(&w, now, now).1, now);
     }
 }
 
-/// A lease released: its window and clock go with it (a later tune's stay).
+/// A lease released: its time-shift goes with it (a later tune's stays).
 fn forget_shift(session: &str) {
-    let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
-    if w.as_ref().is_some_and(|(s, _, _)| s == session) {
-        *w = None;
-    }
-    let mut c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if c.as_ref().is_some_and(|(s, _)| s == session) {
-        *c = None;
+    let mut g = shift_lock();
+    if g.as_ref().is_some_and(|s| s.session == session) {
+        *g = None;
     }
 }
 
-/// The live playback's position now: `(position, behind, earliest, edge)` in seconds (`behind`: how
-/// far the picture is from the live edge). `None` when no live playback has a capture window.
+/// The live playback's position now: `(position, behind, earliest, live)` in seconds of the
+/// capture's time (`live`: the live position, where a playback at the edge is; `behind`: how far the
+/// picture is from it). `None` when no live playback has a capture window.
 pub fn live_shift_state() -> Option<(f64, f64, f64, f64)> {
     let now = wall_s();
-    let (session, w, seen) = WINDOW.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    let (s2, clock) = CLOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    if s2 != session {
-        return None;
-    }
+    let s = shift_lock().clone()?;
+    let (w, seen) = s.window?;
     let (earliest, edge) = capture_span(&w, seen, now);
-    let position = clock.position(now).min(edge);
-    Some((position, (edge - EDGE_LAG_S - position).max(0.0), earliest, edge))
+    let live = edge - EDGE_LAG_S;
+    // at the edge, never paused: the live position, however the capture's reports step
+    let position = if s.clock.at_live() { live } else { s.clock.position(now).min(live) };
+    Some((position, live - position, earliest, live))
 }
 
 /// Can the live channel playing be paused and rewound: a DVR channel whose tuner reported a capture
@@ -279,9 +310,9 @@ pub fn live_can_shift(ps: &PlaybackSession) -> bool {
     }
     // the capture as it stands now: the tuner has recorded on since the window was last reported
     let now = wall_s();
-    WINDOW.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|(s, w, seen)| {
-        let (earliest, edge) = capture_span(w, *seen, now);
-        *s == lease.encoder_session && edge - earliest >= SHIFT_MIN_DEPTH_S
+    shift_lock().as_ref().filter(|s| s.session == lease.encoder_session).and_then(|s| s.window).is_some_and(|(w, seen)| {
+        let (earliest, edge) = capture_span(&w, seen, now);
+        edge - earliest >= SHIFT_MIN_DEPTH_S
     })
 }
 
@@ -295,7 +326,7 @@ pub fn live_shift_url(ps: &PlaybackSession, target: Option<f64>) -> Option<Strin
     let client = plx_plex::plex::client_for(lease.sid)?;
     let offset = match target {
         Some(t) => {
-            let (_, w, _) = WINDOW.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+            let (w, _) = shift_lock().as_ref().filter(|s| s.session == lease.encoder_session)?.window?;
             // never before the capture's start; the edge moved on since the window was reported,
             // and a target is kept short of it by `shift_target`
             Some((t - w.time_stamp).max(w.min_offset))
@@ -309,21 +340,35 @@ pub fn live_shift_url(ps: &PlaybackSession, target: Option<f64>) -> Option<Strin
 pub fn note_live_shift(ps: &PlaybackSession, target: Option<f64>) {
     let Some(lease) = super::decision::live_lease_ref(ps) else { return };
     let now = wall_s();
-    let clock = match target {
-        Some(t) => ShiftClock::at(t, now),
-        None => ShiftClock::at_edge(now),
-    };
-    *CLOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some((lease.encoder_session.clone(), clock));
+    if let Some(s) = shift_lock().as_mut().filter(|s| s.session == lease.encoder_session) {
+        s.clock = match target {
+            Some(t) => ShiftClock::at(t, now),
+            None => ShiftClock::at_edge(now, s.window.map(|(w, seen)| capture_span(&w, seen, now).1)),
+        };
+    }
+}
+
+/// The clock of the live playback's picture (a shift that did not start puts it back).
+pub fn live_shift_clock() -> Option<ShiftClock> {
+    shift_lock().as_ref().map(|s| s.clock)
+}
+
+/// Put back a clock [`live_shift_clock`] read, on the same playback.
+pub fn restore_live_shift_clock(ps: &PlaybackSession, clock: ShiftClock) {
+    let Some(lease) = super::decision::live_lease_ref(ps) else { return };
+    if let Some(s) = shift_lock().as_mut().filter(|s| s.session == lease.encoder_session) {
+        s.clock = clock;
+    }
 }
 
 /// The transport paused or played on: a live playback's clock stands still while paused.
 pub fn note_live_paused(paused: bool) {
     let now = wall_s();
-    if let Some((_, clock)) = CLOCK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(s) = shift_lock().as_mut() {
         if paused {
-            clock.pause(now);
+            s.clock.pause(now);
         } else {
-            clock.resume(now);
+            s.clock.resume(now);
         }
     }
 }
@@ -397,13 +442,14 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
     super::decision::set_subtitle(ps, route.subtitle_stream_id.max(0));
     crate::ff::set_live_stream(true);
     crate::ff::set_provider_stream(route.provider);
-    // pause and rewind: the tuner's capture as the tune answered it, the picture at its edge
-    if !route.provider {
-        if let Some(w) = route.capture {
-            *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = Some((route.encoder_session.clone(), w, wall_s()));
-        }
-        *CLOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some((route.encoder_session.clone(), ShiftClock::at_edge(wall_s())));
-    }
+    // pause and rewind: the tuner's capture as the tune answered it, the picture at its edge (a
+    // Plex channel has none: nothing of an earlier playback stays)
+    *shift_lock() = (!route.provider).then(|| {
+        let now = wall_s();
+        let window = route.capture.map(|w| (w, now));
+        let edge = window.map(|(w, seen)| capture_span(&w, seen, now).1);
+        Shift { session: route.encoder_session.clone(), window, clock: ShiftClock::at_edge(now, edge) }
+    });
     crate::player::log(&format!(
         "livetv: installed live stream {}/{} {}x{} @{} fps, subscription {}, captions {}, keepalive every {}s",
         route.video_codec,
@@ -431,7 +477,8 @@ fn start_keepalive(sid: ServerId, key: String, rk: String, enc: String, stop: Ar
             if since >= KEEPALIVE_S {
                 since = 0;
                 let (ok, window) = client.live_timeline_window(&key, &rk, "playing", &enc);
-                if let Some(w) = window {
+                // not once the lease is released (the answer of a report sent before it)
+                if let Some(w) = window.filter(|_| !stop.load(Ordering::Acquire)) {
                     note_window(&enc, w);
                 }
                 sent += 1;
@@ -613,16 +660,53 @@ mod tests {
         assert_eq!(c.position(90.0), 1_010.0, "paused: still");
         c.resume(90.0);
         assert_eq!(c.position(100.0), 1_020.0, "played on from where it paused");
-        let edge = ShiftClock::at_edge(500.0);
-        assert!(edge.live && edge.position(500.0) < 500.0, "a playback at the edge is a little behind the wall clock");
+        let mut edge = ShiftClock::at_edge(500.0, Some(2_000.0));
+        assert!(edge.at_live() && edge.position(500.0) < 2_000.0, "a playback at the edge is a little behind the capture's edge");
+        edge.pause(510.0);
+        edge.resume(512.0);
+        assert!(edge.live && !edge.at_live(), "paused once: behind the edge since");
         let (earliest, live) = (100.0, 2_000.0);
         assert_eq!(shift_target(1_000.0, -30.0, earliest, live), Some(970.0));
         assert_eq!(shift_target(120.0, -300.0, earliest, live), Some(101.0), "never before the capture's start");
-        assert_eq!(shift_target(1_995.0, -5.0, earliest, live), None, "near the edge: the edge itself");
+        assert_eq!(shift_target(1_999.0, -2.0, earliest, live), None, "near the live position: the edge itself");
         assert_eq!(shift_target(1_980.0, -10.0, earliest, live), Some(1_970.0), "thirty seconds behind is behind");
         assert_eq!(shift_target(1_900.0, 600.0, earliest, live), None, "past it: the edge");
         let w = CaptureWindow { time_stamp: 1_000.0, min_offset: 10.0, max_offset: 600.0 };
         assert_eq!(capture_span(&w, 50.0, 60.0), (1_010.0, 1_610.0), "the edge moves on with the clock");
+    }
+
+    /// **One reference for LIVE** (review 2026-10-26): from the live position, the shortest skip
+    /// back lands behind it and reads so, and one skip on from there comes back to the edge, whatever
+    /// the server's clock says against the TV's.
+    #[test]
+    fn a_skip_back_from_live_lands_behind_it_and_a_skip_on_comes_back() {
+        for (server_ahead, step) in [(0.0, 5.0), (0.0, 10.0), (40.0, 10.0), (-25.0, 15.0)] {
+            let tv_now = 10_000.0;
+            let capture_edge = tv_now + server_ahead - 3.0; // the capture trails a little
+            let clock = ShiftClock::at_edge(tv_now, Some(capture_edge));
+            let (earliest, live) = (capture_edge - 600.0, capture_edge - EDGE_LAG_S);
+            let at = clock.position(tv_now);
+            assert!((live - at).abs() < 1e-9, "at the edge: behind 0 (server {server_ahead:+})");
+            let back = shift_target(at, -step, earliest, live).expect("a skip back from LIVE lands");
+            assert!(live - back >= LIVE_SNAP_S, "and reads as behind ({step} s)");
+            assert_eq!(shift_target(back, step, earliest, live), None, "a skip on comes back to the edge");
+        }
+    }
+
+    /// A clock started at the edge before the capture was known counts from it once it is, its
+    /// pauses kept.
+    #[test]
+    fn a_clock_started_before_the_window_anchors_to_the_capture_when_it_comes() {
+        let mut c = ShiftClock::at_edge(100.0, None);
+        c.pause(102.0);
+        c.resume(106.0);
+        c.anchor(5_000.0, 110.0);
+        assert!(c.anchored);
+        // the edge was 5_000 - 10 at the start: the live position then, ten seconds on, less the pause
+        assert_eq!(c.position(110.0), 5_000.0 - 10.0 - EDGE_LAG_S + 10.0 - 4.0);
+        let before = c;
+        c.anchor(9_999.0, 120.0);
+        assert_eq!(c, before, "anchored once");
     }
 
     /// The HUD names the show and its episode, and a daily show whose episode title is its own name

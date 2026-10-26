@@ -668,13 +668,14 @@ pub(crate) fn player_requests(
 /// the tuner's capture; at (or past) the live edge it plays the edge. Nothing when the channel
 /// cannot be shifted, or when it is at the edge and asked further on.
 fn live_skip(ps: &mut plx_media::route::PlaybackSession, pa: &mut plx_media::player::adapter::PlayerAdapter, delta: i32) {
-    let Some((position, behind, earliest, edge)) = plx_media::route::live_shift_state() else { return };
-    let target = plx_media::route::shift_target(position, f64::from(delta), earliest, edge);
+    let Some((position, behind, earliest, live)) = plx_media::route::live_shift_state() else { return };
+    let target = plx_media::route::shift_target(position, f64::from(delta), earliest, live);
+    // on to the edge from the edge: nothing to do
     if target.is_none() && behind < plx_media::route::LIVE_SNAP_S {
         return;
     }
     let words = match target {
-        Some(t) => format!("{:.0}s behind the live edge", edge - t),
+        Some(t) => format!("{:.0}s behind live", live - t),
         None => "the live edge".to_string(),
     };
     if plx_media::player::lifecycle::live_shift(ps, pa, target) {

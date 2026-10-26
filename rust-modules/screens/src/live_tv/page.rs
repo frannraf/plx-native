@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 use std::ffi::CString;
 
-use plx_data::live_tv::{Availability, OptionsFor, Phase, RecordKind, Source, TunePhase, WriteOp};
+use plx_data::live_tv::{Availability, ChannelKey, OptionsFor, Phase, RecordKind, Source, TunePhase, WriteOp};
 use plx_data::stores::live_tv::Write;
 use plx_machine::machine::{
     By, Canon, Cx, Delivery, Edge, Effects, Enter, EntryId, FocusKey, FocusTarget, Fx, GroupId, Handled, InputEvent,
@@ -77,8 +77,9 @@ pub enum LiveTvOut {
     Source(Source),
     /// A DVR change.
     Write(Write),
-    /// Add channel row `row` to the account's favorites (`on`), or take it off.
-    Favorite { row: usize, on: bool },
+    /// Add channel `key` to the account's favorites (`on`), or take it off: the channel, not a
+    /// row (a favorites write landing while its panel was up rebuilds the Favorites tab).
+    Favorite { key: ChannelKey, on: bool },
     /// Read the recording options of a new recording or of a rule (the panel opened).
     Options(OptionsFor),
     /// Watch the channel a What's On card names (by its lineup id), with the program on now.
@@ -536,6 +537,16 @@ impl LiveTvScreen {
         fx.invalidate(Provenance::Input);
     }
 
+    /// The row a panel's `channel` stands in now, in the lineup shown: the lineup may have been
+    /// read again while the panel was up (a favorites write landing rebuilds the Favorites tab), so
+    /// `row` may hold another channel. `None`: the lineup no longer lists it.
+    fn row_now(&self, row: usize, channel: &Channel) -> Option<usize> {
+        let key = ChannelKey::of(channel);
+        let chans = &self.view.snap.channels;
+        let is = |c: &Channel| ChannelKey::of(c) == key;
+        if chans.get(row).is_some_and(is) { Some(row) } else { chans.iter().position(is) }
+    }
+
     fn close_panel<H: ContentLike>(&mut self, fx: &mut Effects<'_, H>) {
         if self.panel.take().is_some() {
             let back = self.panel_from;
@@ -547,6 +558,7 @@ impl LiveTvScreen {
     fn act<H: ContentLike>(&mut self, i: usize, fx: &mut Effects<'_, H>) {
         let Some(panel) = self.panel.clone() else { return };
         let Some(action) = panel.actions.get(i).copied() else { return };
+        let from = self.panel_from;
         self.close_panel(fx);
         match (action, &panel.target) {
             (Action::Close, _) => {}
@@ -556,15 +568,21 @@ impl LiveTvScreen {
                 self.open_options(OptionsFor::Record { airing: airing.clone(), kind }, fx);
             }
             (Action::EditOptions, Target::Rule(s)) => self.open_options(OptionsFor::Rule { id: s.id.clone() }, fx),
+            // a What's On card's program: its channel by name (the card stands in no guide row)
+            (Action::Watch, Target::Airing { airing, .. }) if model::wo_of(from).is_some() => {
+                let identifier = airing.channel_identifier.clone();
+                self.route(LiveTvOut::WatchHub { identifier, airing: Some(airing.clone()) }, fx)
+            }
             (Action::Watch, Target::Airing { row, airing }) => {
                 self.route(LiveTvOut::Watch { row: *row, airing: Some(airing.clone()) }, fx)
             }
-            (Action::Watch, Target::Channel { row, .. }) => {
-                let airing = self.on_now(*row).cloned();
-                self.route(LiveTvOut::Watch { row: *row, airing }, fx)
+            (Action::Watch, Target::Channel { row, channel }) => {
+                let Some(row) = self.row_now(*row, channel) else { return };
+                let airing = self.on_now(row).cloned();
+                self.route(LiveTvOut::Watch { row, airing }, fx)
             }
-            (Action::Favorite | Action::Unfavorite, Target::Channel { row, .. }) => {
-                self.route(LiveTvOut::Favorite { row: *row, on: action == Action::Favorite }, fx)
+            (Action::Favorite | Action::Unfavorite, Target::Channel { channel, .. }) => {
+                self.route(LiveTvOut::Favorite { key: ChannelKey::of(channel), on: action == Action::Favorite }, fx)
             }
             (action, target) => {
                 if let Some(w) = model::write_for(&self.view.snap, target, action) {
@@ -1037,8 +1055,9 @@ impl LiveTvScreen {
                 self.seat_elem(model::OPT_GO, fx);
             }
         }
-        // A conflicting recording's panel opens over whatever is up (the guide, the list).
-        if self.panel.is_none() {
+        // A conflicting recording's panel opens over whatever is up (the guide, the list), once no
+        // other panel is (the options panel of another recording waits for its own answer).
+        if self.panel.is_none() && self.opts.is_none() {
             if let Some(target) = self.conflict.take() {
                 let from = self.focus.filter(|e| *e < plx_ui::dispatch::STRIP_BASE).unwrap_or(self.mode_pill());
                 self.open_panel(from, target, fx);
@@ -1878,12 +1897,15 @@ impl LiveTvScreen {
             for (i, a) in row.items.iter().enumerate().skip(first) {
                 let elem = model::wo_elem(r, i);
                 let Some(rect) = self.wo_rect(elem) else { continue };
-                if rect.x + rect.w > SCR_W - MARGIN_X + 1.0 || rect.y + rect.h > geom::WO_BOTTOM {
+                if rect.x + rect.w > SCR_W - MARGIN_X + 1.0 || rect.y >= SCR_H {
                     break;
                 }
-                let on = !modal && self.focused(f, elem);
+                // the row under the last whole one peeks in, cut by the screen's edge (a heading
+                // alone there read as an empty row, device 2026-10-26); only whole cards take focus
+                let whole = rect.y + rect.h <= geom::WO_BOTTOM;
+                let on = whole && !modal && self.focused(f, elem);
                 self.draw_wo_card(f, p, rect, a, row.channels, on);
-                if !modal {
+                if whole && !modal {
                     f.stop(p, stop(self.key(elem), rect));
                 }
             }
@@ -1924,7 +1946,7 @@ impl LiveTvScreen {
                 }
             }
             if !shown {
-                let name = station_id(&a.channel_title);
+                let name = model::wo_channel_name(a);
                 let name = if name.is_empty() { a.channel_vcn.as_str() } else { name };
                 TextView::new(name, theme::size::LABEL, theme::TEXT_PRIMARY)
                     .bold()
@@ -1954,7 +1976,7 @@ impl LiveTvScreen {
         let title = if a.begins_at > 0 {
             if a.show_title.is_empty() { a.title.as_str() } else { a.show_title.as_str() }
         } else {
-            a.channel_title.as_str()
+            model::wo_channel_name(a)
         };
         let sub = if live {
             left_words(a.ends_at - now)

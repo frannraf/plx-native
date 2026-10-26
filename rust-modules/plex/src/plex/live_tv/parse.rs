@@ -197,6 +197,28 @@ pub(super) fn favorites(body: &Value) -> Vec<FavoriteChannel> {
         .collect()
 }
 
+/// The account's favorites as an edit starts from them: `None` unless the answer is a shape this
+/// knows and every element of it is an entry kept here. The edit writes the list back whole, so
+/// anything less would drop what was skipped from the list the stock clients share, or replace an
+/// unread list with the edit alone.
+pub(super) fn favorites_whole(body: &Value) -> Option<Vec<FavoriteChannel>> {
+    let elements = match body {
+        Value::Array(a) => a.len(),
+        _ => {
+            let c = body.get("MediaContainer").filter(|c| c.is_object())?;
+            match c.get("FavoriteChannel") {
+                Some(Value::Array(a)) => a.len(),
+                Some(Value::Object(_)) => 1,
+                // none: an empty list only when the container says it holds nothing
+                None if c.get("size").and_then(Value::as_u64) == Some(0) => 0,
+                _ => return None,
+            }
+        }
+    };
+    let list = favorites(body);
+    (list.len() == elements).then_some(list)
+}
+
 /// The metadata half of an airing (titles, ids, subscription marks) from a `Metadata`/`Video`.
 fn airing_meta(m: &Value) -> Airing {
     Airing {

@@ -261,9 +261,10 @@ pub struct LiveHub {
 }
 
 impl LiveHub {
-    /// A hub of channels rather than of programs (every item a channel, or the server says so).
+    /// A hub of channels rather than of programs (every item a channel, or the server says so:
+    /// measured `channels`, the recent channels' hub).
     pub fn of_channels(&self) -> bool {
-        self.kind == "channel" || self.kind == "station" || (!self.items.is_empty() && self.items.iter().all(|a| a.begins_at == 0))
+        matches!(self.kind.as_str(), "channel" | "channels" | "station") || (!self.items.is_empty() && self.items.iter().all(|a| a.begins_at == 0))
     }
 }
 

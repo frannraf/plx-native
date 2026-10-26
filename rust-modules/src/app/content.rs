@@ -1129,6 +1129,11 @@ fn live_tv_requests(app: &mut App) {
                     super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
                     continue;
                 }
+                // a card naming no channel read here plays nothing: the corner's stays
+                if !app.bridge.live_tv_knows_identifier(identifier) {
+                    plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's");
+                    continue;
+                }
                 super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
             }
             _ => {}
@@ -1169,7 +1174,7 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
         LiveTvOut::Write(Write::StopGrab { .. }) => "stop/cancel a recording".into(),
         LiveTvOut::Write(Write::MoveRule { after, .. }) => format!("move a rule ({})", if after.is_some() { "bottom" } else { "top" }),
         LiveTvOut::Write(Write::Favorite { add, .. }) => format!("{} the favorites", if *add { "add to" } else { "take off" }),
-        LiveTvOut::Favorite { row, on } => format!("{} the favorites, row {row}", if *on { "add to" } else { "take off" }),
+        LiveTvOut::Favorite { on, .. } => format!("{} the favorites (a channel panel)", if *on { "add to" } else { "take off" }),
         LiveTvOut::Write(Write::RecordWith { kind, .. }) => format!("record with options ({})", if *kind == RecordKind::Series { "series" } else { "this" }),
         LiveTvOut::Write(Write::EditRule { .. }) => "save a rule's options".into(),
         LiveTvOut::Options(plx_data::live_tv::OptionsFor::Record { .. }) => "the recording options".into(),

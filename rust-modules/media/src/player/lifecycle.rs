@@ -119,9 +119,22 @@ pub fn live_shift(ps: &mut crate::route::PlaybackSession, pa: &mut crate::player
     if paused() {
         set_transport_paused(pa, false);
     }
+    // the stream and the clock as they were, put back when the reload does not start (the next
+    // reload, a foreground restore, plays what played; the read-out says where that is)
+    let (was_url, was_clock) = (crate::route::url(ps), crate::route::live_shift_clock());
     crate::route::set_url(ps, &url);
     crate::route::note_live_shift(ps, target);
-    !matches!(crate::player::engine::reload_transcode(ps, pa, 0), crate::player::engine::ReloadOutcome::NoRoute | crate::player::engine::ReloadOutcome::StartFailed)
+    let started = !matches!(
+        crate::player::engine::reload_transcode(ps, pa, 0),
+        crate::player::engine::ReloadOutcome::NoRoute | crate::player::engine::ReloadOutcome::StartFailed
+    );
+    if !started {
+        crate::route::set_url(ps, &was_url);
+        if let Some(clock) = was_clock {
+            crate::route::restore_live_shift_clock(ps, clock);
+        }
+    }
+    started
 }
 
 /// Resume if a seek landed while paused. Its stay-paused counterpart is the pump's

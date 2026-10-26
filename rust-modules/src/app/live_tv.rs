@@ -190,7 +190,7 @@ impl Bridge {
         if let LiveTvOut::WatchHub { identifier, airing } = out {
             match self.stores.live_tv.row_of_identifier(&identifier) {
                 Some(row) => self.live_tv_ask(row, airing, false),
-                None => plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR"),
+                None => plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's"),
             }
             return;
         }
@@ -205,8 +205,9 @@ impl Bridge {
             LiveTvOut::RefreshHubs => store.refresh_hubs(),
             LiveTvOut::WatchHub { .. } => {}
             LiveTvOut::CloseOptions => store.close_options(),
-            LiveTvOut::Favorite { row, on } => {
-                if !store.set_favorite(row, on) {
+            LiveTvOut::Favorite { key, on } => {
+                // the row the channel stands in now
+                if !store.row_of_key(&key).is_some_and(|row| store.set_favorite(row, on)) {
                     plx_base::eventlog::log("livetv: that favorite cannot be changed from here");
                 }
             }
@@ -281,7 +282,18 @@ impl Bridge {
             return;
         }
         let Some((asked, airing)) = self.live_tv.pending.take() else { return };
-        self.live_tv_ask(asked.row, airing, asked.step);
+        // the row that channel stands in now: a lineup read again meanwhile (a favorites write
+        // landing) moves it, and one that no longer lists it tunes nothing
+        let row = match &asked.key {
+            Some(key) => self.stores.live_tv.row_of_key(key),
+            None => Some(asked.row),
+        };
+        let Some(row) = row else {
+            plx_base::eventlog::log("livetv: the channel waiting for a tuner left the lineup");
+            self.stores.live_tv.cancel_tune();
+            return;
+        };
+        self.live_tv_ask(row, airing, asked.step);
     }
 
     /// CH▲/CH▼ in the live player: the row `step` on from the channel playing, or from the one a
@@ -391,6 +403,11 @@ impl Bridge {
     /// Is the channel a What's On card names (its lineup id) the one playing?
     pub(crate) fn live_tv_is_watching_identifier(&self, identifier: &str) -> bool {
         self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of_identifier(identifier)
+    }
+
+    /// Does a What's On card's lineup id name a channel read here (a Watch of it tunes something)?
+    pub(crate) fn live_tv_knows_identifier(&self, identifier: &str) -> bool {
+        self.stores.live_tv.key_of_identifier(identifier).is_some()
     }
 
     pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {

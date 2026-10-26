@@ -92,7 +92,10 @@ impl AccountClient {
         if !super::guard::allow("favorite channels", "") {
             return Err(LiveError::Refused);
         }
-        let now = self.favorite_channels()?;
+        let Some(now) = parse::favorites_whole(&self.cloud_get(FAVORITES)?) else {
+            plx_base::eventlog::log("livetv: favorites not written: the list read holds what this app does not keep");
+            return Err(LiveError::Unreadable);
+        };
         let next = op.apply(&now);
         if next == now {
             return Ok(now);
@@ -296,6 +299,27 @@ mod tests {
         assert_eq!(less.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["b-2", "c-3"]);
         // a bare array is read too
         assert_eq!(parse::favorites(&serde_json::json!([{"source": "s", "id": "z"}])).len(), 1);
+    }
+
+    /// **An edit never writes back less than it read** (review 2026-10-26): a list with an entry
+    /// this app does not keep, or in a shape it does not know, is not written at all; an empty
+    /// list that says so is.
+    #[test]
+    fn a_favorites_edit_starts_only_from_a_list_read_whole() {
+        let entry = |id: &str| serde_json::json!({"source": "server://KXYZ/p", "id": id});
+        let whole = serde_json::json!({"MediaContainer": {"size": 2, "FavoriteChannel": [entry("a"), entry("b")]}});
+        assert_eq!(parse::favorites_whole(&whole).map(|l| l.len()), Some(2));
+        let one = serde_json::json!({"MediaContainer": {"size": 1, "FavoriteChannel": entry("a")}});
+        assert_eq!(parse::favorites_whole(&one).map(|l| l.len()), Some(1));
+        let skipped = serde_json::json!({"MediaContainer": {"FavoriteChannel": [entry("a"), {"source": "s", "title": "no id"}]}});
+        assert_eq!(parse::favorites_whole(&skipped), None, "an entry with no id would be dropped");
+        assert_eq!(parse::favorites_whole(&serde_json::json!([entry("a"), 7])), None, "nor a stray element");
+        let other = serde_json::json!({"MediaContainer": {"size": 2, "Metadata": [entry("a"), entry("b")]}});
+        assert_eq!(parse::favorites_whole(&other), None, "another shape: the list would be replaced");
+        assert_eq!(parse::favorites_whole(&serde_json::json!({"favorites": []})), None);
+        let empty = serde_json::json!({"MediaContainer": {"size": 0}});
+        assert_eq!(parse::favorites_whole(&empty), Some(Vec::new()));
+        assert_eq!(parse::favorites_whole(&serde_json::json!([])), Some(Vec::new()));
     }
 
     #[test]
