@@ -35,6 +35,22 @@ fn the_whats_on_hubs_read_programs_and_channels_and_skip_empty_ones() {
     assert!(super::hubs_path("../x", 16).is_none());
 }
 
+/// A live timeline answer's capture window: the `CaptureBuffer` one when the playback's own
+/// session rides beside it, the lone top-level one otherwise.
+#[test]
+fn a_timeline_answer_names_the_tuners_capture_window() {
+    let both = serde_json::json!({"MediaContainer": {
+        "TranscodeSession": {"timeStamp": 999.0, "minOffsetAvailable": 0.0, "maxOffsetAvailable": 1.0},
+        "CaptureBuffer": {"TranscodeSession": [{"timeStamp": 1000.5, "minOffsetAvailable": 2.0, "maxOffsetAvailable": 600.0}]}
+    }});
+    let w = super::parse::timeline_capture(&both).expect("window");
+    assert_eq!((w.time_stamp, w.min_offset, w.max_offset), (1000.5, 2.0, 600.0));
+    assert_eq!(w.live_edge(), 1600.5);
+    let lone = serde_json::json!({"MediaContainer": {"TranscodeSession": {"timeStamp": 5.0, "minOffsetAvailable": 0.0, "maxOffsetAvailable": 30.0}}});
+    assert_eq!(super::parse::timeline_capture(&lone).map(|w| w.max_offset), Some(30.0));
+    assert!(super::parse::timeline_capture(&serde_json::json!({"MediaContainer": {"size": 0}})).is_none());
+}
+
 #[test]
 fn providers_keep_only_epg_providers_with_their_dvr_key_and_features() {
     let p = parse::providers(&json(PROVIDERS));

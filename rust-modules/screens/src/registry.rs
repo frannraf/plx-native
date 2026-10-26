@@ -174,6 +174,10 @@ pub enum PlayerReq {
     /// CH▲/CH▼ over a live channel: the channel this many rows on in the guide's lineup (+1 the
     /// next, -1 the one before), tuned and then played in place (`app::playback::step_live_channel`).
     ChannelStep(i32),
+    /// LEFT/RIGHT over a live channel that can be rewound: play it from this many seconds earlier
+    /// (negative) or later than the picture now, within the tuner's capture; at or past the live
+    /// edge it plays the edge (`plx_media::player::lifecycle::live_shift`).
+    LiveSkip(i32),
     /// Accepted only after the owned player confirmation. Never emitted by boot or Play.
     RepairSandbox,
     /// The failure read-out's *Try again*: resolve the failed item again, unchanged, at the

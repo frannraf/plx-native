@@ -591,6 +591,17 @@ pub(super) fn capture_of(v: &Value) -> Option<CaptureWindow> {
     })
 }
 
+/// A live `/:/timeline` answer's capture window: under `CaptureBuffer` when the answer also
+/// carries the playback's own `TranscodeSession` at the top, else that lone top-level one (the
+/// tune answer's shape).
+pub(super) fn timeline_capture(body: &Value) -> Option<CaptureWindow> {
+    let c = container(body)?;
+    match first(c, &["CaptureBuffer"]) {
+        Some(buffer) => capture_of(buffer),
+        None => capture_of(c),
+    }
+}
+
 /// A tune's answer (`POST …/tune`) and a refresh of it (`GET /media/subscriptions/{id}`).
 ///
 /// The documented-by-clients shape is `MediaContainer > MediaSubscription(key) >

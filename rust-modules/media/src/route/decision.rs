@@ -857,6 +857,11 @@ pub(super) fn take_live_lease(ps: &mut PlaybackSession) -> Option<super::live::L
     ps.live.take()
 }
 
+/// The session's live lease, to read (a time-shift asks the stream again on its session).
+pub(super) fn live_lease_ref(ps: &PlaybackSession) -> Option<&super::live::LiveLease> {
+    ps.live.as_ref()
+}
+
 /// Does the session hold a live lease?
 pub(super) fn live_lease_held(ps: &PlaybackSession) -> bool {
     ps.live.is_some()

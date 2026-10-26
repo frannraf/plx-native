@@ -1623,6 +1623,8 @@ then `DELETE /media/subscriptions/{id}` (404 = already released). Open-source cl
 first two and one reports PMS drops an unreported grab after ~300 s; this app does all three
 (`Client::live_release`), and the release is never refused by the write gate.
 
+**Pause and rewind (the app, 2026-10-26).** The keepalive asks for JSON and reads the capture window from its answer (`CaptureBuffer > TranscodeSession`, else the lone top-level one: `parse::timeline_capture`); the tune's own window seeds it. A skip back or on asks `start.m3u8` again on the SAME transcode `session` with `offset` = target − `timeStamp` (never below `minOffsetAvailable`), and the player reloads with it (`player::lifecycle::live_shift`); the tune, its lease and its keepalive stay. A target within 15 s of the live edge asks no offset (the edge). Where the picture is comes from a clock started at each shift and stopped while paused, not from the demuxer. **Not yet measured:** whether a long native pause resumes from the transcode's own playlist, and how far back a server keeps the capture.
+
 **Not determined without a capture:** the exact JSON nesting on a given PMS build, whether a
 conflicted tune leaves a subscription behind, the units of `timeStamp` / the offsets (epoch seconds
 is what clients assume), and the live transcode playlist's window (growing vs sliding).

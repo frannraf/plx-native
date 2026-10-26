@@ -465,6 +465,7 @@ pub(crate) fn live_route(t: Tuned) -> plx_media::route::LiveRoute {
         subtitle_stream_id: t.stream.subtitle_stream_id,
         info: plx_media::route::LiveInfo { title, show_title, channel, begins_at, ends_at, provider: t.cloud },
         provider: t.cloud,
+        capture: t.capture,
     }
 }
 

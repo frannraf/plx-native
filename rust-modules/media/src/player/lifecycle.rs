@@ -98,11 +98,30 @@ pub fn set_transport_paused(
     if paused() == value {
         return true;
     }
-    if value {
-        crate::player::pause(pa)
-    } else {
-        crate::player::resume(pa)
+    let done = if value { crate::player::pause(pa) } else { crate::player::resume(pa) };
+    // a live channel's picture stands while paused (pause and rewind's clock)
+    if done {
+        crate::route::note_live_paused(value);
     }
+    done
+}
+
+/// **Time-shift the live channel playing**: its stream asked again on the same transcode session
+/// from `target` (epoch seconds; `None`: the live edge), and the pipeline reloaded with it; the
+/// tune, its lease and its keepalive stay. Playing on afterwards. `false` when the channel cannot
+/// be shifted (a Plex channel, no capture window, the tuner already handed back).
+pub fn live_shift(ps: &mut crate::route::PlaybackSession, pa: &mut crate::player::adapter::PlayerAdapter, target: Option<f64>) -> bool {
+    if !crate::route::live_can_shift(ps) {
+        return false;
+    }
+    let Some(url) = crate::route::live_shift_url(ps, target) else { return false };
+    // the reload plays: a paused picture moved is a picture the viewer asked to watch from there
+    if paused() {
+        set_transport_paused(pa, false);
+    }
+    crate::route::set_url(ps, &url);
+    crate::route::note_live_shift(ps, target);
+    !matches!(crate::player::engine::reload_transcode(ps, pa, 0), crate::player::engine::ReloadOutcome::NoRoute | crate::player::engine::ReloadOutcome::StartFailed)
 }
 
 /// Resume if a seek landed while paused. Its stay-paused counterpart is the pump's

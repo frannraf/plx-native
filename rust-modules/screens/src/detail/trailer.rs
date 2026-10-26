@@ -481,6 +481,7 @@ impl Transport {
                 clock_grow: 0.0,
                 live: false,
                 live_airing: None,
+                live_behind_s: None,
             },
             measure,
         );

@@ -847,6 +847,11 @@ impl Client {
         self.body_2xx(path_no_token, Method::Post, &[]).is_some()
     }
 
+    /// A POST whose 2xx body the caller reads (a live timeline report's capture window).
+    pub(super) fn body_2xx_post(&self, path_no_token: &str) -> Option<Vec<u8>> {
+        self.body_2xx(path_no_token, Method::Post, &["Accept: application/json"])
+    }
+
     /// DELETE (no body) whose HTTP status is the protocol result: removing a DVR subscription,
     /// cancelling one recording, releasing a live tune (`docs/pms-api.md` §10). `None` when the
     /// request never completed, so a caller that must retry a release can tell "the server said

@@ -161,7 +161,14 @@ pub struct PlayerScreen {
     /// it on screen and only hid it, and BACK could not leave while the pointer showed (device,
     /// 2026-10-22). Until the pointer moves [`POINTER_WAKE_PX`] from here, motion leaves it down.
     pointer_anchor: Option<(f32, f32)>,
+    /// A live channel's skip being keyed in: the seconds pressed so far (back negative) and the
+    /// tick time it goes out at, once the keys have rested ([`LIVE_SKIP_REST_MS`]): a burst of
+    /// presses is one reload of the stream, not one per press.
+    live_skip: Option<(i32, u32)>,
 }
+
+/// How long LEFT/RIGHT rest before a live channel's skip goes out.
+const LIVE_SKIP_REST_MS: u32 = 650;
 
 /// How far the pointer must move from where it rested at a BACK-hide to raise the transport again.
 const POINTER_WAKE_PX: f32 = 48.0;
@@ -191,6 +198,7 @@ impl PlayerScreen {
             clock_warm: Default::default(),
             last_pointer: None,
             pointer_anchor: None,
+            live_skip: None,
         }
     }
 
@@ -613,6 +621,15 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                 // this Tick seeks: a key target waits for OK.
                 self.step_scrub_hold(tick.ms);
                 self.hold_the_transport_for_a_target(tick.ms);
+                // a live channel's skip, once the keys have rested
+                if let Some((delta, at)) = self.live_skip {
+                    if tick.ms.wrapping_sub(at) as i32 >= 0 {
+                        self.live_skip = None;
+                        if delta != 0 {
+                            Self::ask(fx, PlayerReq::LiveSkip(delta));
+                        }
+                    }
+                }
                 self.publish();
                 Handled::Yes
             }
@@ -944,6 +961,22 @@ impl PlayerScreen {
                     // a live channel has no tabs (no Info card, no chapters): the ring is two deep
                     self.key_updown(key, now, !plx_media::route::is_live(ps));
                 }
+                Handled::Yes
+            }
+            // A live channel that can be rewound: LEFT/RIGHT skip back and on by the Skip interval
+            // inside the tuner's capture (the control row keeps them while the transport is up on
+            // it); a held key keeps skipping. The burst goes out once the keys rest (the Tick).
+            Key::Left { .. } | Key::Right { .. }
+                if matches!(edge, Edge::Down | Edge::Repeat)
+                    && plx_media::route::live_can_shift(ps)
+                    && !(self.hud.visible_at_press && self.hud.nav.focus == 1) =>
+            {
+                let step = (input::scrub_step_ns() / 1_000_000_000).clamp(1, 600) as i32;
+                let by = if matches!(key, Key::Right { .. }) { step } else { -step };
+                let (sum, _) = self.live_skip.unwrap_or((0, 0));
+                self.live_skip = Some((sum.saturating_add(by), now.wrapping_add(LIVE_SKIP_REST_MS)));
+                self.hud.extend(now, input::HUD_LINGER_MS);
+                self.publish();
                 Handled::Yes
             }
             Key::Left { .. } | Key::Right { .. } => {

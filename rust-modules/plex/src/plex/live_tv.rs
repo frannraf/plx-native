@@ -560,7 +560,7 @@ pub const LIVE_CEILING: super::Ceiling = super::Ceiling { max_kbps: 12_000, max_
 /// The transcode request for a live key: the same fixed-HLS contract the library's HLS rungs use.
 /// `subtitle_stream_id` names a caption stream of the tuned part to burn in (0 for none): the
 /// profile advertises no subtitle delivery, so the server's one way to show it is in the picture.
-pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64) -> super::TranscodeSpec<'a> {
+pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64, offset: super::TranscodeOffset) -> super::TranscodeSpec<'a> {
     super::TranscodeSpec {
         rating_key: "",
         path_override: Some(key),
@@ -576,7 +576,7 @@ pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: 
         audio_stream_id: 0,
         subtitle_stream_id: subtitle_stream_id.max(0),
         client_subtitles: false,
-        offset: super::TranscodeOffset::Fresh,
+        offset,
     }
 }
 
@@ -590,7 +590,7 @@ impl Client {
         if !key.starts_with('/') || session.is_empty() {
             return Err(LiveError::Invalid);
         }
-        let spec = live_spec(key, session, subtitle_stream_id);
+        let spec = live_spec(key, session, subtitle_stream_id, super::TranscodeOffset::Fresh);
         let started = std::time::Instant::now();
         let decision = self.transcode_decision(off, &spec);
         let Some(decision) = decision else {
@@ -640,6 +640,22 @@ impl Client {
         })
     }
 
+    /// **The live stream again, from another moment of the tuner's capture** (time-shift): the
+    /// same transcode `session` (the server keeps its capture buffer for it), started `offset_s`
+    /// seconds after the capture window's origin ([`CaptureWindow::time_stamp`]), or at the live
+    /// edge with `None`. No request goes out: `start.m3u8` makes its own decision when the player
+    /// opens it, as the community clients rely on (`docs/pms-api.md` §10.6).
+    pub fn live_stream_url(&self, key: &str, session: &str, subtitle_stream_id: i64, offset_s: Option<f64>) -> Option<String> {
+        if !key.starts_with('/') || session.is_empty() {
+            return None;
+        }
+        let offset = match offset_s {
+            Some(s) if s.is_finite() && s >= 0.0 => super::TranscodeOffset::from_micros((s * 1_000_000.0) as i64),
+            _ => super::TranscodeOffset::Fresh,
+        };
+        Some(self.transcode_start_url(&live_spec(key, session, subtitle_stream_id, offset)).to_url())
+    }
+
     /// Stop a live encode (and free its streaming resource). `true` when the server took it.
     pub fn live_stream_stop(&self, session: &str) -> bool {
         self.transcode_stop(session)
@@ -649,8 +665,15 @@ impl Client {
     /// `time=0&duration=0`, so the server keeps the tune alive and records no resume point
     /// (`docs/pms-api.md` §10). `state` is `playing`, `paused` or `stopped`.
     pub fn live_timeline(&self, key: &str, rating_key: &str, state: &str, session: &str) -> bool {
+        self.live_timeline_window(key, rating_key, state, session).0
+    }
+
+    /// [`Client::live_timeline`], and the tuner's capture window its answer carries
+    /// (`CaptureBuffer > TranscodeSession`, else a lone top-level `TranscodeSession`): what can
+    /// be played again of the channel, which moves on as the tuner records.
+    pub fn live_timeline_window(&self, key: &str, rating_key: &str, state: &str, session: &str) -> (bool, Option<CaptureWindow>) {
         if key.is_empty() || session.is_empty() {
-            return false;
+            return (false, None);
         }
         let q = QueryBuilder::new("/:/timeline")
             .opt_str("ratingKey", rating_key)
@@ -660,7 +683,10 @@ impl Client {
             .int("duration", 0)
             .str("X-Plex-Session-Identifier", session);
         let q = self.playback_identity(q);
-        self.post_ok(&q.build())
+        match self.body_2xx_post(&q.build()) {
+            None => (false, None),
+            Some(body) => (true, serde_json::from_slice::<Value>(&body).ok().and_then(|v| parse::timeline_capture(&v))),
+        }
     }
 }
 

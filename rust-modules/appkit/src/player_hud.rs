@@ -1677,10 +1677,14 @@ pub struct Playbar {
     /// A live TV channel (`plx_media::route::is_live`): no duration, no position to scrub to. The
     /// bar is drawn full, to the live edge, and the elapsed clock under the knob reads LIVE.
     pub live: bool,
-    /// On a live channel whose program on air is known: its `(begins, ends)` and the wall clock
-    /// now, epoch seconds. The bar then fills to how far the program has run, as the guide's cell
-    /// does, and its right end says when it ends.
+    /// On a live channel whose program on air is known: its `(begins, ends)` and the moment on
+    /// screen (the wall clock at the live edge; earlier when rewound or paused), epoch seconds. The
+    /// bar then fills to how far the program has run, as the guide's cell does, and its right end
+    /// says when it ends.
     pub live_airing: Option<(i64, i64, i64)>,
+    /// On a live channel that is behind its live edge (paused, or rewound): by how many seconds.
+    /// The clock under the knob then says so ("-2:15") where it says LIVE at the edge.
+    pub live_behind_s: Option<i64>,
 }
 
 impl Playbar {
@@ -1715,6 +1719,10 @@ impl Playbar {
         // Gated on `busy`, not on `loading()`: with `loading()` the transport lit the same spinner
         // the centred read-out was already showing, for the whole of every load AND every seek.
         let paused = plx_media::player::TX.paused.load(Relaxed);
+        // a live channel paused or rewound: the moment on screen, and how far behind the edge
+        let shift = plx_media::route::is_live(ps).then(plx_media::route::live_shift_state).flatten();
+        let at = shift.map_or_else(plx_data::live_tv::wall_now, |(position, ..)| position as i64);
+        let behind = shift.map(|(_, behind, ..)| behind as i64).filter(|b| *b as f64 >= plx_media::route::LIVE_SNAP_S);
         Self {
             pos_ns: dispos,
             dur_ns: plx_media::player::duration_ns(),
@@ -1723,7 +1731,8 @@ impl Playbar {
             now,
             clock_grow: 0.0,
             live: plx_media::route::is_live(ps),
-            live_airing: plx_media::route::live_airing(ps).map(|(begins, ends)| (begins, ends, plx_data::live_tv::wall_now())),
+            live_airing: plx_media::route::live_airing(ps).map(|(begins, ends)| (begins, ends, at)),
+            live_behind_s: behind,
         }
     }
 }
@@ -1814,7 +1823,11 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     // the line clears are the union of the faces drawn.
     // A live channel has no elapsed time worth reading: the clock's place says LIVE (and, at the
     // bar's right end, covers the remaining clock, which the overlap rule below then hides).
-    let elapsed = if bar.live { plx_platform::i18n::msg::live_tv_hud_live().to_string() } else { fmt_time(dispos, false) };
+    let elapsed = match (bar.live, bar.live_behind_s) {
+        (true, Some(behind)) => fmt_time(behind * 1_000_000_000, true),
+        (true, None) => plx_platform::i18n::msg::live_tv_hud_live().to_string(),
+        _ => fmt_time(dispos, false),
+    };
     let (mut el_l, mut el_r) = (f32::INFINITY, f32::NEG_INFINITY);
     for (sz, face_a) in crate::scrub_preview::clock_faces(theme::size::CAPTION, bar.clock_grow).into_iter().flatten() {
         let ety = plx_gfx::text::baseline_y(sz, 1, theme::size::CAPTION, 1, ty);

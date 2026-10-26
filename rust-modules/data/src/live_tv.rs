@@ -455,6 +455,9 @@ pub struct Tuned {
     pub airing: Option<Airing>,
     /// One of Plex's own channels: a provider's stream, no server tune behind it.
     pub cloud: bool,
+    /// The tuner's capture window when the tune answered one: what can be played again of the
+    /// channel (pause and rewind). `None` for a Plex channel.
+    pub capture: Option<plx_plex::plex::live_tv::CaptureWindow>,
 }
 
 /// Where the page's last Watch press stands.

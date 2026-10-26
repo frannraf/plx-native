@@ -653,7 +653,34 @@ pub(crate) fn player_requests(
                 minimize_player(ps, pa, refresh_hubs, pages);
             }
             PlayerReq::ChannelStep(step) => step_live_channel(ps, bridge, step, now, pages),
+            PlayerReq::LiveSkip(delta) => {
+                live_skip(ps, pa, delta);
+                if let Some(player) = super::bridge::player_mut(pages) {
+                    player.hud.extend(now, HUD_LINGER_MS);
+                    player.publish();
+                }
+            }
         }
+    }
+}
+
+/// **Rewind or skip ahead on a live channel**: from where the picture is, `delta` seconds, inside
+/// the tuner's capture; at (or past) the live edge it plays the edge. Nothing when the channel
+/// cannot be shifted, or when it is at the edge and asked further on.
+fn live_skip(ps: &mut plx_media::route::PlaybackSession, pa: &mut plx_media::player::adapter::PlayerAdapter, delta: i32) {
+    let Some((position, behind, earliest, edge)) = plx_media::route::live_shift_state() else { return };
+    let target = plx_media::route::shift_target(position, f64::from(delta), earliest, edge);
+    if target.is_none() && behind < plx_media::route::LIVE_SNAP_S {
+        return;
+    }
+    let words = match target {
+        Some(t) => format!("{:.0}s behind the live edge", edge - t),
+        None => "the live edge".to_string(),
+    };
+    if plx_media::player::lifecycle::live_shift(ps, pa, target) {
+        plx_base::eventlog::log(&format!("livetv: time-shift {delta:+}s: plays from {words}"));
+    } else {
+        plx_base::eventlog::log("livetv: time-shift refused (no capture to play from)");
     }
 }
 

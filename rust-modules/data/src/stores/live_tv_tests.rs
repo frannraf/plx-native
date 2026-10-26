@@ -423,6 +423,7 @@ fn tuned(sub: &str, session: &str) -> Tuned {
         channel: "C1".into(),
         airing: None,
         cloud: false,
+        capture: None,
     }
 }
 

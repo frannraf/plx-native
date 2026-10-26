@@ -231,8 +231,16 @@ fn default_runner() -> Box<dyn Runner> {
 pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
         Job::Tune { serial, dvr_key, channel, label, airing, session, captions } => {
-            let result = tune(client, off, &dvr_key, &channel, &session, captions)
-                .map(|(subscription_id, item, stream)| Tuned { sid, subscription_id, item, stream, channel: label, airing, cloud: false });
+            let result = tune(client, off, &dvr_key, &channel, &session, captions).map(|(subscription_id, item, stream, capture)| Tuned {
+                sid,
+                subscription_id,
+                item,
+                stream,
+                channel: label,
+                airing,
+                cloud: false,
+                capture,
+            });
             Landing::Tuned { serial, result }
         }
         Job::Release { subscription_id, session } => {
@@ -289,6 +297,7 @@ pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, 
                 channel: label,
                 airing,
                 cloud: true,
+                capture: None,
             });
             Landing::Tuned { serial, result }
         }
@@ -332,7 +341,7 @@ fn tune(
     channel: &plx_plex::plex::live_tv::Channel,
     session: &str,
     captions: bool,
-) -> Result<(String, plx_plex::plex::live_tv::TunedItem, plx_plex::plex::live_tv::LiveStream), LiveError> {
+) -> Result<(String, plx_plex::plex::live_tv::TunedItem, plx_plex::plex::live_tv::LiveStream, Option<plx_plex::plex::live_tv::CaptureWindow>), LiveError> {
     let t = match client.live_tune(dvr_key, &channel.identifier, session) {
         Err(LiveError::Status(status @ (400 | 404))) if !channel.vcn.is_empty() && channel.vcn != channel.identifier => {
             plx_base::eventlog::log(&format!("livetv: tune by lineup id answered HTTP {status}; asking by channel number"));
@@ -364,7 +373,7 @@ fn tune(
         }
     }
     match client.live_stream(off, &t.item.key, session, sub) {
-        Ok(stream) => Ok((t.subscription_id, t.item, stream)),
+        Ok(stream) => Ok((t.subscription_id, t.item, stream, t.capture)),
         Err(e) => {
             release(client, &t.subscription_id, session);
             Err(e)
