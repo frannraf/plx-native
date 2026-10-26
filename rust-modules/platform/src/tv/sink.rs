@@ -110,6 +110,9 @@ pub trait VideoSink: Sync {
     unsafe fn plane_send_video_data(&self, mt: &MainThread, source_info: *const c_char) -> c_int;
     unsafe fn plane_send_atmos(&self, mt: &MainThread, media_id: *const c_char) -> c_int;
     unsafe fn plane_start(&self, mt: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long);
+    /// Move the bound plane to `(x, y, w, h)` (authored 1920x1080; the whole canvas is full
+    /// screen): a live channel into the Live TV guide's corner and back. The library's answer.
+    unsafe fn plane_window(&self, mt: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long) -> c_int;
     unsafe fn plane_unload(&self, mt: &MainThread);
     unsafe fn plane_pause(&self, mt: &MainThread);
     unsafe fn plane_resume(&self, mt: &MainThread);
@@ -157,6 +160,7 @@ impl VideoSink for NoSink {
     unsafe fn plane_send_video_data(&self, _mt: &MainThread, _source_info: *const c_char) -> c_int { -1 }
     unsafe fn plane_send_atmos(&self, _mt: &MainThread, _media_id: *const c_char) -> c_int { 0 }
     unsafe fn plane_start(&self, _mt: &MainThread, _x: c_long, _y: c_long, _w: c_long, _h: c_long) {}
+    unsafe fn plane_window(&self, _mt: &MainThread, _x: c_long, _y: c_long, _w: c_long, _h: c_long) -> c_int { 0 }
     unsafe fn plane_unload(&self, _mt: &MainThread) {}
     unsafe fn plane_pause(&self, _mt: &MainThread) {}
     unsafe fn plane_resume(&self, _mt: &MainThread) {}

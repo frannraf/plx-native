@@ -353,14 +353,15 @@ static WINDOW: [std::sync::atomic::AtomicI32; 4] = [
 static WINDOW_MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Show the picture at `(x, y, w, h)` (authored 1920x1080) from the next pump on; the whole
-/// screen is `(0, 0, 1920, 1080)`. The webOS 5+ exported window moves without a reload; on the ACB
-/// path nothing can move it and the answer is `false` (the caller keeps the picture full screen).
+/// screen is `(0, 0, 1920, 1080)`. Both planes move without a reload: the webOS 5+ exported window
+/// (`place_exported`) and, on webOS 4, the ACB plane once it is bound (`place_acb`). With no video
+/// plane the answer is `false` (the caller keeps the picture full screen).
 pub fn set_video_window(x: i32, y: i32, w: i32, h: i32) -> bool {
     for (slot, v) in WINDOW.iter().zip([x, y, w, h]) {
         slot.store(v, Relaxed);
     }
     WINDOW_MOVED.store(true, Relaxed);
-    super::sink().window_mode() == super::VP_EXPORTED
+    super::sink().window_mode() == super::VP_EXPORTED || ACB_OK.load(Relaxed)
 }
 
 /// Is the picture in a corner rather than the whole screen?
@@ -410,6 +411,14 @@ fn place_exported(mt: &MainThread, eng: &mut super::engine::Engine) {
         "vplane: exported window placed src={}x{} at {x},{y} {w}x{h} rv={rv}",
         src.0, src.1
     ));
+}
+
+/// Move the bound webOS 4 (ACB) plane to where the window was put: a live channel into the Live
+/// TV guide's corner, or back to the whole screen. The plane scales the picture to the rect itself.
+fn place_acb(mt: &MainThread) {
+    let [x, y, w, h] = video_window();
+    let rv = unsafe { super::sink().plane_window(mt, x.into(), y.into(), w.into(), h.into()) };
+    super::log(&format!("vplane: acb plane placed at {x},{y} {w}x{h} rv={rv}"));
 }
 
 /// Mirror Engine-confined observations into `Shared` for diagnostics and handled-error context.
@@ -2040,7 +2049,11 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             if rv != -1 {
                 // -1 = client-side isJsonError reject; else accepted
                 eng.video_info_sent = true;
-                unsafe { super::sink().plane_start(mt, 0, 0, 1920, 1080) };
+                // where the window stands now (the whole screen, unless a corner was asked for
+                // before the bind), which this start places: no move is left pending
+                let [x, y, w, h] = video_window();
+                WINDOW_MOVED.store(false, Relaxed);
+                unsafe { super::sink().plane_start(mt, x.into(), y.into(), w.into(), h.into()) };
                 eng.stage = Stage::Streaming;
                 eng.bound_at_frames = Some(SHARED.frames.load(Relaxed));
                 // `acb_start` sets ACB PLAYING. Under a pipeline that is really paused (a late
@@ -2068,6 +2081,11 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         if moved || (now.0 > 0 && now.1 > 0 && now != eng.placed_src) {
             place_exported(mt, eng);
         }
+    }
+    // ---------- webOS 4 (ACB): the bound plane follows the window the same way. Before the bind
+    // the move waits: the bind places the plane where the window stands. ----------
+    if ACB_OK.load(Relaxed) && eng.stage >= Stage::Streaming && WINDOW_MOVED.swap(false, Relaxed) {
+        place_acb(mt);
     }
 
     // ---------- feed AUs after the initial Load has reached Playing. The native clock may itself
@@ -4311,6 +4329,36 @@ mod native_seek_pump_tests {
         rig.frame();
         assert_eq!(ffi_host::acb_calls_for_test().1, 1);
         assert_eq!(ffi_host::acb_calls_for_test().2, 0, "playing: ACB is left PLAYING");
+    }
+
+    /// **webOS 4 keeps a live channel playing in the Live TV guide's corner**: the ACB plane, once
+    /// bound, moves to the window's rect on the next pump (once), and back to the whole screen; a
+    /// corner asked for before the bind waits for it and is where the bind places the plane.
+    #[test]
+    fn a_bound_acb_plane_follows_the_window_into_the_corner_and_back() {
+        let _serial = plx_base::testlock::serial();
+        let _acb = AcbGuard::arm();
+        set_video_window(0, 0, 1920, 1080);
+        let mut rig = Rig::new(None);
+        rig.unbound_acb_session();
+        assert!(set_video_window(1038, 0, 882, 496), "an ACB plane can move");
+        SHARED.frames.store(1, Relaxed);
+        rig.frame();
+        assert!(ffi_host::acb_windows_for_test().is_empty(), "not bound yet: the move waits");
+        SHARED.frames.store(2, Relaxed);
+        rig.frame();
+        assert_eq!(ffi_host::acb_calls_for_test().1, 1, "the bind");
+        rig.frame();
+        assert!(ffi_host::acb_windows_for_test().is_empty(), "the bind placed it: no second move");
+        assert!(set_video_window(0, 0, 1920, 1080));
+        rig.frame();
+        rig.frame();
+        assert_eq!(ffi_host::acb_windows_for_test(), [[0, 0, 1920, 1080]], "back to the whole screen, once");
+        assert!(set_video_window(1038, 0, 882, 496));
+        rig.frame();
+        assert_eq!(ffi_host::acb_windows_for_test().last(), Some(&[1038, 0, 882, 496]), "into the corner");
+        set_video_window(0, 0, 1920, 1080);
+        WINDOW_MOVED.store(false, Relaxed);
     }
 
     /// A late tick binds the plane after the pipeline was already re-paused: ACB must not be left

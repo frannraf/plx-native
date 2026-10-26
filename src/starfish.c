@@ -876,10 +876,24 @@ int acb_send_video_data(const char *sourceInfo) {
     if (!g_acb) return 0;
     return acb.setMediaVideoData(g_acb, sourceInfo, &g_taskId);
 }
+/* setDisplayWindow's isFullScreen: the whole 1920x1080 canvas is full screen, anything smaller is
+ * a window at its rect (the Live TV guide's corner). */
+static int acb_full(long x, long y, long w, long h) { return x == 0 && y == 0 && w >= 1920 && h >= 1080; }
 void acb_start(long x, long y, long w, long h) {
     if (!g_acb) return;
-    acb.setDisplayWindow(g_acb, x, y, w, h, 1, &g_taskId);
+    acb.setDisplayWindow(g_acb, x, y, w, h, acb_full(x, y, w, h), &g_taskId);
     acb.setState(g_acb, APPSTATE_FOREGROUND, PLAYSTATE_PLAYING, &g_taskId);
+}
+/* Move the bound plane: the VP_ACB counterpart of vp_place, for a live channel that plays on in
+ * the Live TV guide's corner and comes back to the whole screen. The same setDisplayWindow
+ * acb_start opens with, on a plane already PLAYING; nothing is reloaded. Returns the library's
+ * answer, 0 with no plane. */
+int acb_window(long x, long y, long w, long h) {
+    if (!g_acb) return 0;
+    int full = acb_full(x, y, w, h);
+    int rv = acb.setDisplayWindow(g_acb, x, y, w, h, full, &g_taskId);
+    if (elogf) { fprintf(elogf, "vplane: acb window %ld,%ld %ldx%ld full=%d rv=%d\n", x, y, w, h, full, rv); fflush(elogf); }
+    return rv;
 }
 void acb_unload(void) {
     if (g_acb) acb.setState(g_acb, APPSTATE_FOREGROUND, PLAYSTATE_UNLOADED, &g_taskId);

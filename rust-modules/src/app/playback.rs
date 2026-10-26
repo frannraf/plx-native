@@ -810,8 +810,8 @@ pub(crate) fn exit_player(
 /// **BACK out of a live channel: it plays on in the Live TV guide's corner** — its window moved
 /// there, its tuner and keepalive kept, the guide back on screen (the origin the player was pushed
 /// over). OK on the same channel there restores it ([`restore_live_corner`]); anything that leaves
-/// the guide ends it ([`stop_live_corner`]). Where the window cannot move (the ACB path), BACK
-/// leaves as it always did.
+/// the guide ends it ([`stop_live_corner`]). The webOS 5+ window and the webOS 4 (ACB) plane both
+/// move; where there is no video plane to move, BACK leaves as it always did.
 pub(crate) fn minimize_player(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,

@@ -130,6 +130,14 @@ pub(super) static ACB_START_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(super) static ACB_PAUSE_CALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(super) static ACB_RESUME_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Every `acb_window` rect, in order. Test-only.
+#[cfg(test)]
+pub(super) static ACB_WINDOWS: Mutex<Vec<[c_long; 4]>> = Mutex::new(Vec::new());
+/// The rects the bound plane was moved to (`acb_window`), in order. Test-only.
+#[cfg(test)]
+pub(super) fn acb_windows_for_test() -> Vec<[c_long; 4]> {
+    ACB_WINDOWS.lock().unwrap().clone()
+}
 /// `(setMediaVideoData, acb_start, acb_pause, acb_resume)` call counts. Test-only.
 #[cfg(test)]
 pub(super) fn acb_calls_for_test() -> (u64, u64, u64, u64) {
@@ -147,6 +155,7 @@ pub(super) fn reset_acb_for_test(accept_video_data: bool) {
     for c in [&ACB_VIDEO_DATA_CALLS, &ACB_START_CALLS, &ACB_PAUSE_CALLS, &ACB_RESUME_CALLS] {
         c.store(0, Relaxed);
     }
+    ACB_WINDOWS.lock().unwrap().clear();
 }
 
 /// Every millis `sf_seek_ms` was called with, in order (#568): what a test reads to prove a
@@ -977,6 +986,13 @@ unsafe fn acb_start(_x: c_long, _y: c_long, _w: c_long, _h: c_long) {
     #[cfg(test)]
     ACB_START_CALLS.fetch_add(1, Relaxed);
 }
+unsafe fn acb_window(_x: c_long, _y: c_long, _w: c_long, _h: c_long) -> c_int {
+    #[cfg(any(test, feature = "test-support"))]
+    note_dispatch("acb_window");
+    #[cfg(test)]
+    ACB_WINDOWS.lock().unwrap().push([_x, _y, _w, _h]);
+    0 // 0 = no plane, which is the host's situation
+}
 unsafe fn acb_unload() {
     #[cfg(any(test, feature = "test-support"))]
     note_dispatch("acb_unload");
@@ -1107,6 +1123,9 @@ impl VideoSink for HostSink {
     }
     unsafe fn plane_start(&self, _: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long) {
         acb_start(x, y, w, h)
+    }
+    unsafe fn plane_window(&self, _: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long) -> c_int {
+        acb_window(x, y, w, h)
     }
     unsafe fn plane_unload(&self, _: &MainThread) {
         acb_unload()

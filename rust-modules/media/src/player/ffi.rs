@@ -71,6 +71,7 @@ mod sys {
         pub(super) fn acb_send_video_data(source_info: *const c_char) -> c_int;
         pub(super) fn acb_send_atmos(media_id: *const c_char) -> c_int;
         pub(super) fn acb_start(x: c_long, y: c_long, w: c_long, h: c_long);
+        pub(super) fn acb_window(x: c_long, y: c_long, w: c_long, h: c_long) -> c_int;
         pub(super) fn acb_unload();
         pub(super) fn acb_pause();
         pub(super) fn acb_resume();
@@ -243,6 +244,10 @@ impl plx_platform::tv::sink::VideoSink for StarfishSink {
     #[inline]
     unsafe fn plane_start(&self, _: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long) {
         sys::acb_start(x, y, w, h)
+    }
+    #[inline]
+    unsafe fn plane_window(&self, _: &MainThread, x: c_long, y: c_long, w: c_long, h: c_long) -> c_int {
+        sys::acb_window(x, y, w, h)
     }
     #[inline]
     unsafe fn plane_unload(&self, _: &MainThread) {
