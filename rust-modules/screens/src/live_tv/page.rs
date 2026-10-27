@@ -1269,7 +1269,11 @@ impl LiveTvScreen {
 
     /// The airing's recording state, as its badge words.
     fn badge(&self, a: &Airing) -> Option<String> {
-        match model::grab_for(&self.view.snap, a).map(|g| &g.status) {
+        let grab = model::grab_for(&self.view.snap, a);
+        if grab.is_some_and(|g| model::grab_conflicted(g, self.frame.now)) {
+            return Some(msg::live_tv_badge_conflict().to_string());
+        }
+        match grab.map(|g| &g.status) {
             Some(s) if s.is_recording() => Some(msg::live_tv_badge_recording().to_string()),
             Some(GrabStatus::Error) => Some(msg::live_tv_badge_failed().to_string()),
             Some(_) => Some(msg::live_tv_badge_scheduled().to_string()),
@@ -2024,6 +2028,8 @@ impl LiveTvScreen {
                 }
                 let mark = if g.status.is_recording() {
                     msg::live_tv_badge_recording()
+                } else if model::grab_conflicted(g, self.frame.now) {
+                    msg::live_tv_badge_conflict()
                 } else if g.status == GrabStatus::Error {
                     msg::live_tv_badge_failed()
                 } else {
@@ -2092,7 +2098,7 @@ impl LiveTvScreen {
         if let Target::Conflict { conflicts, .. } = &panel.target {
             TextView::new(&msg::live_tv_conflict_body(&conflicts.join(", ")), theme::size::LABEL, theme::TEXT_SECONDARY)
                 .with_measure(f.measure)
-                .max_lines(3)
+                .max_lines(4)
                 .h(HAlign::Center)
                 .draw(p, Rect::new(r.x + 40.0, r.y + 32.0 + 52.0 + 16.0, r.w - 80.0, 0.0));
         }
@@ -2136,8 +2142,8 @@ fn action_rect(panel: &Panel, i: usize) -> Rect {
     Rect::new(r.x + 48.0, r.y + 32.0 + 52.0 + 24.0 + panel_body_h(panel) + i as f32 * geom::ACTION_PITCH, r.w - 96.0, geom::ACTION_H)
 }
 
-/// A conflict's three lines of words.
-const PANEL_BODY_H: f32 = 132.0;
+/// A conflict's four lines of words (three cut its last sentence short, device 2026-10-27).
+const PANEL_BODY_H: f32 = 176.0;
 
 fn action_label(a: Action) -> &'static str {
     match a {

@@ -70,5 +70,6 @@
   "live_tv.whats_on.loading": "A műsor betöltése…",
   "live_tv.whats_on.failed": "A jelenlegi műsor nem tölthető be.",
   "live_tv.whats_on.empty": "Most nincs mit megjeleníteni.",
-  "live_tv.whats_on.recent": "Legutóbbi csatornák"
+  "live_tv.whats_on.recent": "Legutóbbi csatornák",
+  "live_tv.badge.conflict": "Ütközés"
 }

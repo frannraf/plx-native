@@ -70,5 +70,6 @@
   "live_tv.whats_on.loading": "Caricamento dei programmi…",
   "live_tv.whats_on.failed": "Impossibile caricare i programmi in onda.",
   "live_tv.whats_on.empty": "Al momento non c'è nulla da mostrare.",
-  "live_tv.whats_on.recent": "Canali recenti"
+  "live_tv.whats_on.recent": "Canali recenti",
+  "live_tv.badge.conflict": "Conflitto"
 }

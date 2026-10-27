@@ -422,7 +422,13 @@ fn create(client: &plx_plex::plex::Client, choice: &TemplateChoice) -> Result<Wr
     let made = client.dvr_create(&CreateSubscription::from_choice(choice))?;
     Ok(WriteDone {
         rule: made.subscription_id,
-        conflicts: made.conflicts.iter().map(|c| if c.airing.title.is_empty() { "another recording".to_string() } else { c.airing.title.clone() }).collect(),
+        // each by its show's name where it has one (an episode's own title named nothing the
+        // viewer would know it by, device 2026-10-27), else its own
+        conflicts: made
+            .conflicts
+            .iter()
+            .map(|c| [&c.airing.show_title, &c.airing.title].into_iter().find(|t| !t.is_empty()).cloned().unwrap_or_else(|| "another recording".to_string()))
+            .collect(),
         favorites: None,
     })
 }

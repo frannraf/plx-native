@@ -263,6 +263,27 @@ fn an_airing_being_recorded_offers_stop_and_its_write_deletes_the_operation() {
     );
 }
 
+/// **A Recordings row's Cancel takes a one-off's rule with it** (device 2026-10-27: cancelling
+/// only the recording left a "Single" rule in the priority list); a series' row skips the one
+/// recording, and a recording under way is stopped, its rule kept.
+#[test]
+fn a_recordings_row_cancel_deletes_a_one_offs_rule_and_skips_a_series_recording() {
+    let mut v = view(2);
+    let grab = |rule: &str, status| Grab { key: format!("/media/grabbers/operations/{rule}"), subscription_id: rule.into(), status, ..Grab::default() };
+    v.snap.rules = vec![
+        Subscription { id: "1".into(), kind: 1, ..Subscription::default() },
+        Subscription { id: "2".into(), kind: 2, ..Subscription::default() },
+    ];
+    let single = Target::Grab(grab("1", GrabStatus::Scheduled));
+    assert_eq!(write_for(&v.snap, &single, Action::CancelRecording), Some(Write::CancelRule { id: "1".into() }));
+    let series = Target::Grab(grab("2", GrabStatus::Scheduled));
+    assert_eq!(write_for(&v.snap, &series, Action::CancelRecording), Some(Write::StopGrab { key: "/media/grabbers/operations/2".into() }));
+    let unknown = Target::Grab(grab("9", GrabStatus::Scheduled));
+    assert_eq!(write_for(&v.snap, &unknown, Action::CancelRecording), Some(Write::StopGrab { key: "/media/grabbers/operations/9".into() }));
+    let running = Target::Grab(grab("1", GrabStatus::InProgress));
+    assert_eq!(write_for(&v.snap, &running, Action::StopRecording), Some(Write::StopGrab { key: "/media/grabbers/operations/1".into() }));
+}
+
 #[test]
 fn a_provider_that_cannot_tune_offers_no_watch() {
     let mut v = view(2);
@@ -585,4 +606,16 @@ fn a_whats_on_channel_card_names_the_station_without_its_number() {
     assert_eq!(wo_channel_name(&ch("", "KXYZDT2")), "KXYZ");
     assert_eq!(wo_channel_name(&ch("7.1", "")), "");
     assert_eq!(wo_channel_name(&ch("4.1", "4.1 KXYZDT (NET)")), "KXYZ (NET)", "a network after the call sign stays");
+}
+
+/// A recording the server marks failed before its airing began lost its tuner (a conflict); one
+/// that failed once under way did fail.
+#[test]
+fn a_recording_failed_before_its_airing_is_a_conflict() {
+    let g = |begins: i64| Grab { status: GrabStatus::Error, airing: Airing { begins_at: begins, ..Airing::default() }, ..Grab::default() };
+    assert!(grab_conflicted(&g(2_000), 1_000));
+    assert!(!grab_conflicted(&g(500), 1_000), "under way: a failure");
+    assert!(!grab_conflicted(&g(2_000), 0), "no clock yet");
+    let scheduled = Grab { status: GrabStatus::Scheduled, ..g(2_000) };
+    assert!(!grab_conflicted(&scheduled, 1_000));
 }

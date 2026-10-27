@@ -1566,7 +1566,12 @@ Program fields: `ratingKey`, `key`, `guid` (what the record template takes),
 
 **A create can answer conflicts** (`MediaSubscription > MediaGrabOperation > Conflicts >
 MediaGrabOperation[]`): the rule EXISTS. "Prefer this" is `PUT …/{id}/move` with no `after`;
-"Cancel this" is `DELETE …/{id}`.
+"Cancel this" is `DELETE …/{id}`. **Measured 2026-10-27** (a two-tuner DVR, three one-off recordings
+at the same hour): the third create answered `Conflicts` naming the other two; `PUT …/move` made it
+first in the priority list (HTTP 200); the recording that lost its tuner then read `status="error"`
+in `/media/subscriptions/scheduled` **before its airing began** — the app reads such a grab as a
+conflict, not a failure. A conflict names a recording by its show (`grandparentTitle`) where it
+has one: its own `title` is the episode's.
 
 ### 10.5 Recording operations — `GET /media/subscriptions/scheduled`, `DELETE /media/grabbers/operations/{id}`
 
@@ -1574,7 +1579,11 @@ MediaGrabOperation[]`): the rule EXISTS. "Prefer this" is `PUT …/{id}/move` wi
 `mediaSubscriptionID`, `status` (`inactive|scheduled|inprogress|complete|cancelled|error|postprocessing|paused`),
 `percent`, and the airing as `Metadata` (one object). `DELETE` on a grab's key cancels that one
 recording — stops it if it is in progress — and leaves its rule; the spec says it is how a conflict
-with a *rolling* (live viewer) subscription is resolved.
+with a *rolling* (live viewer) subscription is resolved. **Measured 2026-10-27:** cancelling a
+one-off's recording this way left its "single" rule (not a series one) in the priority list with nothing
+to record, so the app's Cancel on a one-off's recording deletes the rule instead (`DELETE
+/media/subscriptions/{id}`), as it does from the guide; a series' recording is still skipped by
+deleting the grab alone.
 
 ### 10.6 The live tune — `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`
 

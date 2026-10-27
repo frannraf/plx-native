@@ -70,5 +70,6 @@
   "live_tv.whats_on.loading": "Wird geladen …",
   "live_tv.whats_on.failed": "Das aktuelle Programm konnte nicht geladen werden.",
   "live_tv.whats_on.empty": "Gerade gibt es nichts anzuzeigen.",
-  "live_tv.whats_on.recent": "Zuletzt gesehene Sender"
+  "live_tv.whats_on.recent": "Zuletzt gesehene Sender",
+  "live_tv.badge.conflict": "Konflikt"
 }

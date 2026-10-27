@@ -70,5 +70,6 @@
   "live_tv.whats_on.loading": "Cargando lo que se emite…",
   "live_tv.whats_on.failed": "No se pudo cargar lo que se emite.",
   "live_tv.whats_on.empty": "No hay nada que mostrar ahora mismo.",
-  "live_tv.whats_on.recent": "Canales recientes"
+  "live_tv.whats_on.recent": "Canales recientes",
+  "live_tv.badge.conflict": "Conflicto"
 }

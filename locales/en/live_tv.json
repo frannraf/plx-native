@@ -312,5 +312,9 @@
   "live_tv.whats_on.recent": {
     "value": "Recent Channels",
     "description": "Live TV What's On row: the channels watched lately on this TV."
+  },
+  "live_tv.badge.conflict": {
+    "value": "Conflict",
+    "description": "Badge on a scheduled recording that lost its tuner to recordings of higher priority (a conflict): it will not record unless one of them is cancelled or it is preferred."
   }
 }

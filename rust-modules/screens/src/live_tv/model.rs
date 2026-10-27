@@ -10,7 +10,7 @@
 use plx_data::live_tv::{Snapshot, Source};
 use plx_data::stores::live_tv::Write;
 use plx_data::live_tv::RecordKind;
-use plx_plex::plex::live_tv::{station_id, Airing, Channel, Grab, Setting, SettingKind, Subscription};
+use plx_plex::plex::live_tv::{station_id, Airing, Channel, Grab, GrabStatus, Setting, SettingKind, Subscription};
 use plx_ui::consts::{MARGIN_X, SCR_W};
 use plx_ui::screen::Dir;
 use plx_ui::Rect;
@@ -766,7 +766,7 @@ pub enum RecGroup {
 /// The list: what will record, soonest first (running ones first of all) under a heading per day,
 /// then the rules in the server's priority order.
 pub fn rec_entries(snap: &Snapshot) -> Vec<RecEntry> {
-    let mut grabs: Vec<&Grab> = snap.scheduled.iter().filter(|g| !matches!(g.status, plx_plex::plex::live_tv::GrabStatus::Complete | plx_plex::plex::live_tv::GrabStatus::Cancelled)).collect();
+    let mut grabs: Vec<&Grab> = snap.scheduled.iter().filter(|g| !matches!(g.status, GrabStatus::Complete | GrabStatus::Cancelled)).collect();
     grabs.sort_by_key(|g| (!g.status.is_recording(), g.airing.begins_at));
     let today = local_day(snap.now, snap.utc_offset);
     let mut out: Vec<RecEntry> = grabs
@@ -889,7 +889,7 @@ pub struct Panel {
 /// The recording operation that is this airing, if the server scheduled one.
 pub fn grab_for<'a>(snap: &'a Snapshot, a: &Airing) -> Option<&'a Grab> {
     // A finished or cancelled operation the server still lists covers nothing (as in the list).
-    snap.scheduled.iter().filter(|g| !matches!(g.status, plx_plex::plex::live_tv::GrabStatus::Complete | plx_plex::plex::live_tv::GrabStatus::Cancelled)).find(|g| {
+    snap.scheduled.iter().filter(|g| !matches!(g.status, GrabStatus::Complete | GrabStatus::Cancelled)).find(|g| {
         g.airing.begins_at == a.begins_at
             && ((!a.guid.is_empty() && g.airing.guid == a.guid)
                 || (!a.channel_identifier.is_empty() && g.airing.channel_identifier == a.channel_identifier))
@@ -943,6 +943,12 @@ pub fn channel_actions(snap: &Snapshot, ch: &Channel) -> Vec<Action> {
     out
 }
 
+/// A recording the server marks failed before its airing began: it lost its tuner to others of
+/// higher priority (a conflict), and reads so rather than as a recording that failed.
+pub fn grab_conflicted(g: &Grab, now: i64) -> bool {
+    g.status == GrabStatus::Error && now > 0 && g.airing.begins_at > now
+}
+
 pub fn grab_actions(g: &Grab) -> Vec<Action> {
     let mut out = Vec::new();
     if g.status.is_recording() {
@@ -990,7 +996,14 @@ pub fn write_for(snap: &Snapshot, target: &Target, action: Action) -> Option<Wri
         (Target::Airing { airing, .. }, Action::CancelSeries) => {
             (!airing.show_subscription_id.is_empty()).then(|| Write::CancelRule { id: airing.show_subscription_id.clone() })
         }
-        (Target::Grab(g), Action::StopRecording | Action::CancelRecording) => Some(Write::StopGrab { key: g.key.clone() }),
+        (Target::Grab(g), Action::StopRecording) => Some(Write::StopGrab { key: g.key.clone() }),
+        // A one-off's own rule goes with its recording, as from the guide (cancelling only the
+        // recording left a "Single" rule with nothing to record in the priority list, device
+        // 2026-10-27); a series' recording skips this one airing.
+        (Target::Grab(g), Action::CancelRecording) => match snap.rules.iter().find(|r| !g.subscription_id.is_empty() && r.id == g.subscription_id) {
+            Some(rule) if rule.kind != 2 => Some(Write::CancelRule { id: rule.id.clone() }),
+            _ => Some(Write::StopGrab { key: g.key.clone() }),
+        },
         (Target::Rule(s), Action::DeleteRule) => Some(Write::CancelRule { id: s.id.clone() }),
         (Target::Rule(s), Action::MoveTop) => Some(Write::MoveRule { id: s.id.clone(), after: None }),
         // a rule moved to the top of the priority list wins a tuner conflict (`docs/pms-api.md` §10.4)
