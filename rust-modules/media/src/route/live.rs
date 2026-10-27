@@ -275,13 +275,6 @@ fn shift_lock() -> std::sync::MutexGuard<'static, Option<Shift>> {
 fn note_window(session: &str, w: CaptureWindow) {
     let now = wall_s();
     if let Some(s) = shift_lock().as_mut().filter(|s| s.session == session) {
-        if s.window.is_none() {
-            crate::player::log(&format!(
-                "livetv: capture window: {:.0} s deep, its edge {:+.0} s from this TV's clock",
-                w.depth(),
-                w.live_edge() - now
-            ));
-        }
         s.window = Some((w, now));
         s.clock.anchor(capture_span(&w, now, now).1, now);
     }

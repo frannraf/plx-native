@@ -626,7 +626,6 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                     if tick.ms.wrapping_sub(at) as i32 >= 0 {
                         self.live_skip = None;
                         if delta != 0 {
-                            plx_base::eventlog::log(&format!("livetv: skip {delta:+}s asked"));
                             Self::ask(fx, PlayerReq::LiveSkip(delta));
                         }
                     }
@@ -912,16 +911,6 @@ impl PlayerScreen {
             }
             // Swallowed either way: that is what "the read-out owns the frame" means.
             return Handled::Yes;
-        }
-        // pause and rewind is unmeasured on a set: what a LEFT/RIGHT on a live channel met
-        if matches!(key, Key::Left { .. } | Key::Right { .. }) && edge == Edge::Down && plx_media::route::is_live(ps) {
-            plx_base::eventlog::log(&format!(
-                "livetv: {} on a live channel: can shift {}, transport up {}, focus {}",
-                if matches!(key, Key::Left { .. }) { "LEFT" } else { "RIGHT" },
-                plx_media::route::live_can_shift(ps),
-                self.hud.visible_at_press,
-                self.hud.nav.focus
-            ));
         }
         match key {
             Key::Play | Key::Pause | Key::PlayPause => {

@@ -120,33 +120,6 @@ pub(crate) fn note_capture_source(session: &str, found: bool, timeline: Option<&
     }
 }
 
-/// The first [`TIMELINE_SHAPES`] timeline answers of each live session, in a release build's log
-/// too: their [`shape`] (keys, counts, protocol values — the capture window's `timeStamp` and
-/// offsets among them), which is what reading the window right needs while its units and nesting
-/// are unmeasured.
-pub(crate) fn note_timeline_answer(session: &str, answer: Option<&Value>) {
-    static SEEN: std::sync::Mutex<(String, u32)> = std::sync::Mutex::new((String::new(), 0));
-    let n = {
-        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if g.0 != session {
-            session.clone_into(&mut g.0);
-            g.1 = 0;
-        }
-        g.1 = g.1.saturating_add(1);
-        g.1
-    };
-    if n <= TIMELINE_SHAPES {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        plx_base::eventlog::log(&format!(
-            "livetv: timeline answer #{n} (clock {now}): {}",
-            answer.map_or_else(|| "unreadable".to_string(), shape)
-        ));
-    }
-}
-
-/// Timeline answers per live session whose shape [`note_timeline_answer`] logs.
-const TIMELINE_SHAPES: u32 = 4;
-
 /// How many answers `op` has had in this process (1 for the first).
 fn count(op: &'static str) -> u32 {
     static COUNTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];

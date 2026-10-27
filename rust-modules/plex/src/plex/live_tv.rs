@@ -687,7 +687,6 @@ impl Client {
             None => (false, None),
             Some(body) => {
                 let answer = serde_json::from_slice::<Value>(&body).ok();
-                debug::note_timeline_answer(session, answer.as_ref());
                 let window = answer.as_ref().and_then(parse::timeline_capture).or_else(|| self.transcode_capture(session, answer.as_ref()));
                 (true, window)
             }
