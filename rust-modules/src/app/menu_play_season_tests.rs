@@ -9,57 +9,15 @@ use super::*;
 use plx_data::metadata::{Detail, Season};
 use plx_data::stores::metadata::MetadataCmd;
 use plx_plex::plex::ServerId;
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use crate::app::bridge::test_support::Pms;
 
 const SHOW: &str = "show-1";
 
-/// Serves every connection a two-episode `/children` answer until dropped. Dropping it stops and
-/// joins the thread, so a test that never dials still ends.
-struct Pms {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    port: i32,
-}
-
-impl Pms {
-    fn serve() -> Pms {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port() as i32;
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || {
-            while !flag.load(Ordering::SeqCst) {
-                let Ok((mut conn, _)) = listener.accept() else {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    continue;
-                };
-                conn.set_nonblocking(false).unwrap();
-                let mut buf = [0u8; 2048];
-                let _ = conn.read(&mut buf);
-                let body = r#"{"MediaContainer":{"size":2,"Metadata":[
-                    {"ratingKey":"ep-first","type":"episode","title":"First"},
-                    {"ratingKey":"ep-second","type":"episode","title":"Second"}]}}"#;
-                let _ = write!(
-                    conn,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-            }
-        });
-        Pms { stop, thread: Some(thread), port }
-    }
-}
-
-impl Drop for Pms {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
+/// Every request gets a two-episode `/children` answer.
+fn children(_path: &str) -> (&'static str, String) {
+    ("200 OK", r#"{"MediaContainer":{"size":2,"Metadata":[
+        {"ratingKey":"ep-first","type":"episode","title":"First"},
+        {"ratingKey":"ep-second","type":"episode","title":"Second"}]}}"#.into())
 }
 
 struct Rig {
@@ -163,11 +121,14 @@ impl Drop for Rig {
 /// worker; the landing plays the REQUESTED season's first episode.
 #[test]
 fn an_unloaded_season_is_fetched_off_the_frame_and_its_first_episode_plays_on_landing() {
-    let pms = Pms::serve();
+    let pms = Pms::serve(children);
     let mut rig = Rig::new(pms.port);
 
     rig.tick(0);
     assert!(rig.wait.is_some(), "the wait must outlive the frame that issued the season fetch");
+    // The press ran on the bare store, which leaves its job on the outbox: the frame that issued
+    // it started it, rather than leaving it for a pump to find.
+    rig.bridge.assert_no_store_jobs_left_for_test();
     assert!(rig.bridge.metadata_view().season_loading(), "the season is in flight on a worker");
     assert_eq!(rig.episodes(), ["stale"], "nothing was fetched on the frame");
     assert_eq!(rig.played(), None, "nothing plays before the season lands");
@@ -184,11 +145,12 @@ fn an_unloaded_season_is_fetched_off_the_frame_and_its_first_episode_plays_on_la
 /// replaced the fetch this wait was for.
 #[test]
 fn a_superseded_season_landing_plays_nothing() {
-    let pms = Pms::serve();
+    let pms = Pms::serve(children);
     let mut rig = Rig::new(pms.port);
 
     rig.tick(0);
-    rig.bridge.metadata_mut().run(MetadataCmd::LoadSeason(0)); // the user's own tab press
+    // the user's own tab press, as the dispatcher runs it: the store's job starts in this call
+    rig.bridge.metadata_run(MetadataCmd::LoadSeason(0));
     assert!(rig.pump_until_landed());
     rig.tick(16);
 
@@ -201,7 +163,7 @@ fn a_superseded_season_landing_plays_nothing() {
 /// wait has nothing to play and ends without a trace.
 #[test]
 fn leaving_the_show_during_the_season_wait_cancels_it() {
-    let pms = Pms::serve();
+    let pms = Pms::serve(children);
     let mut rig = Rig::new(pms.port);
 
     rig.tick(0);
@@ -236,7 +198,7 @@ fn a_failed_season_fetch_opens_the_page_instead_of_playing() {
 /// The 12s ceiling that bounds the detail phase bounds the season phase too.
 #[test]
 fn the_ceiling_ends_a_season_wait_that_never_lands() {
-    let pms = Pms::serve();
+    let pms = Pms::serve(children);
     let mut rig = Rig::new(pms.port);
 
     rig.tick(0);

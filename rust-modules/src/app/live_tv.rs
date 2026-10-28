@@ -151,6 +151,9 @@ impl Bridge {
             self.live_tv.instance = Some(instance);
             self.live_tv.generation = None;
             self.live_tv.want = None;
+            // the plex.tv identity Plex's channels and the favorites are read with, as the app
+            // reads it for the Watchlist (the store never reads the session)
+            self.stores.live_tv.seat_cloud_auth(plx_data::live_tv::CloudAuth::of_input(&Self::watchlist_input()));
             self.stores.live_tv.refresh_dvr();
             // the guide opens on the account's favorites, as the stock app's does, until a tab is
             // picked

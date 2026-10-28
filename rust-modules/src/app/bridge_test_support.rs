@@ -18,7 +18,9 @@ pub(super) fn goto(d: &mut Dispatcher<AppHost>, want: AppArg) {
 
 pub(super) fn frame(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, route: AppArg, tick: Tick, inputs: Vec<InputEvent<u32>>) -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame(d, rig, tick, inputs))
+    let out = presented(super::frame(d, rig, tick, inputs));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 /// …and the same driver for the two frames that also want the effect tap or a supplied result
@@ -27,14 +29,18 @@ pub(super) fn frame_with_tap(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, rout
     inputs: Vec<InputEvent<u32>>, tap: &mut dyn plx_ui::dispatch::Tap<AppHost>)
     -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame_with_tap(d, rig, tick, inputs, tap))
+    let out = presented(super::frame_with_tap(d, rig, tick, inputs, tap));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 pub(super) fn frame_with_results(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, route: AppArg, tick: Tick,
     inputs: Vec<InputEvent<u32>>, take: impl FnOnce() -> AppResults,
     tap: &mut dyn plx_ui::dispatch::Tap<AppHost>) -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame_with_results(d, rig, tick, inputs, take, tap))
+    let out = presented(super::frame_with_results(d, rig, tick, inputs, take, tap));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 /// A detail page's argument, for the tests that used to name `Route::Detail` and let a trail
@@ -205,6 +211,9 @@ fn pump_requests(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, mut item: Option
             (Some(_), None) => format!("unperformed watchlist:{label}"),
         });
     }
+    // The requests above include an item menu's Play, whose `describe_movie` emits a store job: the
+    // drain after it must have started it, as the loop's own `update` pump is not run here.
+    rig.assert_no_store_jobs_left_for_test();
     seen
 }
 
@@ -455,7 +464,7 @@ impl World {
         if held { super::watchlist_press_tests::hold_reads(&mut bridge); }
         let mut w = World { d, bridge, frame: 1, pump: Pump::new(), performed: Vec::new(), own: plx_plex::plex::ServerId::UNSET,
             script: Some(script), _session: session, _serial: serial, feed: Some(|d, bridge| {
-                bridge.watchlist_for_test().pump();
+                bridge.watchlist_pump();
                 bridge.watchlist_feed(d);
             }) };
         super::nav_tab(&mut w.d, &mut w.bridge, HomeTab::Watchlist, None, None);
@@ -548,9 +557,9 @@ impl World {
         let (d, bridge) = super::watchlist_press_tests::rig_over(&script);
         World { d, bridge, frame: 1, pump: Pump::new(), performed: Vec::new(), own: plx_plex::plex::ServerId::UNSET,
             script: Some(script), _session: session, _serial: serial, feed: Some(|d, bridge| {
-                bridge.watchlist_for_test().pump();
+                bridge.watchlist_pump();
                 bridge.watchlist_feed(d);
-                bridge.catalog_feed(d);
+                super::watchlist_press_tests::feed_catalog(bridge, d);
             }) }
     }
 
@@ -855,4 +864,81 @@ impl Drop for DirectoryPolicyCleanup {
 fn presented<R>(frame: R) -> R {
     plx_ui::panel_motion::PanelMotion::drain_queued_text_for_test();
     frame
+}
+
+/// A one-thread loopback PMS for route tests: `respond` maps each request's path to a status line
+/// and a JSON body. Dropping it stops and joins the thread, so a test that never dials still ends.
+pub(crate) struct Pms {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) port: i32,
+}
+
+impl Pms {
+    pub(crate) fn serve(respond: fn(&str) -> (&'static str, String)) -> Pms {
+        Self::spawn(move |path, _| respond(path))
+    }
+
+    /// [`Pms::serve`] for a read that pages: `respond` is also handed the request's query string
+    /// (`X-Plex-Container-Start=..&X-Plex-Container-Size=..`), empty when there is none.
+    pub(crate) fn serve_query(respond: fn(&str, &str) -> (&'static str, String)) -> Pms {
+        Self::spawn(respond)
+    }
+
+    fn spawn(respond: impl Fn(&str, &str) -> (&'static str, String) + Send + 'static) -> Pms {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                let Ok((mut conn, _)) = plx_base::testnet::accept(&listener) else {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let target = head.split_whitespace().nth(1).unwrap_or("");
+                let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                let (status, body) = respond(path, query);
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+            }
+        });
+        Pms { stop, thread: Some(thread), port }
+    }
+}
+
+impl Drop for Pms {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Bridge {
+    /// Seat the plex.tv account a Watchlist rig scripts: the Bridge reads the registry for the identity
+    /// it hands the stores (`Bridge::watchlist_input`), so the rig publishes a profile (with the
+    /// plex.tv credential when `credential`) and, where the test holds no scratch session of its own,
+    /// seats one for the client id. The session lives as long as the rig. The caller holds the test lock.
+    pub(crate) fn seat_watchlist_account_for_test(&mut self, credential: bool) {
+        use plx_plex::plex::session;
+        if session::peek().client_id.is_empty() {
+            self.watchlist_session = Some(session::TempSession::new("watchlist-account"));
+        }
+        let user = session::UserRef {
+            plex_tv_token: credential.then(|| "synthetic-credential".to_owned()),
+            ..Default::default()
+        };
+        session::publish_profile_for_test(Some(user), session::current_gen().wrapping_add(1));
+    }
 }

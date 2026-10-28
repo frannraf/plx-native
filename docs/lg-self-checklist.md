@@ -78,7 +78,7 @@ where a background event IS expected) are still unmeasured.
 
 | # | Item | Evidence still required |
 | --- | --- | --- |
-| 3 | Reboot / lifecycle | Run the native **16-case lifecycle matrix**: remote power off/on, AC unplug/replug, Recent List close/relaunch, and both launch paths. Verify every cold relaunch settles on the credential-selected Home route (never an old Detail/Library page), while an app switch with the process still alive preserves the separate suspended-playback resume path. `handlesRelaunch: false` and `nativeLifeCycleInterfaceVersion: 2` do not answer native behaviour by themselves. |
+| 3 | Reboot / lifecycle | Run the native **16-case lifecycle matrix**: remote power off/on, AC unplug/replug, Recent List close/relaunch, and both launch paths. Verify every cold relaunch without launch params settles on the credential-selected Home route (never an old Detail/Library page; a launch link lands on its own title above Home, and a link that arrives over playback ends it the way STOP does, waits under sign-in, a sheet and the background, and works warm only where the guarded relaunch tap installs, `docs/launch-links.md`), while an app switch with the process still alive preserves the separate suspended-playback resume path. `handlesRelaunch: false` and `nativeLifeCycleInterfaceVersion: 2` do not answer native behaviour by themselves. |
 | 13 | LockUp / LatchUp | Run the exact **4-hour continuous soak**: `plxnative-homeosc` grid sweep for 1 h, full-length playback for 2 h, then `plxnative-navosc` route bounce for 1 h. Check `fuser` liveness and the crash log at every hand-off. Time accumulated during unrelated testing is not this evidence. |
 | 14 | Abnormal end | Run wired and wireless, each with static and dynamic IP, while applying the reproducible `rate:` and `blackhole` failure modes. The proxy can create the condition; it cannot reconfigure the television's network. |
 | 15 | Keyboard cursor/editing | On the LG VKB, verify cursor movement and editing with `<` and `>` rather than inferring SDL event delivery from the host simulator. |
@@ -146,7 +146,7 @@ skips; a partial green count is not equivalent to 21/21.
 ## 6. Decisions and N/A items
 
 **#41 — language setting.** Settings now offers System default, English, Spanish, Belarusian, French, Italian,
-Portuguese, German and Hungarian (the languages `locales/languages.json` registers), with changes applied at the next app launch. Localized launcher metadata still follows webOS.
+Portuguese, German, Hungarian and Russian (the languages `locales/languages.json` registers), with changes applied at the next app launch. Localized launcher metadata still follows webOS.
 The native Settings Service supplies UI and formatting locales, and the resolved app language
 becomes `X-Plex-Language` for PMS. Native device checks on 2026-09-27 verified detection, persistence across restarts, Cyrillic
 text, consent scrolling and the contribution QR. See `docs/localization.md` for the scope.

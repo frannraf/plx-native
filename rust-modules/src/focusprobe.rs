@@ -291,7 +291,7 @@ fn push_player(ps: &plx_media::route::PlaybackSession, s: &mut String, overlay: 
     // `upnext` is the PLAYER INSTANCE's countdown since phase 9, so it arrives on `content` with
     // the panels' fields rather than being read off a module global here.
     let slot = match ctrl {
-        ControlSlot::Discs => "discs",
+        ControlSlot::Discs(_) => "discs",
         ControlSlot::Skip(_) => "skip",
         ControlSlot::UpNext(_) => "upnext",
     };
@@ -313,6 +313,14 @@ fn push_player(ps: &plx_media::route::PlaybackSession, s: &mut String, overlay: 
         ctrl.items(),
         b(plx_appkit::player_hud::transport_hidden(ps))
     );
+    // The episode pair's state is emitted whatever occupies the row (all zero under a stand-in),
+    // so an occupant change is a value change and never a schema change.
+    let controls = match ctrl {
+        ControlSlot::Discs(controls) => controls,
+        ControlSlot::Skip(_) | ControlSlot::UpNext(_) => plx_appkit::player_hud::Controls::NONE,
+    };
+    let _ = write!(s, " pair={} previous={} next={} restart={}",
+        b(controls.pair()), b(controls.previous), b(controls.next), b(controls.restart));
     // Whether this item HAS chapters at all — a fact about the item, not about a panel, which is
     // why it stays here while each overlay's own open flag and cursor arrive on `content` from the
     // surface (`app::bridge::content_probe`).
@@ -456,8 +464,8 @@ mod tests {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
         for (rn, sc) in every_screen() {
-            let a = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs, test_store().view());
-            let b = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs, test_store().view());
+            let a = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view());
+            let b = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view());
             assert_eq!(a, b, "{rn} fingerprinted differently twice in a row");
         }
     }
@@ -470,7 +478,7 @@ mod tests {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
         for (rn, sc) in every_screen() {
-            let line = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs, test_store().view());
+            let line = fingerprint(&ps, rn, sc, hud(), ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view());
             assert!(
                 !line.contains('\n'),
                 "{rn}: a fingerprint is ONE line: {line}"
@@ -518,7 +526,7 @@ mod tests {
         let discs = keys(
             "player",
             Screen::Player { overlay: "none" },
-            ControlSlot::Discs,
+            ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE),
         );
         let up = keys(
             "player",
@@ -539,7 +547,7 @@ mod tests {
                 tab: 1,
                 visible: true,
             },
-            ControlSlot::Discs, test_store().view(),
+            ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view(),
         );
         let moved_keys: Vec<String> = moved
             .split(' ')
@@ -565,7 +573,7 @@ mod tests {
                     tab,
                     visible: true,
                 },
-                ControlSlot::Discs, test_store().view(),
+                ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view(),
             )
         };
         assert_ne!(
@@ -594,7 +602,7 @@ mod tests {
                     tab: 0,
                     visible: true
                 },
-                ControlSlot::Discs, test_store().view()
+                ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view()
             ),
             "the overlay tag is not observable"
         );
@@ -612,8 +620,8 @@ mod tests {
     fn the_login_screens_stalled_control_appearing_is_observable() {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
-        let without = fingerprint(&ps, "login", Screen::Login { phase: plx_session::auth::Phase::Idle, has_control: false }, hud(), ControlSlot::Discs, test_store().view());
-        let with = fingerprint(&ps, "login", Screen::Login { phase: plx_session::auth::Phase::Idle, has_control: true }, hud(), ControlSlot::Discs, test_store().view());
+        let without = fingerprint(&ps, "login", Screen::Login { phase: plx_session::auth::Phase::Idle, has_control: false }, hud(), ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view());
+        let with = fingerprint(&ps, "login", Screen::Login { phase: plx_session::auth::Phase::Idle, has_control: true }, hud(), ControlSlot::Discs(plx_appkit::player_hud::Controls::NONE), test_store().view());
         assert_ne!(
             without, with,
             "the login screen's escape/retry/restart control appearing is not observable"

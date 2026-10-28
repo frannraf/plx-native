@@ -721,11 +721,8 @@ impl LiveTvStore {
             return;
         }
         if source.needs_account() && self.cloud_auth.is_none() {
-            self.cloud_auth = CloudAuth::capture();
-            if self.cloud_auth.is_none() {
-                plx_base::eventlog::log("livetv: Plex channels need a plex.tv sign-in");
-                return;
-            }
+            plx_base::eventlog::log("livetv: Plex channels need a plex.tv sign-in");
+            return;
         }
         let shown = Lineup { phase: std::mem::take(&mut self.channels_phase), channels: std::mem::take(&mut self.channels) };
         let left = std::mem::replace(&mut self.source, source.clone());
@@ -751,6 +748,25 @@ impl LiveTvStore {
     #[cfg(test)]
     pub(crate) fn set_cloud_auth(&mut self, auth: CloudAuth) {
         self.cloud_auth = Some(auth);
+    }
+
+    /// The profile's plex.tv identity as the app read it ([`CloudAuth::of_input`]): Plex's own
+    /// channels and the account's favorites are read with it, and a store never reads the session
+    /// itself (docs/sans-io.md S5). Newly seated with the DVR already known, the reads that waited
+    /// for it go.
+    pub fn seat_cloud_auth(&mut self, auth: Option<CloudAuth>) {
+        if auth == self.cloud_auth {
+            return;
+        }
+        let arrived = self.cloud_auth.is_none() && auth.is_some();
+        self.cloud_auth = auth;
+        if arrived && self.provider.is_some() {
+            if let Some(auth) = self.cloud_auth.clone() {
+                self.queue.push_back(Job::CloudTabs { auth });
+            }
+            self.ask_favorites();
+        }
+        self.bump();
     }
 
     /// Ask for the shown source's lineup.
@@ -1397,8 +1413,7 @@ impl LiveTvStore {
                             self.dvr_phase = Phase::Loading;
                             self.ask_dvr();
                             // the guide's tab row also offers Plex's own channels, and the
-                            // account's favorites
-                            self.cloud_auth = CloudAuth::capture();
+                            // account's favorites (with the identity the app seated)
                             if let Some(auth) = self.cloud_auth.clone() {
                                 self.queue.push_back(Job::CloudTabs { auth });
                             }

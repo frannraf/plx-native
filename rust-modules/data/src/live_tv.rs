@@ -103,8 +103,9 @@ impl Source {
     }
 }
 
-/// Who a read of Plex's own channels acts for: the seated profile's plex.tv identity, captured
-/// on the main thread (a worker never reads the session). Its `Debug` names no credential.
+/// Who a read of Plex's own channels acts for: the seated profile's plex.tv identity, as the app
+/// read it on the main thread (a store or a worker never reads the session). Its `Debug` names no
+/// credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CloudAuth {
     pub client_id: String,
@@ -118,9 +119,11 @@ impl std::fmt::Debug for CloudAuth {
 }
 
 impl CloudAuth {
-    /// MAIN THREAD. `None` with no plex.tv identity (signed out, a managed profile with no token).
-    pub fn capture() -> Option<CloudAuth> {
-        crate::watchlist::WatchlistAuth::capture().map(|a| CloudAuth { client_id: a.client_id, credential: a.credential })
+    /// The identity in the input the app read for this pass (`Bridge::watchlist_input`, the one
+    /// both plex.tv stores take). `None` with no plex.tv identity (signed out, a managed profile with
+    /// no token).
+    pub fn of_input(input: &crate::watchlist::WatchlistInput) -> Option<CloudAuth> {
+        input.auth().map(|a| CloudAuth { client_id: a.client_id.clone(), credential: a.credential.clone() })
     }
     pub fn client(&self) -> plx_plex::plex::account::AccountClient {
         plx_plex::plex::account::AccountClient::new(&self.client_id, Some(&self.credential))

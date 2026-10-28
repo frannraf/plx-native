@@ -136,6 +136,11 @@ pub(crate) struct MenuPlayAwait {
     /// "this never got where it was going".
     deadline: u32,
     phase: MenuPlayPhase,
+    /// A landing opens the page instead of playing (a launch link's `open`).
+    open: bool,
+    /// A miss logs and leaves the stack as it is instead of opening the page: a launch link's key
+    /// came from outside the app, so a page for it may not exist (`app::deeplink`).
+    stay_on_miss: bool,
 }
 
 /// Which asynchronous load a [`MenuPlayAwait`] is waiting on. Both phases are polled by the one
@@ -156,7 +161,15 @@ impl MenuPlayAwait {
     /// The wait armed by a press at frame `now`: it starts on the detail request `activate_card`
     /// has just issued, and carries the same 12s ceiling for its whole life.
     fn new(sid: plx_plex::plex::ServerId, expect: String, season_index: Option<i64>, hud_ms: u32, now: u32) -> Self {
-        Self { sid, expect, season_index, hud_ms, deadline: now.wrapping_add(12_000), phase: MenuPlayPhase::Detail }
+        Self {
+            sid, expect, season_index, hud_ms, deadline: now.wrapping_add(12_000), phase: MenuPlayPhase::Detail,
+            open: false, stay_on_miss: false,
+        }
+    }
+
+    /// The wait for a launch link's item (`app::deeplink`), its detail request just issued.
+    pub(crate) fn for_link(sid: plx_plex::plex::ServerId, rk: String, open: bool, now: u32) -> Self {
+        Self { open, stay_on_miss: true, ..Self::new(sid, rk, None, plx_screens::player::input::HUD_LINGER_MS, now) }
     }
 }
 
@@ -217,7 +230,7 @@ pub(crate) unsafe fn activate_card(
                 };
                 // a show/season row's parent lives on the SAME server as the row itself
                 let sid = mm.sid;
-                bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: expect.clone() });
+                bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: expect.clone() });
                 *menu_play_await = Some(MenuPlayAwait::new(
                     sid, expect, (mm.kind == 2).then_some(mm.season_index as i64), hud_ms, now));
             }
@@ -303,7 +316,7 @@ pub(crate) unsafe fn menu_play_tick(
     let Some(wait) = menu_play_await.clone() else {
         return;
     };
-    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase } = wait;
+    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase, open, stay_on_miss } = wait;
     // Something else already moved the app onto the player this frame (a different press, an
     // auto-advance) — the wait is moot and must not fire a second Play on top of it.
     if super::bridge::player(pages).is_some() {
@@ -331,13 +344,17 @@ pub(crate) unsafe fn menu_play_tick(
         if loading && !expired {
             return; // still waiting — try again next frame
         }
-        *menu_play_await = None;
         if loading || !landed {
+            *menu_play_await = None;
             // ceiling, or the fetch settled as a failure — land on the page, as the detail phase does
             super::bridge::open_detail(pages, bridge, sid, expect, None, None);
-        } else {
-            play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
+            return;
         }
+        if !play_door_open(ps, pa, pages, bridge, menu_play_await, (sid, expect, stay_on_miss), expired) {
+            return;
+        }
+        *menu_play_await = None;
+        play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
         return;
     }
     let landed = bridge.metadata_view().current()
@@ -354,9 +371,19 @@ pub(crate) unsafe fn menu_play_tick(
             return; // still waiting — try again next frame
         }
         *menu_play_await = None;
+        if stay_on_miss {
+            plx_base::eventlog::log(&format!(
+                "deeplink: not opened, rk={expect} ({})", if settled { "not returned" } else { "timed out" }));
+            return;
+        }
         // nothing playable / load failed — land on the page, through the transition. `season:
         // None`: the container's own reuse rule is what keeps a re-open from stacking a second
         // copy of a page the user is already standing on (`bridge::open_detail`).
+        super::bridge::open_detail(pages, bridge, sid, expect, None, None);
+        return;
+    }
+    if open {
+        *menu_play_await = None;
         super::bridge::open_detail(pages, bridge, sid, expect, None, None);
         return;
     }
@@ -374,14 +401,48 @@ pub(crate) unsafe fn menu_play_tick(
         if let Some((idx, cur_season)) = pick {
             if idx != cur_season {
                 bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::LoadSeason(idx));
+                // The bare store leaves the season job on its outbox: start it in this call.
+                bridge.start_store_jobs();
                 let gen = bridge.metadata_view().season_gen();
                 *menu_play_await = Some(MenuPlayAwait { phase: MenuPlayPhase::Season { gen, idx }, ..wait });
                 return;
             }
         }
     }
+    if !play_door_open(ps, pa, pages, bridge, menu_play_await, (sid, expect, stay_on_miss), expired) {
+        return;
+    }
     *menu_play_await = None;
     play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
+}
+
+/// **The play door of a [`MenuPlayAwait`]:** the landing may play only through the one door every
+/// Play from a page goes through ([`super::content::clear_engine_for_play`]), because a preview
+/// can still be letting go of the engine when the item lands. `true` means the engine is free and
+/// the caller plays. `false` means the wait goes on, still armed, and is asked again next frame;
+/// at the wait's own `deadline` (`expired`) it ends instead, as the wait's other expiries do: a
+/// link logs why and leaves the stack alone, a card press lands on the item's page.
+unsafe fn play_door_open(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    bridge: &mut super::bridge::Bridge,
+    menu_play_await: &mut Option<MenuPlayAwait>,
+    (sid, expect, stay_on_miss): (plx_plex::plex::ServerId, &str, bool),
+    expired: bool,
+) -> bool {
+    if super::content::clear_engine_for_play(ps, pa, super::bridge::player(pages).is_some()) {
+        return true;
+    }
+    if expired {
+        *menu_play_await = None;
+        if stay_on_miss {
+            plx_base::eventlog::log(&format!("deeplink: not opened, rk={expect} (engine busy)"));
+        } else {
+            super::bridge::open_detail(pages, bridge, sid, expect, None, None);
+        }
+    }
+    false
 }
 
 /// The end of a settled [`MenuPlayAwait`]: play the loaded item's hero (a show's next episode, or
@@ -574,11 +635,19 @@ impl<R: super::playback::PlaybackResources> LiveItemPlayback<'_, R> {
         ps: &mut plx_media::route::PlaybackSession,
         pa: &mut plx_media::player::adapter::PlayerAdapter,
         rk: &str,
+        version: Option<plx_plex::plex::MediaId>,
         pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
         bridge: &mut super::bridge::Bridge,
     ) {
-        if self.0.request_episode(ps, bridge.metadata_mut(), rk) {
-            super::playback::start_playback_with(ps, pa, 0, Origin::Here, HUD_LINGER_MS,
+        // Play from Start restarts; a picked version resumes, as Play does.
+        let resume_ns = match version {
+            None => 0,
+            Some(_) => bridge.metadata_view().current()
+                .and_then(|d| d.episodes.position(rk).and_then(|i| d.episodes.get(i)))
+                .map_or(0, |ep| plx_data::metadata::resume_ns(ep.resume_ms, ep.dur_ms)),
+        };
+        if self.0.request_episode(ps, bridge.metadata_mut(), rk, version) {
+            super::playback::start_playback_with(ps, pa, resume_ns, Origin::Here, HUD_LINGER_MS,
                 None, pages, bridge, self.0);
         }
     }
@@ -589,10 +658,11 @@ impl<R: super::playback::PlaybackResources> LiveItemPlayback<'_, R> {
         pa: &mut plx_media::player::adapter::PlayerAdapter,
         item: &plx_data::pms::PmsMovie,
         from_start: bool,
+        version: Option<plx_plex::plex::MediaId>,
         pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
         bridge: &mut super::bridge::Bridge,
     ) {
-        super::playback::play_item_now_with(ps, pa, item, from_start, Origin::Here, HUD_LINGER_MS,
+        super::playback::play_item_now_with(ps, pa, item, from_start, version, Origin::Here, HUD_LINGER_MS,
             None, pages, bridge, self.0);
     }
 }
@@ -718,9 +788,10 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
             // A show or season row also changes every episode row under it, wherever one is held
             // (a Search result, a Continue Watching card): the scope is read off the row in hand.
             let scope = mark_scope(rk, item.as_ref(), season.as_ref());
-            bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
+            let outcome = bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
                 sid, rk: rk.to_string(), write: w, scope, guid: String::new(),
             });
+            super::bridge::execute_endpoint_outcomes(pages, outcome.endpoints);
         }
         Action::RemoveFromDeck(rk) => {
             // A HIDE, not a reset: the server keeps the item's `viewOffset`, so the card leaves
@@ -738,10 +809,11 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
             // No guid, and it would be ignored if there were one: a deck removal does not follow
             // the title across sources (`viewstate::Write::propagates`) — your Continue Watching
             // row is yours, and hiding a friend's item from it is not a claim about their deck.
-            bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
+            let outcome = bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
                 sid, rk: rk.to_string(), write: plx_data::viewstate::Write::RemoveFromDeck,
                 scope: plx_data::viewstate::Scope::Leaf, guid: String::new(),
             });
+            super::bridge::execute_endpoint_outcomes(pages, outcome.endpoints);
         }
         // The deck card's Play row (OK opens the page): the same captured-row launch as Play from
         // Start, resuming instead of restarting. The row only exists on a Card menu, never on the
@@ -751,7 +823,7 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
         Action::Play(rk) => {
             if let Some(mm) = item.as_ref().filter(|m| m.rk == rk) {
                 if matches!(mm.kind, 0 | 3) {
-                    playback.captured_card(ps, pa, mm, false, pages, bridge);
+                    playback.captured_card(ps, pa, mm, false, None, pages, bridge);
                 } else {
                     activate_card(ps, pa, mm, true, HUD_LINGER_MS, None, pages, bridge,
                         menu_play_await, now);
@@ -767,7 +839,7 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
             // lookup would miss and the press would do nothing — it takes the card-row arm below,
             // which plays the row the menu captured.
             if loaded_episode {
-                playback.loaded_episode(ps, pa, &rk, pages, bridge);
+                playback.loaded_episode(ps, pa, &rk, None, pages, bridge);
                 return;
             }
             // **The row the menu was opened ON, not a re-resolve by key.** This used to walk the
@@ -783,7 +855,18 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
             // own key, so playing a row that does not carry it would be this dispatch disagreeing
             // with itself.
             if let Some(mm) = item.as_ref().filter(|m| m.rk == rk) {
-                playback.captured_card(ps, pa, mm, true, pages, bridge);
+                playback.captured_card(ps, pa, mm, true, None, pages, bridge);
+            }
+        }
+        // The menu turns itself into the version list; this never arrives (`ItemMenuScreen::activate`).
+        Action::ChooseVersion(_) => {}
+        // A picked version plays like Play: the filmstrip's leaf through the loaded season, a card
+        // through the row the menu captured, resuming where it left off.
+        Action::PlayVersion { rk, media } => {
+            if loaded_episode {
+                playback.loaded_episode(ps, pa, &rk, Some(media), pages, bridge);
+            } else if let Some(mm) = item.as_ref().filter(|m| m.rk == rk) {
+                playback.captured_card(ps, pa, mm, false, Some(media), pages, bridge);
             }
         }
         Action::PlayTrailer {
@@ -804,6 +887,7 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
                 acodec,
                 title,
                 context: plx_data::metadata::TRAILER_CONTEXT.to_string(),
+                version: None,
             };
             // A press-and-hold context menu can reach here within the same beat as opening it,
             // which only STARTED the open preview's abandonment (`ContentReq::ItemMenu`'s own
@@ -1298,15 +1382,15 @@ pub(crate) fn delete_all_local_data(meta: &mut plx_data::stores::metadata::Metad
             .into_iter()
             .chain(plx_base::paths::telemetry_candidates())
             .chain(plx_base::paths::telemetry_spool_candidates())
-            .chain(plx_base::paths::telemetry_crashmark_candidates()),
+            .chain(plx_base::paths::telemetry_crashmark_candidates())
+            .chain(plx_base::paths::telemetry_session_candidates()),
         plx_base::paths::runtime_dir(),
     ));
     meta.run(plx_data::stores::metadata::MetadataCmd::Clear);
     // No explicit `ClearRecents` here (phase 7 Search cutover retired the legacy screen's own
     // thin `recents::clear()` wrapper this used to call): recent Search terms
-    // live INSIDE the session file (`plx_data::search::recents`'s doc — "profile-scoped … the
-    // session's atomic worker door"), and the adapter already deleted that file
-    // before this completion sweep. An explicit clear here would queue its own save
+    // live INSIDE the session file (`plx_data::search::recents`), and the adapter already deleted that
+    // file before this completion sweep. An explicit clear here would emit its own save job
     // racing the ordered credential deletion — the worse of the two orders resurrects a stub session file
     // AFTER "delete everything" already removed it. Letting the file deletion alone answer
     // for recents removes that race rather than leaving it to chance ordering.
@@ -1334,7 +1418,7 @@ mod delete_all_tests {
             Self(root)
         }
         fn persistent(&self) -> Vec<std::path::PathBuf> {
-            ["lastplace.json", "telemetry.json", "telemetry-spool.bin", "telemetry-crashmark.json"]
+            ["lastplace.json", "telemetry.json", "telemetry-spool.bin", "telemetry-crashmark.json", "telemetry-session.json"]
                 .iter()
                 .map(|name| self.0.join("persistent").join(format!(".com.beb.plxnative.debug-{name}")))
                 .collect()
@@ -1551,14 +1635,15 @@ pub(crate) unsafe fn key_ok(
 /// one of the two. (It matters most at Home's root, where "what BACK would otherwise do" is hand
 /// the screen back to the television — see [`back_at_root`].)
 pub(crate) fn key_back(
-    ps: &mut plx_media::route::PlaybackSession,
+    player: &mut plx_media::player::machine::Player,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
+    repause_at: &mut i64,
     refresh_hubs: &mut bool,
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
 ) {
     if super::bridge::nav_cancel(pages) {
     } else if super::bridge::player(pages).is_some() {
-        exit_player(ps, pa, refresh_hubs, pages);
+        exit_player(player, pa, repause_at, refresh_hubs, pages);
     } else if matches!(pages.top_arg(), Some(AppArg::Content(_))) {
         // The two stacking screens, through the page transition. All three
         // halves of the pop — the outgoing page's teardown, the trail move and

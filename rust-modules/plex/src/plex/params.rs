@@ -197,6 +197,9 @@ pub struct TranscodeSpec<'a> {
     /// key (`docs/pms-api.md` §10). `None` for every library playback, whose path is
     /// `/library/metadata/{rating_key}`.
     pub path_override: Option<&'a str>,
+    /// The played version's position in `Media[]` (`mediaIndex`), resolved from its id
+    /// (`Metadata::media_version`); 0 is the default version.
+    pub media_index: usize,
     /// The active encoder's PMS playback/timeline wire id.
     pub session: &'a str,
     /// Physical universal-transcoder identity. Production keeps it equal to `session`; the two
@@ -207,6 +210,12 @@ pub struct TranscodeSpec<'a> {
     /// fifth (`audio`) that only ever means anything alongside `remux == true`; one value keeps
     /// that coupling a type can't be built without stating.
     pub contract: EncodeContract,
+    /// The capability value of the attempt this request belongs to: the profile string
+    /// (`X-Plex-Client-Profile-Extra`) is built from it, so the profile PMS reads always comes from
+    /// the value the plan chose its tracks from, never from the process-wide `devcaps::caps()`.
+    /// Deliberately not part of [`EncodeContract`], which stays a request-shape value a seek or a
+    /// track pick can rebuild; the attempt's value rides beside it.
+    pub caps: &'a plx_platform::devcaps::Caps,
     /// Source audio stream id to select (0 = server default).
     pub audio_stream_id: i64,
     /// Subtitle stream id to BURN (0 = none). Burn is Plex's decision for our profile —

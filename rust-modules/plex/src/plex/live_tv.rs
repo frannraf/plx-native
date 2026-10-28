@@ -560,10 +560,20 @@ pub const LIVE_CEILING: super::Ceiling = super::Ceiling { max_kbps: 12_000, max_
 /// The transcode request for a live key: the same fixed-HLS contract the library's HLS rungs use.
 /// `subtitle_stream_id` names a caption stream of the tuned part to burn in (0 for none): the
 /// profile advertises no subtitle delivery, so the server's one way to show it is in the picture.
-pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64, offset: super::TranscodeOffset) -> super::TranscodeSpec<'a> {
+/// A tune is planned by no playback attempt, so its profile is the device's probed capabilities
+/// (`devcaps::caps`), which `caps` carries.
+pub(super) fn live_spec<'a>(
+    key: &'a str,
+    session: &'a str,
+    caps: &'a plx_platform::devcaps::Caps,
+    subtitle_stream_id: i64,
+    offset: super::TranscodeOffset,
+) -> super::TranscodeSpec<'a> {
     super::TranscodeSpec {
         rating_key: "",
         path_override: Some(key),
+        media_index: 0,
+        caps,
         session,
         encoder_session: session,
         contract: super::EncodeContract {
@@ -590,7 +600,8 @@ impl Client {
         if !key.starts_with('/') || session.is_empty() {
             return Err(LiveError::Invalid);
         }
-        let spec = live_spec(key, session, subtitle_stream_id, super::TranscodeOffset::Fresh);
+        let caps = plx_platform::devcaps::caps();
+        let spec = live_spec(key, session, &caps, subtitle_stream_id, super::TranscodeOffset::Fresh);
         let started = std::time::Instant::now();
         let decision = self.transcode_decision(off, &spec);
         let Some(decision) = decision else {
@@ -653,7 +664,8 @@ impl Client {
             Some(s) if s.is_finite() && s >= 0.0 => super::TranscodeOffset::from_micros((s * 1_000_000.0) as i64),
             _ => super::TranscodeOffset::Fresh,
         };
-        Some(self.transcode_start_url(&live_spec(key, session, subtitle_stream_id, offset)).to_url())
+        let caps = plx_platform::devcaps::caps();
+        Some(self.transcode_start_url(&live_spec(key, session, &caps, subtitle_stream_id, offset)).to_url())
     }
 
     /// Stop a live encode (and free its streaming resource). `true` when the server took it.
