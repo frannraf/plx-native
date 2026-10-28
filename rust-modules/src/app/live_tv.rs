@@ -127,6 +127,12 @@ impl Bridge {
     pub(crate) fn live_tv_feed(&mut self, d: &mut Dispatcher<AppHost>) {
         self.live_tv_aim();
         self.stores.live_tv.pump();
+        // the plex.tv identity Plex's channels and the favorites are read with, seated as soon as
+        // the server's Live TV is found, so the favorites are in before the page opens and the guide
+        // opens on them (the store never reads the session; the page's mount seats it again)
+        if self.stores.live_tv.take_cloud_auth_wanted() {
+            self.stores.live_tv.seat_cloud_auth(plx_data::live_tv::CloudAuth::of_input(&Self::watchlist_input()));
+        }
         self.start_store_jobs_of(StoreId::LiveTv);
         // While the guide is in use (its page up, or a channel playing from it) the guide and the
         // recordings lists are kept fresh: stale channel-days are read again, the lists every five

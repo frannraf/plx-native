@@ -479,6 +479,9 @@ pub struct LiveTvStore {
     /// Plex's own channels: their genre tabs, and who their reads act for.
     cloud_tabs: Vec<CloudTab>,
     cloud_auth: Option<CloudAuth>,
+    /// The server's Live TV was found with no identity seated: the application is asked for it
+    /// once ([`LiveTvStore::take_cloud_auth_wanted`]).
+    cloud_auth_wanted: bool,
     /// The account's favorite channels, in its order, and where their read stands.
     favorites: Vec<FavoriteChannel>,
     favorites_phase: Phase,
@@ -550,6 +553,7 @@ impl Default for LiveTvStore {
             stash: HashMap::new(),
             cloud_tabs: Vec::new(),
             cloud_auth: None,
+            cloud_auth_wanted: false,
             favorites: Vec::new(),
             favorites_phase: Phase::Idle,
             machine: String::new(),
@@ -744,6 +748,7 @@ impl LiveTvStore {
     /// itself (docs/sans-io.md S5). Newly seated with the DVR already known, the reads that waited
     /// for it go.
     pub fn seat_cloud_auth(&mut self, auth: Option<CloudAuth>) {
+        self.cloud_auth_wanted = false;
         if auth == self.cloud_auth {
             return;
         }
@@ -756,6 +761,13 @@ impl LiveTvStore {
             self.ask_favorites();
         }
         self.bump();
+    }
+
+    /// Was the server's Live TV just found with no plex.tv identity seated? `true` once: the
+    /// application seats it then ([`LiveTvStore::seat_cloud_auth`]), so Plex's channels and the
+    /// account's favorites are read before the page opens and the guide can open on the favorites.
+    pub fn take_cloud_auth_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.cloud_auth_wanted)
     }
 
     /// Ask for the shown source's lineup.
@@ -1427,10 +1439,12 @@ impl LiveTvStore {
                             self.dvr_phase = Phase::Loading;
                             self.ask_dvr();
                             // the guide's tab row also offers Plex's own channels, and the
-                            // account's favorites (with the identity the app seated)
+                            // account's favorites (with the identity the app seated; none yet,
+                            // the app is asked for it now, so they are in before the page opens)
                             if let Some(auth) = self.cloud_auth.clone() {
                                 self.queue.push_back(Job::CloudTabs { auth });
                             }
+                            self.cloud_auth_wanted = self.cloud_auth.is_none();
                             self.ask_favorites();
                         }
                     }

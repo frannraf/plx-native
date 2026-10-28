@@ -426,6 +426,24 @@ fn a_job_the_runner_refuses_is_asked_again_on_the_next_pump() {
     assert!(!s.tuners_settling(), "a tune that never started holds no tuner");
 }
 
+/// **The identity is asked for as soon as the DVR is found**, once, so Plex's channel tabs and the
+/// account's favorites are read before the page opens (the guide opens on the favorites).
+#[test]
+fn the_dvr_found_asks_once_for_the_identity_and_seating_it_reads_the_favorites() {
+    use crate::live_tv::CloudAuth;
+    let mut s = ready(2);
+    assert!(s.take_cloud_auth_wanted(), "found with no identity: asked for it");
+    assert!(!s.take_cloud_auth_wanted(), "once");
+    s.seat_cloud_auth(Some(CloudAuth { client_id: "cid".into(), credential: "secret".into() }));
+    s.pump();
+    let jobs = take(&mut s);
+    assert!(jobs.iter().any(|(j, _)| matches!(j, Job::Favorites { .. })), "the favorites are read");
+    assert!(jobs.iter().any(|(j, _)| matches!(j, Job::CloudTabs { .. })), "and Plex's channel tabs");
+    // a reset (a profile or server switch) forgets the identity, and the next DVR found asks again
+    s.reset();
+    assert!(!s.take_cloud_auth_wanted(), "nothing found yet");
+}
+
 /// **A release refused just before quitting still goes at exit**: the exit takes the refusal back
 /// before it releases, so the tuner is not left to the server's own timeout.
 #[test]
