@@ -153,7 +153,7 @@ class Dvr(unittest.TestCase):
     def test_a_rule_that_needs_a_busy_tuner_is_created_with_conflicts(self):
         pms = make(tuners=1)
         lineup = mc(pms, "GET", f"/{PROVIDER}/lineups/dvr/channels")["Channel"]
-        mc(pms, "POST", f"/livetv/dvrs/1/channels/{lineup[0]['id']}/tune")
+        mc(pms, "POST", f"/livetv/dvrs/1/channels/{lineup[0]['id']}/tune?X-Plex-Session-Identifier=kxyz-session")
         # a program airing now on another channel needs the only tuner
         now_rows = mc(pms, "GET", f"/{PROVIDER}/grid?channelGridKey={lineup[1]['gridKey']}&date=2025-10-09")["Metadata"]
         cur = next(r for r in now_rows if r["Media"][0]["onAir"])
@@ -171,7 +171,7 @@ class Tune(unittest.TestCase):
         clock = Clock(NOW)
         pms = make(clock=clock)
         cid = mc(pms, "GET", f"/{PROVIDER}/lineups/dvr/channels")["Channel"][2]["id"]
-        sub = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune")["MediaSubscription"][0]
+        sub = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune?X-Plex-Session-Identifier=kxyz-session")["MediaSubscription"][0]
         grab = sub["MediaGrabOperation"][0]
         video = grab["Video"]
         self.assertTrue(video["key"].startswith("/livetv/sessions/"))
@@ -190,26 +190,29 @@ class Tune(unittest.TestCase):
     def test_with_every_tuner_busy_a_tune_answers_conflicts_and_a_key(self):
         pms = make(tuners=1)
         ids = [c["id"] for c in mc(pms, "GET", f"/{PROVIDER}/lineups/dvr/channels")["Channel"]]
-        mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[0]}/tune")
-        second = mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[1]}/tune")["MediaSubscription"]
+        mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[0]}/tune?X-Plex-Session-Identifier=kxyz-session")
+        second = mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[1]}/tune?X-Plex-Session-Identifier=kxyz-session")["MediaSubscription"]
         self.assertTrue(second["key"])
         confs = second["MediaGrabOperation"]["Conflicts"]["MediaGrabOperation"]
         self.assertEqual(len(confs), 1)
         self.assertTrue(confs[0]["key"].startswith("/media/grabbers/operations/t"))
         # stopping the other viewer through its grab key frees the tuner
         self.assertEqual(call(pms, "DELETE", confs[0]["key"])[0], 200)
-        third = mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[1]}/tune")["MediaSubscription"][0]
+        third = mc(pms, "POST", f"/livetv/dvrs/1/channels/{ids[1]}/tune?X-Plex-Session-Identifier=kxyz-session")["MediaSubscription"][0]
         self.assertIn("Video", third["MediaGrabOperation"][0])
 
     def test_tuning_an_unknown_channel_fails_like_pms(self):
         pms = make()
-        self.assertEqual(call(pms, "POST", "/livetv/dvrs/1/channels/nope/tune")[0], 500)
-        self.assertEqual(call(pms, "POST", "/livetv/dvrs/9/channels/x/tune")[0], 404)
+        self.assertEqual(call(pms, "POST", "/livetv/dvrs/1/channels/nope/tune?X-Plex-Session-Identifier=kxyz-session")[0], 500)
+        # a tune that names no session is refused, as a real server refused one (2026-10-22)
+        status, ctype, _ = call(pms, "POST", f"/livetv/dvrs/1/channels/{mc(pms, 'GET', f'/{PROVIDER}/lineups/dvr/channels')['Channel'][0]['id']}/tune")
+        self.assertEqual((status, ctype), (400, "text/html"))
+        self.assertEqual(call(pms, "POST", "/livetv/dvrs/9/channels/x/tune?X-Plex-Session-Identifier=kxyz-session")[0], 404)
 
     def test_the_live_decision_is_an_h264_aac_hls_transcode(self):
         pms = make()
         cid = mc(pms, "GET", f"/{PROVIDER}/lineups/dvr/channels")["Channel"][0]["id"]
-        key = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune")["MediaSubscription"][0][
+        key = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune?X-Plex-Session-Identifier=kxyz-session")["MediaSubscription"][0][
             "MediaGrabOperation"][0]["Video"]["key"]
         d = mc(pms, "GET", "/video/:/transcode/universal/decision?" + urllib.parse.urlencode({"path": key, "protocol": "hls"}))
         part = d["Metadata"][0]["Media"][0]["Part"][0]
@@ -223,7 +226,7 @@ class Tune(unittest.TestCase):
             clock = Clock(NOW)
             pms = make(clock=clock, cache=cache)
             cid = mc(pms, "GET", f"/{PROVIDER}/lineups/dvr/channels")["Channel"][0]["id"]
-            key = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune")["MediaSubscription"][0][
+            key = mc(pms, "POST", f"/livetv/dvrs/1/channels/{cid}/tune?X-Plex-Session-Identifier=kxyz-session")["MediaSubscription"][0][
                 "MediaGrabOperation"][0]["Video"]["key"]
             q = urllib.parse.urlencode({"path": key, "session": "enc1", "protocol": "hls"})
             status, ctype, master = call(pms, "GET", "/video/:/transcode/universal/start.m3u8?" + q)
