@@ -299,6 +299,7 @@ impl Stores {
             StoreId::Browse => self.browse.borrow_mut().take_jobs(),
             StoreId::Search => self.search.take_jobs(),
             StoreId::ViewState => self.viewstate.borrow_mut().take_jobs(),
+            StoreId::LiveTv => self.live_tv.take_jobs(),
             // The other stores emit no jobs yet.
             _ => Vec::new(),
         }
@@ -322,6 +323,7 @@ impl Stores {
             StoreId::Browse => self.browse.borrow().has_jobs(),
             StoreId::Search => self.search.has_jobs(),
             StoreId::ViewState => self.viewstate.borrow().has_jobs(),
+            StoreId::LiveTv => self.live_tv.has_jobs(),
             // The other stores emit no jobs yet.
             _ => false,
         }
@@ -620,6 +622,7 @@ impl Stores {
             StoreId::ViewReconcile => self.reconcile.gen(),
             StoreId::Watchlist => self.watchlist.gen(),
             StoreId::Catalog => self.catalog.gen(),
+            StoreId::LiveTv => self.live_tv.generation(),
             // A landing gate slot only: the stop mailbox is not a store and has no generation.
             StoreId::ViewStop => 0,
         }
@@ -687,6 +690,10 @@ pub enum StoreId {
     Watchlist,
     /// Appended for the same reason: the catalog page's discover record (`crate::catalog`).
     Catalog,
+    /// Appended for the same reason: the Live TV / DVR store (`stores::live_tv`). It has no
+    /// `StoreCmd` and posts no notice (the application feeds its page); the ordinal addresses its
+    /// jobs' answers.
+    LiveTv,
 }
 
 /// Route-scoped background work, distinct from a user command. Polling an idle store must not
@@ -794,6 +801,14 @@ pub enum StoreJob {
     /// runner resolves the loaded item's server to its client at the launch; a server with none
     /// answers the failure without a GET. Not on the tape.
     MetaRelated(plx_machine::job::Job<crate::metadata::MetaRelatedReq>, crate::metadata::MetaRelatedPort),
+    /// One piece of Live TV / DVR server work (a guide read, a DVR list, a write, a tune, a
+    /// release), emitted by the Live TV store's pump (and at exit by `release_for_exit`) and
+    /// addressed by a request id of its own. At most `live_tv::IN_FLIGHT` reads and one write are
+    /// out at a time; a tune goes when it is pressed (one superseded may still be out), a release as
+    /// soon as it is owed. The runner resolves the job's server to its client at the launch: a server
+    /// with none refuses the job, except a release, which is done (nobody is left to ask). Not on
+    /// the tape.
+    LiveTv(plx_machine::job::Job<live_tv::LiveTvReq>, live_tv::LiveTvPort),
 }
 
 /// How the runner admits a job before it starts it: the policy a job kind belongs to, stated on
@@ -849,6 +864,10 @@ impl StoreJob {
             // metadata command"), so no controlled run or replay emits one and the launch is the
             // whole decision (as for the season switch and the episode pages beside it).
             Self::MetaRelated(..) => Admission::Direct,
+            // The Live TV store has no `StoreCmd` and nothing of it is recorded or replayed (a
+            // guide is a picture of wall-clock time, not of a session): the launch is the whole
+            // decision.
+            Self::LiveTv(..) => Admission::Direct,
         }
     }
 
@@ -864,12 +883,13 @@ impl StoreJob {
             Self::BrowseHubs(..) | Self::BrowseDirectory(..) | Self::BrowsePage(..) | Self::BrowseDiscovery(..) => StoreId::Browse,
             Self::Search(..) | Self::SaveRecents(..) => StoreId::Search,
             Self::ViewWrite(..) => StoreId::ViewState,
+            Self::LiveTv(..) => StoreId::LiveTv,
         }
     }
 }
 
 impl StoreId {
-    pub const ALL: [StoreId; 12] = [
+    pub const ALL: [StoreId; 13] = [
         StoreId::Browse,
         StoreId::Hubs,
         StoreId::Metadata,
@@ -882,6 +902,7 @@ impl StoreId {
         StoreId::ViewStop,
         StoreId::Watchlist,
         StoreId::Catalog,
+        StoreId::LiveTv,
     ];
 
     /// The library's ordinal for this store (spec §5.1: the library never names `StoreId`).
@@ -907,6 +928,7 @@ impl StoreId {
             StoreId::ViewStop => "viewstop",
             StoreId::Watchlist => "watchlist",
             StoreId::Catalog => "catalog",
+            StoreId::LiveTv => "livetv",
         }
     }
 }
@@ -1398,7 +1420,7 @@ mod tests {
         for id in StoreId::ALL {
             assert_eq!(StoreId::from_ord(id.ord()), Some(id));
         }
-        assert_eq!(StoreId::from_ord(StoreOrd(12)), None);
+        assert_eq!(StoreId::from_ord(StoreOrd(13)), None);
     }
 
     /// A fan-out call that can fill an outbox names it in a `*_FILLS` list the Bridge drains. A

@@ -728,3 +728,27 @@ worker start and the `client_for` read inside that worker are gone too. The hous
   fan-out has a test that fails when `fan_out` reads the registry again
   (`stores/viewreconcile_tests.rs`), and the runner's branches have tests that fail without the key
   compare in `resolve` (`app/adapters/stores.rs`).
+- **The Live TV lane.** Every piece of the Live TV store's server work (`data/src/stores/live_tv.rs`:
+  providers, lineups, guide days, the DVR lists, writes, tunes, releases, What's On, recording
+  options) leaves as `StoreJob::LiveTv(Job<LiveTvReq>, LiveTvPort)`, emitted by the store's pump
+  and drained by `Bridge::live_tv_feed` in the same call (at exit, by `release_for_exit` and
+  `Bridge::live_tv_release_for_exit`). The store
+  appends its own `StoreId::LiveTv` for the address and posts no notice. Its old runner trait, the
+  `spawn_off_frame` start, the `client_for` read and the `cfg(test)` stand-in runner are gone; the
+  runner's `launch_live_tv` resolves the job's server once and runs `live_tv::execute`, the old
+  worker body, unchanged. Admission is `Direct`: nothing of it is on the tape.
+  - **A refusal hands the job back.** The store remembers each job out by its request id; a
+    refused one (the thread ceiling, or no client for its server) is taken at the next pump, before
+    that pump's landings, and goes back to the front of its queue in the order first asked, giving
+    back what it took (a read its slot, a write its turn, a tune its press while that press is still
+    the one wanted). A release is owed again whatever the epoch, against the server that tuned, and
+    the exit takes refusals too before it releases; one whose server is gone is done, as nobody is
+    left to ask. A refusal wakes no idle frame loop; a worker's landing does.
+  - **Tuners settle on answers.** A tune or a release counts as out until its answer lands, which
+    is what `tuners_settling` reads; the exit's bounded wait for release workers is the runner's
+    (`drain_live_tv_releases`). A reset keeps the inbox, the jobs out and the outbox, so a tune that
+    lands after it is still released.
+  - **A held runner refuses Live TV.** The store asks for its providers whenever a server is
+    current, and no rig serves Live TV, so parking them would run a read against a rig's fixture
+    server wherever a rig runs every parked job. Store tests answer through the port
+    (`data/src/stores/live_tv_tests.rs`).

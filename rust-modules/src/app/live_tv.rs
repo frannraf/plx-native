@@ -18,6 +18,7 @@
 //!   tuner when the playback ends however it ends.
 use plx_data::live_tv::{Availability, ChannelKey, RecordKind, Tuned};
 use plx_data::stores::live_tv::Write;
+use plx_data::stores::StoreId;
 use plx_screens::live_tv::model::{LiveTvView, RowAirings, Want};
 use plx_screens::live_tv::page::{LiveTvOut, LiveTvScreen};
 use plx_screens::registry::AppArg;
@@ -126,6 +127,7 @@ impl Bridge {
     pub(crate) fn live_tv_feed(&mut self, d: &mut Dispatcher<AppHost>) {
         self.live_tv_aim();
         self.stores.live_tv.pump();
+        self.start_store_jobs_of(StoreId::LiveTv);
         // While the guide is in use (its page up, or a channel playing from it) the guide and the
         // recordings lists are kept fresh: stale channel-days are read again, the lists every five
         // minutes. Idle on Home, nothing is asked.
@@ -427,7 +429,8 @@ impl Bridge {
     /// At exit: release whatever tune the store still owns and wait (bounded) for its releases.
     pub(crate) fn live_tv_release_for_exit(&mut self) {
         self.stores.live_tv.release_for_exit();
-        plx_data::stores::live_tv::drain_releases();
+        self.start_store_jobs_of(StoreId::LiveTv);
+        crate::app::adapters::stores::drain_live_tv_releases();
     }
 
     /// A tune that landed for the page, once: the caller installs it into the media route.

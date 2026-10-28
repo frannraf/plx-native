@@ -5,15 +5,15 @@
 //! (`Bridge::metadata_run`, `Bridge::person_pump`, `Bridge::collection_pump`,
 //! `Bridge::catalog_open`, `Bridge::catalog_pump`, `Bridge::subsearch_pump`, `Bridge::search_pump`,
 //! `Bridge::reconcile_pump`, `Bridge::viewstate_run`, `Bridge::viewstate_pump`,
-//! `Bridge::browse_discover_pump`, or
+//! `Bridge::browse_discover_pump`, `Bridge::live_tv_feed`, `Bridge::live_tv_release_for_exit`, or
 //! `Bridge::start_store_jobs` after a command run on the bare store)
 //! and hands each to [`StoreRunner::start`], which owns everything the data layer must not: the
 //! tape's admission record, the worker thread and the process-global client the request reads. A
 //! kind that is not on the tape (the catalog read, a plex.tv call that names no client; subtitle
 //! search; the Search screen's fetches and its recents writes; view reconcile; the Library's
 //! section-hubs, directory and page reads; the view-state writes; the Metadata season switch,
-//! episode-page window and Related window) is started with no admission record, as its inline
-//! spawn was. The detail pump keeps a counted backstop for a sender that did neither
+//! episode-page window and Related window; the Live TV store's work) is started with no admission
+//! record, as its inline spawn was. The detail pump keeps a counted backstop for a sender that did neither
 //! (`Bridge::start_late_store_jobs`).
 //!
 //! **Three admission families** (`plx_data::stores::Admission`, stated by the job kind and matched
@@ -68,6 +68,7 @@ use plx_data::metadata::{
 };
 use plx_data::person::{finish_person_job, PersonPort, PersonReq};
 use plx_data::stores::catalog::{finish_catalog_job, CatalogPort, CatalogReq};
+use plx_data::stores::live_tv::{self, Job as LiveTvJob, Landing as LiveTvLanding, LiveTvPort, LiveTvReq};
 use plx_data::stores::viewreconcile::{finish_reconcile_job, ReconcilePort, ReconcileReq};
 use plx_data::pms::{launch_hubs_job, HubRequest, HubsPort};
 use plx_data::stores::{Admission, StoreJob};
@@ -77,8 +78,23 @@ use plx_data::subsearch::{finish_subsearch_job, SubSearchPort, SubSearchReq};
 use plx_data::viewstate::{finish_view_write_job, ViewWritePort, ViewWriteReq};
 use plx_machine::job::{Job, Port};
 use plx_plex::plex::{Client, ClientKey, ClientKeys};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::app::bootstrap::HomeIo;
+
+/// Live TV release workers still running (waited for at exit, [`drain_live_tv_releases`]).
+static LIVE_TV_RELEASING: AtomicUsize = AtomicUsize::new(0);
+
+/// At exit: wait, at most about three seconds, for Live TV release workers already running, so a
+/// quit right after leaving a tune still frees the tuner. (A counted wait: no clock is read here.)
+pub(crate) fn drain_live_tv_releases() {
+    for _ in 0..150 {
+        if LIVE_TV_RELEASING.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 /// Fill `keys` with the registry's answer for every active server slot, in place (a pump that runs
 /// every frame allocates nothing for it). The only loop over `client_for` that feeds a step: an
@@ -263,6 +279,7 @@ impl StoreRunner {
             StoreJob::MetaSeason(job, port) => self.start_meta_season(job, port),
             StoreJob::MetaEpisodes(job, port) => self.start_meta_episodes(job, port),
             StoreJob::MetaRelated(job, port) => self.start_meta_related(job, port),
+            StoreJob::LiveTv(job, port) => self.start_live_tv(job, port),
         }
     }
 
@@ -314,7 +331,8 @@ impl StoreRunner {
                 | StoreJob::ViewWrite(..)
                 | StoreJob::MetaSeason(..)
                 | StoreJob::MetaEpisodes(..)
-                | StoreJob::MetaRelated(..)) => self.start(other),
+                | StoreJob::MetaRelated(..)
+                | StoreJob::LiveTv(..)) => self.start(other),
         }
     }
 
@@ -412,6 +430,7 @@ impl StoreRunner {
                     | StoreJob::MetaSeason(..)
                     | StoreJob::MetaEpisodes(..)
                     | StoreJob::MetaRelated(..)
+                    | StoreJob::LiveTv(..)
                 ) => held.push(kept),
             }
         }
@@ -711,6 +730,53 @@ impl StoreRunner {
                 parked.push(StoreJob::MetaRelated(job, port));
                 true
             }
+        }
+    }
+
+    /// A Live TV job is not on the tape: the launch is the whole decision. A launch that did not
+    /// happen (the thread ceiling, or no client for the job's server) is refused, and the store
+    /// puts the job back at the front of its queue for its next pump.
+    fn start_live_tv(&mut self, job: Job<LiveTvReq>, port: LiveTvPort) {
+        let addr = job.addr;
+        let refusal = port.clone();
+        if !self.launch_live_tv(job, port) {
+            refusal.refused(addr);
+        }
+    }
+
+    /// Start the job on a worker through the client resolved here, once, for its server. A release
+    /// whose server is gone is done without a worker: nobody is left to ask. A held runner refuses
+    /// every Live TV job: no rig serves Live TV, and the store asks for its providers whenever a
+    /// server is current, so a parked read would reach the rig's fixture server wherever a rig runs
+    /// every parked job.
+    fn launch_live_tv(&mut self, job: Job<LiveTvReq>, port: LiveTvPort) -> bool {
+        match self {
+            Self::Live => {
+                let Job { addr, req: LiveTvReq { sid, job } } = job;
+                let Some(client) = plx_plex::plex::client_for(sid) else {
+                    if matches!(job, LiveTvJob::Release { .. }) {
+                        port.done(addr, LiveTvLanding::Released);
+                        return true;
+                    }
+                    return false;
+                };
+                let releasing = matches!(job, LiveTvJob::Release { .. });
+                if releasing {
+                    LIVE_TV_RELEASING.fetch_add(1, Ordering::AcqRel);
+                }
+                let ok = plx_base::task::spawn_off_frame("livetv", move |off| {
+                    port.done(addr, live_tv::execute(client, off, sid, job));
+                    if releasing {
+                        LIVE_TV_RELEASING.fetch_sub(1, Ordering::AcqRel);
+                    }
+                });
+                if !ok && releasing {
+                    LIVE_TV_RELEASING.fetch_sub(1, Ordering::AcqRel);
+                }
+                ok
+            }
+            #[cfg(test)]
+            Self::Held { .. } => false,
         }
     }
 
@@ -1092,6 +1158,8 @@ impl StoreRunner {
                 StoreJob::MetaRelated(job, port) => {
                     finish_related_job(&port, job.addr, plx_plex::plex::client_for(job.req.sid), job.req);
                 }
+                // A held runner never parks one (`launch_live_tv` refuses it); refused as it would be.
+                StoreJob::LiveTv(job, port) => port.refused(job.addr),
             }
         }
         n
@@ -1103,7 +1171,9 @@ mod tests {
     use super::*;
     use plx_data::stores::browse::DirectorySnapshot;
     use plx_data::stores::collection::{CollectionCmd, CollectionStore};
+    use plx_data::live_tv::Tuned;
     use plx_data::stores::hubs::{HubsCmd, HubsStore};
+    use plx_data::stores::live_tv::LiveTvStore;
     use plx_data::stores::metadata::{MetadataCmd, MetadataStore};
     use plx_data::stores::person::{PersonCmd, PersonStore};
     use plx_data::stores::search::{SearchCmd, SearchStore};
@@ -4172,5 +4242,70 @@ mod tests {
         assert!(bridge.metadata_run(MetadataCmd::SeekRelated { at: 60, seen: (0, 24) }));
         bridge.assert_no_store_jobs_left_for_test();
         assert_eq!(bridge.run_held_store_jobs_for_test(), 1, "and the seek's");
+    }
+
+    // ---- the Live TV lane: each launch outcome reaches the store as the answer it is ----
+
+    /// A Live TV store opened on `sid`, and the providers read its first pump emitted.
+    fn live_tv_read(sid: ServerId) -> (LiveTvStore, StoreJob) {
+        let mut store = LiveTvStore::default();
+        store.open(sid);
+        store.pump();
+        let mut jobs = store.take_jobs();
+        assert_eq!(jobs.len(), 1, "the providers read: {jobs:?}");
+        (store, jobs.remove(0))
+    }
+
+    fn is_providers(jobs: &[StoreJob]) -> bool {
+        matches!(jobs, [StoreJob::LiveTv(job, _)] if job.req.job == LiveTvJob::Providers)
+    }
+
+    /// A read for a server the registry holds no client for is not started: it is refused, and the
+    /// store asks it again on its next pump.
+    #[test]
+    fn a_live_tv_read_whose_server_is_gone_is_refused_and_asked_again() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = CollectionRig;
+        plx_plex::plex::reset_servers_for_test();
+        let (mut store, job) = live_tv_read(ServerId::from_raw(3));
+        StoreRunner::live().start(job);
+        assert!(store.take_jobs().is_empty(), "nothing until the next pump");
+        store.pump();
+        assert!(is_providers(&store.take_jobs()), "asked again");
+    }
+
+    /// A release whose server is gone is done, not refused: nobody is left to ask, so it is not owed
+    /// again, and the tuner it held counts as back.
+    #[test]
+    fn a_live_tv_release_whose_server_is_gone_is_done_and_not_owed_again() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = CollectionRig;
+        plx_plex::plex::reset_servers_for_test();
+        let mut store = LiveTvStore::default();
+        store.release_tuned(Tuned { sid: ServerId::from_raw(3), subscription_id: "1".into(), ..Tuned::default() });
+        store.pump();
+        let mut jobs = store.take_jobs();
+        assert!(matches!(&jobs[..], [StoreJob::LiveTv(job, _)] if matches!(job.req.job, LiveTvJob::Release { .. })), "{jobs:?}");
+        assert!(store.tuners_settling(), "out: the tuner is not back yet");
+        StoreRunner::live().start(jobs.remove(0));
+        store.pump();
+        assert!(!store.tuners_settling(), "done: the tuner counts as back");
+        assert!(store.take_jobs().is_empty(), "and the release is not owed again");
+    }
+
+    /// A held runner never parks a Live TV job: no rig serves Live TV, so it refuses it (the store
+    /// asks again) and no rig that runs every parked job runs a Live TV read on its thread.
+    #[test]
+    fn a_held_runner_refuses_a_live_tv_job_and_parks_nothing() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = CollectionRig;
+        plx_plex::plex::reset_servers_for_test();
+        let sid = plx_plex::plex::register_for_test("runner", "127.0.0.1", 9, "t", "cid");
+        let (mut store, job) = live_tv_read(sid);
+        let mut runner = StoreRunner::held_all();
+        runner.start(job);
+        assert_eq!(runner.run_held(), 0, "nothing parked");
+        store.pump();
+        assert!(is_providers(&store.take_jobs()), "refused, so asked again");
     }
 }

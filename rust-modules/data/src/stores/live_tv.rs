@@ -2,14 +2,19 @@
 //! guide's day cache, the recording rules and operations, and the writes a page asks for.
 //! The protocol is `plx_plex::plex::live_tv`; the snapshot and cache are `crate::live_tv`.
 //!
-//! Like `stores::notify`, it has no `StoreId` and no `StoreCmd`: the application opens it for the
-//! current server, pumps it once a frame (`Bridge::live_tv_feed`), forwards a page's requests to it
-//! and hands the page a [`Snapshot`] when [`LiveTvStore::generation`] moved. Nothing is recorded or
-//! replayed through the landing gate: a guide is a picture of wall-clock time, not of a session.
+//! It has no `StoreCmd` and posts no notice (its `StoreId` only addresses its jobs' answers): the
+//! application opens it for the current server, pumps it once a frame (`Bridge::live_tv_feed`),
+//! forwards a page's requests to it and hands the page a [`Snapshot`] when
+//! [`LiveTvStore::generation`] moved. Nothing is recorded or replayed through the landing gate: a
+//! guide is a picture of wall-clock time, not of a session.
 //!
-//! **Work runs off the frame** through a [`Runner`] (`spawn_off_frame` in production), at most
-//! [`IN_FLIGHT`] reads at a time; the server's client is resolved at the spawn site and every
-//! landing carries the store's epoch, so a server switch or a reset turns late answers into no-ops.
+//! **Work leaves as jobs** (docs/sans-io.md): the store starts no thread and reads no client. Its
+//! step pushes each piece of server work on its outbox as a `StoreJob::LiveTv`
+//! ([`LiveTvStore::take_jobs`]), at most [`IN_FLIGHT`] reads at a time; the application's runner
+//! resolves the server's client and runs [`execute`] off the frame, and the one answer comes back
+//! through the job's [`LiveTvPort`] stamped with the store's epoch, so a server switch or a reset
+//! turns late answers into no-ops. A job the runner could not start is answered `refused` and goes
+//! back to the front of its queue, to be asked again on the next pump.
 //! **Writes** go through the plex layer's gate (a debug build writes only to the mock unless the
 //! owner armed `plxnative-livetv-live`) one at a time in press order, and each ends in a
 //! [`WriteNotice`]. A successful record or cancel overlays the guide at once and re-reads the DVR
@@ -30,9 +35,11 @@ use plx_plex::plex::live_tv::{
     Airing, Channel, CloudTab, CreateSubscription, EditSubscription, EpgProvider, FavoriteChannel, FavoriteOp, Grab, LiveError, LiveHub,
     Subscription, TemplateChoice,
 };
+use super::{StoreId, StoreJob};
+use plx_machine::job::Port;
+use plx_machine::machine::{Addr, MachineId, RequestId};
 use plx_plex::plex::ServerId;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Reads in flight at once (a guide window asks for a dozen channel-days).
@@ -41,20 +48,6 @@ pub const IN_FLIGHT: usize = 4;
 /// Guide art whose UltraBlur colours are remembered; the oldest is forgotten first and asked
 /// again if its program is shown again.
 pub const MAX_BLURS: usize = 48;
-
-/// Release workers still running (waited for at exit, [`drain_releases`]).
-static RELEASING: AtomicUsize = AtomicUsize::new(0);
-
-/// At exit: wait, at most about three seconds, for release workers already running, so a quit
-/// right after leaving a tune still frees the tuner. (A counted wait: no clock is read here.)
-pub fn drain_releases() {
-    for _ in 0..150 {
-        if RELEASING.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
 
 /// A unit of server work.
 #[derive(Clone, Debug, PartialEq)]
@@ -146,54 +139,61 @@ pub struct WriteDone {
     pub favorites: Option<Vec<FavoriteChannel>>,
 }
 
-/// Where a job's worker posts its landing; stamped with the store epoch it was issued under.
-#[derive(Clone)]
-pub struct Post {
-    epoch: u64,
-    inbox: Arc<Mutex<Vec<(u64, Landing)>>>,
+/// One job as the application's runner starts it (`StoreJob::LiveTv`): the work, and the server it
+/// is asked of. A release names the server that tuned, which may no longer be the one the store
+/// reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveTvReq {
+    pub sid: ServerId,
+    pub job: Job,
 }
 
-impl Post {
-    pub fn post(&self, landing: Landing) {
-        self.inbox.lock().unwrap_or_else(|e| e.into_inner()).push((self.epoch, landing));
-        plx_machine::idle::invalidate();
-        plx_machine::present::wake_from_worker();
+/// One answer in the store's inbox: the epoch its job was emitted under, the job's request id, and
+/// its landing (`None`: the runner never started it).
+type Answer = (u64, RequestId, Option<Landing>);
+
+/// Where a job's one answer goes: the store's inbox, stamped with the epoch the job was emitted
+/// under. `done` is the worker's landing; `refused` (no thread, or no client for the job's server)
+/// hands the job back to its queue. A release whose server is gone is `done` with
+/// [`Landing::Released`]: nobody is left to ask.
+#[derive(Clone)]
+pub struct LiveTvPort {
+    epoch: u64,
+    inbox: Arc<Mutex<Vec<Answer>>>,
+}
+
+impl LiveTvPort {
+    fn answer(&self, addr: Addr, landing: Option<Landing>) {
+        self.inbox.lock().unwrap_or_else(|e| e.into_inner()).push((self.epoch, addr.req, landing));
     }
 }
 
-/// Runs a job for a server. `false` = it could not start (the OS refused the thread).
-pub trait Runner {
-    fn run(&mut self, sid: ServerId, job: Job, post: Post) -> bool;
+impl Port<Landing> for LiveTvPort {
+    /// A worker's landing wakes the frame loop to take it.
+    fn done(&self, addr: Addr, out: Landing) {
+        self.answer(addr, Some(out));
+        plx_machine::idle::invalidate();
+        plx_machine::present::wake_from_worker();
+    }
+
+    /// A refusal is answered on the frame thread, in the call that took the job: the next pump
+    /// takes it whenever a frame next runs, as a refused start always waited for one, and an idle
+    /// loop is not woken for it.
+    fn refused(&self, addr: Addr) {
+        self.answer(addr, None);
+    }
 }
 
-/// The production runner: one small worker per job, the server's client resolved at the spawn site.
-#[cfg(not(any(test, feature = "test-support")))]
-struct Spawn;
+/// Two ports are the same when they answer into the same inbox under the same epoch.
+impl PartialEq for LiveTvPort {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch && Arc::ptr_eq(&self.inbox, &other.inbox)
+    }
+}
 
-#[cfg(not(any(test, feature = "test-support")))]
-impl Runner for Spawn {
-    fn run(&mut self, sid: ServerId, job: Job, post: Post) -> bool {
-        let Some(client) = plx_plex::plex::client_for(sid) else {
-            // A server that is gone cannot be asked; its release has nobody left to ask.
-            if matches!(job, Job::Release { .. }) {
-                return true;
-            }
-            return false;
-        };
-        let releasing = matches!(job, Job::Release { .. });
-        if releasing {
-            RELEASING.fetch_add(1, Ordering::AcqRel);
-        }
-        let ok = plx_base::task::spawn_off_frame("livetv", move |off| {
-            post.post(execute(client, off, sid, job));
-            if releasing {
-                RELEASING.fetch_sub(1, Ordering::AcqRel);
-            }
-        });
-        if !ok && releasing {
-            RELEASING.fetch_sub(1, Ordering::AcqRel);
-        }
-        ok
+impl std::fmt::Debug for LiveTvPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveTvPort").field("epoch", &self.epoch).finish_non_exhaustive()
     }
 }
 
@@ -208,26 +208,8 @@ pub const HUBS_FRESH_S: i64 = 3 * 60;
 /// Channels the What's On page remembers as watched lately (the latest first).
 pub const RECENT_KEPT: usize = 12;
 
-/// Under test only an injected runner runs: a default-built store never reaches a server.
-#[cfg(any(test, feature = "test-support"))]
-struct Refuse;
-
-#[cfg(any(test, feature = "test-support"))]
-impl Runner for Refuse {
-    fn run(&mut self, _sid: ServerId, _job: Job, _post: Post) -> bool {
-        false
-    }
-}
-
-fn default_runner() -> Box<dyn Runner> {
-    #[cfg(not(any(test, feature = "test-support")))]
-    return Box::new(Spawn);
-    #[cfg(any(test, feature = "test-support"))]
-    return Box::new(Refuse);
-}
-
-/// Do `job` against `client` (server `sid`), on a worker. Public so a test runner can execute jobs
-/// against a loopback client too.
+/// Do `job` against `client` (server `sid`), on a worker: the application's runner calls it with
+/// the client it resolved for the job's server, and hands the landing to the job's port.
 pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
         Job::Tune { serial, dvr_key, channel, label, airing, session, captions } => {
@@ -437,8 +419,12 @@ fn create(client: &plx_plex::plex::Client, choice: &TemplateChoice) -> Result<Wr
 pub struct LiveTvStore {
     sid: Option<ServerId>,
     epoch: u64,
-    inbox: Arc<Mutex<Vec<(u64, Landing)>>>,
-    runner: Box<dyn Runner>,
+    inbox: Arc<Mutex<Vec<Answer>>>,
+    /// Jobs emitted and not yet taken by the application ([`LiveTvStore::take_jobs`]).
+    outbox: Vec<StoreJob>,
+    /// Jobs taken and not yet answered, by request id: a refusal puts its job back in its queue.
+    out: HashMap<RequestId, LiveTvReq>,
+    next_req: u32,
     queue: VecDeque<Job>,
     in_flight: usize,
     write_queue: VecDeque<Write>,
@@ -474,6 +460,8 @@ pub struct LiveTvStore {
     releases: VecDeque<(ServerId, Job)>,
     /// Tune jobs started and not yet landed (a superseded one still takes a tuner until then).
     tunes_running: usize,
+    /// Release jobs started and not yet answered (the tuner each frees is not back until then).
+    releases_running: usize,
     /// The last guide window a page asked for: a Retry and the minute's re-ask of failed days
     /// ask it again.
     window: Option<(std::ops::Range<usize>, i64, i64)>,
@@ -519,17 +507,13 @@ struct Lineup {
 
 impl Default for LiveTvStore {
     fn default() -> Self {
-        Self::with_runner(default_runner())
-    }
-}
-
-impl LiveTvStore {
-    pub fn with_runner(runner: Box<dyn Runner>) -> Self {
         Self {
             sid: None,
             epoch: 0,
             inbox: Arc::default(),
-            runner,
+            outbox: Vec::new(),
+            out: HashMap::new(),
+            next_req: 0,
             queue: VecDeque::new(),
             in_flight: 0,
             write_queue: VecDeque::new(),
@@ -553,6 +537,7 @@ impl LiveTvStore {
             tune_queue: None,
             captions: false,
             tunes_running: 0,
+            releases_running: 0,
             tuned: None,
             releases: VecDeque::new(),
             window: None,
@@ -578,7 +563,9 @@ impl LiveTvStore {
             generation: 0,
         }
     }
+}
 
+impl LiveTvStore {
     fn bump(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
@@ -620,17 +607,19 @@ impl LiveTvStore {
         self.cancel_tune();
         let keep = (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial);
         let releases = std::mem::take(&mut self.releases);
-        let tunes_running = self.tunes_running;
-        // A tune still in flight lands under the old epoch: `pump` releases it, so the inbox
-        // stays (`with_runner` would orphan it) and only the epoch moves.
+        let (tunes_running, releases_running, next_req) = (self.tunes_running, self.releases_running, self.next_req);
+        // Jobs out still answer, under the old epoch: a tune that lands is released by `pump`, a
+        // release refused is owed again. So the inbox, the jobs out and the outbox stay, and only
+        // the epoch moves.
         let inbox = Arc::clone(&self.inbox);
-        let runner = std::mem::replace(&mut self.runner, Box::new(NoRun));
+        let out = std::mem::take(&mut self.out);
+        let outbox = std::mem::take(&mut self.outbox);
         let epoch = self.epoch + 1;
-        *self = Self::with_runner(runner);
+        *self = Self::default();
         self.epoch = epoch;
-        self.inbox = inbox;
+        (self.inbox, self.out, self.outbox, self.next_req) = (inbox, out, outbox, next_req);
         self.releases = releases;
-        self.tunes_running = tunes_running;
+        (self.tunes_running, self.releases_running) = (tunes_running, releases_running);
         // the generation and serials never go back: a page compares them for "moved"
         (self.now, self.utc_offset, self.generation, self.notice_serial, self.tune_serial) = keep;
         self.bump();
@@ -902,9 +891,11 @@ impl LiveTvStore {
         Some(t)
     }
 
-    /// At exit: a tune landed and not played is released now (with every release still owed).
-    /// A tune still in flight cannot be named yet; the server reclaims it.
+    /// At exit: a tune landed and not played is released now (with every release still owed, a
+    /// refused one included), as jobs the application starts at once. A tune still in flight
+    /// cannot be named yet; the server reclaims it.
     pub fn release_for_exit(&mut self) {
+        self.take_answers();
         self.cancel_tune();
         self.start();
     }
@@ -926,7 +917,7 @@ impl LiveTvStore {
     /// a tune still on its way (a superseded one holds a tuner until it lands and is released)? A
     /// DVR with no tuner to spare answers the next tune "busy" until none is.
     pub fn tuners_settling(&self) -> bool {
-        !self.releases.is_empty() || RELEASING.load(Ordering::Acquire) > 0 || self.tunes_running > 0
+        !self.releases.is_empty() || self.releases_running > 0 || self.tunes_running > 0
     }
 
     /// Did the last Watch press fail (its notice not yet dismissed)?
@@ -1368,8 +1359,33 @@ impl LiveTvStore {
                 self.bump();
             }
         }
-        let landed: Vec<(u64, Landing)> = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
-        for (epoch, landing) in landed {
+        self.take_answers();
+        self.start();
+        self.generation != before
+    }
+
+    /// Every answer the runner and the workers have given since the last take. The refusals go
+    /// first, back to the front of their queues in the order they were first asked (the nearest
+    /// rows' days first), so the work a landing asks for at the front goes ahead of them, as it
+    /// did when a refused start was put back in the same call.
+    fn take_answers(&mut self) {
+        let answers: Vec<Answer> = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut landed = Vec::with_capacity(answers.len());
+        let mut refused = Vec::new();
+        for (epoch, req, landing) in answers {
+            let Some(asked) = self.out.remove(&req) else { continue };
+            match landing {
+                Some(landing) => landed.push((epoch, asked, landing)),
+                None => refused.push((epoch, asked)),
+            }
+        }
+        for (epoch, asked) in refused.into_iter().rev() {
+            self.refused(epoch, asked);
+        }
+        for (epoch, asked, landing) in landed {
+            if matches!(asked.job, Job::Release { .. }) {
+                self.releases_running = self.releases_running.saturating_sub(1);
+            }
             if matches!(landing, Landing::Tuned { .. }) {
                 self.tunes_running = self.tunes_running.saturating_sub(1);
             }
@@ -1382,8 +1398,6 @@ impl LiveTvStore {
             }
             self.land(landing);
         }
-        self.start();
-        self.generation != before
     }
 
     fn land(&mut self, landing: Landing) {
@@ -1625,45 +1639,82 @@ impl LiveTvStore {
     /// Start queued work up to the read budget, and the next write if none is running.
     fn start(&mut self) {
         while let Some((owner, job)) = self.releases.pop_front() {
-            let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
-            if !self.runner.run(owner, job.clone(), post) {
-                // the OS refused a thread: try again next frame
-                self.releases.push_front((owner, job));
-                break;
-            }
+            self.releases_running += 1;
+            self.emit(owner, job);
         }
         let Some(sid) = self.sid else { return };
         if let Some(job) = self.tune_queue.take() {
-            let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
-            if self.runner.run(sid, job.clone(), post) {
-                self.tunes_running += 1;
-            } else {
-                self.tune_queue = Some(job);
-            }
+            self.tunes_running += 1;
+            self.emit(sid, job);
         }
         if !self.writing {
             if let Some(w) = self.write_queue.pop_front() {
-                let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
-                if self.runner.run(sid, Job::Write(w.clone()), post) {
-                    self.writing = true;
-                    self.write_running = Some(w);
-                } else {
-                    self.write_queue.push_front(w);
-                }
+                self.writing = true;
+                self.write_running = Some(w.clone());
+                self.emit(sid, Job::Write(w));
                 self.bump();
             }
         }
         while self.in_flight < IN_FLIGHT {
             let Some(job) = self.queue.pop_front() else { break };
-            let post = Post { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
-            if self.runner.run(sid, job.clone(), post) {
-                self.in_flight += 1;
-            } else {
-                // the OS refused a thread: try again next frame
+            self.in_flight += 1;
+            self.emit(sid, job);
+        }
+    }
+
+    /// Leave `job` against server `sid` on the outbox, with the port its one answer comes back
+    /// through, and remember it until it answers.
+    fn emit(&mut self, sid: ServerId, job: Job) {
+        self.next_req = self.next_req.wrapping_add(1);
+        let req = RequestId(self.next_req);
+        let ask = LiveTvReq { sid, job };
+        self.out.insert(req, ask.clone());
+        let addr = Addr { to: MachineId::Store(StoreId::LiveTv.ord()), req };
+        let port = LiveTvPort { epoch: self.epoch, inbox: Arc::clone(&self.inbox) };
+        self.outbox.push(StoreJob::LiveTv(plx_machine::job::Job { addr, req: ask }, port));
+    }
+
+    /// A job the runner never started (no thread, or no client for its server) goes back to the
+    /// front of its queue, to be asked again on the next pump, and gives back the count it took. A
+    /// release is owed whatever the epoch; a tune only while its press is still the one wanted;
+    /// anything else asked under an earlier epoch is moot (that epoch's counts went with it).
+    fn refused(&mut self, epoch: u64, asked: LiveTvReq) {
+        let LiveTvReq { sid, job } = asked;
+        match job {
+            Job::Release { .. } => {
+                self.releases_running = self.releases_running.saturating_sub(1);
+                self.releases.push_front((sid, job));
+            }
+            Job::Tune { serial, .. } | Job::CloudTune { serial, .. } => {
+                self.tunes_running = self.tunes_running.saturating_sub(1);
+                if epoch == self.epoch && self.tune_wanted && serial == self.tune_serial && self.tune_queue.is_none() {
+                    self.tune_queue = Some(job);
+                }
+            }
+            _ if epoch != self.epoch => {}
+            Job::Write(w) => {
+                self.writing = false;
+                self.write_running = None;
+                self.write_queue.push_front(w);
+                self.bump();
+            }
+            job => {
+                self.in_flight = self.in_flight.saturating_sub(1);
                 self.queue.push_front(job);
-                break;
             }
         }
+    }
+
+    /// The jobs emitted since the last take, in order. The caller owes each one to the
+    /// application's runner, which answers it through its port.
+    #[must_use]
+    pub fn take_jobs(&mut self) -> Vec<StoreJob> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Does the outbox hold a job nobody has taken?
+    pub fn has_jobs(&self) -> bool {
+        !self.outbox.is_empty()
     }
 
     /// The page's picture.
@@ -1709,14 +1760,6 @@ impl LiveTvStore {
     /// The guide cache, for a page that draws rows straight from it.
     pub fn guide(&self) -> &GuideCache {
         &self.guide
-    }
-}
-
-/// The placeholder runner a reset holds for an instant.
-struct NoRun;
-impl Runner for NoRun {
-    fn run(&mut self, _sid: ServerId, _job: Job, _post: Post) -> bool {
-        false
     }
 }
 
