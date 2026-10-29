@@ -4246,11 +4246,14 @@ mod tests {
 
     // ---- the Live TV lane: each launch outcome reaches the store as the answer it is ----
 
+    /// The wall clock these tests pump the Live TV store with (a fixed, believable minute).
+    const LIVE_CLOCK: plx_data::live_tv::WallClock = plx_data::live_tv::WallClock { now: 1_800_000_000, utc_offset: 0 };
+
     /// A Live TV store opened on `sid`, and the providers read its first pump emitted.
     fn live_tv_read(sid: ServerId) -> (LiveTvStore, StoreJob) {
         let mut store = LiveTvStore::default();
         store.open(sid);
-        store.pump();
+        store.pump(LIVE_CLOCK);
         let mut jobs = store.take_jobs();
         assert_eq!(jobs.len(), 1, "the providers read: {jobs:?}");
         (store, jobs.remove(0))
@@ -4270,7 +4273,7 @@ mod tests {
         let (mut store, job) = live_tv_read(ServerId::from_raw(3));
         StoreRunner::live().start(job);
         assert!(store.take_jobs().is_empty(), "nothing until the next pump");
-        store.pump();
+        store.pump(LIVE_CLOCK);
         assert!(is_providers(&store.take_jobs()), "asked again");
     }
 
@@ -4283,12 +4286,12 @@ mod tests {
         plx_plex::plex::reset_servers_for_test();
         let mut store = LiveTvStore::default();
         store.release_tuned(Tuned { sid: ServerId::from_raw(3), subscription_id: "1".into(), ..Tuned::default() });
-        store.pump();
+        store.pump(LIVE_CLOCK);
         let mut jobs = store.take_jobs();
         assert!(matches!(&jobs[..], [StoreJob::LiveTv(job, _)] if matches!(job.req.job, LiveTvJob::Release { .. })), "{jobs:?}");
         assert!(store.tuners_settling(), "out: the tuner is not back yet");
         StoreRunner::live().start(jobs.remove(0));
-        store.pump();
+        store.pump(LIVE_CLOCK);
         assert!(!store.tuners_settling(), "done: the tuner counts as back");
         assert!(store.take_jobs().is_empty(), "and the release is not owed again");
     }
@@ -4305,7 +4308,7 @@ mod tests {
         let mut runner = StoreRunner::held_all();
         runner.start(job);
         assert_eq!(runner.run_held(), 0, "nothing parked");
-        store.pump();
+        store.pump(LIVE_CLOCK);
         assert!(is_providers(&store.take_jobs()), "refused, so asked again");
     }
 }

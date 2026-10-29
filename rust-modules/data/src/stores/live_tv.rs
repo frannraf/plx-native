@@ -60,9 +60,9 @@ pub enum Job {
     /// the lists, an older one landing after it is history (`Landing::Dvr`).
     Dvr { serial: u32 },
     Write(Write),
-    /// Tune `channel` on DVR `dvr_key` and open its encode under `session`, with the broadcast's
-    /// closed captions burned in when `captions`.
-    Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, session: String, captions: bool },
+    /// Tune `channel` on DVR `dvr_key` and open its encode under a fresh session (the worker makes
+    /// it), with the broadcast's closed captions burned in when `captions`.
+    Tune { serial: u32, dvr_key: String, channel: Channel, label: String, airing: Option<Airing>, captions: bool },
     /// Release a tune nobody will play: stop its encode, delete its subscription.
     Release { subscription_id: String, session: String },
     /// The UltraBlur colours of a piece of guide art (the page's tint).
@@ -212,7 +212,8 @@ pub const RECENT_KEPT: usize = 12;
 /// the client it resolved for the job's server, and hands the landing to the job's port.
 pub fn execute(client: &plx_plex::plex::Client, off: &plx_base::task::OffFrame, sid: ServerId, job: Job) -> Landing {
     match job {
-        Job::Tune { serial, dvr_key, channel, label, airing, session, captions } => {
+        Job::Tune { serial, dvr_key, channel, label, airing, captions } => {
+            let session = lt::new_session_id();
             let result = tune(client, off, &dvr_key, &channel, &session, captions).map(|(subscription_id, item, stream, capture)| Tuned {
                 sid,
                 subscription_id,
@@ -657,7 +658,7 @@ impl LiveTvStore {
         let label = channel.words();
         plx_base::eventlog::log(&format!("livetv: tune #{} asked for channel row {ch}", self.tune_serial));
         self.tune_phase = TunePhase::Tuning { channel: label.clone() };
-        self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, session: lt::new_session_id(), captions: self.captions });
+        self.tune_queue = Some(Job::Tune { serial: self.tune_serial, dvr_key, channel, label, airing, captions: self.captions });
         self.bump();
         true
     }
@@ -843,7 +844,7 @@ impl LiveTvStore {
             Ok(_) => {}
         }
         let result = result.map_err(|e| e.reason());
-        let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        let now = self.now;
         self.guide.land(key, date, result, now);
     }
 
@@ -851,7 +852,7 @@ impl LiveTvStore {
     /// the shown window's now (their programs stay on screen meanwhile), another tab's when it is
     /// shown again.
     pub fn refresh_stale(&mut self) {
-        let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        let now = self.now;
         // What's On, once read, stays fresh while the guide is in use
         if self.hubs_phase.is_ready() && now - self.hubs_at >= HUBS_FRESH_S {
             self.refresh_hubs();
@@ -1321,7 +1322,7 @@ impl LiveTvStore {
 
     /// The airing on now on channel row `ch`, from the guide cache (the player's record disc).
     pub fn on_now(&self, ch: usize) -> Option<Airing> {
-        let now = if self.now > 0 { self.now } else { lt::wall_now() };
+        let now = self.now;
         self.airings(ch, now, now + 1).into_iter().find(|a| a.airs_at(now))
     }
 
@@ -1382,16 +1383,16 @@ impl LiveTvStore {
         self.bump();
     }
 
-    /// Once a frame: the clock, then every landing, then whatever can start. `true` = the
-    /// snapshot moved.
-    pub fn pump(&mut self) -> bool {
+    /// Once a frame: the clock the app read, then every landing, then whatever can start. `true` =
+    /// the snapshot moved.
+    pub fn pump(&mut self, clock: lt::WallClock) -> bool {
         let before = self.generation;
-        let now = lt::wall_now();
+        let now = clock.now;
         if lt::plausible_now(now) {
             let minute = now - now.rem_euclid(60);
             if minute != self.now {
                 self.now = minute;
-                let offset = plx_platform::i18n::utc_offset_s(minute);
+                let offset = clock.utc_offset;
                 if offset != self.utc_offset || !self.offset_logged {
                     // Once, and on a change: the guide's times are UTC plus this, and whether the
                     // set's libc knows the viewer's zone is a device question the log answers.
@@ -1538,7 +1539,7 @@ impl LiveTvStore {
                     Ok(hubs) => {
                         self.hubs = hubs;
                         self.hubs_phase = Phase::Ready;
-                        self.hubs_at = if self.now > 0 { self.now } else { lt::wall_now() };
+                        self.hubs_at = self.now;
                     }
                     // what was shown stays (a refresh that failed); nothing shown says why
                     Err(e) if !self.hubs_phase.is_ready() => self.hubs_phase = Phase::Failed(e.reason()),

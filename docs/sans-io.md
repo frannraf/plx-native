@@ -752,6 +752,9 @@ worker start and the `client_for` read inside that worker are gone too. The hous
     is what `tuners_settling` reads; the exit's bounded wait for release workers is the runner's
     (`drain_live_tv_releases`). A reset keeps the inbox, the jobs out and the outbox, so a tune that
     lands after it is still released.
+  - **The clock is handed in.** `LiveTvStore::pump` takes a `WallClock` (epoch seconds and the
+    viewer's UTC offset) that `Bridge::live_tv_feed` reads, the offset once a minute; the step
+    reads neither. A tune's encode session is made by its worker (`live_tv::execute`), not the step.
   - **A held runner refuses Live TV.** The store asks for its providers whenever a server is
     current, and no rig serves Live TV, so parking them would run a read against a rig's fixture
     server wherever a rig runs every parked job. Store tests answer through the port

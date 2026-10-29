@@ -4,10 +4,12 @@
 //!
 //! **Why the clock is read here.** A guide is a picture of wall-clock time: what is on now, where
 //! the now-line sits, which UTC day a window needs. The `wall` gate keeps clock reads out of
-//! `stores/`, `ui/`, `screens/` and the application, so the one read lives in this IO seam
-//! ([`wall_now`]), beside the data it dates, as `crate::watchlist`'s `today` does. A television
-//! without a battery clock can read 1970 until NTP has run; [`plausible_now`] says so, and the
-//! store waits rather than asking the server for a guide of 1970.
+//! `stores/`, `ui/`, `screens/` and the application, so the read lives in this IO seam
+//! ([`wall_now`]), beside the data it dates. The store's step never calls it: the Bridge reads it,
+//! and the viewer's UTC offset, and hands both to the pump as a [`WallClock`]
+//! (docs/sans-io-guide.md: a step reads no clock). A television without a battery clock can read
+//! 1970 until NTP has run; [`plausible_now`] says so, and the store waits rather than asking the
+//! server for a guide of 1970.
 
 use plx_plex::plex::live_tv::{
     Airing, Channel, CloudTab, EpgProvider, FavoriteChannel, Grab, LiveHub, LiveStream, Setting, Subscription, TemplateChoice, TunedItem,
@@ -22,8 +24,17 @@ pub fn wall_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The wall clock for one pump of the store, as the app read it: epoch seconds, and the viewer's
+/// UTC offset at that minute. A store's step reads no clock (docs/sans-io-guide.md); the guide is
+/// a picture of wall-clock time, so the app hands it in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WallClock {
+    pub now: i64,
+    pub utc_offset: i64,
+}
+
 /// A fresh opaque id for a live encode (the transcoder `session`): the kernel's UUID on the
-/// television (Linux), else a process-unique token.
+/// television (Linux), else a process-unique token. A file read: the tune's worker makes it.
 pub fn new_session_id() -> String {
     if let Ok(u) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
         let t = u.trim();

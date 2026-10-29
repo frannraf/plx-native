@@ -47,6 +47,9 @@ pub(crate) struct Feed {
     rolled_at: Option<u32>,
     /// The wall-clock minute the guide and the recordings lists were last kept fresh at.
     freshened: Option<i64>,
+    /// The wall-clock minute the viewer's UTC offset was last read at, and that offset (the store
+    /// is handed both; localtime is read once a minute, not every frame).
+    offset_at: Option<(i64, i64)>,
 }
 
 /// A Watch asked for: its tab and row, the channel there, and whether the live player's CH▲/CH▼
@@ -126,7 +129,18 @@ impl Bridge {
     /// moved and ask the store for the window the page shows.
     pub(crate) fn live_tv_feed(&mut self, d: &mut Dispatcher<AppHost>) {
         self.live_tv_aim();
-        self.stores.live_tv.pump();
+        // the store reads no clock: the wall clock and the viewer's offset are read here
+        let now = plx_data::live_tv::wall_now();
+        let minute = now.div_euclid(60);
+        let utc_offset = match self.live_tv.offset_at {
+            Some((at, offset)) if at == minute => offset,
+            _ => {
+                let offset = plx_platform::i18n::utc_offset_s(minute * 60);
+                self.live_tv.offset_at = Some((minute, offset));
+                offset
+            }
+        };
+        self.stores.live_tv.pump(plx_data::live_tv::WallClock { now, utc_offset });
         // the plex.tv identity Plex's channels and the favorites are read with, seated as soon as
         // the server's Live TV is found, so the favorites are in before the page opens and the guide
         // opens on them (the store never reads the session; the page's mount seats it again)
@@ -137,7 +151,6 @@ impl Bridge {
         // While the guide is in use (its page up, or a channel playing from it) the guide and the
         // recordings lists are kept fresh: stale channel-days are read again, the lists every five
         // minutes. Idle on Home, nothing is asked.
-        let minute = plx_data::live_tv::wall_now() / 60;
         let in_use = d.nav.tabs.stack.entries.iter().any(|e| e.arg == AppArg::LiveTv) || self.live_tv.watching.is_some();
         if in_use && self.live_tv.freshened != Some(minute) {
             self.live_tv.freshened = Some(minute);
