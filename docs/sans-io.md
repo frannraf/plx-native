@@ -43,8 +43,8 @@ dropped.
 
 **Scope.** `workers` and `globals` read the machines: everything under `rust-modules/data/src`,
 `session/src`, `screens/src`, `ui/src`, `appkit/src` and `machine/src`, plus
-`plex/src/plex/session.rs` (the session owner's state), the player's `lifecycle.rs` and `recovery.rs`
-(the failed-open ladder machine) and the route planners `route/plan.rs` and `route/plan_memory.rs`. The IO layers (the rest of `plex/`, `media/`,
+`plex/src/plex/session.rs` (the session owner's state), the player's `lifecycle.rs`, `recovery.rs`
+(the failed-open ladder machine) and `release.rs` (the native object's release machine) and the route planners `route/plan.rs` and `route/plan_memory.rs`. The IO layers (the rest of `plex/`, `media/`,
 `net/`, `platform/`) are where those calls belong, so they are not scanned. `forks` reads the whole
 of `data/`, `plex/`, `media/` and `session/`, because a fork anywhere in them is a test that does not
 run the product's code. `fxlanes` reads the one fn, `Bridge::app_effect` in `rust-modules/src/app/bridge.rs`.
@@ -57,6 +57,10 @@ run the product's code. `fxlanes` reads the one fn, `Bridge::app_effect` in `rus
   `it.peek()` are not workers or registry reads); `peek` is also a site in
   `plex/src/plex/session.rs`, the module that defines it. A local launcher (`launch_browse_discovery`) is no
   site of its own: the real call inside it is.
+- `task::beside` is not a `workers` site: its scoped sibling is joined before the IO body that asked for
+  it returns, so no worker outlives the call and there is no ledger line to shrink; scoped concurrency
+  inside an IO body a runner already runs off the frame is allowed, a machine step never calls it (it
+  would block the frame on the network, and `beside` asserts it is not on the frame thread).
 - A getter named without a call (`.and_then(client_for)`) reads the registry as surely as a call
   does, so it is a site. Only a rename (`use ...::client_for as x`) fails outright, because the
   calls through `x` are invisible to the scan.
