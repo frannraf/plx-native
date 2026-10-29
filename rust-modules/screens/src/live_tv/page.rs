@@ -82,8 +82,9 @@ pub enum LiveTvOut {
     Favorite { key: ChannelKey, on: bool },
     /// Read the recording options of a new recording or of a rule (the panel opened).
     Options(OptionsFor),
-    /// Watch the channel a What's On card names (by its lineup id), with the program on now.
-    WatchHub { identifier: String, airing: Option<Airing> },
+    /// Watch the channel a What's On card names (by its lineup id, else its number), with the
+    /// program on now.
+    WatchHub { identifier: String, vcn: String, airing: Option<Airing> },
     /// What's On opened: read its rows again.
     RefreshHubs,
     /// The recording-options panel closed without a write.
@@ -570,8 +571,8 @@ impl LiveTvScreen {
             (Action::EditOptions, Target::Rule(s)) => self.open_options(OptionsFor::Rule { id: s.id.clone() }, fx),
             // a What's On card's program: its channel by name (the card stands in no guide row)
             (Action::Watch, Target::Airing { airing, .. }) if model::wo_of(from).is_some() => {
-                let identifier = airing.channel_identifier.clone();
-                self.route(LiveTvOut::WatchHub { identifier, airing: Some(airing.clone()) }, fx)
+                let (identifier, vcn) = (airing.channel_identifier.clone(), airing.channel_vcn.clone());
+                self.route(LiveTvOut::WatchHub { identifier, vcn, airing: Some(airing.clone()) }, fx)
             }
             (Action::Watch, Target::Airing { row, airing }) => {
                 self.route(LiveTvOut::Watch { row: *row, airing: Some(airing.clone()) }, fx)
@@ -836,7 +837,8 @@ impl LiveTvScreen {
                     let on_now = now > 0 && a.begins_at > 0 && a.airs_at(now);
                     if a.begins_at == 0 || on_now || (now > 0 && a.ends_at <= now) {
                         let airing = on_now.then(|| a.clone());
-                        self.route(LiveTvOut::WatchHub { identifier: a.channel_identifier.clone(), airing }, fx);
+                        let (identifier, vcn) = (a.channel_identifier.clone(), a.channel_vcn.clone());
+                        self.route(LiveTvOut::WatchHub { identifier, vcn, airing }, fx);
                     } else {
                         self.open_panel(elem, Target::Airing { row: 0, airing: a }, fx);
                     }

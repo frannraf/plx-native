@@ -62,6 +62,11 @@ fn airing(ch: usize, begins: i64, guid: &str, show: &str) -> Airing {
 
 /// A store opened on a server whose providers and lineup (`n` channels) have landed.
 fn ready(n: usize) -> LiveTvStore {
+    ready_with((0..n).map(channel).collect())
+}
+
+/// A store opened on a server whose providers and lineup (`channels`) have landed.
+fn ready_with(channels: Vec<Channel>) -> LiveTvStore {
     let mut s = LiveTvStore::default();
     s.open(sid());
     s.pump();
@@ -74,7 +79,7 @@ fn ready(n: usize) -> LiveTvStore {
     assert!(kinds.contains(&std::mem::discriminant(&Job::Dvr { serial: 0 })));
     for (job, post) in jobs {
         match job {
-            Job::Channels { .. } => post.post(Landing::Channels(Ok((0..n).map(channel).collect()))),
+            Job::Channels { .. } => post.post(Landing::Channels(Ok(channels.clone()))),
             Job::Dvr { serial } => post.post(Landing::Dvr { serial, result: Ok((vec![], vec![])) }),
             other => panic!("unexpected {other:?}"),
         }
@@ -788,6 +793,39 @@ fn a_channel_is_read_once_whichever_tab_or_row_shows_it() {
     assert!(!s.row_pending(0, NOON, NOON + 3600));
     // …and the DVR's own rows keep theirs too: a DVR channel and a Plex channel never share a key
     assert_ne!(ChannelKey::of(&channel(2)), ChannelKey::of(&cloud(2)));
+}
+
+/// **A What's On card names its channel** by its lineup id, else a grid key, else the number of a
+/// DVR channel (the server's channel hubs name theirs in a form of their own); the surest way wins
+/// wherever it finds one, and a channel the tab shown does not list is shown in its own tab.
+#[test]
+fn a_whats_on_card_names_its_channel_by_lineup_id_else_grid_key_else_a_dvr_number() {
+    use crate::live_tv::{CloudAuth, Source};
+    let cloud = |n: usize| Channel { cloud: true, part_key: format!("/library/parts/{n}.m3u8"), ..channel(n) };
+    let dvr = vec![Channel { grid_key: "g0".into(), ..channel(0) }, channel(1), channel(2)];
+    let mut s = ready_with(dvr.clone());
+    let key = |c: &Channel| Some(ChannelKey::of(c));
+    assert_eq!(s.key_of_card("c1", ""), key(&dvr[1]), "by lineup id");
+    assert_eq!(s.key_of_card("g0", ""), key(&dvr[0]), "by grid key");
+    assert_eq!(s.key_of_card("KXYZ-hub", "2.1"), key(&dvr[2]), "by number when the id is neither");
+    assert_eq!(s.key_of_card("c1", "0.1"), key(&dvr[1]), "the lineup id before another channel's number");
+    assert_eq!(s.key_of_card("KXYZ-hub", ""), None);
+    assert_eq!(s.key_of_card("KXYZ-hub", "9.1"), None);
+    assert_eq!(s.key_of_card("", ""), None, "an empty id names nothing");
+    // Plex's own channels shown: a number names no channel of theirs, only the DVR's
+    s.set_cloud_auth(CloudAuth { client_id: "cid".into(), credential: "secret".into() });
+    s.select_source(Source::Plex);
+    s.pump();
+    let (_, post) = take(&mut s).into_iter().find(|(j, _)| matches!(j, Job::CloudChannels { .. })).expect("the Plex lineup");
+    post.post(Landing::CloudChannels { source: Source::Plex, result: Ok(vec![cloud(5), cloud(6)]) });
+    s.pump();
+    assert_eq!(s.key_of_card("c6", ""), key(&cloud(6)), "a Plex channel by its lineup id");
+    assert_eq!(s.key_of_card("KXYZ-hub", "6.1"), None, "never by its number");
+    assert_eq!(s.row_of_card("KXYZ-hub", "2.1"), Some(2), "the DVR channel numbered so…");
+    assert_eq!(*s.source(), Source::Dvr, "…in the DVR's tab, shown for it");
+    assert_eq!(s.key_of(2), key(&dvr[2]));
+    assert_eq!(s.row_of_card("g0", ""), Some(0), "in the tab shown");
+    assert_eq!(*s.source(), Source::Dvr);
 }
 
 const MACHINE: &str = "m1";

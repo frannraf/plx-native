@@ -502,6 +502,14 @@ pub struct LiveTvStore {
 }
 
 /// A lineup put aside (a guide tab not shown). Its channels' days stay in the one cache.
+/// How a What's On card named its channel ([`LiveTvStore::card_channel`]), the surest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamedBy {
+    LineupId,
+    GridKey,
+    Number,
+}
+
 #[derive(Default)]
 struct Lineup {
     phase: Phase,
@@ -1199,34 +1207,63 @@ impl LiveTvStore {
         self.recent.truncate(RECENT_KEPT);
     }
 
-    /// The lineups not shown a channel named by its lineup id is looked for in, in order: the
-    /// DVR's (a hub of the server's provider names its DVR's channels), then Plex's own (a channel
-    /// watched lately may be one of theirs).
+    /// The lineups not shown a What's On card's channel is looked for in, in order: the DVR's (a
+    /// hub of the server's provider names its DVR's channels), then Plex's own (a channel watched
+    /// lately may be one of theirs).
     const NAMED_IN: [Source; 2] = [Source::Dvr, Source::Plex];
 
-    /// The channel a lineup id names, in the lineup shown else [`Self::NAMED_IN`].
-    pub fn key_of_identifier(&self, identifier: &str) -> Option<ChannelKey> {
-        let named = |c: &&Channel| !identifier.is_empty() && c.identifier == identifier;
-        self.channels
-            .iter()
-            .find(named)
-            .or_else(|| Self::NAMED_IN.iter().find_map(|source| self.lineup_of(source).0.iter().find(named)))
-            .map(ChannelKey::of)
+    /// The channel a What's On card names by its lineup id `identifier` and number `vcn`: its row
+    /// in the lineup shown, else in one of [`Self::NAMED_IN`] (`Some` of it), and how it was named.
+    /// The surest way that finds one wins wherever it finds it: the lineup id, then a grid key,
+    /// then the number of a DVR channel (the server's channel hubs name theirs in a form of their
+    /// own; a number is the server's, never one of Plex's channels').
+    fn card_channel(&self, identifier: &str, vcn: &str) -> Option<(Option<Source>, usize, NamedBy)> {
+        for by in [NamedBy::LineupId, NamedBy::GridKey, NamedBy::Number] {
+            let names = |c: &Channel| match by {
+                NamedBy::LineupId => !identifier.is_empty() && c.identifier == identifier,
+                NamedBy::GridKey => !identifier.is_empty() && c.grid_key == identifier,
+                NamedBy::Number => !vcn.is_empty() && !c.cloud && c.vcn == vcn,
+            };
+            if let Some(row) = self.channels.iter().position(names) {
+                return Some((None, row, by));
+            }
+            let elsewhere = Self::NAMED_IN.into_iter().find_map(|source| {
+                let row = self.lineup_of(&source).0.iter().position(names)?;
+                Some((source, row))
+            });
+            if let Some((source, row)) = elsewhere {
+                return Some((Some(source), row, by));
+            }
+        }
+        None
     }
 
-    /// The channel a What's On item names, by its lineup id: in the lineup shown, else in one of
-    /// [`Self::NAMED_IN`], shown for it.
-    pub fn row_of_identifier(&mut self, identifier: &str) -> Option<usize> {
-        if identifier.is_empty() {
-            return None;
+    /// The channel a What's On card names ([`Self::card_channel`]).
+    pub fn key_of_card(&self, identifier: &str, vcn: &str) -> Option<ChannelKey> {
+        let (source, row, _) = self.card_channel(identifier, vcn)?;
+        let lineup = source.map_or(self.channels.as_slice(), |s| self.lineup_of(&s).0);
+        lineup.get(row).map(ChannelKey::of)
+    }
+
+    /// The row of the channel a What's On card names ([`Self::card_channel`]), its lineup shown
+    /// for it when the one shown does not list it.
+    pub fn row_of_card(&mut self, identifier: &str, vcn: &str) -> Option<usize> {
+        let (source, row, by) = self.card_channel(identifier, vcn)?;
+        if by != NamedBy::LineupId {
+            plx_base::eventlog::log(&format!("livetv: a What's On card names its channel by {}", match by {
+                NamedBy::LineupId => "lineup id",
+                NamedBy::GridKey => "grid key",
+                NamedBy::Number => "number",
+            }));
         }
-        if let Some(row) = self.channels.iter().position(|c| c.identifier == identifier) {
-            return Some(row);
+        if let Some(source) = source {
+            self.tab_picked = true;
+            self.show_source(source.clone());
+            if self.source != source {
+                return None;
+            }
         }
-        let source = Self::NAMED_IN.into_iter().find(|source| self.lineup_of(source).0.iter().any(|c| c.identifier == identifier))?;
-        self.tab_picked = true;
-        self.show_source(source);
-        self.channels.iter().position(|c| c.identifier == identifier)
+        Some(row)
     }
 
     // ---- recording options -------------------------------------------------------------------
