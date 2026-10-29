@@ -187,10 +187,13 @@ impl Bridge {
     pub(crate) fn live_tv_request(&mut self, out: LiveTvOut) {
         // a What's On card: its channel's row (the DVR's tab shown for it when the tab shown
         // does not list it), then the guide's own Watch
-        if let LiveTvOut::WatchHub { identifier, airing } = out {
-            match self.stores.live_tv.row_of_identifier(&identifier) {
+        if let LiveTvOut::WatchHub { identifier, vcn, airing } = out {
+            match self.stores.live_tv.row_of_card(&identifier, &vcn) {
                 Some(row) => self.live_tv_ask(row, airing, false),
-                None => plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's"),
+                None => plx_base::eventlog::log(&format!(
+                    "livetv: that What's On card names no channel of this DVR or of Plex's (by id{})",
+                    if vcn.is_empty() { "; it has no number" } else { " or number" }
+                )),
             }
             return;
         }
@@ -400,14 +403,14 @@ impl Bridge {
 
     /// Is `row` of the tab shown the channel last asked to be watched (the corner's, while one
     /// plays there)?
-    /// Is the channel a What's On card names (its lineup id) the one playing?
-    pub(crate) fn live_tv_is_watching_identifier(&self, identifier: &str) -> bool {
-        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of_identifier(identifier)
+    /// Is the channel a What's On card names (its lineup id, else its number) the one playing?
+    pub(crate) fn live_tv_is_watching_card(&self, identifier: &str, vcn: &str) -> bool {
+        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of_card(identifier, vcn)
     }
 
-    /// Does a What's On card's lineup id name a channel read here (a Watch of it tunes something)?
-    pub(crate) fn live_tv_knows_identifier(&self, identifier: &str) -> bool {
-        self.stores.live_tv.key_of_identifier(identifier).is_some()
+    /// Does a What's On card name a channel read here (a Watch of it tunes something)?
+    pub(crate) fn live_tv_knows_card(&self, identifier: &str, vcn: &str) -> bool {
+        self.stores.live_tv.key_of_card(identifier, vcn).is_some()
     }
 
     pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {

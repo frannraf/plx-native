@@ -1124,13 +1124,13 @@ fn live_tv_requests(app: &mut App) {
                 }
                 super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
             }
-            LiveTvOut::WatchHub { identifier, .. } if corner => {
-                if app.bridge.live_tv_is_watching_identifier(identifier) {
+            LiveTvOut::WatchHub { identifier, vcn, .. } if corner => {
+                if app.bridge.live_tv_is_watching_card(identifier, vcn) {
                     super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
                     continue;
                 }
                 // a card naming no channel read here plays nothing: the corner's stays
-                if !app.bridge.live_tv_knows_identifier(identifier) {
+                if !app.bridge.live_tv_knows_card(identifier, vcn) {
                     plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's");
                     continue;
                 }
