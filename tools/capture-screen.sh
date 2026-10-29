@@ -3,7 +3,8 @@
 # capture-screen.sh — grab the LG webOS TV screen to an image file on this Mac.
 #
 # Uses the TV's AV-framework capture service:
-#     luna://com.webos.service.tv.capture/executeOneShot
+#     luna://com.webos.service.tv.capture/executeOneShot   (webOS 4.5)
+#     luna://com.webos.service.capture/executeOneShot      (seen on webOS 10.3.1; refuses VIDEO)
 # which taps the FINAL panel output. Plane coverage depends on the method:
 #
 #     DISPLAY  (default) : hardware VIDEO overlay plane + GLES/graphics(UI) plane,
@@ -77,13 +78,22 @@ export PLX_TV_ADDR="$TV_HOST"
 # ---- run the capture ----------------------------------------------------------
 # luna-send only delivers its request reliably under a pseudo-TTY -> ssh -tt.
 PAYLOAD="{\"path\":\"${REMOTE}\",\"method\":\"${METHOD}\",\"width\":${CAP_W},\"height\":${CAP_H},\"format\":\"${DEV_FMT}\"}"
-RESP=$("${SSH[@]}" -tt "${TV_USER}@${TV_HOST}" \
-        "mkdir -p /tmp/capture; luna-send -n 1 'luna://com.webos.service.tv.capture/executeOneShot' '${PAYLOAD}'" \
-        2>/dev/null | tr -d '\r')
+# webOS 4.5 names the service com.webos.service.tv.capture; webOS 10.3.1 names it
+# com.webos.service.capture, same method and payload. The old name is tried first. When neither
+# captures, every service's answer is printed: the one that exists may have said why (VIDEO's
+# "no signal state").
+ANSWERS=""
+for SERVICE in com.webos.service.tv.capture com.webos.service.capture; do
+  RESP=$("${SSH[@]}" -tt "${TV_USER}@${TV_HOST}" \
+          "mkdir -p /tmp/capture; luna-send -n 1 'luna://${SERVICE}/executeOneShot' '${PAYLOAD}'" \
+          2>/dev/null | tr -d '\r') || true
+  printf '%s' "$RESP" | grep -q '"returnValue": *true' && break
+  ANSWERS="${ANSWERS}${SERVICE}: ${RESP}"$'\n'
+done
 
 if ! printf '%s' "$RESP" | grep -q '"returnValue": *true'; then
-  echo "ERROR: capture failed (method=$METHOD). Service response:" >&2
-  printf '%s\n' "$RESP" >&2
+  echo "ERROR: capture failed (method=$METHOD). Service responses:" >&2
+  printf '%s' "$ANSWERS" >&2
   [ "$METHOD" = "VIDEO" ] && \
     echo "Hint: VIDEO fails with 'no signal state' when nothing is decoded on the video plane." >&2
   exit 1
