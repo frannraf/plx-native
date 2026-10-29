@@ -119,6 +119,8 @@ before `SDL_Init` (§5).
 | `78 \| 1<<30` | `sym` | `page_dir`, Library route only | page the grid down |
 | `300` | `wcode` | `page_dir`, Library route only | CH▲ pages up (evdev 402 `KEY_CHANNELUP`) |
 | `301` | `wcode` | `page_dir`, Library route only | CH▼ pages down (evdev 403 `KEY_CHANNELDOWN`) |
+| `480` | `wcode` | `page_dir`, Library route only | CH▲ pages up, as webOS 4 spells it (measured on webOS 4.10.2) |
+| `481` | `wcode` | `page_dir`, Library route only | CH▼ pages down, as webOS 4 spells it |
 | `8` | `sym` | `screens::search::SearchScreen::step`, while editing | backspace |
 | `156 \| 1<<30` | `sym` | `screens::search::SearchScreen::step`, while editing | the panel's **Clear all**. **Not producible from the evdev table** — it reaches us through the fork's own text/IME path, which is why it is measured but has no evdev provenance. |
 | `48..=57` | `sym` | `screens::profiles`, PIN keypad | type that digit into the PIN. `screens::profiles::digit_of` also reads the range out of `wcode`, where it is **not** a digit — §9. |
@@ -181,8 +183,9 @@ and evdev 6 `KEY_5`.
 simulator before the fix — the digit `5` moved the grid focus a full page, and left every later key
 in the script acting on a different item. The real rocker, 300/301, was already bound beside them,
 so the two constants are **deleted**, not repointed: a constant that silently changes value is how a
-doc or a log predating the change comes to read as the opposite of what it says. `page_dir` now
-answers `SDLK_PAGEUP`/`SDLK_PAGEDOWN` and 300/301 and nothing else.
+doc or a log predating the change comes to read as the opposite of what it says. `page_dir` then
+answered `SDLK_PAGEUP`/`SDLK_PAGEDOWN` and 300/301 and nothing else; webOS 4's 480/481 joined later
+(the table of keys bound outside `classify`).
 
 Graded three ways: `page_dir(digit) == None` and `is_bound(digit) == true` in `ui::consts`' host
 tests, and the `k:53,34` row of `tests/keytable.json`, which is inert on all three recorded screens.

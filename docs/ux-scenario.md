@@ -65,7 +65,7 @@ that date, where they had never once fired.
 | **Stop** | 120, 260, also 413 | leave the player (§6.4) |
 | **Fast-forward** | 451 | seek forward |
 | **Rewind** | 452 | seek backward |
-| **CH ▲ / CH ▼** | 300 / 301 (also `SDLK_PAGEUP`/`PAGEDOWN`) | page the Library grid |
+| **CH ▲ / CH ▼** | 300 / 301, 480 / 481 on webOS 4 (also `SDLK_PAGEUP`/`PAGEDOWN`) | page the Library grid |
 | anything else | — | swallowed as `Key::Other`; no screen acts on it |
 
 **LEFT/RIGHT carry a flag.** A press that arrived as the plain direction sym is

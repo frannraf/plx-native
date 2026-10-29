@@ -229,7 +229,7 @@ pub const WCODE_STOP_CD: c_uint = 260;
 pub const WCODE_PLAYPAUSE: c_uint = 261;
 /// evdev 174 `KEY_EXIT` -> 505. LG's checklist item 38 wants the app terminated on this press.
 pub const WCODE_EXIT: c_uint = 505;
-/// **The channel rocker, and since 2026-08-23 the ONLY spelling of it** — evdev 402/403
+/// **The channel rocker as webOS 10 spells it** (webOS 4's is [`WCODE_CH_UP_ALT`]) — evdev 402/403
 /// `KEY_CHANNELUP`/`KEY_CHANNELDOWN` -> **300/301** in the television's own table. The digits
 /// 33/34 used to sit beside these in [`page_dir`], described as the rocker and hedged as "almost
 /// certainly NOT"; the note where they were deleted, a few dozen lines up, is why. The `_KEY`
@@ -237,6 +237,15 @@ pub const WCODE_EXIT: c_uint = 505;
 /// retired pair.
 pub const WCODE_CH_UP_KEY: c_uint = 300;
 pub const WCODE_CH_DOWN_KEY: c_uint = 301;
+/// **The rocker as webOS 4 spells it.** An OLED55C9AUA (webOS 4.10.2, firmware 05.50.00) delivers
+/// CH▲/CH▼ as wcode **480/481** with no sym — measured 2026-10-23 off the app's own key log, for
+/// the network-input service's `CHANNELUP` and for evdev 402/403 written to the IR remote node and
+/// the Magic Remote node alike (BACK injected the same way arrived as Escape, so the path is the
+/// remote's). That set's `libSDL2` carries the same 402 -> 300 table entry as the webOS 10 set's,
+/// so 480/481 come by another input path on webOS 4; the app accepts both spellings
+/// ([`page_dir`]), and the rocker that did nothing there pages again.
+pub const WCODE_CH_UP_ALT: c_uint = 480;
+pub const WCODE_CH_DOWN_ALT: c_uint = 481;
 
 /// OK/confirm press — RETURN, keypad ENTER, or the remote's SELECT. The ONE OK predicate
 /// (app.rs + the login/profiles screens all route through it).
@@ -428,10 +437,10 @@ mod canonical_input_tests {
 /// [`is_bound`] is the predicate that answers that question.
 #[inline]
 pub fn page_dir(sym: c_uint, wcode: c_uint) -> Option<c_int> {
-    if sym == SDLK_PAGEUP || wcode == WCODE_CH_UP_KEY {
+    if sym == SDLK_PAGEUP || wcode == WCODE_CH_UP_KEY || wcode == WCODE_CH_UP_ALT {
         return Some(-1);
     }
-    if sym == SDLK_PAGEDOWN || wcode == WCODE_CH_DOWN_KEY {
+    if sym == SDLK_PAGEDOWN || wcode == WCODE_CH_DOWN_KEY || wcode == WCODE_CH_DOWN_ALT {
         return Some(1);
     }
     None
@@ -531,6 +540,8 @@ mod tests {
         assert_eq!(page_dir(SDLK_PAGEDOWN, 0), Some(1));
         assert_eq!(page_dir(0, WCODE_CH_UP_KEY), Some(-1)); // evdev 402/403, the real rocker
         assert_eq!(page_dir(0, WCODE_CH_DOWN_KEY), Some(1));
+        assert_eq!(page_dir(0, WCODE_CH_UP_ALT), Some(-1)); // the same rocker on webOS 4
+        assert_eq!(page_dir(0, WCODE_CH_DOWN_ALT), Some(1));
         assert_eq!(page_dir(SDLK_UP, 0), None, "the D-pad is not the pager");
         assert_eq!(page_dir(0, WCODE_FASTFORWARD), None);
     }
@@ -716,6 +727,8 @@ mod tests {
             (SDLK_PAGEDOWN, 0),
             (0, WCODE_CH_UP_KEY),
             (0, WCODE_CH_DOWN_KEY),
+            (0, WCODE_CH_UP_ALT),
+            (0, WCODE_CH_DOWN_ALT),
             (SDLK_BACKSPACE, 42),
             (SDLK_CLEAR, 156),
         ] {
