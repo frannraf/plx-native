@@ -1,0 +1,11 @@
+# count: 3
+# Test/production forks (docs/sans-io.md), area `data-live_tv`: one line per production-visible `#[cfg(..)]` / `cfg!(..)` whose predicate reads `test` or `feature = "test-support"`
+# (`not(test)`, `not(any(test, feature = "test-support"))`, ...) in every machine crate (data/, plex/, media/, session/, screens/, ui/, appkit/ and machine/), keyed `<path>::<item name>` (an attribute on an item), `<path>::<enclosing fn>` (a statement or an inline `cfg!`) or `<path>::<struct>` (a field).
+# Logic is one thing in production and tests deliver it events: there is no cfg(test) fork. Spec: ci/check-deps.sh `forks`.
+# The gate compares this list to the tree as an exact multiset: a new site fails it, and so does a line whose site is gone, so it only shrinks. A migration lands by deleting its lines; do not add one to make a new site pass.
+# FORK-ONLY (frannraf/plx-native live-tv): the Live TV store predates upstream's sans-IO split and still
+# starts its own job, reads the session and forks for tests. These lines record that debt; the
+# upstream-bound Live TV branch must migrate them (typed effects, injected input) and delete them.
+rust-modules/data/src/stores/live_tv.rs::Spawn
+rust-modules/data/src/stores/live_tv.rs::default_runner
+rust-modules/data/src/stores/live_tv.rs::impl Runner for Spawn
