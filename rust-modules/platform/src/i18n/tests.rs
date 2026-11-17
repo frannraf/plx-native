@@ -1081,10 +1081,3 @@ fn local_midnight_follows_the_zone_and_the_clock_change_of_each_date() {
             "local midnight failed (or ran nothing) under {zone}:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     }
 }
-
-#[test]
-fn the_utc_offset_is_a_whole_number_of_minutes_within_a_day() {
-    let off = utc_offset_s(1_760_000_000);
-    assert!(off.abs() <= 14 * 3600, "{off}");
-    assert_eq!(off % 60, 0, "{off}");
-}

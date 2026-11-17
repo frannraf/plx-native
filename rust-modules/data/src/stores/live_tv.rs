@@ -1371,7 +1371,7 @@ impl LiveTvStore {
             let minute = now - now.rem_euclid(60);
             if minute != self.now {
                 self.now = minute;
-                let offset = plx_platform::i18n::utc_offset_s(minute);
+                let offset = crate::live_tv::utc_offset_s(minute);
                 if offset != self.utc_offset || !self.offset_logged {
                     // Once, and on a change: the guide's times are UTC plus this, and whether the
                     // set's libc knows the viewer's zone is a device question the log answers.

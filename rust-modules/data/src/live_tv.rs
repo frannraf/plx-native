@@ -15,6 +15,23 @@ use plx_plex::plex::live_tv::{
 use plx_plex::plex::ServerId;
 use std::collections::HashMap;
 
+/// The local offset from UTC at `epoch_s`, in seconds: what a guide adds to an airing's UTC instant
+/// to print its local time. Read from the operating system's zone through upstream's
+/// `i18n::local_clock_time` (the minute's local wall time against its UTC one), so daylight-saving
+/// changes are the C library's. 0 when it cannot say (the device then reads UTC, which is also
+/// what it shows before its time zone is configured).
+pub fn utc_offset_s(epoch_s: i64) -> i64 {
+    let minute = epoch_s - epoch_s.rem_euclid(60);
+    let Some([h, m]) = plx_platform::i18n::local_clock_time(minute) else { return 0 };
+    let local = i64::from(h) * 3_600 + i64::from(m) * 60;
+    let utc = minute.rem_euclid(86_400);
+    let mut offset = local - utc;
+    // the two clocks can be on different days: real offsets run from UTC-12 to UTC+14
+    if offset > 14 * 3_600 { offset -= 86_400; }
+    if offset < -12 * 3_600 { offset += 86_400; }
+    offset
+}
+
 /// The wall clock, epoch seconds.
 pub fn wall_now() -> i64 {
     std::time::SystemTime::now()
@@ -536,5 +553,15 @@ impl Snapshot {
     /// Can channel `ch` be added to (or taken off) the favorites from here?
     pub fn can_favorite(&self, ch: &Channel) -> bool {
         self.favorites_phase.is_ready() && (self.is_favorite(ch) || if ch.cloud { self.favorite_cloud } else { self.favorite_dvr })
+    }
+}
+
+#[cfg(test)]
+mod utc_offset_tests {
+    #[test]
+    fn the_utc_offset_is_a_whole_number_of_minutes_within_a_day() {
+        let off = super::utc_offset_s(1_760_000_000);
+        assert!((-12 * 3600..=14 * 3600).contains(&off), "{off}");
+        assert_eq!(off % 60, 0, "{off}");
     }
 }

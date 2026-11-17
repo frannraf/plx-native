@@ -1299,7 +1299,7 @@ impl LiveTvScreen {
     /// A time of day for instant `t`, at the offset in force then (an airing past a daylight-saving
     /// change reads its own hour, as the player's bar does), else the guide's.
     fn time_of(&self, t: i64) -> String {
-        let local = (t + plx_platform::i18n::utc_offset_s(t)).rem_euclid(86_400);
+        let local = (t + plx_data::live_tv::utc_offset_s(t)).rem_euclid(86_400);
         plx_platform::i18n::current().time_of_day([(local / 3_600) as i32, ((local % 3_600) / 60) as i32]).unwrap_or_default()
     }
 

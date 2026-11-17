@@ -36,6 +36,9 @@ def make(tuners=2, clock=None, cache=None):
 
 
 def call(pms, method, path):
+    # a tune names its session, as the app does and a real server requires (744b6efe)
+    if path.endswith("/tune"):
+        path += "?X-Plex-Session-Identifier=KXYZ-session"
     return pms.handle(method, path, b"", {})
 
 

@@ -566,7 +566,7 @@ pub(super) fn airing_frac((begins, ends, now): (i64, i64, i64)) -> f64 {
 
 /// An epoch instant as the viewer's wall clock reads it ("2:00 PM"), as the guide prints its times.
 fn wall_time(t: i64) -> String {
-    let local = (t + plx_platform::i18n::utc_offset_s(t)).rem_euclid(86_400);
+    let local = (t + plx_data::live_tv::utc_offset_s(t)).rem_euclid(86_400);
     plx_platform::i18n::current().time_of_day([(local / 3_600) as i32, ((local % 3_600) / 60) as i32]).unwrap_or_default()
 }
 

@@ -31,23 +31,6 @@ pub enum Clock {
     H24,
 }
 
-/// The local offset from UTC at `epoch_s`, in seconds, as the C library's time zone states it
-/// (`localtime_r`'s `tm_gmtoff`): what a guide adds to an airing's UTC instant to print its local
-/// time. 0 when the library cannot say — the device then reads UTC, which is also what it shows
-/// before its time zone is configured. Unverified on the set: whether webOS's libc carries the
-/// viewer's zone (`/etc/localtime`) is a device question this function does not answer.
-pub fn utc_offset_s(epoch_s: i64) -> i64 {
-    let t = epoch_s as libc::time_t;
-    // SAFETY: `localtime_r` writes only into `tm`, which outlives the call; `t` is a plain value.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return 0;
-        }
-        i64::from(tm.tm_gmtoff)
-    }
-}
-
 pub struct LocaleContext {
     preference: Preference,
     language: Language,
