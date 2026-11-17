@@ -1,6 +1,8 @@
 {
   "_comment": "The CLOSED ALPHABET every string value in a committed replay fixture must belong to (restructure spec §5.6 rule 2). Match literals exactly or patterns with fullmatch. Synthetic construction against tests/mock_pms.py remains required: membership is a vocabulary check, not proof of data provenance, and cannot distinguish private values coincidentally equal to allowed words/numbers. CLI, outbound guard and host tests share this policy. Add new protocol constants by source-backed name, never by harvesting an unchecked recording.",
   "_sources": {
+    "hero_proposal": "screens/src/home/mod.rs and detail/hero.rs format Movie/TV Show identity with locales/en/browse.json browse.kind.movie and browse.kind.tv_show; appkit/src/hero_layout.rs formats, remaining minutes through browse.detail.minutes_left, and episode dates through ui/src/fmt.rs hero_date and LocaleContext::date_medium (controlled en-US, tests/mock_pms.py synthetic dates).",
+    "playback_diagnostics": "locales/en/settings.json settings.trace.* labels and uppercase section; app/bootstrap/effects.rs deterministic playback_trace status/off codec.",
     "quiet_refetch": "app/bootstrap/effects.rs encodes HubsCmd::RefetchSourceQuiet as {\"hubs\":{\"refetch_source_quiet\":<server>}}: the quiet Home refetch of app/reread.rs.",
     "localization": "ui/table.rs TableView draw elides each section header (uppercased, at CAPTION) through the Measure, so the Settings root's eight headers (Playback, Privacy, Legal, System, About, Information, Reporting, On this TV, from locales/en/settings.json) enter the measurement table in capitals; locales/en/settings.json names the Language destination (Language, its detail line and System default); locales/en/browse.json browse.person.credits pluralises the Filmography count, measured word by word as it wraps; i18n/mod.rs LocaleContext formats dates as ICU YMD short with a full year, and controlled System resolves to en-US, so tests/mock_pms.py's 2011-03-14 reads 3/14/2011; plx_appkit::hero_layout::play_label names the Home hero's Play control (browse.detail.play, or browse.detail.resume, \"Resume\", for a resume point), the one label Home, Detail and the card menu share.",
     "playback_settings": "plex/session.rs DirectPlayMode serializes auto/forced/disabled. screens/settings.rs supplies the added Playback destinations, detail lines and root copy.",
@@ -17,11 +19,18 @@
     "subtitle_preferences": "rust-modules/plex/src/plex/session.rs: SubtitleTone::White serializes as white and is the captured default in every synthetic session.",
     "session_persistence": "rust-modules/plex/src/plex/session.rs: SaveAuthority::Routine (also PublicOnly, FreshReauthentication — already covered/unused in controlled recordings); rust-modules/plex/src/plex/session/async_persistence.rs: PersistencePurpose::Background; rust-modules/src/auth/owner.rs: CommitAdmission::RegistryOnly. These serialize into every controlled session commit/plan once a store owns its own persistence (cleanup/ownership), so a synthetic recording now always carries them.",
     "related_hub_key": "rust-modules/plex/src/plex/hubs.rs is_pageable_hub_key: the Related hub of a Detail page is paged through its own key, /library/metadata/{digits}/similar (tests/mock_pms.py serves it); a recorded Detail page names it in its page request.",
-    "year_length_caption": "The year · length caption Home's poster shelves draw under the default Under posters setting (ui/src/caption_policy.rs year_length: the year, then ui/src/fmt.rs duration_minutes_in, locales/en/core.json core.duration_hours \"{hours}h {minutes}m\" and core.duration_minutes \"{minutes}m\", joined by a middle dot): tests/mock_pms.py _base draws the year as 1990 + rng.randrange(35) (four digits) and _movie the length as (80 + rng.randrange(80)) * 60_000 ms. Owner decision 2026-10-20: a general year · length pattern, not the one literal.",
+    "year_length_caption": "The year · length caption Home's poster shelves draw under the default Under posters setting (ui/src/caption_policy.rs part_value, the Year and Length parts: the year, then ui/src/fmt.rs duration_minutes_in, locales/en/core.json core.duration_hours \"{hours}h {minutes}m\" and core.duration_minutes \"{minutes}m\", joined by a middle dot): tests/mock_pms.py _base draws the year as 1990 + rng.randrange(35) (four digits) and _movie the length as (80 + rng.randrange(80)) * 60_000 ms. Owner decision 2026-10-20: a general year · length pattern, not the one literal.",
     "hold_hint": "ui/src/hold_hint.rs measures the three runs of Home's \"Hold OK for options\" capsule when a recorded Home rests on a shelf tile: locales/en/widgets.json widgets.hint.hold_options (pre and post words, split at the key placeholder) and KEY (the OK cap).",
-    "watchlist_fixture_guids": "tests/mock_pms.py DiscoverFixture.bind: the first movies/shows of the library take the Watchlist fixture's guids (`plex://<kind>/<hex>`, hex = `5d7768` + the title's index + 16 md5 digits of `watchlist-fixture-<index>`), so a PMS item's guid and the Media matches of Detail carry these 14 strings. Listed literally, one per held fixture title; a general 24-hex pattern would admit a household's real Plex guids and is not permitted."
+    "watchlist_fixture_guids": "tests/mock_pms.py DiscoverFixture.bind: the first movies/shows of the library take the Watchlist fixture's guids (`plex://<kind>/<hex>`, hex = `5d7768` + the title's index + 16 md5 digits of `watchlist-fixture-<index>`), so a PMS item's guid and the Media matches of Detail carry these 14 strings. Listed literally, one per held fixture title; a general 24-hex pattern would admit a household's real Plex guids and is not permitted.",
+    "rating_images": "tests/mock_pms.py _movie: ratingImage and audienceRatingImage of every synthetic movie are the two Plex rating-image URIs rottentomatoes://image.rating.ripe and rottentomatoes://image.rating.upright, which the Library poster ratings (#1129) carry into the recorded Home hubs result.",
+    "settings_v2": "locales/en/settings.json settings.title (\"Settings\", the root's 48 title) and settings.support.section (\"Support\", drawn uppercase at CAPTION as SUPPORT): the Settings v2 root's title and the header of its Support group (Privacy & data, Diagnostics, Legal notices, About PlxNative) enter the measurement table. The Privacy & data page and the Legal index draw their 48 title in the follow-focus left column, so the page names (settings.privacy.title, measured word by word as it wraps: Privacy, Privacy &; settings.legal.section, Legal) are measured too.",
+    "cw_stills_footer": "ui/src/still_footer.rs draws the Continue Watching stills' started line: the status \"<n>m left\" (locales/en/core.json core.footer_left_minutes) and, with the card's episode tag, core.footer_tag leads it (\"S<n> E<n> ·\" then the status after one space), at the mock's synthetic durations and resume offsets (tests/mock_pms.py); each is measured word by word and so enters the measurement table.",
+    "home_resume_pill": "Home formats a compact remaining duration through ui/src/fmt.rs duration_minutes_in (core.duration_minutes in controlled en-US). The episode metadata uses episode_address (core.season and core.episode joined by a middle dot). These three exact values are measured for the seed-1 mock.",
+    "hero_episode_label": "screens/src/home/mod.rs hero_ladder gives an EPISODE hero's block as one bold line, ui/src/fmt.rs episode_kicker: core.episode_ordinal (\"S<n>, E<n>\"), the KICKER_SEPARATOR (\" · \") and the episode's title, which tests/mock_pms.py names s[0-9a-f]{8}; it is measured as one run, so it enters the measurement table."
   },
   "patterns": [
+    "[0-9]+ min left",
+    "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{1,2}, [0-9]{4}",
     "/library/metadata/people/[0-9]+/thumb/1",
     "plex://(movie|show)/s[0-9a-f]{8}",
     "/s[0-9a-f]{8}/s[0-9a-f]{8}\\.mkv",
@@ -31,9 +40,12 @@
     "s[0-9a-f]{8}( s[0-9a-f]{8}){23}",
     "s[0-9a-f]{8}( s[0-9a-f]{8}){1,23}(…)?",
     "s[0-9a-f]{8}, s[0-9a-f]{8}(, s[0-9a-f]{8})*,?",
-    "s[0-9a-f]{8} · [0-9]+m left",
+    "S[0-9]+ · E[0-9]+ · [0-9]+m left",
+    "[0-9]+m left",
+    "S[0-9]+ E[0-9]+ · [0-9]+m left",
     "[0-9]{4} · ([0-9]+h )?[0-9]+m",
     "Character [0-9]+ · s[0-9a-f]{8}",
+    "S[0-9]+, E[0-9]+ · s[0-9a-f]{8}",
     "(Actor|Appeared|Director|Producer|Composer|Cinematographer|Writer|Other) · [0-9]+",
     "/library/metadata/[0-9]+/(thumb|art)/1",
     "/library/metadata/[0-9]+/similar",
@@ -59,6 +71,11 @@
     "press phase=(idle|down|up) live=[01] active=[01] long=[01]"
   ],
   "literals": [
+    "32m",
+    "47m",
+    "S2 · E2",
+    "Movie", "TV Show",
+    "Diagnostics", "Record playback diagnostics", "Local: up to 60s / 8 MiB. May slow playback.", "Save diagnostic log", "Local recording and app log for support.", "Delete diagnostic recordings", "Recording", "Recorded", "Saved", "Unavailable", "Failed", "Saving", "DIAGNOSTICS", "status", "off",
     "Hold",
     "for options",
     "OK",
@@ -67,6 +84,11 @@
     "disabled",
     "Playback",
     "ABOUT",
+    "SUPPORT",
+    "Settings",
+    "Legal",
+    "Privacy",
+    "Privacy &",
     "INFORMATION",
     "LEGAL",
     "ON THIS TV",
@@ -155,6 +177,7 @@
     "click",
     "drag",
     "wheel",
+    "pan",
     "text",
     "token",
     "lifecycle",
@@ -291,6 +314,8 @@
     "5d776805d5ce05c5416f24a9",
     "plex://movie/5d776805d5ce05c5416f24a9",
     "5d77680689a097bc6e38b0f0",
-    "plex://movie/5d77680689a097bc6e38b0f0"
+    "plex://movie/5d77680689a097bc6e38b0f0",
+    "rottentomatoes://image.rating.ripe",
+    "rottentomatoes://image.rating.upright"
   ]
 }

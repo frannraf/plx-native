@@ -141,9 +141,10 @@ or a plaintext URL. `net::keypin::apply` sets the pin FIRST and checks it: `VERI
 only after libcurl accepted the pin, so a libcurl that refuses the option leaves the request strict
 and failed, and `confirm` then compares the presented leaf's key itself (via `CERTINFO`) in case a TLS
 backend accepts the option and never enforces it. Every key-mode handle also sets
-`CURLOPT_FRESH_CONNECT` and `CURLOPT_FORBID_REUSE`, so it always does its own handshake (a reused
-keep-alive connection has no certificate to confirm) at the price of one handshake per key-mode
-request. A key-mode answer is never learned from (`peer_pin` is never read), so key mode cannot
+`CURLOPT_FRESH_CONNECT`, `CURLOPT_FORBID_REUSE` and `CURLOPT_SSL_SESSIONID_CACHE` = 0, so it always
+does its own FULL handshake (a reused keep-alive connection and a resumed TLS session both present no
+certificate to confirm; libcurl 8.12+ keeps the session cache on the multi, so a media source's next
+attempt would resume the last one's) at the price of one full handshake per key-mode request. A key-mode answer is never learned from (`peer_pin` is never read), so key mode cannot
 rewrite what it is checking against.
 **One table, filled once:** `net::keypin` is process-wide, keyed by lowercase `host:port`, with
 replace semantics. `session::replace_cache` is the single choke point that projects the session
@@ -153,7 +154,7 @@ machine registered at runtime; a key `session::learn_server_key` learns reaches 
 queued write is applied and projected (the projection is the only production source of a key; `register_lazy` only binds hosts);
 sign-out empties it (revoked/missing/cleared sessions project nothing). Both stacks share
 the decision and the option code: the control plane in `net::request_tls_sink` (wrapped by `request_tls_evidence`), the media plane
-in `curlio::CurlSource::start_range_until`, which every open, reopen and seek goes through. After a
+in `net::range_io::CurlSource::start_range_until`, which every open, reopen and seek goes through. After a
 key-mode success the host is LATCHED for 10 minutes on the monotonic clock (later requests skip the
 doomed strict handshake; the timer does not slide; a strict success or a changed pin clears it; rc 90
 in key mode clears it and is the failure). The log carries one line when a host first engages, with
@@ -192,7 +193,7 @@ three attempts. A name mismatch, a self-signed leaf (18/19), plex.tv or any othe
 mode. After a success the host is latched in the same `keypin` state for 10 minutes on the monotonic
 clock (later requests skip the doomed strict handshake, the timer does not slide, a strict success or
 a refusal by the bundle clears it); both stacks share the decision, the control plane in
-`net::request_tls_sink` (wrapped by `request_tls_evidence`) and the media plane in `curlio::CurlSource::start_range_until`. Unlike key
+`net::request_tls_sink` (wrapped by `request_tls_evidence`) and the media plane in `net::range_io::CurlSource::start_range_until`. Unlike key
 mode a roots-mode answer IS strictly verified, so it may teach `peer_pin`. The log carries one line when
 the fallback engages, one when it first succeeds and one when the bundle refuses too, naming only the
 verify result.
@@ -299,8 +300,15 @@ be registered. Direct identity candidates settle as one race, and a relay fallba
 local/remote probe opportunity. **The race does not wait for a route that cannot change the
 answer** (`auth::race_decided`): once a verified, credential-eligible winner exists, a candidate
 that cannot outrank it (`candidate_score` is a function of the candidate alone) is left behind, and
-a better-ranked one that has not answered gets `ProbeDeadlines::grace` (1.5 s) from the first
-win, not its own 5 s/10 s deadline. Waiting for every candidate made a healthy sign-in cost a
+a higher-scored or better-tier route that has not answered gets `ProbeDeadlines::grace`
+(1.5 s) from the first verified answer, not its own 5 s/10 s deadline. An IPv6
+route at the same location, scheme and score as the current IPv4 winner gets only
+250 ms **from that IPv4 route's own verified reply**, even if a different higher
+tier remains outstanding. Another address of the same family and score cannot
+displace the accepted route or extend its window. These are per-route eligibility
+deadlines, enforced both when a reply arrives and while deciding which pending
+routes to wait for. Candidate ranking is IPv6-first within location/scheme,
+with both families retained and no user preference. Waiting for every candidate made a healthy sign-in cost a
 dead public address's full deadline, so "taking longer than usual" ran on every sign-in
 (`screens/login.rs`'s `DISCOVERY_ESCAPE_AFTER_MS` derives its number from this cost). A race with
 no winner still runs every candidate to its deadline, and the relay phase still starts only then. Authenticated fallback attempts share a separate 20-second budget,
@@ -354,7 +362,11 @@ The whole shared-source feature rests on keeping these apart:
   RANKS favourites first, because a browsing preference is not an authorization boundary and
   removing results would invent a false negative for a film the user owns and can play. The
   unscoped list survives as `browse::all_source_rows`, which is the Favorite libraries editor's, and
-  is the only way a non-favourite comes back. The rules are `pins.rs` (pure); the store is keyed by
+  is the only place a library is switched back on. It is no longer the only way to BROWSE a
+  non-favourite: the Library's Sort & Filter menu lists every reachable library of the viewed type,
+  favourite or not, and its header pill shows while that library is on view. Such a pick is not
+  remembered as the profile's last library (`remembered_section` restores favourites only). The
+  `+N` Sources picker and the tab strip stay favourites-only. The rules are `pins.rs` (pure); the store is keyed by
   the profile's `uuid`; the page that asks once is `AppArg::Onboard` (`Route::Onboard` before
   restructure phase 12 (D1) retired `enum Route`), first-run *Favorite
   libraries* — `ui::onboard` through phase 4, `screens::onboard`'s owned `OnboardScreen` since
@@ -508,8 +520,9 @@ a dead source is **absent** from Home and states itself in its own library secti
   in `profile_prefs` (`[{user, account, prefs}]`, `account` the `grant::account_key` stamp, the owner
   `user: ""`), and what a profile reads is `stored_effective` = its own value, else the frozen
   top-level key (`Setting::get`, a garbage own value included), else the default. The top-level keys
-  are never copied and never written by a pick (`persist_profile_pref` is the only writer; it
-  refuses without a seat, across a tenure or credential change and with an empty stamp, and prunes
+  are never copied and never written by a pick (`persist_profile_pref`, for a `Copy` `Setting`, and `persist_profile_hud`, for the HUD package id string,
+  are the only writers and share `persist_profile_with`; they
+  refuse without a seat, across a tenure or credential change and with an empty stamp, and prunes
   records of other accounts). `profile_prefs` is account-bound (`ACCOUNT_BOUND_PREFERENCES`, so
   sign-out drops it and the legacy keys stay). Who is seated is `session::Seat`
   (`Seat::of(profile, stamp)`, `current_seat()`); the live cells follow it in `plx_media::route`.
@@ -630,9 +643,10 @@ a dead source is **absent** from Home and states itself in its own library secti
   has no cap and no guard. A stored document already AT the cap leaves no room for the strict tier's
   second copy (old and new halves side by side), which the guard cannot create. A record created on
   webOS 4.x is ACL-only; a record that already holds a keymanager envelope still stages.
-- **`session::peek()` is a write-through cache over the persisted session, not a fresh read.** A
-  hit is one uncontended `Mutex` lock and an `Arc<Session>` clone — no `IO`, no helper round trip —
-  which is what makes it safe to call every frame. The invariants
+- **`session::peek()` is a write-through cache over the persisted session, not a fresh read.** It
+  is a pure read of that cache: one uncontended `Mutex` lock and an `Arc<Session>` clone — no `IO`,
+  no helper round trip, no submit, no clock, on a hit or a miss — which is what makes it safe to
+  call every frame. The invariants
   that keep it correct, all in `session.rs`'s module doc and worth knowing before touching either
   the cache or a write path:
   - Cached records come from completed reads or durable writes under `IO`. `Revoked` separately
@@ -641,10 +655,15 @@ a dead source is **absent** from Home and states itself in its own library secti
   - Only `session.rs` writes the session domain of the record; every `persistence::commit_*`/
     `write_session`/`commit_cleared` caller updates the cache through a read install, proven-write
     install, cache drop, or local revocation. Read installs cannot undo revocation.
-  - `peek` never takes `IO`, including on a miss. It returns the previous snapshot and schedules
-    one refresh on `storage_worker`'s bounded FIFO. The worker reads and installs under `IO`,
-    then advances a visible-session generation only if the served content changed. The bridge
-    observes it and invalidates on the frame thread. Cached views also observe it through
+  - `peek` never takes `IO` and never refills the cache, including on a miss: it returns the
+    previous snapshot (or the empty session). The refill belongs to the session owner
+    (`SessionMachine`): the application's frame step asks `refresh_need()` what the cache lacks
+    and delivers `SessionEvent::CacheObserved`, the owner answers with its `SessionFx::RefreshCache`
+    effect, the application's session adapter runs `refresh_cache_job` on `storage_worker`'s
+    bounded FIFO, and the outcome returns as `SessionEvent::CacheRefreshed` (one refresh in
+    flight, owned by the machine rather than a `peek` side channel). The job reads and installs
+    under `IO`, then advances a visible-session generation only if the served content changed. The
+    bridge observes it and invalidates on the frame thread. Cached views also observe it through
     `VisibleSessionWatch` (or include `visible_generation()` in their cache key) and rebuild;
     invalidating drawing alone cannot refresh a retained value. `peek_settled()` keeps transient
     reads distinct from an authoritative empty session. Unchanged retries remain quiet. A queued
@@ -653,8 +672,11 @@ a dead source is **absent** from Home and states itself in its own library secti
     `IO` first (the fence/OCC check), then install their own proven outcome. A miss can therefore
     never overwrite a newer concurrent write.
   - A `Locked`/`Blocked` read (keymanager unavailable, a helper hiccup) is cached only
-    transiently, for `LOCKED_RETRY` (about a second) after completion — never latched forever the way a naive
-    per-field cache once was (the bug PR #120's stopgap shipped and this cache replaced).
+    transiently: `peek` serves the last known state and the owner re-reads it no sooner than
+    `LOCKED_RETRY_MS` (1000) of frame time later, per cache generation (a backoff counted on the
+    frame tick the owner receives, not a wall-clock deadline in `session.rs`) — never latched
+    forever the way a naive per-field cache once was (the bug PR #120's stopgap shipped and this
+    cache replaced).
   - Sign-out (`clear()`) drops the cached `Arc` immediately; the tokens it held must not remain
     reachable in memory after a sign-out just because nothing had overwritten the cache yet.
   - `plex::session::async_persistence`'s Stage B coordinator is unwired and keeps its own,

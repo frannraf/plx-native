@@ -88,7 +88,7 @@ fn the_capsule_is_wanted_only_where_the_header_names_two_libraries() {
     // One world at a time (it holds the serial lock): each is built, asked and dropped in turn.
     let wanted = |two_libraries| World::movies_library("route-scroll-capsule", two_libraries).library().probe_capsule_wanted();
     assert!(wanted(true), "two libraries on the header: the capsule restates the one on view");
-    assert!(!wanted(false), "one library: nothing to restate");
+    assert!(wanted(false), "a singleton keeps its library identity when scrolled");
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn glass_step(r: &mut World, glass: &mut plx_ui::frame::glass::GlassPlan, inputs
     sources.borrow_mut().begin(r.d.backdrop_layers(1.0));
     {
         let _declarations = backdrop::discover(sources.clone());
-        r.d.draw_with_glass_below(&mut r.bridge, glass, true, backdrop::Z::ALL);
+        r.d.draw_with_glass_below(&mut r.bridge.bridge(), glass, true, backdrop::Z::ALL);
     }
     sources.borrow_mut().resolve();
     let seen = {

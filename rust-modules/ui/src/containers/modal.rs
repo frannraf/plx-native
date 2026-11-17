@@ -15,7 +15,8 @@
 //!   A surface's LIFT (the element it was opened from) is drawn by the dispatcher's one lift pass
 //!   (`Z::OPENER`), after every surface, so a panel never covers the element it grows out of. The
 //!   host page's own opener (`Screen::opener`) is drawn in that same pass, by the dispatcher.
-//! - `prune()` is the ONLY place Closing clears, so Closing surfaces step unconditionally (the
+//! - `prune()` clears a Closing surface once its fade settles (a page opening over one retires it
+//!   at once instead: `Navigation::commit`), so Closing surfaces step unconditionally (the
 //!   fade must finish whatever the host is doing) — `the_closing_phase_is_stepped_even_when_the_host_is_frozen`.
 //! - `on_miss(style)` is consulted only while the surface is `Open`: a click beside a Compact,
 //!   Sheet or PlayerPanel dismisses it; an Alert ignores the miss; an Opaque surface swallows it.
@@ -26,6 +27,7 @@ use plx_machine::motion;
 use plx_machine::machine::GroupId;
 use super::super::screen::{Enter, FocusTarget, ReturnState, ScreenEvent, UnderlaySource};
 use super::stack::{Entry, Instance};
+use super::transition::{dip_eased, DIP_IN_MS, DIP_OUT_MS};
 use super::{Life, Minter};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,6 +77,19 @@ pub enum OnMiss {
     Swallow,
 }
 
+/// **How a surface arrives** ([`Screen::entry_motion`](crate::screen::Screen::entry_motion)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EntryMotion {
+    /// The appear spring ([`APPEAR_K`]) every surface rides: the ground rises over the live host.
+    #[default]
+    Spring,
+    /// **The route dip** (Settings v2): the host dips to the app ground in [`DIP_OUT_MS`], then the
+    /// surface's own opaque ground fades up off it in [`DIP_IN_MS`], on `PageDip`'s smoothstep —
+    /// the page transition every other route already has, as a surface's entry. It is the entry
+    /// only: a dismissal runs the appear spring back down from wherever the surface is.
+    Dip,
+}
+
 /// The appear spring (the `Popover` choreography's first half, pure).
 #[derive(Clone, Copy, Debug)]
 pub struct PopoverMotion {
@@ -99,6 +114,13 @@ pub struct PopoverMotion {
     held_ms: f32,
     /// Ticks the current hold has lasted; the first is the capture frame.
     held_ticks: u32,
+    /// How the surface arrives; chosen from the mounted screen on its first ticks
+    /// ([`PopoverMotion::choose`]) and fixed once a real step has run.
+    entry: EntryMotion,
+    /// Milliseconds of the entry dip stepped so far (`EntryMotion::Dip` only).
+    dip_ms: f32,
+    /// A real (non-held) step has run: `entry` is fixed.
+    begun: bool,
 }
 
 /// The appear spring's stiffness (`popover.rs`'s number).
@@ -126,7 +148,26 @@ impl PopoverMotion {
             holding: false,
             held_ms: 0.0,
             held_ticks: 0,
+            entry: EntryMotion::Spring,
+            dip_ms: 0.0,
+            begun: false,
         }
+    }
+    /// Choose how the surface arrives. Honoured until the first real step has run (the screen is
+    /// mounted by the time the held frames tick, and a late answer must not retime a running entry).
+    pub fn choose(&mut self, entry: EntryMotion) {
+        if !self.begun {
+            self.entry = entry;
+        }
+    }
+    /// **How far the entry dip has taken the host page to the app ground**, `0..=1`: it rises over
+    /// [`DIP_OUT_MS`], stays at 1 while the ground fades up over it, and is 0 for every other
+    /// surface, before the dip starts and once it is over or a dismissal has begun.
+    pub fn floor(&self) -> f32 {
+        if self.entry != EntryMotion::Dip || self.target <= 0.0 || self.dip_ms >= DIP_OUT_MS + DIP_IN_MS {
+            return 0.0;
+        }
+        dip_eased(self.dip_ms / DIP_OUT_MS)
     }
     /// Pin the spring where it is for the next [`tick`](Self::tick) — see [`hold`](Self::hold).
     pub fn hold_one_frame(&mut self) {
@@ -172,6 +213,11 @@ impl PopoverMotion {
             present.note(plx_machine::present::PresentEvent::Motion);
             return;
         }
+        self.begun = true;
+        if self.entry == EntryMotion::Dip && self.target > 0.0 && self.dip_ms < DIP_OUT_MS + DIP_IN_MS {
+            self.step_dip(t, present);
+            return;
+        }
         motion::spring(&mut self.appear, &mut self.vel, self.target, APPEAR_K, t, present);
         if self.settled() {
             let changed = self.appear != self.target || self.vel != 0.0;
@@ -183,6 +229,23 @@ impl PopoverMotion {
                 present.note(plx_machine::present::PresentEvent::Motion);
             }
         }
+    }
+}
+
+impl PopoverMotion {
+    /// One frame of the entry dip: the host dips for [`DIP_OUT_MS`] with the surface still at
+    /// appear 0, then `appear` rises over [`DIP_IN_MS`] on the dip's smoothstep and lands exactly on
+    /// its target. Time-driven, so a frame dump and a replay see the same curve.
+    fn step_dip(&mut self, t: Tick, present: &mut PresentHandle<'_>) {
+        self.dip_ms += t.dt() * 1000.0;
+        self.vel = 0.0;
+        if self.dip_ms >= DIP_OUT_MS + DIP_IN_MS {
+            self.appear = self.target;
+        } else {
+            self.appear = self.target * dip_eased((self.dip_ms - DIP_OUT_MS) / DIP_IN_MS);
+        }
+        // the frame that lands the endpoint is painted too
+        present.note(plx_machine::present::PresentEvent::Motion);
     }
 }
 
@@ -225,15 +288,8 @@ pub fn surface_policy(style: Style, phase: Phase, ground_ready: bool) -> (HostUp
     }
 }
 
-/// **Does this STYLE hold a snapshot of its host?** — the one answer `popover`'s process-wide
-/// `HOST_USERS` counter is driven from (`app/bridge.rs`'s `sync_host`).
-///
-/// DERIVED from [`surface_policy`] rather than restating it as a second `matches!` over `Style`,
-/// and that is the whole point of the function existing. The counter is what arms
-/// `popover::host::page_pass`'s freeze, so a style the table calls `HostRender::Cached` and this
-/// answer calls `false` produces a surface whose host is redrawn in full on every frame it is up
-/// — with nothing failing, because the two statements live three modules apart and nothing
-/// compares them.
+/// Does this style retain a host snapshot? Derived from the sole policy table, never
+/// restated in Bridge or the renderer. `ModalPresentation` captures this request explicitly.
 ///
 /// **That is exactly what happened to `Style::Compact` (restructure phase 8).** The bridge listed
 /// `Sheet | Opaque { snapshot: true } | Alert` by hand and left Compact out — the one production
@@ -243,11 +299,8 @@ pub fn surface_policy(style: Style, phase: Phase, ground_ready: bool) -> (HostUp
 /// 58 ms frames with the whole library page — ambient wash, shelves, poster grid and all their
 /// text — re-rendered under an open menu, `loop=` 43-45 against a floor of 45.
 ///
-/// The phase is deliberately NOT a parameter. `HOST_USERS` is an ownership count held from the
-/// surface's first live frame to its release; a per-frame answer would flap as
-/// `Opaque { snapshot: true }` crosses into `Replaced` and the bridge would owe a release it
-/// never took. `Phase::Opening` with no ground drawn is the phase at which every style states
-/// its host policy in full.
+/// The snapshot may remain useful through an opaque surface's replaced phase and its close.
+/// Opening with no ground drawn states the style's full snapshot lifetime requirement.
 pub fn style_caches_host(style: Style) -> bool {
     surface_policy(style, Phase::Opening, false).1 != HostRender::Live
 }
@@ -257,34 +310,35 @@ pub fn style_caches_host(style: Style) -> bool {
 /// ~0.2 s of frames nobody can see, each one a full panel (and, for a glass menu, the source
 /// pass behind it, which a page reflowing under a Remove re-takes every frame). 2% of a panel and
 /// of a 30% dim is below what the panel can show.
-pub const CLOSING_GONE: f32 = 0.02;
+pub const CLOSING_GONE: f32 = plx_machine::machine::MODAL_CLOSING_GONE;
 
-thread_local! {
-    /// The most opaque surface over the page after this frame's surface step ([`set_veil`]).
-    pub(crate) static VEIL: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+/// Immutable owner-addressed render input. The identity only separates GL cache borrowers;
+/// every logical fact is derived from ModalStack, never published to TLS.
+#[derive(Clone, Debug)]
+pub struct ModalPresentation {
+    pub read: plx_machine::machine::ModalRead,
+    pub reflow: bool,
+    key: ModalCacheKey,
+}
+/// GL snapshot signature only. Never consulted for phase, policy, veil or input decisions.
+#[derive(Clone, Debug)]
+pub struct ModalCacheKey {
+    owner: std::sync::Arc<()>,
+    layers: Vec<(EntryId, bool)>,
+}
+impl ModalCacheKey {
+    pub fn same_snapshot(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.owner, &other.owner) && self.layers == other.layers
+    }
+}
+impl ModalPresentation {
+    pub fn cache_key(&self) -> ModalCacheKey { self.key.clone() }
 }
 
-/// The dispatcher's statement, right after it steps the surfaces and before any page tick, of how
-/// much of a surface stands over the page this frame: 1 for an `Opening` or `Open` one, the
-/// appear of a `Closing` one, the largest of them, 0 for none. Thread-local, like
-/// [`page_image_held`](super::transition::page_image_held), and for the same reader: a page's
-/// layout animation that must not run under a menu ([`page_veiled`]).
-pub fn set_veil(v: f32) {
-    VEIL.with(|c| c.set(v));
-}
+// Veil is captured by ModalStack::presentation before pages tick. Consumers read Cx.modal;
+// there is no ambient logical publication, even when two dispatchers share one render thread.
 
-/// The page is under a menu this frame: a surface is opening, open, or still at least
-/// [`CLOSING_GONE`] opaque on its way out, which is to say the menu still holds the host. **The page
-/// does not move while this is true**: a layout motion that a menu's choice started (the
-/// Watchlist's Remove, a card leaving its grid) waits for this to clear (`cards::landing`), and so
-/// does the data that would change what the page shows (`app/watchlist.rs`'s feed). A surface
-/// whose body answers [`Screen::lets_host_reflow`] (the Watchlist's Sort & Filter menu) casts no veil:
-/// the page reflows under it.
-pub fn page_veiled() -> bool {
-    VEIL.with(|c| c.get()) >= CLOSING_GONE
-}
-
-/// The veil a set of surfaces casts ([`set_veil`]).
+/// The veil captured from the owning stack, after its surfaces step.
 pub(crate) fn veil_of<H: Host>(surfaces: &[Surface<H>]) -> f32 {
     surfaces
         .iter()
@@ -313,6 +367,7 @@ pub struct ModalStack<H: Host> {
     pub retired: Vec<Entry<H>>,
     /// The ONE field every surface's dim inherits through — see [`ModalUnderlay`].
     pub underlay: ModalUnderlay,
+    presentation_owner: std::sync::Arc<()>,
 }
 
 /// **What the stack's underlay field was last latched from.** The latch is re-taken exactly when
@@ -392,9 +447,17 @@ pub trait DimSink {
 }
 
 /// The production [`DimSink`].
-pub struct GlDims;
+pub struct GlDims<'a> {
+    present: plx_machine::machine::PresentHandle<'a>,
+}
 
-impl DimSink for GlDims {
+impl<'a> GlDims<'a> {
+    pub fn new(present: &'a mut plx_machine::present::Present) -> Self {
+        Self { present: plx_machine::machine::PresentHandle::of(present) }
+    }
+}
+
+impl DimSink for GlDims<'_> {
     fn video_plane(&self) -> bool {
         plx_gfx::gfx::video_plane_frame()
     }
@@ -428,7 +491,7 @@ impl DimSink for GlDims {
         if pending {
             // A frame for the read to land in, without claiming the page changed — which would
             // re-capture the host and restart the read it is waiting on.
-            plx_machine::idle::wake();
+            self.present.note(plx_machine::present::PresentEvent::Wake);
         }
     }
     fn dim(&mut self, field: &crate::underlay::UnderlayField, alpha: f32) {
@@ -565,6 +628,27 @@ impl<H: Host> ModalStack<H> {
             surfaces: Vec::new(),
             retired: Vec::new(),
             underlay: ModalUnderlay::new(),
+            presentation_owner: std::sync::Arc::new(()),
+        }
+    }
+
+    pub fn presentation(&self) -> ModalPresentation {
+        let holders: Vec<_> = self.surfaces.iter()
+            .filter(|s| s.phase != Phase::Hidden && style_caches_host(s.style))
+            .map(|s| s.entry.id).collect();
+        let closing_only = !holders.is_empty() && self.surfaces.iter()
+            .filter(|s| holders.contains(&s.entry.id)).all(|s| s.phase == Phase::Closing);
+        ModalPresentation {
+            read: plx_machine::machine::ModalRead {
+                input_covered: self.input_owner().is_some(),
+                host_cached: !holders.is_empty(),
+                closing_only,
+                veil: veil_of(&self.surfaces),
+            },
+            reflow: false,
+            key: ModalCacheKey { owner: self.presentation_owner.clone(),
+                layers: self.surfaces.iter().filter(|s| holders.contains(&s.entry.id))
+                    .map(|s| (s.entry.id, s.phase == Phase::Closing)).collect() },
         }
     }
 
@@ -605,7 +689,8 @@ impl<H: Host> ModalStack<H> {
     }
 
     /// Dismiss: the phase goes to `Closing` NOW (the input owner changes on this frame); the body
-    /// leaves when `prune` clears it. Returns whether the id named an open surface.
+    /// leaves when `prune` clears it, or when a page opening over it retires it
+    /// (`Navigation::commit`). Returns whether the id named an open surface.
     pub fn dismiss(&mut self, id: EntryId) -> bool {
         let Some(s) = self.surfaces.iter_mut().find(|s| s.entry.id == id) else {
             return false;
@@ -698,7 +783,7 @@ impl<H: Host> ModalStack<H> {
     /// One frame: EVERY surface's motion steps — Closing ones unconditionally, whatever the host
     /// fold says — and an Opening surface whose spring settled becomes Open.
     ///
-    /// **Each surface's step runs in its OWN [`MotionScope`](plx_machine::idle::MotionScope)** (§4.4),
+    /// **Each surface's step runs in its OWN [`MotionScope`](plx_machine::motion::report::MotionScope)** (§4.4),
     /// the `plx_machine::idle` half of the `Present::set_scope(Surface)` the dispatcher already sets around
     /// it: a panel's appear spring is the PANEL's motion, never the host page's. The scope merges
     /// back, so it changes who the motion is attributed to and never whether it counts.
@@ -707,7 +792,12 @@ impl<H: Host> ModalStack<H> {
             if s.phase == Phase::Hidden {
                 continue;
             }
-            let _scope = plx_machine::idle::MotionScope::open();
+            let _scope = plx_machine::motion::report::MotionScope::open();
+            if s.phase == Phase::Opening {
+                if let Some(inst) = s.entry.inst.as_ref() {
+                    s.motion.choose(inst.screen.entry_motion());
+                }
+            }
             s.motion.tick(t, present);
             if s.phase == Phase::Opening && s.motion.settled() {
                 s.phase = Phase::Open;
@@ -715,13 +805,13 @@ impl<H: Host> ModalStack<H> {
         }
     }
 
-    /// The ONLY place Closing clears: a Closing surface whose fade settled leaves for good.
-    pub fn prune(&mut self) -> Vec<Life<H>> {
+    /// Retire every surface `gone` names: it leaves for good and its entry is kept for the
+    /// dispatcher's release.
+    pub fn retire_where(&mut self, gone: impl Fn(&Surface<H>) -> bool) -> Vec<Life<H>> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.surfaces.len() {
-            let s = &self.surfaces[i];
-            if s.phase == Phase::Closing && (s.motion.settled() || s.faded()) {
+            if gone(&self.surfaces[i]) {
                 let s = self.surfaces.remove(i);
                 out.push(Life::Ev(s.entry.id, ScreenEvent::WillLeave(Leave::ForGood)));
                 out.push(Life::Unmount(s.entry.id));
@@ -730,6 +820,14 @@ impl<H: Host> ModalStack<H> {
                 i += 1;
             }
         }
+        out
+    }
+
+    /// Clears a Closing surface whose fade settled: it leaves for good. (A page opening over a
+    /// Closing surface retires it without waiting for the fade, through `retire_where` in
+    /// `Navigation::commit`.)
+    pub fn prune(&mut self) -> Vec<Life<H>> {
+        let out = self.retire_where(|s| s.phase == Phase::Closing && (s.motion.settled() || s.faded()));
         // The last surface is gone: nothing is dimming this host any more, and the next stack
         // presented over it — perhaps over a different page — starts from a fresh read.
         if self.surfaces.is_empty() {
@@ -802,21 +900,22 @@ impl<H: Host> ModalStack<H> {
     ///
     /// The dims only: a surface's LIFT (the element it was opened from) is drawn after every
     /// surface, by the dispatcher's lift pass, so the panel's glass grows out from under it.
-    pub fn draw_scrims(&mut self, nav_page_alpha: f32) {
+    pub fn draw_scrims(&mut self, nav_page_alpha: f32, present: &mut plx_machine::present::Present) {
+        let mut sink = GlDims::new(present);
         // Nothing is up: no dim to paint, and the field is not this frame's to touch.
         if self.surfaces.is_empty() {
             return;
         }
-        if plx_gfx::gfx::blur_source_pass() {
+        if plx_gfx::gfx::blur_source_pass() || crate::frame::backdrop::source_walk() {
             // Declaration/source traversals consume the published field. Only the visible
             // traversal may advance its capture/readback lifecycle or the held-ground ledger.
             let dims = self.scrims(nav_page_alpha);
             for (_, alpha) in &dims {
-                GlDims.dim(self.underlay.field(), *alpha);
+                sink.dim(self.underlay.field(), *alpha);
             }
             return;
         }
-        self.draw_scrims_on(nav_page_alpha, &mut GlDims);
+        self.draw_scrims_on(nav_page_alpha, &mut sink);
     }
 
     /// **The stack's latched underlay field**: the frozen ground a lifted opener's glass stands on
@@ -991,6 +1090,25 @@ mod hide_tests {
         assert_eq!(ms.surface(id).unwrap().motion.appear, 0.0);
         let life = ms.prune();
         assert_eq!(life.len(), 2, "…and it retires on the next frame");
+    }
+
+    #[test]
+    fn deferred_dim_wakes_its_private_owner_not_the_worker_door() {
+        use plx_machine::present::Present;
+        let _serial = plx_base::testlock::serial();
+        let mut owner = Present::new();
+        let mut other = Present::new();
+        let mut worker = Present::global();
+        for p in [&mut owner, &mut other, &mut worker] { p.take(0); p.acknowledge(0); }
+        let mut dims = GlDims::new(&mut owner);
+        dims.in_flight(true);
+        dims.in_flight(false);
+        drop(dims);
+        assert!(owner.peek(1), "a deferred dim must schedule its addressed private-door owner");
+        assert!(!other.peek(1));
+        assert!(!worker.peek(1), "rendering cannot notify the process-global worker door");
+        assert!(!owner.page_damaged());
+        assert!(!owner.page_moving());
     }
 
     /// **The hold lasts until the host snapshot has left the GPU, not one frame.** The frame after
@@ -1176,5 +1294,128 @@ mod hide_tests {
         assert!(!ms.hide(EntryId(id.0 + 99)));
         assert_eq!(ms.surface(id).unwrap().phase, Phase::Open);
         assert!(ms.prune().is_empty());
+    }
+}
+
+/// **The entry dip** ([`EntryMotion::Dip`]): the 70 + 140 ms curve a surface that opts in arrives on,
+/// sampled frame by frame, and the guarantee that every other surface still rides the spring.
+#[cfg(test)]
+mod entry_dip_tests {
+    use super::*;
+    use plx_machine::present::Present;
+
+    /// 10 ms frames: 70 and 210 ms land exactly on a frame.
+    const DT_US: u32 = 10_000;
+
+    /// A motion opened toward 1 with the held capture frame already spent, as `ModalStack::present`
+    /// leaves it, advanced one tick at a time.
+    struct Rig {
+        motion: PopoverMotion,
+        present: Present,
+        ms: u32,
+    }
+    impl Rig {
+        fn opening(entry: EntryMotion) -> Self {
+            let mut motion = PopoverMotion::at(0.0);
+            motion.to(1.0);
+            motion.hold_one_frame();
+            motion.choose(entry);
+            let mut rig = Self { motion, present: Present::new(), ms: 0 };
+            rig.step(); // the held frame: appear stays 0, nothing of the entry has started
+            assert_eq!((rig.motion.appear, rig.motion.floor()), (0.0, 0.0));
+            rig
+        }
+        fn step(&mut self) {
+            self.ms += DT_US / 1000;
+            let mut ph = PresentHandle::of(&mut self.present);
+            self.motion.tick_gated(Tick { ms: self.ms, dt_us: DT_US }, &mut ph, false);
+        }
+        /// Advance to `ms` into the entry (past the held frame).
+        fn to(&mut self, ms: u32) -> (f32, f32) {
+            while self.ms - DT_US / 1000 < ms {
+                self.step();
+            }
+            (self.motion.appear, self.motion.floor())
+        }
+    }
+
+    fn smooth(t: f32) -> f32 {
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// **The curve**: the surface stays at 0 and the host dips for 70 ms, then `appear` runs the
+    /// smoothstep over 140 ms and lands exactly on 1; the floor rises over the first 70 ms, holds at
+    /// 1 under the fade-up and is 0 once the entry is over.
+    #[test]
+    fn the_dip_is_70_ms_out_then_140_ms_in() {
+        let mut rig = Rig::opening(EntryMotion::Dip);
+        let (a, f) = rig.to(40);
+        assert_eq!(a, 0.0, "nothing of the surface is visible while the host dips");
+        assert!((f - smooth(40.0 / 70.0)).abs() < 1e-4, "down the dip after 40 ms: {f}");
+        let (a, f) = rig.to(70);
+        assert_eq!((a, f), (0.0, 1.0), "at the floor, the surface not yet begun");
+        let (a, f) = rig.to(140);
+        assert!((a - 0.5).abs() < 1e-4, "half way up after 70 + 70 ms: {a}");
+        assert_eq!(f, 1.0, "the ground fades up OFF the floor");
+        let (a, f) = rig.to(210);
+        assert_eq!(a, 1.0, "lands exactly on the target");
+        assert_eq!(f, 0.0, "the floor is gone with the entry");
+        assert!(rig.motion.settled());
+    }
+
+    /// Every frame of the rise is the smoothstep of its own elapsed time and never goes backwards.
+    #[test]
+    fn the_rise_is_the_route_dips_smoothstep_and_monotone() {
+        let mut rig = Rig::opening(EntryMotion::Dip);
+        let mut last = 0.0;
+        for ms in (10..=210).step_by(10) {
+            let (a, _) = rig.to(ms);
+            let want = smooth(((ms as f32 - 70.0) / 140.0).clamp(0.0, 1.0));
+            assert!((a - want).abs() < 1e-4, "{ms} ms: {a} vs {want}");
+            assert!(a >= last, "{ms} ms went backwards");
+            last = a;
+        }
+        assert_eq!(last, 1.0);
+    }
+
+    /// **A dismissal mid-dip is the spring, from where it stands**: no floor over the host it is
+    /// leaving, and it runs down to 0 rather than snapping.
+    #[test]
+    fn a_dismissal_during_the_dip_runs_the_spring_down_with_no_floor() {
+        let mut rig = Rig::opening(EntryMotion::Dip);
+        rig.to(140);
+        let before = rig.motion.appear;
+        assert!(before > 0.0 && before < 1.0);
+        rig.motion.to(0.0);
+        assert_eq!(rig.motion.floor(), 0.0, "no floor on the way out");
+        rig.step();
+        let after = rig.motion.appear;
+        assert!(after < before && after > 0.0, "{before} -> {after}: a spring, not a cut");
+        for _ in 0..400 {
+            rig.step();
+        }
+        assert_eq!(rig.motion.appear, 0.0);
+        assert!(rig.motion.settled());
+    }
+
+    /// **Every other surface is unchanged**: with `EntryMotion::Spring` (the default) the motion is
+    /// the `APPEAR_K` spring frame for frame and never has a floor; and a late `choose` cannot retime
+    /// an entry that has begun.
+    #[test]
+    fn a_spring_surface_is_the_appear_spring_and_a_begun_entry_is_not_retimed() {
+        let mut rig = Rig::opening(EntryMotion::Spring);
+        let mut reference = crate::Spring::at(0.0);
+        // (the first 45 frames: past that the spring's own visual-rest snap takes over)
+        for i in 0..45 {
+            rig.step();
+            reference.step(1.0, APPEAR_K, DT_US as f32 / 1e6);
+            assert_eq!(rig.motion.appear, reference.pos, "frame {i}");
+            assert_eq!(rig.motion.floor(), 0.0);
+        }
+        rig.motion.choose(EntryMotion::Dip);
+        assert_eq!(rig.motion.floor(), 0.0, "a begun spring entry stays a spring");
+        rig.step();
+        reference.step(1.0, APPEAR_K, DT_US as f32 / 1e6);
+        assert_eq!(rig.motion.appear, reference.pos, "…and keeps stepping the spring");
     }
 }

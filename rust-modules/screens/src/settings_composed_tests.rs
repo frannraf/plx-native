@@ -46,7 +46,7 @@
 use super::*;
 #[allow(unused_imports)]
 use super::test_support::*;
-use crate::registry::{self, AppFx, AppMsg};
+use crate::registry::{self, AppMsg};
 use plx_ui::containers::modal::{Phase, Style};
 use plx_ui::dispatch::{CxParts, Dispatcher, NoTap, Rig, Split};
 use plx_ui::fixture::{key, tick, FixtureMeasure};
@@ -92,6 +92,9 @@ pub struct SurfaceRig {
     /// How many times BACK reached the root of the ROOT stack (the platform's Home).
     roots: u32,
     pub(super) preference_commands: Vec<registry::PreferenceCmd>,
+    pub(super) preferences: Option<plx_plex::plex::session::ProfilePrefs>,
+    /// The television keyboard raises (`true`) and lowers (`false`) that reached the platform, in order.
+    keyboard: Vec<bool>,
 }
 
 impl SurfaceRig {
@@ -102,17 +105,23 @@ impl SurfaceRig {
             stores: plx_data::stores::Stores::default(),
             directory: Default::default(),
             roots: 0,
-            preference_commands: Vec::new(),
+            preference_commands: Vec::new(), preferences: None,
+            keyboard: Vec::new(),
         }
     }
 }
 
 impl Rig<InnerHost> for SurfaceRig {
+    fn system_keyboard(&mut self, up: bool) {
+        self.keyboard.push(up);
+    }
     fn split(&mut self) -> Split<'_, InnerHost> {
-        self.stores.capture_browse(&mut self.directory);
+        self.stores.capture_seeded_browse_for_test(&mut self.directory, plx_plex::plex::current_server());
+        let mut inputs = crate::registry::capture_fixture();
+        if let Some(preferences) = &self.preferences { inputs.preferences = Some(preferences.clone()); }
         Split {
             mounter: &mut self.mounter,
-            views: self.directory.view(),
+            views: crate::registry::InnerViews::new(self.directory.view(), Box::leak(Box::new(inputs))),
             measure: &self.measure,
         }
     }
@@ -136,11 +145,30 @@ impl Rig<InnerHost> for SurfaceRig {
     fn app_fx(
         &mut self,
         _from: MachineId,
-        effect: AppFx,
+        effect: crate::registry::InlineAppFx,
         _parts: &CxParts<u32>,
         _out: &mut Effects<'_, InnerHost>,
     ) {
-        if let AppFx::Preferences(command) = effect { self.preference_commands.push(command); }
+        match effect {
+            crate::registry::InlineAppFx::Session(plx_session::auth::SessionCmd::AnswerPlaintext { machine_id, choice, .. }) => {
+                let account = plx_plex::plex::grant::account_key(&plx_plex::plex::session::peek().account_token);
+                plx_plex::plex::grant::record(&account, &machine_id, choice).expect("fixture grant answer");
+            }
+            _ => {}
+        }
+    }
+    fn run_yielded_app_command(&mut self, d: &mut Dispatcher<InnerHost>,
+        report: &mut plx_ui::dispatch::FrameReport, tap: &mut dyn plx_ui::dispatch::Tap<InnerHost>) -> Option<u32> {
+        let command = d.take_app_command()?;
+        let outcome = match &command.effect {
+            Ok(_) => plx_machine::machine::AppCommandOutcome::Completed,
+            Err(outcome) => *outcome,
+        };
+        if let Ok(crate::registry::ExternalAppFx::Preferences(command)) = command.effect {
+            self.preference_commands.push(command);
+        }
+        Some(d.resume_app_command(self, command.id, outcome,
+            vec![], report, tap).unwrap())
     }
     fn log(&mut self, _line: &str) {}
     fn prepare(&mut self, _b: &mut Budget, _present: &mut Present) {}
@@ -331,7 +359,7 @@ fn composed_owner_favourites_footer_survives_left_down_and_idle_frames() {
     // the real Onboard Tick can poll discovery without spawning network work.
     let mut rig = SurfaceRig::new();
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([a, b]);
-    rig.stores.capture_browse(&mut rig.directory);
+    rig.stores.capture_seeded_browse_for_test(&mut rig.directory, a);
     let pins = rig.directory.view().favorite_sections().to_vec();
     let (mut d, mut rig, id) = consent_opened_on(SettingsPage::Favourites, rig);
     seat(&mut d, id, 0);
@@ -350,14 +378,14 @@ fn composed_owner_favourites_footer_survives_left_down_and_idle_frames() {
         frame(&mut d, &mut rig, ms + 16, vec![]);
         assert_eq!(d.focus().unwrap().elem, registry::BAND);
     }
-    rig.stores.capture_browse(&mut rig.directory);
+    rig.stores.capture_seeded_browse_for_test(&mut rig.directory, a);
     assert_eq!(rig.directory.view().favorite_sections(), pins,
         "draft navigation cannot persist pins");
     assert_eq!(d.nav.input_owner(), Some(InputOwner::Entry(id)));
 }
 
 /// **The composition, at depth.** Signed out, the Settings root's rows are Video & playback
-/// / Language / Privacy & data / Legal notices / About, so OK on Legal notices pushes the Legal index; LEFT off that index's
+/// / Language / Privacy & data / Diagnostics / Legal notices / About, so OK on Legal notices pushes the Legal index; LEFT off that index's
 /// column then runs the whole chain — edge rule, synthetic BACK, the surface's own pop —
 /// and lands back on the Settings root with the surface still up and still owning input.
 #[test]
@@ -437,6 +465,29 @@ fn left_at_the_surfaces_own_root_dismisses_it() {
     );
 }
 
+/// **The Player HUD page's address field reaches the television's keyboard through the family's surface**: OK on the row
+/// raises it for the SURFACE's instance (the inner page's delivery is re-addressed), BACK lowers it and leaves the page
+/// where it was rather than popping it.
+#[test]
+fn the_hud_pages_address_field_raises_and_lowers_the_television_keyboard() {
+    let _g = plx_base::testlock::serial();
+    let _sess = scratch_session("composed-hud-address-keyboard");
+    let (mut d, mut rig, id) = consent_opened(SettingsPage::PlayerHud);
+    let before = path(&d, id);
+    assert!(before.starts_with("settings/"), "{before}");
+    let rows = d.focus().map(|k| k.elem);
+    assert!(rows.is_some(), "the page seats a row");
+    // With no store behind the rig the page lists the gallery row and its address row, and seats the first.
+    frame(&mut d, &mut rig, 32, vec![key(Key::Down, tick(32))]);
+    frame(&mut d, &mut rig, 48, vec![key(Key::Ok, tick(48))]);
+    assert_eq!(rig.keyboard, [true], "OK on the address row raises the keyboard");
+    assert!(path(&d, id).contains("editing=true"), "{}", path(&d, id));
+    frame(&mut d, &mut rig, 64, vec![key(Key::Back, tick(64))]);
+    assert_eq!(rig.keyboard, [true, false], "BACK lowers it");
+    assert!(path(&d, id).contains("editing=false"), "the page is still there: {}", path(&d, id));
+    assert_eq!(d.nav.input_owner(), Some(InputOwner::Entry(id)), "BACK closed the field, not the surface");
+}
+
 /// **Regression, end to end: OK on Settings' second row must not reopen Legal already seated on
 /// Legal's own second row.** Traced to every page in this family sharing the surface's outer
 /// `EntryId` and `GroupId(0)` (`RouteSurface::run_inner`, `FocusTarget`'s doc on `machine.rs`): a
@@ -467,15 +518,16 @@ fn a_real_push_seats_the_new_page_fresh_and_a_pop_restores_the_row_that_opened_i
         path(&d, id)
     );
 
-    // Mounting the surface already seats row 0 (its own `Enter::Fresh`); three real DOWNs
-    // move focus — and the engine's remembered cursor for `(id, GroupId(0))` — to row 3.
-    for i in 1..=3u32 {
+    // Mounting the surface already seats row 0 (its own `Enter::Fresh`); four real DOWNs
+    // move focus — and the engine's remembered cursor for `(id, GroupId(0))` — to row 4,
+    // Legal notices (Settings v2: Diagnostics is the root's own row, between Privacy & data and it).
+    for i in 1..=4u32 {
         frame(&mut d, &mut rig, 16 * i, vec![key(Key::Down, tick(16 * i))]);
     }
     let legal_row = d.focus().expect("a row is focused after a real DOWN");
-    assert_eq!(legal_row.elem, root_key(RootId::Legal), "the third DOWN is Legal notices in the signed-out fixture");
+    assert_eq!(legal_row.elem, root_key(RootId::Legal), "the fourth DOWN is Legal notices in the signed-out fixture");
 
-    frame(&mut d, &mut rig, 64, vec![key(Key::Ok, tick(64))]);
+    frame(&mut d, &mut rig, 96, vec![key(Key::Ok, tick(96))]);
     assert!(
         path(&d, id).contains("/legal:"),
         "OK on Legal notices pushed the index: {}",
@@ -525,6 +577,7 @@ fn playback_picker_seats_the_saved_option_and_restores_its_parent_row() {
     plx_media::route::restore_direct_play_mode(plx_media::route::DirectPlayMode::Auto);
     for back in [Key::Back, Key::Left] {
         let (mut d, mut rig, id) = consent_opened(SettingsPage::Playback);
+        rig.preferences = Some(plx_plex::plex::session::ProfilePrefs { playback_quality: Some(plx_media::route::Quality::P480), direct_play_mode: Some(plx_media::route::DirectPlayMode::Auto), ..Default::default() });
         // A real DOWN/UP gives the engine an explicit parent cursor at Default quality.
         frame(&mut d, &mut rig, 32, vec![key(Key::Down, tick(32))]);
         frame(&mut d, &mut rig, 48, vec![key(Key::Up, tick(48))]);
@@ -730,7 +783,8 @@ pub fn settle_frames(d: &mut Dispatcher<InnerHost>, rig: &mut SurfaceRig, from_m
 
 /// Walk focus to `elem` with real DOWN presses (a `set_focus` seat sends the page no `FocusMoved`).
 pub fn walk_to(d: &mut Dispatcher<InnerHost>, rig: &mut SurfaceRig, mut ms: u32, elem: u32) -> u32 {
-    for _ in 0..12 {
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(d.focus().map(|k| k.elem)) {
         if d.focus().map(|k| k.elem) == Some(elem) {
             return ms;
         }

@@ -35,14 +35,16 @@ fn a_mounted_detail_page_follows_a_corrected_credit() {
         rk: "42".into(),
         ..Default::default()
     }));
+    pump_detail(test_state(), test_adapter(), &crate::pms::registry_keys_for_test(), false);
     assert_eq!(current(test_state()).unwrap().source(), "admin");
 
     // the roster refresh re-grades it, with nothing touching the mounted page
     plx_plex::plex::describe_server(house, "Mac mini", "", plx_plex::plex::GrantEvidence::outside());
+    pump_detail(test_state(), test_adapter(), &crate::pms::registry_keys_for_test(), false);
     assert_eq!(
         current(test_state()).unwrap().source(),
         "",
-        "the page re-asks the registry rather than carrying a copy taken at fetch time"
+        "the page follows captured facts rather than carrying a stale worker credit"
     );
 
     // and a share is still credited, so this is not a blanket clear
@@ -53,6 +55,7 @@ fn a_mounted_detail_page_follows_a_corrected_credit() {
         rk: "318".into(),
         ..Default::default()
     }));
+    pump_detail(test_state(), test_adapter(), &crate::pms::registry_keys_for_test(), false);
     assert_eq!(current(test_state()).unwrap().source(), "friend");
 
     set_current_for_test(test_state(), None);
@@ -356,6 +359,68 @@ fn the_playing_item_carries_its_plex_type() {
     );
 }
 
+fn two_versions() -> plx_plex::plex::Metadata {
+    serde_json::from_value(serde_json::json!({ "type": "episode", "Media": [
+        { "id": 3086, "bitrate": 2372, "width": 1920, "height": 1080, "videoResolution": "1080",
+          "videoCodec": "h264", "audioCodec": "aac", "audioChannels": 2, "container": "mp4",
+          "Part": [{ "key": "/p/3134", "size": 1000, "Stream": [{ "id": 1, "streamType": 2, "codec": "aac" }] }] },
+        { "id": 3082, "bitrate": 14663, "width": 3840, "height": 2160, "videoResolution": "4k",
+          "videoCodec": "hevc", "audioCodec": "eac3", "audioChannels": 6,
+          "Part": [{ "key": "/p/3130", "container": "mkv", "size": 6000, "Stream": [
+            { "id": 2, "streamType": 1, "colorTrc": "smpte2084" },
+            { "id": 3, "streamType": 2, "codec": "eac3" }] }] }
+    ] })).unwrap()
+}
+
+/// A picked version's track store, frame size and part all come from THAT `Media[]` entry, so the
+/// route can never pair version 0's part with version 1's streams; a version the item lost falls
+/// back to the default and says so by naming no played version.
+#[test]
+fn a_picked_version_is_the_whole_playing_item() {
+    let it = two_versions();
+    let (item, played) = playing_version_from(SRV_A, "42", Some(&it), Some(plx_plex::plex::MediaId(3082)));
+    let played = played.expect("the version is listed");
+    assert_eq!((played.index, played.part.as_str(), played.vcodec.as_str()), (1, "/p/3130", "hevc"));
+    assert_eq!((item.width, item.audio[0].id, item.hdr), (3840, 3, true));
+    let (item, played) = playing_version_from(SRV_A, "42", Some(&it), Some(plx_plex::plex::MediaId(9)));
+    assert!(played.is_none());
+    assert_eq!((item.width, item.audio[0].id), (1920, 1));
+    let (item, played) = playing_version_from(SRV_A, "42", Some(&it), None);
+    assert!(played.is_none(), "the default needs no override");
+    assert_eq!(item.width, 1920);
+}
+
+/// The picker's facts come off the listing row, one per version in the server's order; a
+/// single-version item offers none.
+#[test]
+fn versions_are_listed_only_when_there_is_a_choice() {
+    let v = crate::pms::versions_of(&two_versions());
+    assert_eq!(v.iter().map(|v| v.id.0).collect::<Vec<_>>(), [3086, 3082]);
+    assert_eq!((v[1].kbps, v[1].resolution.as_str(), v[1].channels, v[1].size, v[1].hdr), (14663, "4k", 6, 6000, true));
+    assert_eq!((v[0].container.as_str(), v[1].container.as_str()), ("mp4", "mkv"), "the part's container wins");
+    let one: plx_plex::plex::Metadata =
+        serde_json::from_value(serde_json::json!({ "Media": [{ "id": 1, "Part": [{ "key": "/p/1" }] }] })).unwrap();
+    assert!(crate::pms::versions_of(&one).is_empty());
+}
+
+#[test]
+fn each_version_carries_the_dolby_vision_of_its_own_video_stream() {
+    let it: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({ "Media": [
+        { "id": 1, "Part": [{ "key": "/p/1", "Stream": [
+            { "id": 1, "streamType": 1, "DOVIPresent": true, "DOVIProfile": 5, "DOVIBLCompatID": 0 },
+            { "id": 2, "streamType": 1 }] }] },
+        { "id": 2, "Part": [{ "key": "/p/2", "Stream": [{ "id": 3, "streamType": 1, "colorTrc": "smpte2084" }] }] }
+    ] })).unwrap();
+    let v = crate::pms::versions_of(&it);
+    assert_eq!(
+        (v[0].dovi.present, v[0].dovi.profile, v[0].dovi.bl_compat),
+        (true, 5, 0),
+        "a later video stream without DOVI fields keeps the record",
+    );
+    assert_eq!(v[1].dovi, crate::metadata::Dovi::NONE);
+    assert!(serde_json::to_value(&v[1]).unwrap().get("dovi").is_none(), "a version without Dolby Vision records nothing new");
+}
+
 /// `PlayingItem.hdr` is the played leaf's video HDR flag (PQ or HLG transfer), the fact the
 /// player's HDR overlay dim reads; an SDR leaf and an absent item are not HDR.
 #[test]
@@ -421,7 +486,7 @@ fn the_playing_item_cache_is_not_trusted_once_the_item_has_played() {
     // a fresh landing of the played item is a fresh read
     set_current_for_test(test_state(), Some(page(vec![embedded.clone()])));
     install_playing(test_state(), cached_playing(test_state(), SRV_A, "42"));
-    assert!(install_landed_detail(test_state(), test_adapter(), Some(page(vec![embedded]))));
+    assert!(install_landed_detail(test_state(), test_adapter(), Some(page(vec![embedded])), &plx_plex::plex::ClientKeys::default(), false));
     assert!(cached_playing(test_state(), SRV_A, "42").is_some(), "read after the playback: trusted again");
     clear(test_state(), test_adapter());
 }
@@ -543,13 +608,13 @@ fn a_detail_read_in_flight_across_a_watched_edit_installs_with_it_made_again() {
     state.ledger.landed(older);
     assert!(run(&mut state, adapter, MetadataCmd::RequestDetail { sid, rk: "42".into() })); // the read goes out…
     let pressed = state.ledger.record(&at, crate::viewstate::ViewEdit::Watched(true)); // …then the press
-    assert!(install_landed_detail(&mut state, adapter, Some(fresh())));
+    assert!(install_landed_detail(&mut state, adapter, Some(fresh()), &plx_plex::plex::ClientKeys::default(), false));
     assert_eq!(tile_state(&state), Some((true, 0)));
 
     // a read requested after the press's write LANDED: the server has it, its answer stands
     state.ledger.landed(pressed);
     assert!(run(&mut state, adapter, MetadataCmd::RequestDetail { sid, rk: "42".into() }));
-    assert!(install_landed_detail(&mut state, adapter, Some(fresh())));
+    assert!(install_landed_detail(&mut state, adapter, Some(fresh()), &plx_plex::plex::ClientKeys::default(), false));
     assert_eq!(tile_state(&state), Some((false, 4)), "the server's answer stands");
 }
 
@@ -585,7 +650,7 @@ fn a_single_episode_flip_steps_the_season_count_and_the_re_read_overwrites_it_wi
     // the server says two of three are watched (one of them elsewhere), after the optimistic step
     set_watched_local(test_state(), &ep, true);
     assert_eq!(count(), 1);
-    assert!(install_landed_detail(test_state(), test_adapter(), Some(show(2))));
+    assert!(install_landed_detail(test_state(), test_adapter(), Some(show(2)), &plx_plex::plex::ClientKeys::default(), false));
     assert_eq!(count(), 2, "the re-read overwrites the optimistic count with the server's number");
     clear(test_state(), test_adapter());
 }
@@ -614,7 +679,7 @@ fn the_servers_facts_and_offset_patch_related_and_collection_tiles_only_where_th
     }));
     let adapter = std::sync::Arc::new(MetadataAdapter::default());
     let run = |rk: &str, sid, edit| super::run(test_state(), &adapter, MetadataCmd::ApplyView { at: ViewAt::leaf(sid, rk), edit });
-    let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0 };
+    let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0, sort: None };
     assert!(run("r1", SRV_A, facts));
     assert!(!run("r1", SRV_A, facts), "facts that agree with the tile change nothing");
     assert!(!run("r0", SRV_B, facts), "another server's r0 names nothing here");
@@ -660,4 +725,24 @@ fn an_offset_moves_the_loaded_item_and_the_episode_it_names_and_only_when_it_dif
     assert_eq!(d.resume_ms, 7_000);
     assert_eq!((d.episodes.get(0).unwrap().resume_ms, d.episodes.get(1).unwrap().resume_ms), (42_000, 6), "no other episode moved");
     clear(test_state(), test_adapter());
+}
+
+#[test]
+fn pdf_proposal_on_deck_watch_flip_is_immediate_outside_the_loaded_season() {
+    let _guard = plx_base::testlock::serial();
+    let mut state = MetadataState::default();
+    state.current = Some(Detail {
+        sid: SRV_A, rk: "show".into(), kind: "show".into(), is_show: true,
+        on_deck: Some(Episode { rk: "next".into(), season: 2, resume_ms: 60_000, dur_ms: 120_000, ..Default::default() }),
+        ..Default::default()
+    });
+    assert!(!set_watched_local(&mut state, &crate::viewstate::ViewAt::leaf(SRV_B, "next"), true));
+    let at = crate::viewstate::ViewAt::leaf(SRV_A, "next");
+    assert!(set_watched_local(&mut state, &at, true), "the on-deck copy is a mounted view of this leaf");
+    let ep = state.current.as_ref().unwrap().on_deck.as_ref().unwrap();
+    assert!(ep.watched);
+    assert_eq!(ep.resume_ms, 0);
+    assert!(!state.current.as_ref().unwrap().watched, "one episode never marks the whole show");
+    assert!(set_watched_local(&mut state, &at, false));
+    assert!(!state.current.as_ref().unwrap().on_deck.as_ref().unwrap().watched);
 }

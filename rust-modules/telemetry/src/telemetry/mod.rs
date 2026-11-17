@@ -34,6 +34,7 @@ pub mod posthog;
 pub mod queue;
 pub mod sender;
 pub mod sentry;
+pub mod session;
 pub mod spool;
 pub mod transition;
 
@@ -44,7 +45,9 @@ const RELEASE_PREFIX: &str = "plxnative@";
 static RELEASE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
 /// Record the release string every outbound report carries (Sentry `release`, the SDK and client
-/// version, the usage context's `app_version`).
+/// version, the usage context's `app_version`). The one exception to `release` is a crash-log
+/// record left by another build than this one, which `crashreport::stamp_release` files under no
+/// release rather than this one.
 ///
 /// **The application hands it in**: `PLX_VERSION` is published by the application's build script, a
 /// `cargo:rustc-env` reaches that one crate only, and the rule that derives it is written once
@@ -134,7 +137,10 @@ pub fn activate_initial(c: Consent) -> native::Guard {
     // `holding 5 records` directly above `net: bound libcurl`.
     // The native daemon's envelopes and the local C/panic log are recovered together: the two may
     // describe the same death, and pairing them keeps it one Sentry event — the more useful one.
-    crashreport::recover_pending();
+    let crashes_found = crashreport::recover_pending();
+    // The previous process's open release-health session is reported now that this boot knows
+    // whether it died of a crash, and this process's own begins.
+    session::recover_and_start(crashes_found);
     // The SDK capture backend starts only after consent is published and old fallback records are
     // safely queued. Its guard lives for the whole app and restores the C tracer on clean exit.
     native::sync(&c)
@@ -290,7 +296,7 @@ pub fn flush_soon() {
     let ok = plx_base::task::spawn_small("telemetry", move || {
         let retry = flush_now(&c, decision_revision);
         FLUSHING.store(false, Ordering::Release);
-        if AGAIN.load(Ordering::Acquire) {
+        if worker_tail_reruns(&AGAIN, decision_revision, consent::revision) {
             flush_soon();
         }
         if let Some(seconds) = retry {
@@ -312,6 +318,24 @@ pub fn flush_soon() {
     if !ok {
         FLUSHING.store(false, Ordering::Release);
     }
+}
+
+/// Whether a finishing worker must look again: a flush was asked for while it ran (`again`), or
+/// the decision it ran with is no longer the installed one. Pure, so the interleaving is testable
+/// as data.
+fn rerun_after_flush(again: bool, ran_revision: u32, installed_revision: u32) -> bool {
+    again || ran_revision != installed_revision
+}
+
+/// The worker tail's whole decision: read the request flag, THEN the installed revision, so a
+/// decision installed after the snapshot is seen. The worker calls this and nothing else, which is
+/// what lets a test pin the call site rather than only [`rerun_after_flush`].
+fn worker_tail_reruns(
+    again: &std::sync::atomic::AtomicBool,
+    ran_revision: u32,
+    installed: impl Fn() -> u32,
+) -> bool {
+    rerun_after_flush(again.load(std::sync::atomic::Ordering::Acquire), ran_revision, installed())
 }
 
 /// The flush itself, on the worker.
@@ -364,7 +388,11 @@ fn process_records(
     let mut retired = Vec::new();
     let mut retry: Option<u64> = None;
     'destinations: for dest in [queue::Dest::Sentry, queue::Dest::PostHog] {
-        for r in all.iter().filter(|r| r.dest == dest) {
+        // A release-health session goes after the crash reports of its lane: a `429` on one holds the
+        // lane, and it must not be what holds a crash report back.
+        let mut lane: Vec<&queue::Record> = all.iter().filter(|r| r.dest == dest).collect();
+        lane.sort_by_key(|r| session::is_session_body(&r.body) && dest == queue::Dest::Sentry);
+        for r in lane.iter().copied() {
             // Never carry an old consent snapshot through a withdrawal, a sign-out or a quick
             // off→on cycle. A request that already passed this check may finish because the socket
             // API has no cancellation; PRIVACY.md ("Your choices") states that narrow in-flight
@@ -393,7 +421,7 @@ fn process_records(
                 (sender::Verdict::Keep, hold) => {
                     let s = hold.unwrap_or(sender::DEFAULT_HOLD_S);
                     retry = Some(retry.map_or(s, |old| old.min(s)));
-                    for held in all.iter().filter(|h| h.dest == dest).skip_while(|h| h.event_id != r.event_id) {
+                    for held in lane.iter().copied().skip_while(|h| h.event_id != r.event_id) {
                         delivery::settle(&held.event_id, delivery::DeliveryState::Held);
                     }
                     break;
@@ -437,6 +465,26 @@ pub fn is_minted_id(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Thread A snapshots revision 1, then thread B installs revision 2 and raises AGAIN while A
+    /// still holds FLUSHING; A then clears AGAIN and spawns with the stale revision 1. At the
+    /// worker's tail AGAIN reads false, yet the installed decision is newer than the one it ran
+    /// with, and `process_records` sent nothing for it: the tail must run another flush.
+    #[test]
+    fn a_decision_installed_after_the_snapshot_is_not_lost_at_the_worker_tail() {
+        assert!(
+            super::rerun_after_flush(false, 1, 2),
+            "AGAIN was cleared by the winner after the new decision raised it; the stale worker must still rerun"
+        );
+        assert!(super::rerun_after_flush(true, 2, 2), "an explicit request still reruns");
+        assert!(!super::rerun_after_flush(false, 2, 2), "nothing new: stop");
+        // The tail function the worker really calls, with a flag that is never raised.
+        let again = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::worker_tail_reruns(&again, 1, || 2), "tail: a newer decision reruns");
+        assert!(!super::worker_tail_reruns(&again, 2, || 2), "tail: nothing new stops");
+        again.store(true, std::sync::atomic::Ordering::Release);
+        assert!(super::worker_tail_reruns(&again, 2, || 2), "tail: a request reruns");
+    }
+
     #[test]
     fn a_held_destination_does_not_block_the_other_destination() {
         let record = |id: &str, category, dest| queue::Record {
@@ -474,6 +522,33 @@ mod tests {
         assert_eq!(attempted, vec!["s1", "p1"]);
         assert_eq!(retired, vec!["p1"]);
         assert_eq!(retry, Some(7));
+    }
+
+    /// A 429 on a release-health session must not hold the crash reports behind it: the Sentry
+    /// lane tries crash reports first.
+    #[test]
+    fn a_held_session_record_does_not_hold_the_crash_reports_behind_it() {
+        let record = |id: &str, body: &[u8]| queue::Record {
+            category: queue::Category::Errors,
+            dest: queue::Dest::Sentry,
+            event_id: id.into(),
+            body: body.to_vec(),
+        };
+        let all = vec![
+            record("sess", br#"{"attrs":{"release":"r"},"did":"d","sid":"s","started":"t"}"#),
+            record("crash", br#"{"event_id":"c","level":"fatal"}"#),
+        ];
+        let c = consent::Consent {
+            asked_version: consent::POLICY_VERSION,
+            errors: true,
+            errors_id: Some("e".repeat(32)),
+            ..Default::default()
+        };
+        let (retired, retry) = process_records(&all, &c, || true, |r| {
+            if r.event_id == "sess" { (sender::Verdict::Keep, Some(60)) } else { (sender::Verdict::Done, None) }
+        });
+        assert_eq!(retired, vec!["crash"]);
+        assert_eq!(retry, Some(60));
     }
 
     fn watched_record(id: &str, category: queue::Category) -> queue::Record {

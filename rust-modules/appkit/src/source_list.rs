@@ -1,28 +1,7 @@
-//! **The Sources ROW MODEL** — one list of libraries grouped by server, drawn on two surfaces.
-//!
-//! The Library toolbar's Source panel (`screens::library::menu`, deliverable A) and the Favorite libraries
-//! editor — first run, and its Settings twin (`crate::screens::onboard`, deliverable F) — show
-//! the SAME list:
-//! your servers, each server's libraries, and which of them are favorites. The canvas says so in as
-//! many words — F "is the same list as A's On Home level, in the flow's own frame rather than a
-//! panel" — so it is one builder, and the two screens differ only in the frame around it, in the
-//! LEVEL they ask for, and in whether the roster-refresh row rides along.
-//!
-//! **They no longer differ in a control.** The panel used to carry a `TabPill::segment` pair at its
-//! top swapping its own two levels; the levels are now a property of the SURFACE, one each and
-//! fixed — the panel is a picker, the editor is the switches — so there is nothing to swap and the
-//! pills are gone. That was never only a tidy-up: with the switch governing the whole app rather
-//! than Home alone, a picker that could turn into an editor would let a library be un-favourited
-//! from inside the list of favourites and then vanish out of it under the cursor.
-//!
-//! Building it twice would have been the ordinary thing to do and the wrong one: the two would
-//! have drifted on exactly the details that make the list readable — which column carries a mark,
-//! which carries a word, what an unreachable group says and where it says it — and each drift
-//! would read as a bug on whichever screen you saw second.
-//!
-//! Pure over its inputs, so it is host-testable without a live section table (which is also why
-//! `browse` hands out owned [`SrcGroup`](plx_data::browse::SrcGroup)/[`SrcRow`](plx_data::browse::SrcRow)
-//! projections rather than borrows of its statics).
+//! Shared library row models. The favorites editor groups switches by server; the compact
+//! Library options picker puts server identity and availability on each additional-library row.
+//! Picker ticks identify the current library; editor switches identify favorites.
+
 use plx_data::browse::{SourceState, SrcGroup};
 use plx_plex::plex::probe::Location;
 use plx_ui::form::{Form, FormId, FormSection, RowKey, RowKind};
@@ -38,11 +17,8 @@ use std::convert::Infallible;
 /// and no words, OnHome draws every row's word and no ticks — neither level mirrors the other's
 /// marks.
 ///
-/// The Library panel is [`Level::Browse`] and nothing else, and is scoped to the FAVOURITES of the
-/// type being browsed. The Favorite libraries editor is [`Level::OnHome`] and nothing else — it has
-/// no current library to point at, because first run happens before there is a Library screen to
-/// have been on, and it is the one surface that lists every granted library so a non-favourite has
-/// a way back.
+/// Library options uses the compact picker for hidden favorites and available non-favorites.
+/// Favorite libraries uses OnHome switches over every granted library.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     /// a picker: one tick, on the library you are looking at; OK closes the panel
@@ -158,7 +134,10 @@ fn tier_word(t: Location) -> Option<&'static str> {
 ///
 /// Written as an exhaustive match rather than `reachable() && state != Unauthorized`, so that a
 /// fifth state has to be given an answer here instead of quietly inheriting one.
-fn usable(g: &SrcGroup) -> bool {
+///
+/// Public because it is also the answer to "is a library that is NOT a favourite worth offering?"
+/// (Library options offers non-favorites on servers that pass it).
+pub fn usable(g: &SrcGroup) -> bool {
     match g.state {
         SourceState::NotProbed | SourceState::Reachable | SourceState::Unreachable => g.reachable(),
         SourceState::Unauthorized => false,
@@ -217,6 +196,13 @@ fn header_accessory(sec: Section, g: &SrcGroup) -> Section {
     }
 }
 
+/// A library as a picker row: its title is the server's, and a library on a shared server carries
+/// the owner's handle beside it, dimmed (an own server has none).
+fn library_row(title: &str, handle: &str) -> Row {
+    let row = Row::new(title).server_label();
+    if handle.is_empty() { row } else { row.value(handle).server_value().value_dim(true) }
+}
+
 /// Build the list.
 ///
 /// The levels never mirror each other's marks. **Browse** is a picker: one tick, on the library you
@@ -246,7 +232,8 @@ pub fn form(
         // working also SAYS so there, and says it FIRST — see [`accessory`]. It is a state in the
         // same register as the rows' own `On`/`Off`.
         //
-        // The Browse picker (the header's "+N" list) names a shared group by what it IS, "Shared
+        // The grouped Browse picker names a shared
+        // group by what it IS, "Shared
         // with you", and puts the owner's handle on each row, dimmed (library-redesign board
         // `LibraryMore`); the group's own state words still lead its header.
         let shared_pick = level == Level::Browse && !g.handle.is_empty();
@@ -259,16 +246,15 @@ pub fn form(
         };
         let mut sec = FormSection::from_head(head);
         for r in mine {
-            let mut row = Row::new(r.title.clone()).server_label();
+            let mut row = if level == Level::Browse {
+                // A picker tick identifies the library currently on view.
+                library_row(&r.title, &g.handle).checked(r.current)
+            } else {
+                Row::new(r.title.clone()).server_label()
+            };
             let kind = match level {
-                Level::Browse => {
-                    // One line a row: the +N list holds only libraries the fold hid, so no tick
-                    // (the library on view is never in it) and no count line.
-                    if shared_pick {
-                        row = row.value(g.handle.clone()).server_value().value_dim(true);
-                    }
-                    RowKind::Choice
-                }
+                // One line a row: a tick on the library on view and no count line.
+                Level::Browse => RowKind::Choice,
                 Level::OnHome => {
                     row = row
                         .toggle(r.pinned)
@@ -304,6 +290,28 @@ pub fn form(
         }
     }
     out.into_iter().fold(Form::new(), Form::section)
+}
+
+/// A compact library picker. Server identity and connection state live on each row, so the
+/// headerless list remains legible when it contains only one additional library.
+pub fn compact_picker(groups: &[SrcGroup], rows: &[plx_data::browse::SrcRow], tail: Tail) -> SrcForm {
+    if rows.is_empty() && tail == Tail::None { return Form::new(); }
+    let mut section = FormSection::new("");
+    for row in rows {
+        let Some(group) = groups.get(row.src) else { continue };
+        let target = SrcTarget::Library(row.section);
+        let detail = [group.name.as_str(), accessory(group).as_str()].into_iter()
+            .filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
+        section = section.item(target, RowKind::Choice, target,
+            Row::new(row.title.clone()).server_label().detail(detail).server_detail().checked(row.current))
+            .disabled(!usable(group));
+    }
+    if tail == Tail::Recheck {
+        if !rows.is_empty() { section = section.separator(); }
+        section = section.item(SrcTarget::Recheck, RowKind::Button, SrcTarget::Recheck,
+            Row::new(plx_platform::i18n::msg::widgets_source_new_shares()));
+    }
+    Form::new().section(section)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! **The application bundle's SCREEN-SIDE half** (restructure spec §3.1, phase 5b): the effects a
-//! screen may ask for (`AppFx`), the messages a machine receives (`AppMsg`), and the requests an
-//! owned screen makes of the legacy LOOP (`LoopReq`) while the two coexist (§14).
+//! screen may ask for (`AppFx`), the messages a machine receives (`AppMsg`), and the app-runner
+//! commands (`LoopReq`) that require platform or application-owned resources.
 //!
 //! **…and, since restructure phase 10, the concrete `ScreenArg` ([`AppArg`]) and the one `mount`
 //! match ([`AppMounter`])** — which §2.1 always put here and which lived in `app/bridge.rs` until
@@ -20,11 +20,15 @@
 //! screens a second time for the surface's own inner stack (`screens::settings::InnerHost`), which
 //! is how one `OnboardScreen` mounts twice (§6.2).
 //!
-//! `LoopReq` is a DEBT with a phase number on each variant: a request the loop performs because
-//! the machine that should own it (Session, Player, Navigation over the app's real stack) is not
-//! on the dispatcher yet. The bridge drains them after every dispatcher frame.
+//! Loop, Player and the other external app commands retain their dispatcher FIFO head while
+//! the runner borrows application resources. Results rejoin that drain; no family queue is drained
+//! after the frame. Async Session and persistence completions retain their addressed owner fences.
 
 pub use crate::family::SettingsPage;
+pub use crate::family::InnerViews;
+pub use crate::inputs::{GrantInputs, RuntimePolicy, ScreenInputs};
+#[cfg(test)]
+pub(crate) use crate::inputs::{capture_fixture, caption_fixture, empty_fixture, publication_fixture};
 /// The stored Under posters setting as the ui caption policy: the shared door a screen outside
 /// Settings (the Library's Collections page) reads it through, so none names `crate::settings`.
 pub use crate::settings::caption_policy_of;
@@ -33,7 +37,7 @@ use std::sync::Arc;
 use crate::settings::{Family, RouteSurface};
 use plx_data::stores::{StoreCmd, StoreId, StoreWork};
 use plx_machine::machine::{
-    Canon, Chrome, Cx, Effects, EntryId, Host, InstanceId, LogicalState, ScreenId,
+    Canon, Chrome, Cx, Effects, EntryId, Host, InstanceId, LogicalState, MachineId, ScreenId,
 };
 use plx_ui::screen::{Mounter, ReturnState, Screen};
 
@@ -50,15 +54,17 @@ pub enum AppFx {
     SessionEffect(plx_session::auth::owner::SessionFx),
     /// Account and install preference IO, admitted by the application before work starts.
     Preferences(PreferenceCmd),
+    /// Local firmware logging; the runner answers this surface through an addressed event.
+    PlaybackTrace(plx_platform::playback_trace::Command),
     /// A store command, executed as a `Deliver` to the store machine in the same drain.
     Store(StoreId, StoreCmd),
     /// Poll only the store work this visible route owns, after its read-only step returns.
     StoreWork(StoreWork),
     /// The consent MACHINE's command (§2.2): it owns the two decisions and publishes them.
     Consent(ConsentCmd),
-    /// A request of the legacy loop (§14) — see [`LoopReq`].
+    /// An ordered app-resource command — see [`LoopReq`].
     Loop(LoopReq),
-    /// Content-page requests, executed by the navigation bridge during coexistence (phase 7).
+    /// Content-page commands, executed at the yielded dispatcher FIFO head.
     Content(ContentReq),
     /// Home-page semantic requests. The bridge owns navigation/player/menu execution.
     Home(HomeReq),
@@ -71,12 +77,139 @@ pub enum AppFx {
     /// The Live TV page's requests: watching, DVR changes, the strip and BACK.
     LiveTv(crate::live_tv::LiveTvOut),
     Catalog(crate::catalog::CatalogOut),
-    /// Player-route requests — what an overlay panel on the player's own `ModalStack` asks of the
-    /// loop, because the thing being asked for needs the `MainThread` token, the route or the
-    /// trail (§14). Executed by `app/playback.rs`'s drain.
+    /// Player-route commands requiring the MainThread capability, route or navigation stack.
+    /// The app runner executes each at its FIFO head, outside the screen's machine step.
     Player(PlayerReq),
     /// The item context menu's committed row (phase 10) — see [`ItemMenuReq`].
     ItemMenu(ItemMenuReq),
+    /// The player-HUD page's commands on the package store, executed by the Bridge (PR10).
+    Huds(HudCmd),
+}
+
+/// Operations executed while the dispatcher holds only logical owner borrows.
+pub enum InlineAppFx {
+    Session(plx_session::auth::SessionCmd),
+    PlaybackTrace(plx_platform::playback_trace::Command),
+    Store(StoreId, StoreCmd),
+    StoreWork(StoreWork),
+    Consent(ConsentCmd),
+    Huds(HudCmd),
+}
+
+/// Commands borrowing the navigation/player resource bundle, never inline effects.
+pub enum ResourceAppFx {
+    Library(LibraryReq),
+    Home(HomeReq),
+    Content(ContentReq),
+    ItemMenu(ItemMenuReq),
+    /// The Live TV page's requests: a corner channel's stop or restore needs the player.
+    LiveTv(crate::live_tv::LiveTvOut),
+}
+
+/// Operations admitted outside machine borrows, at the retained FIFO head.
+/// Inline store work cannot be placed in a yielded envelope:
+/// ```compile_fail
+/// use plx_screens::registry::{ExternalAppFx, InlineAppFx};
+/// let inline = InlineAppFx::StoreWork(plx_data::stores::StoreWork::Browse);
+/// let _: ExternalAppFx = inline;
+/// ```
+/// External commands cannot be passed to the logical executor:
+/// ```compile_fail
+/// use plx_screens::registry::{ExternalAppFx, InlineAppFx, ContentReq};
+/// fn logical(_: InlineAppFx) {}
+/// logical(ExternalAppFx::Content(ContentReq::Back));
+/// ```
+pub enum ExternalAppFx {
+    SessionEffect(plx_session::auth::owner::SessionFx),
+    Preferences(PreferenceCmd),
+    Loop(LoopReq),
+    Content(ContentReq),
+    Home(HomeReq),
+    Library(LibraryReq),
+    Search(SearchReq),
+    Watchlist(crate::watchlist::page::WatchlistOut),
+    Catalog(crate::catalog::CatalogOut),
+    Player(PlayerReq),
+    ItemMenu(ItemMenuReq),
+    LiveTv(crate::live_tv::LiveTvOut),
+}
+
+impl plx_machine::machine::AppEffect for AppFx {
+    type Inline = InlineAppFx;
+    type ExternalFx = ExternalAppFx;
+    fn route(self) -> plx_machine::machine::EffectDisposition<InlineAppFx, ExternalAppFx> {
+        use plx_machine::machine::EffectDisposition::{Inline, External};
+        match self {
+            Self::Session(v) => Inline(InlineAppFx::Session(v)),
+            Self::PlaybackTrace(v) => Inline(InlineAppFx::PlaybackTrace(v)),
+            Self::Store(id, v) => Inline(InlineAppFx::Store(id, v)),
+            Self::StoreWork(v) => Inline(InlineAppFx::StoreWork(v)),
+            Self::Consent(v) => Inline(InlineAppFx::Consent(v)),
+            Self::Huds(v) => Inline(InlineAppFx::Huds(v)),
+            Self::SessionEffect(v) => External(ExternalAppFx::SessionEffect(v)),
+            Self::Preferences(v) => External(ExternalAppFx::Preferences(v)),
+            Self::Loop(v) => External(ExternalAppFx::Loop(v)),
+            Self::Content(v) => External(ExternalAppFx::Content(v)),
+            Self::Home(v) => External(ExternalAppFx::Home(v)),
+            Self::Library(v) => External(ExternalAppFx::Library(v)),
+            Self::Search(v) => External(ExternalAppFx::Search(v)),
+            Self::Watchlist(v) => External(ExternalAppFx::Watchlist(v)),
+            Self::LiveTv(v) => External(ExternalAppFx::LiveTv(v)),
+            Self::Catalog(v) => External(ExternalAppFx::Catalog(v)),
+            Self::Player(v) => External(ExternalAppFx::Player(v)),
+            Self::ItemMenu(v) => External(ExternalAppFx::ItemMenu(v)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod effect_routing_contract {
+    #[test]
+    fn resource_and_store_effects_have_disjoint_execution_types() {
+        use super::*;
+        use plx_machine::machine::{AppEffect, EffectDisposition};
+        assert!(matches!(AppFx::Content(ContentReq::Back).route(),
+            EffectDisposition::External(ExternalAppFx::Content(ContentReq::Back))));
+        assert!(matches!(AppFx::StoreWork(StoreWork::Browse).route(),
+            EffectDisposition::Inline(InlineAppFx::StoreWork(StoreWork::Browse))));
+    }
+}
+
+/// Owned external-runner envelope: the original sender (including mounted lifetime), frozen
+/// navigation bookmark, FIFO sequence, and unmodified command/request identity. The dispatcher
+/// retains the head until a terminal receipt; this type is NOT another request queue.
+/// Family handler migration uses this contract without changing the screen's `Fx::App` spelling.
+pub type AppCommand = plx_machine::machine::AppCommand<ExternalAppFx, ReturnState<u32, PageMemory>>;
+
+/// The package-store view delivered through the HUD command channels.
+pub use crate::hud_settings::HudList;
+
+/// What the Player HUD settings page asks of the package store (`plx_data::hudpacks::HudStore`). The
+/// answers come back as the page's own data, the list the Bridge sends down the channel `Open` carries.
+#[derive(Clone)]
+pub enum HudCmd {
+    /// The page opened: read every candidate directory again, and publish the list (now and whenever it
+    /// changes) down this channel until the page drops its end.
+    Open(std::sync::mpsc::Sender<HudList>),
+    /// A child gallery view subscribes without cancelling an installation or rescanning files.
+    Watch(std::sync::mpsc::Sender<HudList>),
+    /// Pick a package id (or `builtin:classic`) for the seated profile.
+    Select(String),
+    /// Download the exact package from the checked registry index, pending confirmation.
+    FetchRegistry(plx_data::hudpacks::Sha),
+    /// The initiating detail view went away before confirming its offer.
+    CancelRegistry(plx_data::hudpacks::Sha),
+    /// Delete an installed package.
+    Remove(String),
+    /// Install the drop file listed under this hash; the viewer has confirmed it.
+    InstallDrop(plx_data::hudpacks::Sha),
+    /// Fetch the package at this address, parsed by `plx_data::hudpacks::address::parse`. Nothing is installed:
+    /// what comes back is validated and published as the list's `offer` for the viewer to confirm.
+    Fetch(plx_data::hudpacks::address::Address),
+    /// Install the offered package listed under this hash; the viewer has confirmed it.
+    InstallOffer(plx_data::hudpacks::Sha),
+    /// The viewer declined the offered package under this hash: nothing is written.
+    DeclineOffer(plx_data::hudpacks::Sha),
 }
 
 /// A private live receipt. Requests contain account credentials and are intentionally unsupported
@@ -87,7 +220,16 @@ pub struct AccountPreferenceReply {
 }
 
 pub enum PreferenceCmd {
-    /// Capture the live profile only after admission: even session::peek can schedule storage IO.
+    AutoSignIn { on: bool, reply: std::sync::mpsc::Sender<bool> },
+    /// Install lesson write, fenced by the requesting runtime/profile lifetime.
+    HoldHint { taught: plx_plex::plex::session::HoldHintTaught,
+        live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reply: std::sync::mpsc::Sender<bool> },
+    /// Demand viewer features; the app coalesces this profile-scoped read.
+    EnsureMarkerAccess,
+    ChooseMarker { kind: plx_data::metadata::MarkerKind, mode: plx_plex::plex::session::MarkerSkipMode,
+        scope: u64, reply: std::sync::mpsc::Sender<bool> },
+    /// Capture the live profile only after admission.
     Load { reply: std::sync::mpsc::Sender<AccountPreferenceReply> },
     Save {
         request: plx_plex::plex::account::PreferenceRequest,
@@ -159,6 +301,14 @@ pub struct ItemMenuReq {
     pub from_home: bool,
 }
 
+/// A change to the cursor hold started when Back dismisses the player transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackCursorChange {
+    Hide,
+    Wake,
+    Release,
+}
+
 /// **What a player overlay asks for**, once its own `step` has decided.
 ///
 /// A panel on the player's page-owned `ModalStack` owns its own state and its own input, but not
@@ -168,6 +318,13 @@ pub struct ItemMenuReq {
 /// So the panel decides and the loop performs, exactly as `LibraryReq` does for the Library.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerReq {
+    BackCursor {
+        owner: MachineId,
+        playback: u32,
+        change: BackCursorChange,
+    },
+    AutoSkip { id: plx_appkit::skip_policy::OfferId, reply: plx_machine::machine::MachineId },
+    CancelAutoSkip(plx_appkit::skip_policy::OfferId),
     /// BACK over a live channel's bare picture: it plays on in the Live TV guide's corner
     /// (`app::playback::minimize_player`); STOP and the failure read-out still `Exit`.
     Minimize,
@@ -208,34 +365,37 @@ pub enum PlayerReq {
     CommitSeek(i64),
     /// Apply the `…` popover's chosen row.
     More(plx_appkit::more_menu::Action),
-    /// Apply the Info card's focused action.
-    Info(plx_appkit::info_panel::InfoAction),
-    /// The panel took a DOWN past its own bottom: drop the HUD's ring onto the tabs row.
-    FocusTabs,
     /// Keep the transport alive while a panel is being read (`HUD_MENU_MS`), or hand it the
     /// ordinary linger as a panel closes (`HUD_LINGER_MS`).
     ExtendHud(u32),
-    /// The Info card's OK landed on a control FACE, which has a press dip of its own: arm the
-    /// tvOS press and commit on the spring-back rather than acting now.
-    ArmInfoPress,
     /// The track menu picked a row. `route::commit_audio_selection`/`commit_subtitle_selection`
     /// take the playback session's `&mut`, which a screen never has (§2.2) — so the panel decides
     /// and the loop performs, exactly as every other request in this enum.
     CommitTrack(plx_appkit::track_menu::TrackCommit),
-    /// **Present one of the player's overlays directly** (restructure phase 12) — the tabs row's OK
-    /// (`OverlayKind::Info`/`::Chapters`, the old `key_ok`'s `focus == 2` arm) and the failure
-    /// read-out's own recovery escape (`OverlayKind::More { quality: true }`, the old
-    /// `key_player_failed`'s `ChooseQuality` arm). Both used to reach
+    /// **Present one of the player's overlays directly** (restructure phase 12) — the failure read-out's own
+    /// recovery escape (`OverlayKind::More` on its Quality page, the old `key_player_failed`'s `ChooseQuality`
+    /// arm) and the Tracks->Timing hand-off. (The tabs row's OK used to be here with the Info and Chapters
+    /// overlays; it asks `PlayerReq::Command(HudCommand::ToggleSection(..))` now, and those two are sections of
+    /// the page.) The first used to reach
     /// `super::bridge::open_player_overlay` straight from the loop's key ladder; `PlayerScreen`
     /// may not name that function itself (§2.2), so it asks instead.
     OpenOverlay(crate::player::overlay::OverlayKind),
-    /// **OK landed on the transport's own control row** — whichever disc, the Skip pill or the Up
-    /// Next tile currently occupies it (restructure phase 12, the old `key_ok`'s `focus == 1`
-    /// arm). Arms the same tvOS press dip [`ArmInfoPress`](PlayerReq::ArmInfoPress) does; the
-    /// loop's existing commit-frame dispatch (`app/run.rs`'s `Route::Player =>
-    /// activate_player_row(...)`) is unchanged and performs whatever the row decides once the
-    /// spring-back has played.
-    ArmControlRow,
+
+    /// **A press on a control of the discs committed**, after the engine's tvOS dip has played
+    /// (`PressCommit`, [`PlayerScreen`](crate::player::PlayerScreen)): perform this command. The screen resolves the command of the control the
+    /// engine holds, so the app's performer (`app::playback::perform_hud_command`) never reads a
+    /// cursor. Keyboard and pointer presses use this same commit path.
+    Command(plx_appkit::player_hud::command::HudCommand),
+    /// **A press on a stand-in committed** — the Skip pill, or one of the Up Next pair — after the
+    /// same dip. A stand-in's meaning depends on the segment it offers, which the app resolves on
+    /// the committing frame (`app::playback::activate_ctrl_row`), so it carries no command.
+    StandIn,
+    /// **BACK over a Skip / Up Next offer** — retire this exact segment in the metadata store's
+    /// skipped set (`MetadataCmd::MarkSkipped`). The store's skipped set is the only dismissal
+    /// state and the row is re-resolved from it every frame, which is what turns the offer into
+    /// the discs; the same set also retires a synthesized tail, which is what keeps a silent
+    /// credits marker from coming back.
+    DismissOffer(plx_data::metadata::Marker),
     /// **Leave the player** — the one ritual the STOP key, a BACK with nothing else open, and the
     /// failure read-out's own BACK escape all perform (`exit_player`; restructure phase 12,
     /// replacing `app/run.rs`'s direct calls to it from the player's own key arms).
@@ -326,7 +486,9 @@ pub enum LibraryReq {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryMenuKind {
     Sort, Filter, Genre, Sources, Type,
-    /// The header's one Sort & Filter popover: Show / Sort / Filter sections. `Sort`, `Filter` and
+    /// The header's one Sort & Filter popover: Show / Sort / Filter sections, then (with two or more
+    /// libraries of the kind on offer) the Sources list's per-server sections and a headerless
+    /// Favorite libraries block. `Sort`, `Filter` and
     /// `Type` remain as the single-purpose menus the scripted pipeline names.
     SortFilter,
 }
@@ -455,7 +617,8 @@ pub enum ItemMenuKind {
     /// The detail page's episode filmstrip. `mark` is resolved by the page through the same
     /// `ep_state` that draws the still's own state line, so the tile and the menu opened on it
     /// cannot describe one episode two ways.
-    Episode { mark: plx_ui::widgets::PosterMark },
+    /// `versions` is the episode's (two or more for the Play Version row), captured at open.
+    Episode { mark: plx_ui::widgets::PosterMark, versions: Vec<plx_data::pms::MediaVersion> },
     /// The detail page's season tabs. `show_rk` is the show the page has loaded and `index` the
     /// tab's season number (`Season::index`): together the address of the season's episodes, which
     /// is all a season-scoped write reaches them by (`viewstate::Scope::Season`).
@@ -476,7 +639,7 @@ impl PartialEq for ItemMenuKind {
         match (self, other) {
             (Self::Card { row: a, from_deck: da }, Self::Card { row: b, from_deck: db }) =>
                 da == db && a.sid == b.sid && a.rk == b.rk && a.kind == b.kind,
-            (Self::Episode { mark: a }, Self::Episode { mark: b }) => a == b,
+            (Self::Episode { mark: a, .. }, Self::Episode { mark: b, .. }) => a == b,
             (Self::Season { mark: a, show_rk: sa, index: ia }, Self::Season { mark: b, show_rk: sb, index: ib }) =>
                 a == b && sa == sb && ia == ib,
             (Self::Catalog { state: a }, Self::Catalog { state: b }) => a == b,
@@ -501,7 +664,7 @@ impl plx_machine::machine::LogicalState for ItemMenuArg {
         c.u32(u32::from(self.sid.raw())).str(&self.rk);
         match &self.kind {
             ItemMenuKind::Card { row, from_deck } => { c.u32(0).bool(*from_deck).u32(row.kind as u32); }
-            ItemMenuKind::Episode { mark } => { c.u32(1).u32(*mark as u32); }
+            ItemMenuKind::Episode { mark, .. } => { c.u32(1).u32(*mark as u32); }
             ItemMenuKind::Season { mark, show_rk, index } => { c.u32(2).u32(*mark as u32).str(show_rk).u64(*index as u64); }
             ItemMenuKind::Catalog { state } => { c.u32(3).u32(*state as u32); }
         }
@@ -780,7 +943,7 @@ const KEY_SLACK: usize = 256;
 pub(crate) fn key_cap(live: usize) -> usize { 2 * live + KEY_SLACK }
 
 /// How many keys may leave the page before a table that drops its keys sweeps them: Home's
-/// placeholder slots, and the Recommended page's item and slot keys (`RecommendedScreen::rebuild`,
+/// placeholder slots, and the Recommended page's card and control keys (`RecommendedScreen::rebuild`,
 /// off `KeyRegistry::count`). Closing the gap a key at a time moves every key behind it in the
 /// table and in the indexes that name positions, so a page that changes a few keys per publication
 /// paid for the whole table on each one; the sweep is batched instead. What waits on Home is a key
@@ -1147,6 +1310,9 @@ pub enum ContentPanel {
     /// *Also available* (`screens::alt_sources`), anchored to the drawn rect of the pill that
     /// opened it — bit-preserving, so a canonical argument holds it without float equality.
     AltSources { anchor: [u32; 4] },
+    /// *Play Version* (`screens::versions_panel`), anchored to the drawn rect of the disc that
+    /// opened it, as [`Self::AltSources`] is to its pill.
+    Versions { anchor: [u32; 4] },
     /// *Track information* (`screens::tracks_panel`), opened at 1-based `page`. Every interactive
     /// opening passes 1; `/tmp/plxnative-tracks=<n>` is the only caller that does not, and it is
     /// what makes a headless capture of page 2 possible at all.
@@ -1198,6 +1364,18 @@ impl ContentPanel {
                     }),
                 )
             }
+            Self::Versions { anchor } => {
+                let (sid, rk) = subject?;
+                (
+                    Style::Compact,
+                    AppArg::VersionsPanel(crate::versions_panel::VersionsArg {
+                        host,
+                        sid,
+                        rk: rk.to_string(),
+                        anchor,
+                    }),
+                )
+            }
             Self::Tracks { page } => (
                 Style::Alert,
                 AppArg::TracksPanel(crate::tracks_panel::TracksPanelArg { page }),
@@ -1227,23 +1405,33 @@ pub enum PlayIntent {
         acodec: String,
         title: String,
         context: String,
+        /// The version picked on the Play Version panel, `None` for the default (`Media[0]`).
+        version: Option<plx_plex::plex::MediaId>,
+        /// The show the item's episode belongs to, `""` for anything that is not an episode (a
+        /// trailer, a movie, an extra). The queue builder keys the PlayQueue off the show so the
+        /// episodes before this one are in it, which is what the HUD's Previous needs.
+        show_rk: String,
     },
     /// The alternative source the page had selected (`route::request_play_movie`). Owned rather
     /// than a `&'static` catalog borrow: it is held inside `PageAction`/`AppFx` across a frame
     /// boundary, and once Detail's `selected` becomes an owned per-page snapshot (rather than a
     /// process-wide catalog read) there is no `'static` row left to borrow.
-    Movie(plx_data::pms::PmsMovie),
+    Movie {
+        item: plx_data::pms::PmsMovie,
+        /// As [`PlayIntent::Item`]'s.
+        version: Option<plx_plex::plex::MediaId>,
+    },
 }
 
-pub trait ContentLike: AppLike<Memory = PageMemory> {}
-impl<H: AppLike<Memory = PageMemory>> ContentLike for H {}
+pub trait ContentLike: AppLike<Memory = PageMemory> + ScreenInputsLike {}
+impl<H: AppLike<Memory = PageMemory> + ScreenInputsLike> ContentLike for H {}
 
 /// A host publishing the Person model borrowed from its concrete store owner for this frame.
-pub trait PersonLike: AppLike + Sized {
+pub trait PersonLike: AppLike + ScreenInputsLike + Sized {
     fn person<'a>(cx: &Cx<'a, Self>) -> plx_data::person::PersonView<'a>;
 }
 
-pub trait CollectionLike: AppLike + Sized {
+pub trait CollectionLike: AppLike + ScreenInputsLike + Sized {
     fn collection<'a>(cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a>;
 
     /// **The title of the page BACK returns to**, as the user sees it on that page: the entry
@@ -1270,7 +1458,8 @@ pub trait MetadataLike: AppLike + Sized {
 
 /// A host that publishes Home's retained catalog view. The view is borrowed from the rig-owned
 /// snapshot and is therefore valid for the complete step/draw query without per-frame cloning.
-pub trait HomeLike: AppLike<Memory = PageMemory> + Sized {
+pub trait HomeLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
+    fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts>;
     fn hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::pms::HubsView<'a>;
 }
 
@@ -1278,16 +1467,20 @@ pub trait HomeLike: AppLike<Memory = PageMemory> + Sized {
 /// read the Player machine's decisions through it; a change is asked for as an effect
 /// (`AppFx::Player`, `ContentReq::Play`), because the publication is a copy and there is no `&mut`
 /// on this path by construction.
-pub trait PlayerLike: AppLike<Memory = PageMemory> + Sized {
+pub trait PlayerLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
     fn session<'a>(cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession;
+    /// Viewer pause intent sampled by the host at this frame's Tick boundary.
+    fn transport_paused(cx: &Cx<'_, Self>) -> bool;
 }
 
-pub trait SearchLike: AppLike<Memory = PageMemory> + Sized {
+pub trait SearchLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
     fn search<'a>(cx: &Cx<'a, Self>) -> plx_data::search::view::SearchView<'a>;
 }
 
 /// A host that publishes all three retained Library views captured at the frame split.
-pub trait LibraryLike: AppLike<Memory = PageMemory> + Sized {
+pub trait LibraryLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
+    fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts>;
+    fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a>;
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
     fn section_hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::HubsView<'a>;
@@ -1304,6 +1497,20 @@ pub trait LibraryLike: AppLike<Memory = PageMemory> + Sized {
     fn collections_count(_cx: &Cx<'_, Self>, _section: usize) -> Option<Result<u32, Forbidden>> {
         None
     }
+
+    /// **Today's calendar date** in the viewer's time zone, `[year, month, day]`: an INPUT the
+    /// Library words its date values by ("Today", "Yesterday", "27 Oct" this year, "Oct 2024" any
+    /// other), `None` when the host has none (every date then reads as month and year). A screen
+    /// reads no clock and fetches no date: the application's loop publishes it once per frame (it
+    /// reads the platform's calendar date at most once a minute, `app::clock::today`) and a screen
+    /// only receives the answer through its views, the way a frame's time arrives on a `Tick` and
+    /// the playback session on the frame's publication. The caption cache keys its labels on it, so
+    /// they rebuild when the day turns.
+    ///
+    /// CONTRACT FREEZE: a provided method so every existing host compiles.
+    fn today(_cx: &Cx<'_, Self>) -> Option<[i32; 3]> {
+        None
+    }
 }
 
 /// The server refused the collections listing (HTTP 401/403): the answer is final for the identity
@@ -1315,18 +1522,28 @@ pub struct Forbidden;
 /// A host carrying the retained Browse directory needed by Chrome and the Settings family.
 /// Full Library hosts implement this automatically; the nested Settings host carries only this
 /// one publication so its Onboard child never falls back to the compatibility selector.
-pub trait DirectoryLike: AppLike + Sized {
+pub trait DirectoryLike: AppLike + ScreenInputsLike + Sized {
+    fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
 }
 
 impl<H: LibraryLike> DirectoryLike for H {
+    fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { LibraryLike::marker_prefs(cx) }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a> {
         LibraryLike::directory(cx)
     }
 }
 
 /// Session's immutable frame publication; playback retains its separate `session` view.
-pub trait AuthLike: AppLike + Sized {
+/// A host must explicitly supply the retained inputs; no ambient or neutral fallback.
+pub trait ScreenInputsLike: AppLike + Sized {
+    fn screen_inputs<'a>(cx: &Cx<'a, Self>) -> &'a crate::inputs::ScreenInputs;
+    /// Native preview is an app resource capability, unavailable to controlled/fixture hosts.
+    /// It is not harness policy or a profile preference; controlled recordings have no native port.
+    fn native_preview_available(_cx: &Cx<'_, Self>) -> bool { false }
+}
+
+pub trait AuthLike: AppLike + ScreenInputsLike + Sized {
     fn auth<'a>(cx: &Cx<'a, Self>) -> plx_session::auth::SessionRead<'a>;
 }
 
@@ -1339,20 +1556,49 @@ pub enum DetailRefreshPhase {
     Requested,
 }
 
+/// Explicit offline screen-host capture; the production machine has no registry fallback.
+#[cfg(test)]
+pub(crate) fn run_person_fixture(store: &mut plx_data::stores::person::PersonStore,
+    cmd: plx_data::stores::person::PersonCmd) -> bool {
+    let mut keys = plx_plex::plex::ClientKeys::default();
+    keys.refill_roster(plx_plex::plex::current_server(), plx_plex::plex::server_roster_gen(),
+        plx_plex::plex::server_facts_gen(), plx_plex::plex::server_ids(),
+        plx_plex::plex::client_for, plx_plex::plex::server_facts, plx_plex::plex::server_probe_result);
+    let bio = plx_base::devtrig::read("personbio");
+    let input = plx_data::person::PersonInput { keys: &keys, session: None, visible_generation: 0,
+                profile_scope: 0, owner_epoch: 0, profile_generation: 0, tenure: 0, profile_key: "",
+        controlled: false, profile_refused: false, credits_refused: false, dev_bio: bio.as_deref(), dev_credits: None };
+    store.run_with_input(cmd, &input)
+}
+
 /// The application's messages (spec §3.1).
 pub enum AppMsg {
+    /// Pure observation of the actual visible Watch opportunity after a successful final swap.
+    /// Frame/entry/instance addressing and one-shot admission belong to Dispatcher.
+    PlayerPresented { watch: Option<plx_appkit::skip_policy::OfferId>, paired: bool },
+    AutoSkipResolved { id: plx_appkit::skip_policy::OfferId, outcome: plx_appkit::skip_policy::OfferOutcome },
+    PlaybackTrace(plx_platform::playback_trace::Status),
     Session(plx_session::auth::owner::SessionEvent),
     Consent(ConsentCmd),
+    /// A command of the player-HUD package store, delivered to [`MachineId::Huds`].
+    Huds(HudCmd),
     RestartReply { correlation: u32, accepted: bool },
     SelectionReply { correlation: u32, accepted: bool, flow_epoch: u64 },
     BackReply { correlation: u32, resumed: bool },
     Store(StoreCmd),
+    /// Person commands retain their originating body through deferred delivery and teardown.
+    PersonCommand { from: MachineId, command: plx_data::stores::person::PersonCmd },
     StoreWork(StoreWork),
     HubsResult(plx_data::stores::hubs::HubsResult),
     Home(HomeCmd),
     Library(LibraryCmd),
     LibraryEdit { target: plx_data::stores::browse::SectionAddress, edit: plx_data::stores::browse::QueryEdit },
     LibrarySelect(plx_data::stores::browse::SectionAddress),
+    /// A Sources menu pick delivered after the close animation, still tied to its opening page.
+    LibraryMenuSelect {
+        origin: plx_data::stores::browse::SectionAddress,
+        target: plx_data::stores::browse::SectionAddress,
+    },
     DetailRestore {
         spot: plx_data::metadata::Spot,
         episode: Option<String>,
@@ -1365,9 +1611,38 @@ pub enum AppMsg {
     /// `Deferred` for a covered one; `None` is ignored.
     DetailReconcile { refresh: DetailRefreshPhase },
     /// The *Also available* surface committed a row: open that copy's own page. The SURFACE names
-    /// the destination and the PAGE navigates, which is `LibraryMenu`'s shape (`LibrarySelect`) and
+    /// the destination and the PAGE navigates, which is `LibraryMenu`'s shape (`LibraryMenuSelect`) and
     /// what keeps "what a press means on the Detail page" in one place instead of two.
     AltSourceOpen(ContentArg),
+    /// The *Play Version* surface committed a row: play that version of the page's item, as its
+    /// Play pill would (resuming). The surface names the version and the page plays it.
+    PlayVersion(plx_plex::plex::MediaId),
+    /// **A `toggle_section` command was performed** (`app::playback::perform_hud_command`, from a tab's
+    /// OK or click or from a package's disc): the player page opens that section if it is closed and closes it
+    /// if it is open, under the package's policy. The page owns the sections ([`crate::player::input::Sections`]),
+    /// so the app asks for the change as an addressed event and never writes them.
+    HudSection(plx_appkit::player_hud::command::Section),
+    /// **Close every open section** (an app switch, a decoder park): the page puts them all away, each the way a
+    /// press on its opener does. Idempotent, which a toggle is not: two of these in one frame (the app's WILL and
+    /// DID both park) leave the page closed, where two toggles would close it and reopen it.
+    HudSectionsClose,
+    /// Reset the mounted player's transport in its own event order.
+    PlayerTransportReset { for_reload: bool },
+    /// Extend the player's HUD from the observation time, not delivery time.
+    PlayerExtendHud { now: u32, duration_ms: u32 },
+    PlayerStart { now: u32, hud_ms: u32 },
+    PlayerPinHud { now: u32, duration_ms: u32, tab: Option<i32> },
+    PlayerSlot { slot: plx_appkit::player_hud::ControlSlot, primary: bool },
+    PlayerFollowRow { slot: plx_appkit::player_hud::ControlSlot, now: u32 },
+    PlayerCancelNext { decline: bool },
+    PlayerHudCommand { command: plx_appkit::player_hud::command::HudCommand, now: u32 },
+    PlayerModel(plx_appkit::player_hud::model::HudModel),
+    PlayerCompiled(std::sync::Arc<plx_appkit::hud_format::compile::Compiled>),
+    PlayerHudPolicy(crate::player::HudPolicy),
+    PlayerOverlayRetarget(crate::player::overlay::OverlayKind),
+    PlayerOverlayTrackRow(plx_appkit::track_menu::TrackRow),
+    PlayerOverlayQuality,
+    PlayerOverlayPick(String),
 }
 
 /// What the consent machine is told (§2.3): a person's answer to both questions at once.
@@ -1376,8 +1651,8 @@ pub enum ConsentCmd {
     Record { errors: bool, usage: bool },
 }
 
-/// What an owned screen asks the LEGACY LOOP to do, because the owner of that decision is not on
-/// the dispatcher yet. Each names the phase that retires it.
+/// Commands requiring app-owned resources. The runner executes these at their dispatcher FIFO
+/// head; the historical phase annotations below describe their original migration boundaries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoopReq {
     /// BACK at a root the platform owns (Home, the FIRST consent question): hand the screen to
@@ -1408,11 +1683,13 @@ pub enum LoopReq {
     AccountChangeProfile,
     AccountSignIn,
     AccountSignOut,
-    /// PRESENTS the Settings surface over the same page, so the host route does not move.
+    /// PRESENTS the Settings surface, rooted at the page, over the same page, so the host route
+    /// does not move: `Root` for the account menu's Settings row, `LibraryFavourites` for the
+    /// Library options menu's Favorite libraries row.
     /// Reachable signed OUT as well: a person who cannot sign in has still received a copy of this
     /// software, and LG requires the privacy notice to be readable in the app rather than only on
     /// the store listing.
-    AccountSettings,
+    OpenSettings(SettingsPage),
     /// Lab builds only, and it changes no route: the tester stays where they were and the toast
     /// says what happened.
     AccountSendDiagnostics,
@@ -1462,6 +1739,22 @@ pub mod word {
     pub const PLAYBACK: &str = "playback";
     pub const AUDIO: &str = "audio";
     pub const PICKER: &str = "picker";
+    /// The Player HUD page (`screens::hud_settings`), a page of the Settings family's inner stack.
+    pub const PLAYER_HUD: &str = "player-hud";
+    /// The Language page, the Diagnostics page and the Under posters pages (`screens::settings`,
+    /// `settings_diagnostics`, `settings_under_posters`): pages of the Settings family's inner stack, each its own
+    /// `overlay=` word. The two details pickers answer one word PER KIND (`DetailsPage::name`) so a scene
+    /// that boots the Show picker cannot be satisfied by the Movie one. Several are hyphenated, which is why
+    /// `tests/run.py` captures an overlay word as `[\w-]+`.
+    pub const LANGUAGE: &str = "language";
+    pub const DIAGNOSTICS: &str = "diagnostics";
+    pub const UNDER_POSTERS: &str = "under-posters";
+    pub const UNDER_POSTERS_MOVIE: &str = "under-posters-movie";
+    pub const UNDER_POSTERS_SHOW: &str = "under-posters-show";
+    pub const HUD_GALLERY: &str = "hud-gallery";
+    pub const HUD_DETAIL: &str = "hud-detail";
+    pub const HUD_ABOUT: &str = "hud-about";
+    pub const HUD_PREVIEW: &str = "hud-preview";
     pub const CONSENT: &str = "consent";
     pub const ONBOARD: &str = "onboard";
     /// The QR sign-in (`screens::login::LoginScreen`). Same spelling as `app::words::route_word`'s
@@ -1795,6 +2088,9 @@ pub enum AppArg {
     /// rect of the pill it hangs off — is on the argument, `LibraryMenuArg`'s shape and for the
     /// same reason: the entry outlives any one frame's idea of where that pill was.
     AltSources(crate::alt_sources::AltSourcesArg),
+    /// The Detail page's *Play Version* list (§6.2's page-owned panels), anchored to the hero disc
+    /// that opened it, [`Self::AltSources`]'s shape.
+    VersionsPanel(crate::versions_panel::VersionsArg),
     /// The Detail page's *Track information* sheet (§6.2's page-owned panels). It carries only the
     /// 1-based PAGE the sheet opens at — a boot address like `Settings`'s root, not an identity —
     /// because the sheet describes `metadata::current()` and the host it is presented over is the
@@ -1855,14 +2151,54 @@ pub enum AppArg {
     /// are two entries (`person → detail → person` is three), which is the whole reason the
     /// identity rides on the argument instead of being a variant of a page alphabet.
     Content(ContentArg),
-    /// The Settings family, rooted at this page (`SettingsPage::Root` for every real opening).
+    /// The Settings family, rooted at this page (`SettingsPage::Root` for every opening but the
+    /// Library's Favorite libraries row, `LoopReq::OpenSettings(SettingsPage::LibraryFavourites)`).
     Settings(SettingsPage),
     /// The first-run consent question, rooted at this stage byte (0 for every real opening;
     /// `screens::consent`'s `STAGE_PRODUCT` for `/tmp/plxnative-consent=product`).
     FirstRunConsent(u8),
 }
 
+/// Data-only frame probe policy. A new ordinary screen selects `Generic` here; it does not
+/// extend an application-layer route ladder. Legacy schemas remain explicit for recorded bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeKind { Generic, Content, Login, Profiles, Onboard, Player, Surface }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteProbe {
+    pub word: &'static str,
+    pub kind: ProbeKind,
+}
+
 impl AppArg {
+    /// The heartbeat and probe share this registration-owned declaration. No wildcard: every
+    /// argument must choose its word and schema, including non-page surfaces.
+    pub fn route_probe(&self) -> RouteProbe {
+        use ProbeKind::*;
+        let (word, kind) = match self {
+            Self::Login => ("login", Login),
+            Self::Profiles => ("profiles", Profiles),
+            Self::Onboard => ("onboard", Onboard),
+            Self::Home => ("home", Content),
+            Self::Library | Self::LibraryCollections { .. } | Self::LibraryRecommended { .. } => ("library", Content),
+            Self::Search => ("search", Content),
+            Self::Watchlist => ("watchlist", Content),
+            Self::LiveTv => ("livetv", Content),
+            Self::Player => ("player", Player),
+            Self::Content(ContentArg::Detail { .. }) => ("detail", Content),
+            Self::Content(ContentArg::Person { .. } | ContentArg::Filmography { .. }) => ("person", Content),
+            Self::Content(ContentArg::Collection(_)) => ("collection", Content),
+            Self::Content(ContentArg::Catalog { .. }) => ("catalog", Content),
+            Self::Settings(_) | Self::FirstRunConsent(_) | Self::LibraryMenu(_)
+            | Self::AccountMenu | Self::WatchlistMenu(_) | Self::ItemMenu(_)
+            | Self::PlayerOverlay(_) | Self::AltSources(_) | Self::VersionsPanel(_)
+            | Self::TracksPanel(_) | Self::AboutPanel | Self::PersonBio | Self::CollectionAbout => ("", Surface),
+        };
+        RouteProbe { word, kind }
+    }
+
+    pub fn route_word(&self) -> &'static str { self.route_probe().word }
+
     /// Is this one of the library screen's three routes: the full grid and the two pages its header
     /// pushes over it (Collections, Recommended)? They are all the one `LibraryScreen` family, so a
     /// request or a command addressed to "the library" is answered on any of them.
@@ -1871,13 +2207,32 @@ impl AppArg {
     }
 }
 
-pub const ARG_SHAPE: &str = "AppArg{Login,Profiles,Onboard,Home,Library,LibraryCollections{section:u32},LibraryRecommended{section:u32},Search,Watchlist,Player,Content:{Detail{sid:u32,rk:str},Person{sid:u32,key:str,guid:str,name:str,thumb:str},Filmography{sid:u32,key:str},Collection{sid:u32,rk:str,sec:i64,tag:i64,name:str},Catalog{hex:str}},Settings:SettingsPage{Root,Playback,AudioSubtitles,Favourites,Privacy,Legal,About,Document(u8),Preview(u8),ConsentStage(u8),Language,Contribute},FirstRunConsent(u8),LibraryMenu{host:u32,target:{epoch:u32,sid:u32,section:u64},kind:u32,anchor:[u32;4]},\
-     PlayerOverlay{Tracks(tab:i32),Info,Chapters,More(quality:bool)},\
+pub const ARG_SHAPE: &str = "AppArg{Login,Profiles,Onboard,Home,Library,LibraryCollections{section:u32},LibraryRecommended{section:u32},Search,Watchlist,Player,Content:{Detail{sid:u32,rk:str},Person{sid:u32,key:str,guid:str,name:str,thumb:str},Filmography{sid:u32,key:str},Collection{sid:u32,rk:str,sec:i64,tag:i64,name:str},Catalog{hex:str}},Settings:SettingsPage{Root,Playback,AudioSubtitles,Favourites,LibraryFavourites,Privacy,Legal,About,Document(u8),Preview(u8),ConsentStage(u8),Language,Contribute},FirstRunConsent(u8),LibraryMenu{host:u32,target:{epoch:u32,sid:u32,section:u64},kind:u32,anchor:[u32;4]},\
+     PlayerOverlay{Tracks(tab:i32),Info,Chapters,More(page:u8)},\
      AltSources{host:u32,sid:u32,rk:str,anchor:[u32;4]},\
+     VersionsPanel{host:u32,sid:u32,rk:str,anchor:[u32;4]},\
      TracksPanel{page:i32},AboutPanel,PersonBio,CollectionAbout,AccountMenu,\
      ItemMenu{sid:u32,rk:str,kind:{Card{from_deck:bool,type:u32},Episode{mark:u32},Season{mark:u32},Catalog{state:u32}},\
      host:u32,focus:Option<{entry:u32,elem:u32}>,anchor:[u32;4],loaded_episode:bool,from_home:bool,catalog:Option<{guid:str}>},\
      WatchlistMenu{host:u32,options:{type:u32,sort:u32,descending:bool,show:u32},anchor:[u32;4]}}";
+
+/// Append-only page samples for heartbeat/scenario validation. Adding an ordinary screen
+/// extends this registration census here, never a central application test table.
+#[cfg(any(test, feature = "test-support"))]
+pub fn every_page_arg() -> Vec<AppArg> {
+    let sid = plx_plex::plex::ServerId::UNSET;
+    vec![
+        AppArg::Login, AppArg::Profiles, AppArg::Onboard, AppArg::Home, AppArg::Library,
+        AppArg::LibraryCollections { section: 0 }, AppArg::LibraryRecommended { section: 0 },
+        AppArg::Content(ContentArg::Detail { sid, rk: String::new() }),
+        AppArg::Content(ContentArg::Person {
+            sid, key: String::new(), guid: String::new(), name: String::new(), thumb: String::new(),
+        }),
+        AppArg::Content(ContentArg::Collection(plx_plex::plex::collections::CollectionRef::by_tag(sid, 0, 1, ""))),
+        AppArg::Content(ContentArg::Catalog { hex: [0; 12] }),
+        AppArg::Search, AppArg::Watchlist, AppArg::LiveTv, AppArg::Player,
+    ]
+}
 
 impl LogicalState for AppArg {
     fn write(&self, c: &mut Canon) {
@@ -1900,6 +2255,8 @@ impl LogicalState for AppArg {
             Self::ItemMenu(arg) => { c.u32(9); arg.write(c); }
             // 13, after the About/Bio/Collection sheets' 10-12: allocated forward.
             Self::WatchlistMenu(arg) => { c.u32(13); arg.write(c); }
+            // 14, forward of the Watchlist menu's 13.
+            Self::VersionsPanel(arg) => { c.u32(14); arg.write(c); }
             // The seven PAGE variants keep the canon bytes `Legacy(Route)` wrote — a `0` tag and
             // then the route's own — so a recording taken before the fold and one taken after are
             // byte-comparable at every page frame. Only the SHAPE STRING moved, which is what the
@@ -1951,6 +2308,7 @@ impl plx_ui::screen::ScreenArg for AppArg {
             | AppArg::WatchlistMenu(_)
             | AppArg::PlayerOverlay(_)
             | AppArg::AltSources(_)
+            | AppArg::VersionsPanel(_)
             | AppArg::TracksPanel(_)
             | AppArg::AboutPanel
             | AppArg::PersonBio
@@ -2008,6 +2366,8 @@ impl plx_ui::screen::ScreenArg for AppArg {
             AppArg::Content(ContentArg::Collection(_)) => page_id::COLLECTION.0,
             // 27, forward of the Watchlist menu's 26: the catalog page (plan W6).
             AppArg::Content(ContentArg::Catalog { .. }) => 27,
+            // 30, forward of the Recommended page's 29.
+            AppArg::VersionsPanel(_) => 30,
         })
     }
     fn title(&self) -> Option<&str> {
@@ -2074,6 +2434,23 @@ pub struct AppMounter {
     /// taken before a blocking resolve, so a load longer than the 4.5 s linger expired the HUD
     /// before it was ever drawn and the user got a blank screen instead of a transport.
     pub player_hud_ms: Option<u32>,
+    /// **The rect the NEXT player menu hangs from**: the compiled package's anchor for the opener that asked
+    /// (`PlayerScreen::menu_anchor`), stamped by the app at the press and consumed by the overlay's mount,
+    /// a seed like `player_hud_ms` and for the same reason: the canonical `PlayerOverlayArg` is the panel's
+    /// KIND, so a rect of floats cannot ride on it. `None` mounts the menu at its own default.
+    pub player_menu_anchor: Option<plx_ui::Rect>,
+    /// **The folded rows the NEXT More menu lists** ([`plx_appkit::more_menu::folded_rows`], computed by the app at the
+    /// press from the compiled package and the playing item's predicates): a seed beside the anchor, consumed by
+    /// the same mount and for the same reason. Empty for classic, for a menu opened without a player HUD under it
+    /// (the failure read-out's recovery) and for every other overlay.
+    pub player_more_folds: Vec<plx_appkit::more_menu::FoldedRow>,
+    /// **The compiled HUD the NEXT player instance is constructed with** (`PlayerScreen::new`'s argument): the last
+    /// compile `adopt_hud` took into use (the classic at boot, a dev package, or a chosen package the driver handed
+    /// over), and handed to the mount the way the seeds above are.
+    /// Cloned, not consumed: every player instance draws from the app's current compile. The mount never compiles, reads no registry and holds no fallback of its own; a
+    /// mounter nothing seeded (a controlled run, which compiles nothing outside a frame and never reaches the
+    /// player) hands the page `Compiled::default()`, which has no state for any frame.
+    pub player_compiled: std::sync::Arc<plx_appkit::hud_format::compile::Compiled>,
 }
 
 /// **The one `mount` match** (spec §2.1) — the whole of what "add a screen" costs, in the module
@@ -2106,13 +2483,22 @@ where
             AppArg::ItemMenu(arg) => Box::new(
                 crate::item_menu::ItemMenuScreen::new(entry, arg.clone()).with_watchlist(arg.watchlist)),
             AppArg::WatchlistMenu(arg) => Box::new(crate::watchlist::menu::WatchlistMenuScreen::new(entry, *arg)),
-            AppArg::PlayerOverlay(arg) => Box::new(
-                crate::player::overlay::PlayerOverlayScreen::new_with(
-                    H::session(cx), H::metadata(cx), entry, arg.kind, H::subtitle_search(cx).is_some()),
-            ),
+            AppArg::PlayerOverlay(arg) => {
+                let offer_search = H::subtitle_search(cx).is_some();
+                Box::new(crate::player::overlay::PlayerOverlayScreen::new_captured(
+                    H::session(cx), H::metadata(cx), entry, arg.kind, offer_search,
+                    self.player_menu_anchor.take(), std::mem::take(&mut self.player_more_folds), H::screen_inputs(cx)))
+            }
             AppArg::AltSources(arg) => Box::new(
                 crate::alt_sources::AltSourcesScreen::new(entry, arg.clone(), H::metadata(cx)),
             ),
+            AppArg::VersionsPanel(arg) => {
+                let versions = H::metadata(cx)
+                    .current()
+                    .filter(|d| plx_plex::plex::same_item((d.sid, d.rk.as_str()), (arg.sid, arg.rk.as_str())))
+                    .map_or(&[][..], crate::detail::hero_versions);
+                Box::new(crate::versions_panel::VersionsPanelScreen::new(entry, arg.clone(), versions))
+            }
             AppArg::TracksPanel(arg) => Box::new(
                 crate::tracks_panel::TracksPanelScreen::new(entry, *arg),
             ),
@@ -2221,7 +2607,7 @@ where
             // instant it mounts (`AppMounter::player_hud_ms`), never from the keypress that asked
             // for the playback.
             AppArg::Player => {
-                let mut page = crate::player::PlayerScreen::new(entry);
+                let mut page = crate::player::PlayerScreen::new(entry, std::sync::Arc::clone(&self.player_compiled));
                 // **Where BACK, Stop and EOS land** (§5.1). Captured at the MOUNT, from the page
                 // that was on top when the push was asked for — never read live, because an
                 // overlay opening on this page's own stack changes the input owner and must not
@@ -2307,6 +2693,12 @@ pub fn every_surface_arg() -> Vec<AppArg> {
             rk: "1".into(),
             anchor: [0; 4],
         }),
+        AppArg::VersionsPanel(crate::versions_panel::VersionsArg {
+            host: plx_machine::machine::InstanceId(1),
+            sid: plx_plex::plex::ServerId::UNSET,
+            rk: "1".into(),
+            anchor: [0; 4],
+        }),
         AppArg::TracksPanel(crate::tracks_panel::TracksPanelArg { page: 1 }),
         AppArg::AboutPanel,
         AppArg::PersonBio,
@@ -2323,6 +2715,7 @@ pub fn every_surface_arg() -> Vec<AppArg> {
             | AppArg::ItemMenu(_)
             | AppArg::WatchlistMenu(_)
             | AppArg::AltSources(_)
+            | AppArg::VersionsPanel(_)
             | AppArg::TracksPanel(_)
             | AppArg::AboutPanel
             | AppArg::PersonBio
@@ -2401,12 +2794,14 @@ pub const SCREEN_SHAPES: &[&str] = &[
     // Descriptive only, and already behind the shipped list (no fr, no it): never generate this
     // from the language registry, or every added language moves SCREEN_SHAPES_PIN and forces the
     // replay fixtures to be re-recorded.
+    "PlaybackDiagnosticsV1{Root:{trace:off|recording|saved|exported|saving|unavailable|failed},Effects:command->addressed-status}",
     "LocalizationSettingsV4{Root:{language:system|en|es|be},Language:{selected:system|en|es|be,focus:u32,busy:bool,failed:bool},Contribute:QrLink,LoginReportAlert:{send:bool,scroll_target_bits:u32},ConsentDisclosure:{scroll_target_bits:u32,scroll_owner:answer_band},ConsentDeleteDisclosure:{scroll_target_bits:u32},BandPart:MeasuredRowOrColumn}",
     crate::preferences::SHAPE,
     crate::preferences::PICKER_SHAPE,
     crate::watchlist::page::WatchlistScreen::SHAPE,
     crate::watchlist::menu::SHAPE,
     crate::catalog::CatalogScreen::SHAPE,
+    crate::versions_panel::SHAPE,
 ];
 
 /// The pin over [`SCREEN_SHAPES`] — bump it in the same edit that adds an entry, and say why.
@@ -2580,7 +2975,34 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // `(row:u32,sp:..,card:Option<u32>)`, in write order; the Collection and Watchlist grids name
 // `bands` symbolically, so their shape strings did not change. One bump; the three replay fixtures
 // were re-recorded against it; the previous pin was 0x0803_2f8d_c828_6d70.
-const SCREEN_SHAPES_PIN: u64 = 0x6b71_df9e_04db_2b76;
+// Player two-press BACK while busy: `PlayerScreen`'s `hud` gains `exit_armed` (a BACK hid the
+// transport while the pipeline was busy, so the hide cannot show) and `back_leaves_at_press` (that
+// arming, sampled before the press un-dismisses), both after `visible_at_press` in the canon and
+// the shape string. One bump; the three replay fixtures were re-recorded against it; the previous
+// pin was 0x6b71_df9e_04db_2b76.
+// Play Version: `item_menu::SHAPE`'s `Action` gains `ChooseVersion` (tag 12) and `PlayVersion`
+// (tag 13, with its `media:u64` id); `ARG_SHAPE` gains `VersionsPanel{host,sid,rk,anchor}` and
+// `screens::versions_panel::SHAPE` is appended. One bump; the three replay fixtures were
+// re-recorded against it; the previous pin was 0x209b_8063_1907_d7c8.
+// Immediate jump state adds SeekBurst target/time and the pending FF/REW tap flag.
+// The independent settings also update the Preferences and Picker state versions.
+// Previous pin: 0x3cf2_5b06_5ed9_8faa. Re-record the incompatible anchors through plxnative-rec.
+// HUD commands (PR3): `PlayerOverlay::More` names the page it opens on, `More(page:u8)` (0 the
+// root, 1 Quality, 2 Speed) where it carried `More(quality:bool)`, so the Speed page can be
+// addressed. One bump; the three replay fixtures were re-recorded against it; the previous pin was
+// 0x9425_f33f_3f53_6aa5.
+// Opt-in playback diagnostics adds Root status and addressed command replies.
+// Replay anchors are re-recorded through tools/plxnative-rec rerecord.
+// Contextual Library favorites editor adds a distinct SettingsPage address.
+// Automatic marker skipping adds per-kind preferences, addressed grant scope and timer/offer state.
+// Incompatible replay anchors are re-recorded through tools/plxnative-rec rerecord.
+// The restored Up Next pair retains a scoped declined segment across timer/grant changes.
+// Previous screen pin: 0x1802_f17e_e583_f977; re-record incompatible replay anchors.
+// The player's Back motion gate keeps its last position and fixed anchor in the canon.
+// Previous pin: 0xf852_85cc_f116_356b. Re-record incompatible replay anchors.
+// The Library menu retains its parent scroll across a Genre drill-in and the selected library
+// through its closing morph. Previous pin: 0x7e36_4373_746a_c3dc.
+const SCREEN_SHAPES_PIN: u64 = 0x1427_1d82_bf6b_e04c;
 
 #[cfg(test)]
 mod arg_tests {
@@ -2883,3 +3305,5 @@ mod compaction_tests {
         assert_eq!(table, vec![1, 2, 3]);
     }
 }
+
+pub(crate) mod sort_info;

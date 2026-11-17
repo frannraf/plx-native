@@ -62,7 +62,7 @@ pub(crate) struct Asked {
 /// came up still finds its DVR, and a server that is down is not hammered.
 const PROVIDERS_RETRY_MS: u32 = 30_000;
 
-impl Bridge {
+impl Bridge<'_> {
     /// Is the Live TV pill on the strip (the store found a DVR)?
     pub(crate) fn live_tv_on_strip(&self) -> bool {
         matches!(self.stores.live_tv.availability(), Availability::Available)
@@ -83,11 +83,11 @@ impl Bridge {
         let store = &mut self.stores.live_tv;
         if store.providers_failed() {
             let now = crate::app::clock::now();
-            match self.live_tv.retry_at {
-                None => self.live_tv.retry_at = Some(now.wrapping_add(PROVIDERS_RETRY_MS)),
+            match self.retained.live_tv.retry_at {
+                None => self.retained.live_tv.retry_at = Some(now.wrapping_add(PROVIDERS_RETRY_MS)),
                 // the logical clock wraps: due once `now` passes `at`
                 Some(at) if now.wrapping_sub(at) as i32 >= 0 => {
-                    self.live_tv.retry_at = None;
+                    self.retained.live_tv.retry_at = None;
                     if let Some(sid) = store.server() {
                         store.open(sid);
                     }
@@ -95,18 +95,18 @@ impl Bridge {
                 Some(_) => {}
             }
         } else {
-            self.live_tv.retry_at = None;
+            self.retained.live_tv.retry_at = None;
         }
         match store.server() {
             Some(sid) if plx_plex::plex::client_for(sid).is_none() => {
                 store.reset();
-                self.live_tv.tried.clear();
+                self.retained.live_tv.tried.clear();
             }
             Some(sid) if *store.availability() == Availability::None => {
-                if !self.live_tv.tried.contains(&sid) {
-                    self.live_tv.tried.push(sid);
+                if !self.retained.live_tv.tried.contains(&sid) {
+                    self.retained.live_tv.tried.push(sid);
                 }
-                let tried = &self.live_tv.tried;
+                let tried = &self.retained.live_tv.tried;
                 if let Some(next) = plx_plex::plex::server_ids().find(|id| !tried.contains(id)) {
                     store.open(next);
                 }
@@ -130,27 +130,29 @@ impl Bridge {
         // recordings lists are kept fresh: stale channel-days are read again, the lists every five
         // minutes. Idle on Home, nothing is asked.
         let minute = plx_data::live_tv::wall_now() / 60;
-        let in_use = d.nav.tabs.stack.entries.iter().any(|e| e.arg == AppArg::LiveTv) || self.live_tv.watching.is_some();
-        if in_use && self.live_tv.freshened != Some(minute) {
-            self.live_tv.freshened = Some(minute);
+        let in_use = d.nav.tabs.stack.entries.iter().any(|e| e.arg == AppArg::LiveTv) || self.retained.live_tv.watching.is_some();
+        if in_use && self.retained.live_tv.freshened != Some(minute) {
+            self.retained.live_tv.freshened = Some(minute);
             self.stores.live_tv.refresh_stale();
             if minute % 5 == 0 {
                 self.stores.live_tv.refresh_dvr_quietly();
             }
         }
+        // a menu veiling the page holds what landed until it lets go of the host (`watchlist_feed`'s rule)
+        let page_veiled = d.modal_presentation().read.page_veiled();
         let Some((instance, page)) = Self::live_tv_page(d) else {
-            if self.live_tv.instance.take().is_some() {
-                self.live_tv.generation = None;
-                self.live_tv.want = None;
+            if self.retained.live_tv.instance.take().is_some() {
+                self.retained.live_tv.generation = None;
+                self.retained.live_tv.want = None;
             }
             // a Watch press whose page is gone is nobody's
             self.live_tv_cancel_tune();
             return;
         };
-        if self.live_tv.instance != Some(instance) {
-            self.live_tv.instance = Some(instance);
-            self.live_tv.generation = None;
-            self.live_tv.want = None;
+        if self.retained.live_tv.instance != Some(instance) {
+            self.retained.live_tv.instance = Some(instance);
+            self.retained.live_tv.generation = None;
+            self.retained.live_tv.want = None;
             self.stores.live_tv.refresh_dvr();
             // the guide opens on the account's favorites, as the stock app's does, until a tab is
             // picked
@@ -160,28 +162,28 @@ impl Bridge {
             self.stores.live_tv.want_blur(&art);
         }
         let want = page.want();
-        if want != self.live_tv.want {
+        if want != self.retained.live_tv.want {
             if let Some(w) = &want {
                 self.stores.live_tv.want_window(w.rows.clone(), w.from, w.to);
             }
-            self.live_tv.want = want.clone();
-            self.live_tv.generation = None;
+            self.retained.live_tv.want = want.clone();
+            self.retained.live_tv.generation = None;
         }
-        if plx_ui::containers::modal::page_veiled() {
+        if page_veiled {
             return;
         }
         let generation = self.stores.live_tv.generation();
-        if self.live_tv.generation == Some(generation) {
+        if self.retained.live_tv.generation == Some(generation) {
             return;
         }
-        self.live_tv.generation = Some(generation);
+        self.retained.live_tv.generation = Some(generation);
         page.input(view_of(&self.stores.live_tv, want.as_ref()));
+        // what landed is drawn on the next frame (the page is fed outside its own step)
+        d.present.note_in_scope(plx_machine::present::Scope::Page,
+            plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Landing(
+                MachineId::Instance(instance))));
     }
 
-    /// The page's requests, drained by `content::live_tv_requests`.
-    pub(crate) fn take_live_tv_reqs(&mut self) -> Vec<(MachineId, LiveTvOut, ReturnState<u32, PageMemory>)> {
-        std::mem::take(&mut self.live_tv_reqs)
-    }
 
     /// A page request that is the store's (the strip, BACK and the chip are navigation).
     pub(crate) fn live_tv_request(&mut self, out: LiveTvOut) {
@@ -228,7 +230,7 @@ impl Bridge {
         if plx_media::route::record_asked() || self.live_tv_step_busy() {
             return;
         }
-        let Some(key) = self.live_tv.watching.clone() else { return };
+        let Some(key) = self.retained.live_tv.watching.clone() else { return };
         let Some(row) = self.stores.live_tv.row_of_key(&key) else {
             plx_base::eventlog::log("livetv: record from the player: the guide's tab does not list that channel");
             return;
@@ -257,15 +259,15 @@ impl Bridge {
             if let Some(words) = store.channel_words(row) {
                 store.show_tuning(words);
             }
-            self.live_tv.asked = None;
-            self.live_tv.pending = Some((asked, airing));
+            self.retained.live_tv.asked = None;
+            self.retained.live_tv.pending = Some((asked, airing));
             return;
         }
-        self.live_tv.pending = None;
+        self.retained.live_tv.pending = None;
         if store.tune(row, airing) {
-            self.live_tv.asked = Some(asked);
+            self.retained.live_tv.asked = Some(asked);
         } else {
-            self.live_tv.asked = None;
+            self.retained.live_tv.asked = None;
             plx_base::eventlog::log("livetv: nothing to tune on that row");
         }
     }
@@ -273,18 +275,18 @@ impl Bridge {
     /// Once a frame: a Watch waiting on a tuner goes when none is still coming back, while the
     /// screen that asked for it is up (a CH▲/CH▼'s the player, a guide press's the guide).
     pub(crate) fn live_tv_pump(&mut self, in_player: bool, in_guide: bool) {
-        let Some((asked, _)) = &self.live_tv.pending else { return };
+        let Some((asked, _)) = &self.retained.live_tv.pending else { return };
         // …while the screen that asked is up and the guide still shows the tab it asked under (a
         // row of another tab is another channel)
         if (asked.step && !in_player) || (!asked.step && !in_guide) || &asked.source != self.stores.live_tv.source() {
-            self.live_tv.pending = None;
+            self.retained.live_tv.pending = None;
             self.stores.live_tv.cancel_tune();
             return;
         }
         if plx_media::route::live_releasing() || self.stores.live_tv.tuners_settling() {
             return;
         }
-        let Some((asked, airing)) = self.live_tv.pending.take() else { return };
+        let Some((asked, airing)) = self.retained.live_tv.pending.take() else { return };
         // the row that channel stands in now: a lineup read again meanwhile (a favorites write
         // landing) moves it, and one that no longer lists it tunes nothing
         let row = match &asked.key {
@@ -305,7 +307,7 @@ impl Bridge {
     pub(crate) fn live_tv_step_target(&self, step: i32) -> Option<usize> {
         let store = &self.stores.live_tv;
         // from the step under way, else the channel playing where the tab shown lists it
-        let from = match (&self.live_tv.pending, &self.live_tv.asked, &self.live_tv.watching) {
+        let from = match (&self.retained.live_tv.pending, &self.retained.live_tv.asked, &self.retained.live_tv.watching) {
             (Some((a, _)), _, _) if a.step => (&a.source == store.source()).then_some(a.row),
             (_, Some(a), _) if a.step => (&a.source == store.source()).then_some(a.row),
             (_, _, Some(key)) => store.row_of_key(key),
@@ -332,11 +334,11 @@ impl Bridge {
     /// moved, while a CH▲/CH▼ is under way, or when the guide shows another tab.
     pub(crate) fn live_tv_program_now(&mut self) -> Option<plx_plex::plex::live_tv::Airing> {
         let generation = self.stores.live_tv.generation();
-        if self.live_tv.rolled_at == Some(generation) || self.live_tv_step_busy() {
+        if self.retained.live_tv.rolled_at == Some(generation) || self.live_tv_step_busy() {
             return None;
         }
-        self.live_tv.rolled_at = Some(generation);
-        let key = self.live_tv.watching.as_ref()?;
+        self.retained.live_tv.rolled_at = Some(generation);
+        let key = self.retained.live_tv.watching.as_ref()?;
         let row = self.stores.live_tv.row_of_key(key)?;
         self.stores.live_tv.on_now(row)
     }
@@ -358,7 +360,7 @@ impl Bridge {
 
     /// Is a CH▲/CH▼ under way (waiting on a tuner, or tuning)?
     pub(crate) fn live_tv_step_busy(&self) -> bool {
-        self.live_tv.pending.as_ref().is_some_and(|(a, _)| a.step) || self.live_tv.asked.as_ref().is_some_and(|a| a.step)
+        self.retained.live_tv.pending.as_ref().is_some_and(|(a, _)| a.step) || self.retained.live_tv.asked.as_ref().is_some_and(|a| a.step)
     }
 
     /// The player was left (STOP, BACK, the background): a CH▲/CH▼ under way is dropped, its tune
@@ -366,32 +368,32 @@ impl Bridge {
     pub(crate) fn live_tv_abandon_step(&mut self) {
         if self.live_tv_step_busy() {
             plx_base::eventlog::log("livetv: a channel step is dropped (the player was left)");
-            self.live_tv.pending = None;
-            self.live_tv.asked = None;
+            self.retained.live_tv.pending = None;
+            self.retained.live_tv.asked = None;
             self.stores.live_tv.cancel_tune();
         }
     }
 
     /// The Watch the landed tune answers (taken: one landing per ask).
     pub(crate) fn live_tv_take_asked(&mut self) -> Option<Asked> {
-        self.live_tv.asked.take()
+        self.retained.live_tv.asked.take()
     }
 
     /// The landed tune plays: it is the channel watched now.
     pub(crate) fn live_tv_now_watching(&mut self, asked: &Asked) {
-        self.live_tv.watching = asked.key.clone();
+        self.retained.live_tv.watching = asked.key.clone();
     }
 
     /// No channel plays any more: nothing is watched from the guide (which is kept fresh only while
     /// its page is up or a channel plays from it).
     pub(crate) fn live_tv_forget_watching(&mut self) {
-        self.live_tv.watching = None;
+        self.retained.live_tv.watching = None;
     }
 
     /// The Watch asked failed (the store says so): forget it. `Some(step)` once per failure.
     pub(crate) fn live_tv_take_failure(&mut self) -> Option<bool> {
-        if self.live_tv.asked.is_some() && self.stores.live_tv.tune_failed() {
-            return self.live_tv.asked.take().map(|a| a.step);
+        if self.retained.live_tv.asked.is_some() && self.stores.live_tv.tune_failed() {
+            return self.retained.live_tv.asked.take().map(|a| a.step);
         }
         None
     }
@@ -405,7 +407,7 @@ impl Bridge {
     /// plays there)?
     /// Is the channel a What's On card names (its lineup id, else its number) the one playing?
     pub(crate) fn live_tv_is_watching_card(&self, identifier: &str, vcn: &str) -> bool {
-        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of_card(identifier, vcn)
+        self.retained.live_tv.watching.is_some() && self.retained.live_tv.watching == self.stores.live_tv.key_of_card(identifier, vcn)
     }
 
     /// Does a What's On card name a channel read here (a Watch of it tunes something)?
@@ -414,13 +416,13 @@ impl Bridge {
     }
 
     pub(crate) fn live_tv_is_watching(&self, row: usize) -> bool {
-        self.live_tv.watching.is_some() && self.live_tv.watching == self.stores.live_tv.key_of(row)
+        self.retained.live_tv.watching.is_some() && self.retained.live_tv.watching == self.stores.live_tv.key_of(row)
     }
 
     /// Forget a Watch press still on its way (the app is going to the background).
     pub(crate) fn live_tv_cancel_tune(&mut self) {
-        self.live_tv.pending = None;
-        self.live_tv.asked = None;
+        self.retained.live_tv.pending = None;
+        self.retained.live_tv.asked = None;
         self.stores.live_tv.cancel_tune();
     }
 
@@ -533,5 +535,7 @@ pub(crate) fn live_playing_item(t: &Tuned) -> plx_data::metadata::PlayingItem {
         markers: Vec::new(),
         chapters: Vec::new(),
         hdr: false,
+        // a live channel has no duration
+        duration_ms: None,
     }
 }

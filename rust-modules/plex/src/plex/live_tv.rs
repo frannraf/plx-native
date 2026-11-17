@@ -560,10 +560,13 @@ pub const LIVE_CEILING: super::Ceiling = super::Ceiling { max_kbps: 12_000, max_
 /// The transcode request for a live key: the same fixed-HLS contract the library's HLS rungs use.
 /// `subtitle_stream_id` names a caption stream of the tuned part to burn in (0 for none): the
 /// profile advertises no subtitle delivery, so the server's one way to show it is in the picture.
-pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64, offset: super::TranscodeOffset) -> super::TranscodeSpec<'a> {
+/// `caps` is the device's (`devcaps::caps()`): a live encode is one fixed rendition, no plan picks its tracks.
+pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: i64, offset: super::TranscodeOffset,
+    caps: &'a plx_platform::devcaps::Caps) -> super::TranscodeSpec<'a> {
     super::TranscodeSpec {
         rating_key: "",
         path_override: Some(key),
+        media_index: 0,
         session,
         encoder_session: session,
         contract: super::EncodeContract {
@@ -577,6 +580,7 @@ pub(super) fn live_spec<'a>(key: &'a str, session: &'a str, subtitle_stream_id: 
         subtitle_stream_id: subtitle_stream_id.max(0),
         client_subtitles: false,
         offset,
+        caps,
     }
 }
 
@@ -590,7 +594,8 @@ impl Client {
         if !key.starts_with('/') || session.is_empty() {
             return Err(LiveError::Invalid);
         }
-        let spec = live_spec(key, session, subtitle_stream_id, super::TranscodeOffset::Fresh);
+        let caps = plx_platform::devcaps::caps();
+        let spec = live_spec(key, session, subtitle_stream_id, super::TranscodeOffset::Fresh, &caps);
         let started = std::time::Instant::now();
         let decision = self.transcode_decision(off, &spec);
         let Some(decision) = decision else {
@@ -653,7 +658,8 @@ impl Client {
             Some(s) if s.is_finite() && s >= 0.0 => super::TranscodeOffset::from_micros((s * 1_000_000.0) as i64),
             _ => super::TranscodeOffset::Fresh,
         };
-        Some(self.transcode_start_url(&live_spec(key, session, subtitle_stream_id, offset)).to_url())
+        let caps = plx_platform::devcaps::caps();
+        Some(self.transcode_start_url(&live_spec(key, session, subtitle_stream_id, offset, &caps)).to_url())
     }
 
     /// Stop a live encode (and free its streaming resource). `true` when the server took it.
@@ -683,7 +689,7 @@ impl Client {
             .int("duration", 0)
             .str("X-Plex-Session-Identifier", session);
         let q = self.playback_identity(q);
-        match self.body_2xx_post(&q.build()) {
+        match self.post_accepting_json(&q.build()) {
             None => (false, None),
             Some(body) => {
                 let answer = serde_json::from_slice::<Value>(&body).ok();

@@ -50,7 +50,9 @@ fn map(stores: &mut Stores, out: &NotifyOut, pages: &[ContentArg]) -> super::not
 
 fn map_shown(stores: &mut Stores, out: &NotifyOut, pages: &[ContentArg], shown: Shown) -> super::notify_map::Spent {
     let dir = DirectorySnapshot::default();
-    stores.notify_map(out, pages, shown, dir.view())
+    let spent = stores.notify_map(out, pages, shown, dir.view(), &crate::pms::registry_keys_for_test());
+    stores.watchlist.dispatch_jobs_for_test();
+    spent
 }
 
 fn pending(stores: &Stores) -> Vec<String> {
@@ -130,6 +132,27 @@ fn stopped_unheld_coalesced_source_refetch_and_invalidate() {
     assert!(pending(&stores).is_empty(), "no per-item read of an item nothing shows");
     assert_eq!(spent.refetched, [SID], "two stops on one server are one refetch");
     assert_eq!(spent.invalidated, [SID], "that server's section shelves are invalidated, once");
+}
+
+#[test]
+fn created_or_removed_items_owe_the_servers_grids_one_re_list() {
+    let _g = plx_base::testlock::serial();
+    let mut stores = holding(&[]);
+    use crate::stores::notify::NotifyLibrary;
+    use plx_plex::plex::notify::{LibraryEntry, LibraryKind, LibraryState};
+    let entry = |id: &str, state| LibraryEntry { item_id: id.into(), kind: LibraryKind::Movie, state, section: None };
+    let out = NotifyOut {
+        library: vec![
+            NotifyLibrary { sid: SID, entries: vec![entry("a", LibraryState::Created)] },
+            NotifyLibrary { sid: SID, entries: vec![entry("b", LibraryState::Deleted)] },
+        ],
+        ..Default::default()
+    };
+    let spent = map(&mut stores, &out, &[]);
+    assert_eq!(spent.relisted, [SID], "two reports in one pump are one re-list");
+    assert_eq!(spent.refetched, [SID], "and one quiet Home refetch");
+    assert_eq!(spent.invalidated, [SID], "and one section-shelf invalidate");
+    assert!(map(&mut stores, &NotifyOut::default(), &[]).relisted.is_empty(), "spent once");
 }
 
 #[test]
@@ -687,10 +710,80 @@ fn a_feed_that_came_back_after_a_gap_sweeps_the_titles_of_that_server() {
 }
 
 #[test]
-fn a_library_change_leaves_home_and_the_reads_alone() {
+fn a_library_change_moves_the_servers_lists_and_reads_no_item() {
     let _g = plx_base::testlock::serial();
     let (mut stores, _script, sid) = watchlist_of_three();
     let spent = map(&mut stores, &library(sid, vec![created("20"), deleted("11")]), &[]);
-    assert_eq!(spent, Default::default(), "no Home refetch, no shelf invalidation");
-    assert!(pending(&stores).is_empty());
+    assert_eq!(spent.refetched, [sid], "one quiet Home refetch");
+    assert_eq!(spent.invalidated, [sid], "one section-shelf invalidate");
+    assert_eq!(spent.relisted, [sid], "one re-list of its grids");
+    assert!(pending(&stores).is_empty(), "no per-item read-back");
+}
+
+/// The quiet refetch is a Hubs step, and a Hubs step settles the launches the runner refused since the
+/// last one: its refreshes are part of what the pass spent, not dropped.
+#[test]
+fn a_refusal_the_quiet_refetch_step_settles_is_carried_out_of_the_pass() {
+    let _g = plx_base::testlock::serial();
+    let _session = plx_plex::plex::session::TempSession::new("notify-refusal");
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("notify-refusal", "127.0.0.1", 9, "synthetic", "cid");
+    let mut stores = Stores::default();
+    let keys = crate::pms::registry_keys_for_test();
+    let dir = DirectorySnapshot::default();
+    let first = stores.hubs.run_with_directory(crate::stores::hubs::HubsCmd::RefetchHubs, dir.view(), &keys);
+    assert!(first.endpoints.is_empty(), "the refusal is the runner's answer, not the kick's");
+    stores.hubs.refuse_jobs_for_test();
+    let spent = map(&mut stores, &library(sid, vec![created("20")]), &[]);
+    assert_eq!(spent.refetched, [sid]);
+    assert_eq!(spent.endpoints.iter().map(|r| r.sid).collect::<Vec<_>>(), [sid]);
+    plx_plex::plex::reset_servers_for_test();
+}
+
+fn owes_lines() -> usize {
+    std::fs::read_to_string(plx_base::eventlog::events_log())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("notify: owes"))
+        .count()
+}
+
+/// A scan reports a create every few seconds: the server's listings are told once per spacing, the
+/// change that lands inside it waits (one entry, however many arrive) and is spent when it is due,
+/// and the waiting is not logged frame after frame.
+#[test]
+fn a_servers_listings_are_told_at_most_once_per_spacing() {
+    let _g = plx_base::testlock::serial();
+    plx_base::eventlog::with_private_log(|| {
+        let mut stores = holding(&[]);
+        let change = library(SID, vec![created("20")]);
+        let mut calls = 0u64;
+        let mut tick = |stores: &mut Stores, out: &NotifyOut| {
+            calls += 1;
+            (map(stores, out, &[]).relisted, calls)
+        };
+        let (relisted, first) = tick(&mut stores, &change);
+        assert_eq!(relisted, [SID], "the first change is told at once");
+        let logged = owes_lines();
+        for _ in 0..3 {
+            assert!(tick(&mut stores, &NotifyOut::default()).0.is_empty());
+        }
+        for _ in 0..2 {
+            assert!(tick(&mut stores, &change).0.is_empty(), "inside the spacing it waits, coalesced");
+        }
+        assert!(stores.notify_owed_for_test().contains(&(SID, "listings".to_string())), "owed, not dropped");
+        let mut spent_at = Vec::new();
+        for _ in 0..2 * LIBRARY_SPACING_FRAMES {
+            let (relisted, at) = tick(&mut stores, &NotifyOut::default());
+            if !relisted.is_empty() {
+                assert_eq!(relisted, [SID]);
+                spent_at.push(at);
+            }
+        }
+        assert_eq!(spent_at, [first + LIBRARY_SPACING_FRAMES], "told once, the frame the spacing is up");
+        assert!(stores.notify_owed_for_test().is_empty());
+        // The refetch and the invalidate of the two changes inside the spacing are spent as they come
+        // (their own spacing is downstream), so those frames log; the frames that only wait do not.
+        assert_eq!(owes_lines() - logged, 3, "the two changes and the deferred listings: three lines, none per waiting frame");
+    });
 }

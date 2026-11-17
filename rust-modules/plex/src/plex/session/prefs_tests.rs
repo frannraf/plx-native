@@ -9,12 +9,12 @@
 //! T-live and T-settings sit in media (`route/prefs_tests.rs`), where the lists they hold to these
 //! descriptors are declared.
 use super::prefs::{Descriptor, Fallback, ListRow, Parse, ProfileMemory, Row, Scope, Setting, SettingsWrite, DESCRIPTORS};
-use super::prefs::{AudioEnhancementsPref, AutoSignInPref, DeckPressPref, UnderPostersPref, DirectPlayModePref, LastHeroBlurPref,
+use super::prefs::{DolbyVisionModePref, InstantDpadSeekingPref, UriEnginePref, AudioEnhancementsPref, AutoSignInPref, DeckPressPref, UnderPostersPref, DirectPlayModePref, LastHeroBlurPref,
     LastLibraryRow, LibraryViewsRow, NextEpisodeModePref, PlaintextConsentRow, QualityPref, ServerKeyPinsRow,
     HdrOverlayBrightnessPref, SkipIntervalPref, SubtitleOffsetsPref, SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref,
-    HoldHintTaughtPref, TrailerAutoplayPref, UiResolutionPref};
+    HoldHintTaughtPref, HudEndTimePref, TrailerAutoplayPref, UiResolutionPref};
 use super::{
-    CanonicalSessionPreferences, DeckPress, UnderPosters, UnderPostersDetails, DirectPlayMode, LastLibrary, LibraryViews, NextEpisodeMode,
+    DolbyVisionMode, InstantDpadSeeking, UriEngine, CanonicalSessionPreferences, DeckPress, UnderPosters, UnderPostersLadder, DetailPart, DetailParts, DirectPlayMode, LastLibrary, LibraryViews, NextEpisodeMode,
     PlaintextChoice, PlaintextConsent, PlaybackQuality, Preferences, ServerKeyPin, Session, SkipInterval,
     HdrOverlayBrightness, HoldHintTaught, SubtitleOffsetEntry, SubtitlePosition, SubtitleSize, SubtitleTone, UiResolution,
 };
@@ -110,22 +110,28 @@ fn every_marker_names_its_own_field() {
     check_row::<HdrOverlayBrightnessPref>(HdrOverlayBrightness::Half);
     check_row::<NextEpisodeModePref>(NextEpisodeMode::Off);
     check_row::<SkipIntervalPref>(SkipInterval::Seconds30);
+    check_row::<InstantDpadSeekingPref>(InstantDpadSeeking::On);
+    check_row::<UriEnginePref>(UriEngine::On);
+    check_row::<DolbyVisionModePref>(DolbyVisionMode::Off);
+    check_row::<super::IntroSkipPref>(super::MarkerSkipMode::Automatic);
+    check_row::<super::CreditsSkipPref>(super::MarkerSkipMode::Disabled);
     check_row::<DeckPressPref>(DeckPress::Play);
-    check_row::<UnderPostersPref>(UnderPosters { title: true, details: UnderPostersDetails::Genre });
+    check_row::<UnderPostersPref>(UnderPosters { title: true, details: DetailParts::of(&[DetailPart::Genre]), show_details: DetailParts::of(&[DetailPart::Genre]), sort_value: false });
     check_row::<AudioEnhancementsPref>(crate::plex::AudioEnhancements { boost_dialog: true, normalize_loudness: false });
     // A5: the remaining `Copy` rows.
     check_row::<AutoSignInPref>(true);
     check_row::<TrailerAutoplayPref>(true);
+    check_row::<HudEndTimePref>(false);
     check_row::<LastHeroBlurPref>(Some([[0.5, 0.25, 0.125]; 4]));
     check_row::<UiResolutionPref>(UiResolution::Hd720);
     check_row::<HoldHintTaughtPref>(HoldHintTaught { card: true, pill: false });
-    // The table lists exactly these sixteen `Setting` rows, the four list rows below, the two
+    // The table lists exactly these twenty-two `Setting` rows, the five list rows below, the two
     // memory-door rows (`TrackMemoryPref`, whose field check is
     // `track_memory_tests::the_list_row_names_its_own_field`, and `SubtitleOffsetsPref`, checked by
     // `the_subtitle_offsets_row_names_its_own_field`) and the per-profile record list
     // (`ProfilePrefsPref`, `profile_prefs_tests::nothing_picked_serializes_to_no_key`): a row needs
     // its line in one of the four places.
-    assert_eq!(DESCRIPTORS.len(), 16 + 4 + 2 + 1);
+    assert_eq!(DESCRIPTORS.len(), 22 + 5 + 2 + 1 + 1, "plus `HudSelectionPref`, a `String` row checked by `profile_prefs_tests`");
 }
 
 /// The list rows do what `check_row` proves for the `Copy` ones: the marker names its own field
@@ -207,7 +213,7 @@ fn t_account_the_bound_rows_are_the_platform_bound_keys() {
 /// Settings dispatcher's T-settings), pinned here per key so a change is a visible edit. The nine
 /// are `Profile` rows with the legacy install key as their fallback since the per-profile work (P1a),
 /// and so is `trailer_autoplay` since P1c, which also gained its live cell and its Confirm Settings
-/// row then; every other fact, of every other row, is what `main` declared.
+/// row then, and `subtitle_tone` gained its Optimistic Settings row (Subtitle color) next to its player-panel writer; every other fact, of every other row, is what `main` declared.
 #[test]
 fn the_declared_live_and_settings_facts_are_the_ones_main_has() {
     let row = |key: &str| -> &Descriptor { DESCRIPTORS.iter().find(|d| d.key == key).unwrap() };
@@ -217,18 +223,22 @@ fn the_declared_live_and_settings_facts_are_the_ones_main_has() {
         ("direct_play_mode", Some(Confirm)),
         ("next_episode_mode", Some(Confirm)),
         ("skip_interval", Some(Confirm)),
+        ("instant_dpad_seeking", Some(Confirm)),
+        ("dolby_vision_mode", Some(Confirm)),
+        ("intro_skip", Some(Confirm)),
+        ("credits_skip", Some(Confirm)),
         ("deck_press", Some(Confirm)),
         ("under_posters", Some(Confirm)),
         ("subtitle_size", Some(Optimistic)),
         ("subtitle_position", Some(Optimistic)),
         ("hdr_overlay_brightness", Some(Optimistic)),
-        ("subtitle_tone", None),
+        ("subtitle_tone", Some(Optimistic)),
         ("audio_enhancements", None),
         ("trailer_autoplay", Some(Confirm)),
     ] {
         let d = row(key);
         assert_eq!(d.settings, settings, "{key}");
-        assert!(d.live, "{key}: every one of the twelve has a live cell in media");
+        assert!(d.live, "{key}: every declared live setting has a cell in media");
         assert_eq!(d.scope, Scope::Profile, "{key}: DECLARED FLIP (P1a, and P1c for trailer_autoplay, where live and settings flipped too): it was Install on main");
         assert_eq!(d.fallback, Fallback::LegacyInstallKey, "{key}: a profile with no value of its own reads the TV's");
         assert!(!d.account_bound, "{key}: the top-level key is the TV's, the profile's own value is `profile_prefs`");
@@ -330,18 +340,26 @@ fn garbage_fixtures() -> Vec<(&'static str, Vec<Value>)> {
         ("hdr_overlay_brightness", generic()),
         ("next_episode_mode", generic()),
         ("skip_interval", generic()),
+        ("instant_dpad_seeking", generic()),
+        ("uri_engine", generic()),
+        ("dolby_vision_mode", generic()),
+        ("intro_skip", generic()),
+        ("credits_skip", generic()),
         ("deck_press", generic()),
         ("under_posters", generic()),
         ("audio_enhancements", generic()),
+        ("hud_selection", vec![Value::Null, json!(17), json!(true), json!([1, "x"]), json!({"unexpected": 1})]),
         // A5. A switch's garbage excludes the booleans, which are VALID values for it.
         ("auto_sign_in", not_a_bool()),
         ("ui_resolution", generic()),
         ("hold_hint_taught", generic()),
         ("trailer_autoplay", not_a_bool()),
+        ("hud_end_time", not_a_bool()),
         ("last_hero_blur", vec![Value::Null, json!("zzz"), json!(17), json!([1, "x"]), json!([[1, 2, 3]]), json!({"unexpected": 1})]),
         // A list's garbage is anything that is not an array; a mixed array is driven separately.
         ("plaintext_consent", not_a_list()),
         ("server_key_pins", not_a_list()),
+        ("native_audio_refused", not_a_list()),
         ("last_library", not_a_list()),
         ("library_sorts", not_a_list()),
         ("track_memory", not_a_list()),
@@ -363,6 +381,7 @@ fn good_element(key: &str) -> Value {
     match key {
         "plaintext_consent" => json!({"machine_id":"m","account":"a","choice":"allowed"}),
         "server_key_pins" => json!({"machine_id":"m","pin":"sha256//x"}),
+        "native_audio_refused" => json!({"firmware":"kisscurl-koli","codec":"vorbis","channels":2}),
         "last_library" => json!({"user":"u1","libs":[{"kind":"movie","machine_id":"m","key":1}]}),
         "library_sorts" => json!({"user":"u1","libs":[{"machine_id":"m","key":1,"sort":"plays"}]}),
         "subtitle_offsets" => json!({"user":"u1","items":[{"machine_id":"m","rating_key":"42","offset_ms":1500}]}),
@@ -472,6 +491,15 @@ fn under_posters_session(value: Value) -> Session {
     serde_json::from_value(json!({ "under_posters": value })).expect("a session with the key parses")
 }
 
+fn parts(ps: &[DetailPart]) -> DetailParts {
+    DetailParts::of(ps)
+}
+
+/// A value from plain parts, the sort value On.
+fn up(title: bool, details: &[DetailPart], show_details: &[DetailPart]) -> UnderPosters {
+    UnderPosters { title, details: parts(details), show_details: parts(show_details), sort_value: true }
+}
+
 /// Soft parse, omit-at-default, and a field's garbage costing only that field.
 #[test]
 fn under_posters_is_soft_per_field_and_omitted_at_the_default() {
@@ -480,31 +508,175 @@ fn under_posters_is_soft_per_field_and_omitted_at_the_default() {
     }
     // A later build's spelling of `details` keeps the title the viewer chose.
     let kept = under_posters_session(json!({ "title": true, "details": "future_kind" }));
-    assert_eq!(kept.under_posters(), UnderPosters { title: true, details: UnderPostersDetails::YearLength });
+    assert_eq!(kept.under_posters(), UnderPosters { title: true, ..UnderPosters::DEFAULT });
     // And a bad title keeps the details.
     let kept = under_posters_session(json!({ "title": "yes", "details": "genre" }));
-    assert_eq!(kept.under_posters(), UnderPosters { title: false, details: UnderPostersDetails::Genre });
+    assert_eq!(kept.under_posters(), up(false, &[DetailPart::Genre], &[DetailPart::Genre]));
     // The default is not written, so a session predating the field serializes as it did.
     let json = serde_json::to_string(&Session::default()).unwrap();
     assert!(!json.contains("under_posters"), "{json}");
     assert_eq!(UnderPosters::default(), UnderPosters::DEFAULT);
 }
 
+/// **The migration**: every value the old single-choice ladder could hold reads as the parts it
+/// stood for, for movies and for shows, from a record that has only the old keys.
 #[test]
-fn under_posters_round_trips_and_packs_into_one_byte() {
-    for details in UnderPostersDetails::LADDER {
+fn every_old_ladder_value_migrates_to_the_parts_it_stood_for() {
+    use DetailPart as P;
+    use UnderPostersLadder as L;
+    // (stored spelling, rung, movie parts, show parts)
+    let table: [(&str, L, &[DetailPart], &[DetailPart]); 5] = [
+        ("year_length", L::YearLength, &[P::Year, P::Length], &[P::Year, P::Seasons]),
+        ("genre", L::Genre, &[P::Genre], &[P::Genre]),
+        ("video", L::Video, &[P::VideoQuality], &[P::Year, P::Seasons]),
+        ("age_rating_score", L::AgeRatingScore, &[P::AgeRating, P::Score], &[P::AgeRating, P::Score]),
+        ("none", L::None, &[], &[]),
+    ];
+    assert_eq!(table.len(), L::LADDER.len(), "a rung was added without a migration row");
+    for (spelling, rung, movie, show) in table {
+        assert_eq!(rung.movie_parts(), parts(movie), "{spelling}");
+        assert_eq!(rung.show_parts(), parts(show), "{spelling}");
+        // The old single `details` key seeds both kinds.
+        let seeded = under_posters_session(json!({ "details": spelling })).under_posters();
+        assert_eq!((seeded.details, seeded.show_details), (parts(movie), parts(show)), "{spelling}");
+        // A show never holds a part it does not offer.
+        assert_eq!(seeded.show_details, seeded.show_details.for_shows());
+        assert_eq!(seeded.details, seeded.details.for_movies());
+    }
+    // A profile with no stored details at all reads the defaults on both keys.
+    assert_eq!(under_posters_session(json!({})).under_posters(), UnderPosters::DEFAULT);
+    // Once the pre-parts `show_details` key is stored it is a choice, whatever the movie value is.
+    let chosen = under_posters_session(json!({ "details": "genre", "show_details": "age_rating_score" })).under_posters();
+    assert_eq!((chosen.details, chosen.show_details), (parts(&[P::Genre]), parts(&[P::AgeRating, P::Score])));
+    let held = under_posters_session(json!({ "details": "genre", "show_details": "video" })).under_posters();
+    assert_eq!(held.show_details, DetailParts::SHOW_DEFAULT, "a movie-only rung under the show key reads as Year and Seasons");
+    // A spelling this build does not know is no choice: the movie value seeds it.
+    let unknown = under_posters_session(json!({ "details": "age_rating_score", "show_details": "future_kind" })).under_posters();
+    assert_eq!(unknown.show_details, parts(&[P::AgeRating, P::Score]));
+}
+
+/// A part list that is present is the choice: it wins over the old keys, drops what this build
+/// or the kind does not know, keeps the first four of too many, and is soft.
+#[test]
+fn stored_part_lists_win_over_the_old_keys_and_are_held_to_the_kind_and_the_maximum() {
+    use DetailPart as P;
+    let read = |v: Value| under_posters_session(v).under_posters();
+    let both = read(json!({ "details": "genre", "detail_parts": ["year", "score"], "show_details": "genre", "show_detail_parts": ["seasons"] }));
+    assert_eq!((both.details, both.show_details), (parts(&[P::Year, P::Score]), parts(&[P::Seasons])));
+    // An empty list is a choice (Nothing), not an absence.
+    let nothing = read(json!({ "details": "genre", "detail_parts": [], "show_detail_parts": [] }));
+    assert_eq!((nothing.details, nothing.show_details), (DetailParts::NONE, DetailParts::NONE));
+    // Unknown spellings and non-strings are dropped; the rest stand.
+    assert_eq!(read(json!({ "detail_parts": ["year", "future", 3, null, "length"] })).details, parts(&[P::Year, P::Length]));
+    // A part the kind does not offer is dropped (a movie has no seasons, a show no length or video quality).
+    let foreign = read(json!({ "detail_parts": ["seasons", "year"], "show_detail_parts": ["length", "video_quality", "genre"] }));
+    assert_eq!((foreign.details, foreign.show_details), (parts(&[P::Year]), parts(&[P::Genre])));
+    // More than four keep the first four in the line's order, whatever order they were stored in.
+    let many = read(json!({ "detail_parts": ["score", "age_rating", "video_quality", "genre", "length", "year"] }));
+    assert_eq!(many.details, parts(&[P::Year, P::Length, P::Genre, P::VideoQuality]));
+    assert_eq!(many.details.len(), DetailParts::MAX);
+    // A list that is not a list is absent: the old key stands in, and the other kind's list is its own.
+    let soft = read(json!({ "details": "genre", "detail_parts": "year", "show_detail_parts": [P::Score.name()] }));
+    assert_eq!((soft.details, soft.show_details), (parts(&[P::Genre]), parts(&[P::Score])));
+    // A show list absent beside a movie list reads the movie's old key for shows, never the movie list.
+    let lone = read(json!({ "details": "age_rating_score", "detail_parts": ["year"] }));
+    assert_eq!((lone.details, lone.show_details), (parts(&[P::Year]), parts(&[P::AgeRating, P::Score])));
+}
+
+/// A write keeps the old keys beside the parts, so a build that predates the parts reads the
+/// nearest old rung. The ticks survive a downgrade only until that older build saves the record
+/// (its `ProfilePrefs` carries no extensions, so it writes back the old keys alone).
+#[test]
+fn a_write_carries_the_parts_and_the_nearest_old_rung_for_a_downgrade() {
+    use DetailPart as P;
+    let v = up(false, &[P::Genre, P::Score], &[P::Seasons]);
+    let json: Value = serde_json::to_value(Session::default().with_pref::<UnderPostersPref>(v)).unwrap();
+    assert_eq!(json["under_posters"]["detail_parts"], json!(["genre", "score"]));
+    assert_eq!(json["under_posters"]["show_detail_parts"], json!(["seasons"]));
+    assert_eq!(json["under_posters"]["details"], json!("genre"), "the nearest old rung to Genre + Score");
+    assert_eq!(json["under_posters"]["show_details"], json!("year_length"), "Seasons is the show's Year and Seasons rung");
+    let back: Session = serde_json::from_value(json).unwrap();
+    assert_eq!(back.under_posters(), v);
+    // The nearest rung, rung by rung.
+    use UnderPostersLadder as L;
+    assert_eq!(L::nearest(DetailParts::NONE), L::None);
+    assert_eq!(L::nearest(parts(&[P::Length])), L::YearLength);
+    assert_eq!(L::nearest(parts(&[P::Score, P::Year])), L::YearLength);
+    assert_eq!(L::nearest(parts(&[P::VideoQuality, P::Score])), L::Video);
+    assert_eq!(L::nearest(parts(&[P::AgeRating])), L::AgeRatingScore);
+    // Every rung survives movie -> parts -> rung.
+    for rung in L::LADDER {
+        assert_eq!(L::nearest(rung.movie_parts()), rung);
+    }
+}
+
+/// Every set of up to four parts a kind offers round-trips through the file and through the
+/// packed live cell.
+#[test]
+fn every_set_round_trips_through_the_file_and_the_packed_cell() {
+    let subsets = |offered: &[DetailPart]| -> Vec<DetailParts> {
+        (0u32..(1 << offered.len()))
+            .map(|m| parts(&offered.iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|(_, p)| *p).collect::<Vec<_>>()))
+            .filter(|s| s.len() <= DetailParts::MAX)
+            .collect()
+    };
+    let (movies, shows) = (subsets(&DetailPart::MOVIE), subsets(&DetailPart::SHOW));
+    assert_eq!((movies.len(), shows.len()), (57, 31), "C(6,0..4) and C(5,0..4)");
+    for (&details, &show_details) in movies.iter().zip(shows.iter().cycle()) {
         for title in [false, true] {
-            let v = UnderPosters { title, details };
-            let session = Session::default().with_pref::<UnderPostersPref>(v);
-            assert_eq!(serde_json::to_string(&session).unwrap().contains("under_posters"), v != UnderPosters::DEFAULT);
-            let back: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
-            assert_eq!(back.under_posters(), v);
-            assert_eq!(UnderPosters::unpack(v.pack()), v, "{v:?}");
+            for sort_value in [true, false] {
+                let v = UnderPosters { title, details, show_details, sort_value };
+                let session = Session::default().with_pref::<UnderPostersPref>(v);
+                assert_eq!(serde_json::to_string(&session).unwrap().contains("under_posters"), v != UnderPosters::DEFAULT);
+                let back: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+                assert_eq!(back.under_posters(), v);
+                assert_eq!(UnderPosters::unpack(v.pack()), v, "{v:?}");
+            }
         }
     }
-    assert_eq!(UnderPosters::DEFAULT.pack(), 0, "the live cell's seed is the default");
-    assert_eq!(UnderPosters::unpack(0xFE).details, UnderPostersDetails::YearLength, "out of range reads the default");
-    for d in UnderPostersDetails::LADDER {
-        assert_eq!(UnderPostersDetails::from_index(d.index()), d);
+    for &show_details in &shows {
+        let v = UnderPosters { show_details, ..UnderPosters::DEFAULT };
+        assert_eq!(UnderPosters::unpack(v.pack()), v);
     }
+    // Out of range reads valid: more than four, and parts a kind does not offer, are held.
+    let wild = UnderPosters::unpack(0xFFFF);
+    assert!(wild.details.len() <= DetailParts::MAX && wild.show_details.len() <= DetailParts::MAX);
+    assert_eq!((wild.details, wild.show_details), (wild.details.for_movies(), wild.show_details.for_shows()));
+}
+
+#[test]
+fn sort_value_is_on_by_default_stored_as_its_off_state_and_soft_parsed() {
+    use DetailPart as P;
+    // Everyone starts On: the default, the packed seed and a profile that never chose it.
+    assert!(UnderPosters::DEFAULT.sort_value && UnderPosters::default().sort_value);
+    assert_eq!(UnderPosters::unpack(UnderPosters::DEFAULT.pack()), UnderPosters::DEFAULT);
+    assert_eq!(UnderPosters::DEFAULT.pack() & 2, 0, "bit 1 is the Off state");
+    assert_eq!(UnderPosters { sort_value: false, ..UnderPosters::DEFAULT }.pack(), UnderPosters::DEFAULT.pack() | 2);
+    let absent = under_posters_session(json!({"title":true,"details":"genre"}));
+    assert!(absent.under_posters().sort_value);
+    // The retired `show_sort_info` key of the earlier switch is ignored, whatever it said, and
+    // is never written back.
+    for old in [json!(true), json!(false), json!("yes")] {
+        let read = under_posters_session(json!({"title":true,"details":"genre","show_sort_info":old}));
+        assert_eq!(read.under_posters(), up(true, &[P::Genre], &[P::Genre]));
+    }
+    assert!(!serde_json::to_string(&Session::default().with_pref::<UnderPostersPref>(
+        UnderPosters { title: true, ..UnderPosters::DEFAULT })).unwrap().contains("show_sort_info"));
+    // Off round-trips through the file and the packed cell, and only Off is written.
+    let off = UnderPosters { sort_value: false, ..up(true, &[P::VideoQuality], &[P::Year, P::Seasons]) };
+    let json = serde_json::to_string(&Session::default().with_pref::<UnderPostersPref>(off)).unwrap();
+    assert!(json.contains("sort_value_off"), "{json}");
+    let on = serde_json::to_string(&Session::default().with_pref::<UnderPostersPref>(
+        UnderPosters { sort_value: true, ..off })).unwrap();
+    assert!(!on.contains("sort_value"), "{on}");
+    let restored: Session = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.under_posters(), off);
+    assert_eq!(UnderPosters::unpack(off.pack()), off);
+    // A malformed value costs only that field and reads as the default On.
+    for bad in [json!("yes"), json!(3), Value::Null, json!([true])] {
+        let read = under_posters_session(json!({"title":true,"details":"genre","sort_value_off":bad}));
+        assert_eq!(read.under_posters(), up(true, &[P::Genre], &[P::Genre]));
+    }
+    let read = under_posters_session(json!({"title":true,"sort_value_off":true}));
+    assert!(!read.under_posters().sort_value && read.under_posters().title);
 }

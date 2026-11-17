@@ -5,10 +5,22 @@
 # These exist because the stub-.so link trick (see the Makefile header) makes the LINK succeed
 # whether or not a symbol or library is really on the TV. The first sign of trouble would
 # otherwise be a rejected webosbrew PR, or a television that will not start.
+# Usage: ci/check-elf.sh [binary [both|feed|uri]]. PLAYBACK_BACKENDS supplies the same mode when
+# the second argument is omitted; the historical default is both for ordinary CI release builds.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 BIN="${1:-pkg/plxnative}"
+fail() { echo "::error::$*"; exit 1; }
+ok()   { echo "  ok — $*"; }
+
+[ "$#" -le 2 ] || fail "usage: ci/check-elf.sh [binary [both|feed|uri]]"
+PLAYBACK_MODE="${2-${PLAYBACK_BACKENDS-both}}"
+case "$PLAYBACK_MODE" in
+  both|feed|uri) ;;
+  *) fail "PLAYBACK_BACKENDS must be exactly both, feed or uri for an ELF artifact" ;;
+esac
+
 # macOS ships no readelf; fall back to the NDK's, which is on any machine that can build this.
 NDK_BIN="${WEBOS_SDK:-$HOME/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot}/bin"
 if [ -z "${READELF:-}" ]; then
@@ -23,9 +35,6 @@ if [ -z "${OBJDUMP:-}" ]; then
   else OBJDUMP=llvm-objdump
   fi
 fi
-
-fail() { echo "::error::$*"; exit 1; }
-ok()   { echo "  ok — $*"; }
 
 # Check producers before inspecting output: early grep/head consumers can otherwise turn
 # successful scans into SIGPIPE failures, or hide producer failures in negative assertions.
@@ -43,27 +52,52 @@ ok "ELF32 / ARM / soft-float / ARMv7"
 
 echo "== Starfish callback interposer =="
 # libplayerAPIs' fixed libpf thunk calls this exact C++ symbol through an R_ARM_JUMP_SLOT. A normal
-# executable-private definition is absent from .dynsym and therefore cannot preempt that slot; the
-# link must export exactly this one symbol. Conversely, Load-with-context is resolved and owner-
+# executable-private definition is absent from .dynsym and therefore cannot preempt that slot; a
+# Feed build's link must export this symbol, and a URI build must not (uri mode below). Conversely, Load-with-context is resolved and owner-
 # checked with dlsym so a firmware which lacks the overload refuses playback instead of killing the
 # app in the dynamic loader before main.
 SMP_HOOK='_ZN17StarfishMediaAPIs20callbackFunctionHookEixPKc'
 SMP_LOAD_CTX='_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_PvES2_'
 DYN_SYMS=$("$READELF" --dyn-syms -W "$BIN") || fail "readelf --dyn-syms failed"
 HOOK_ROWS=$(awk -v symbol="$SMP_HOOK" '$NF == symbol { print }' <<<"$DYN_SYMS")
-[ "$(wc -l <<<"$HOOK_ROWS" | tr -d ' ')" -eq 1 ] \
-  || fail "callbackFunctionHook interposer is not present exactly once in .dynsym"
-awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } \
-     END { exit !ok }' <<<"$HOOK_ROWS" \
-  || fail "callbackFunctionHook interposer is not a GLOBAL/DEFAULT .dynsym function"
+if [ "$PLAYBACK_MODE" = uri ]; then
+  [ -z "$HOOK_ROWS" ] || fail "URI backend exports Feed callbackFunctionHook in .dynsym"
+else
+  [ "$(wc -l <<<"$HOOK_ROWS" | tr -d ' ')" -eq 1 ] \
+    || fail "callbackFunctionHook interposer is not present exactly once in .dynsym"
+  awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } \
+       END { exit !ok }' <<<"$HOOK_ROWS" \
+    || fail "callbackFunctionHook interposer is not a GLOBAL/DEFAULT .dynsym function"
+fi
 if awk -v symbol="$SMP_LOAD_CTX" '$NF == symbol { found=1 } END { exit !found }' <<<"$DYN_SYMS"; then
   fail "Load-with-context is a dynamic symbol dependency; it must be dlsym'd for firmware fallback"
 fi
 RELOCS=$("$READELF" -rW "$BIN") || fail "readelf -rW failed"
+if [ "$PLAYBACK_MODE" = uri ] && grep -Fq "$SMP_HOOK" <<<"$RELOCS"; then
+  fail "URI backend has a Feed callbackFunctionHook relocation"
+fi
 if grep -q "$SMP_LOAD_CTX" <<<"$RELOCS"; then
   fail "Load-with-context has a dynamic relocation; missing firmware would fail before main"
 fi
-ok "exact hook exported GLOBAL/DEFAULT; Load-with-context has no loader dependency"
+if [ "$PLAYBACK_MODE" = uri ]; then
+  ok "no Feed hook or relocation; Load-with-context has no loader dependency"
+else
+  ok "exact hook exported GLOBAL/DEFAULT; Load-with-context has no loader dependency"
+fi
+
+echo "== libc exit interposer =="
+# src/exit.c defines libc's `exit` in the executable so that an `exit()` made by a shared library
+# (SDL's SDLTimer thread made one in PLX-NATIVE-1P) ends the process through plx_exit_record
+# (src/crashtrace.c), which ends it without running the exit handlers. It only binds when the
+# executable's .dynsym defines it: exactly one `exit` row, defined here as FUNC GLOBAL DEFAULT. readelf prints a definition bare
+# and an import with its version (`exit@GLIBC_2.4 (2)`), so an `exit@...` row, or an UND one, means
+# some object still calls libc's own `exit` and src/exit.c did not take over.
+EXIT_ROWS=$(awk '$8 == "exit" || index($8, "exit@") == 1 { n++ } END { print n + 0 }' <<<"$DYN_SYMS")
+EXIT_DEFINED=$(awk '$8 == "exit" && $4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { n++ } \
+                    END { print n + 0 }' <<<"$DYN_SYMS")
+[ "$EXIT_ROWS" -eq 1 ] && [ "$EXIT_DEFINED" -eq 1 ] \
+  || fail "libc exit interposer: .dynsym must define exit exactly once (FUNC GLOBAL DEFAULT) and import no exit@... (src/exit.c, EXIT_INTERPOSER_LDFLAG)"
+ok "exit exported GLOBAL/DEFAULT and not imported"
 
 echo "== crash-report identity =="
 # Two facts a Sentry crash report is built out of, and BOTH fail silently when wrong: a frame comes
@@ -162,10 +196,19 @@ echo "== DT_NEEDED =="
 # The expectation file is regenerated in C collation to match.
 DYNAMIC=$("$READELF" -d "$BIN") || fail "readelf -d failed"
 sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' <<<"$DYNAMIC" | LC_ALL=C sort > "$AUDIT_TMP/dt-needed.actual"
-if ! diff -u ci/expected-dt-needed.txt "$AUDIT_TMP/dt-needed.actual"; then
-  fail "DT_NEEDED drifted. If intended, confirm with tools/fwcompat.py that it exists on every supported release, then update ci/expected-dt-needed.txt"
+if [ "$PLAYBACK_MODE" = uri ]; then
+  if grep -Fxq 'libplayerAPIs.so.1' "$AUDIT_TMP/dt-needed.actual" \
+      || grep -Fxq 'libpf-1.0.so.1' "$AUDIT_TMP/dt-needed.actual"; then
+    fail "URI backend retains a Feed library in DT_NEEDED"
+  fi
+  EXPECTED_NEEDED=ci/expected-dt-needed-uri.txt
+else
+  EXPECTED_NEEDED=ci/expected-dt-needed.txt
 fi
-ok "$(wc -l < "$AUDIT_TMP/dt-needed.actual" | tr -d ' ') entries, unchanged"
+if ! diff -u "$EXPECTED_NEEDED" "$AUDIT_TMP/dt-needed.actual"; then
+  fail "DT_NEEDED drifted for $PLAYBACK_MODE. If intended, confirm with tools/fwcompat.py that it exists on every supported release, then update $EXPECTED_NEEDED"
+fi
+ok "$(wc -l < "$AUDIT_TMP/dt-needed.actual" | tr -d ' ') entries for $PLAYBACK_MODE, unchanged"
 
 echo "== storage helper =="
 # pkg/plxnative-storage ships to the TV beside the app and links the same way, through the same stub

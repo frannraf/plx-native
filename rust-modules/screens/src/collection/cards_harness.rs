@@ -16,6 +16,9 @@ impl Host for CollectionHost {
     type Init = super::super::family::NoInit;
     type Memory = PageMemory;
 }
+impl crate::registry::ScreenInputsLike for CollectionHost {
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+}
 impl CollectionLike for CollectionHost {
     fn collection<'a>(cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a> { cx.views }
 }
@@ -41,7 +44,7 @@ pub(crate) fn mount(n: usize) -> Box<dyn CardHarness> { Box::new(Harness::new(n)
 impl Harness {
     fn new(n: usize) -> Self {
         let mut store = plx_data::stores::collection::CollectionStore::default();
-        store.run(CollectionCmd::Open { target: CollectionTarget { id: set(), want: PAGE_SIZE } });
+        store.run(CollectionCmd::Open { target: CollectionTarget { id: set(), want: PAGE_SIZE } }, &plx_plex::plex::ClientKeys::default());
         store.install_for_test((0..n).map(|i| item(&format!("m{i}"))).collect(), CollectionStatus::Ready);
         let mut screen = CollectionScreen::new(ENTRY, set());
         screen.page.sync(store.view().current().unwrap(), &FixtureMeasure);
@@ -53,6 +56,7 @@ impl Harness {
 
     fn cx(&self) -> Cx<'_, CollectionHost> {
         Cx { views: self.store.view(), tick: Tick { ms: self.ms, dt_us: 16_667 }, measure: &FixtureMeasure,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY) }
@@ -62,8 +66,9 @@ impl Harness {
     fn step(&mut self, ev: ScreenEvent<CollectionHost>) -> bool {
         let mut present = plx_machine::present::Present::new();
         let mut out = Vec::new();
-        let (_, moving) = plx_machine::idle::scoped_motion(|| {
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
             let cx = Cx { views: self.store.view(), tick: Tick { ms: self.ms, dt_us: 16_667 }, measure: &FixtureMeasure,
+                modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
                 press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
                 focus: FocusRead { current: self.focus, ..Default::default() }, owner: InputOwner::Entry(ENTRY) };
             let mut fx = Effects::new(&mut out,

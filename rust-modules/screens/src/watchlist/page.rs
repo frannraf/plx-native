@@ -291,6 +291,12 @@ struct Page {
     /// (`plx_ui::page_header::SharedRow`): built when the options, the count or the locale change,
     /// not per question. Derived from them; not canon.
     header_rows: plx_ui::page_header::SharedRow<header::Row>,
+    /// What the row carries over from the row it replaced (`plx_ui::page_header::HeaderSwap`): the
+    /// sort control's criterion changing, the read-out coming, going or saying another thing. The
+    /// row is held behind `&self` (the focus questions find it on the first ask), so the swap is
+    /// begun from the rebuild itself ([`Page::header_row`], `SharedRow::get_replacing`) and sits
+    /// behind the same kind of cell. Decoration, never canon: not in `SHAPE` or `write_canon`.
+    header_swap: std::cell::RefCell<plx_ui::page_header::HeaderSwap>,
 }
 
 impl Page {
@@ -300,9 +306,9 @@ impl Page {
 
     /// The caption of the tile at `i` under the Under posters setting: its row and state, and the
     /// facts of its matched copy.
-    fn label(&self, i: usize) -> TileLabel {
+    fn label(&self, i: usize, policy: &plx_ui::caption_policy::CaptionPolicy) -> TileLabel {
         match self.tiles.get(i).zip(self.cells.get(i)) {
-            Some((t, c)) => caption::label(&t.row, t.state, &caption::policy(), &c.listing),
+            Some((t, c)) => caption::label(&t.row, t.state, policy, &c.listing),
             None => TileLabel::default(),
         }
     }
@@ -380,7 +386,11 @@ impl Page {
         (std::ptr::from_ref(plx_platform::i18n::current()) as usize).hash(&mut h);
         self.options.hash(&mut h);
         header::Count::narrowed(count).hash(&mut h);
-        self.header_rows.get(h.finish(), || header::Row::new(measure, &self.options.summary(), count))
+        self.header_rows.get_replacing(
+            h.finish(),
+            || header::Row::new(measure, &self.options.summary(), count),
+            |old, new| new.begin_swap(old, &mut self.header_swap.borrow_mut()),
+        )
     }
 
     fn readout(&self) -> Option<Readout> {
@@ -488,6 +498,7 @@ fn tile_facts<'a>(t: &'a WatchTile, c: &'a Cell) -> TileFacts<'a> {
 
 /// The grid's content (`CardSource`): the snapshot's titles and what was derived for them.
 struct Titles<'a> {
+    policy: plx_ui::caption_policy::CaptionPolicy,
     page: &'a Page,
 }
 
@@ -518,7 +529,7 @@ impl<H: ContentLike> CardSource<H> for Titles<'_> {
         }
     }
     fn label(&self, i: usize) -> TileLabel {
-        self.page.label(i)
+        self.page.label(i, &self.policy)
     }
     fn progress(&self, i: usize) -> Option<f32> {
         self.page.cells.get(i)?.resume
@@ -560,6 +571,7 @@ struct CountHold {
 /// The tiles a landing is fading out, in the order the grid names them (`Grid::ghost_keys`); one
 /// the page did not keep is `None` and is not drawn.
 struct GhostTitles<'a> {
+    policy: plx_ui::caption_policy::CaptionPolicy,
     tiles: Vec<Option<&'a (WatchTile, Cell)>>,
     /// Test support: the ghost posters actually asked for (`Page::ghost_draws`).
     #[cfg(test)]
@@ -590,7 +602,7 @@ impl<H: ContentLike> CardSource<H> for GhostTitles<'_> {
     /// Read only for the focused card's ghost, which keeps its caption until the landing steps.
     fn label(&self, i: usize) -> TileLabel {
         match self.tiles.get(i).copied().flatten() {
-            Some((t, c)) => caption::label(&t.row, t.state, &caption::policy(), &c.listing),
+            Some((t, c)) => caption::label(&t.row, t.state, &self.policy, &c.listing),
             None => TileLabel::default(),
         }
     }
@@ -637,8 +649,9 @@ impl<H: ContentLike> StackPage<H> for Page {
         out.extend([Sec::Items, Sec::Status, Sec::Head]);
     }
 
-    fn cards<'a>(&'a self, _cx: &'a Cx<'_, H>, k: Sec) -> Option<Titles<'a>> {
-        (k == Sec::Items && !self.cells.is_empty()).then_some(Titles { page: self })
+    fn cards<'a>(&'a self, cx: &'a Cx<'_, H>, k: Sec) -> Option<Titles<'a>> {
+        (k == Sec::Items && !self.cells.is_empty()).then_some(Titles { page: self,
+            policy: crate::registry::captions::policy_for(H::screen_inputs(cx)) })
     }
 
     /// A reserved cell whose row has landed: the title now keyed in the same cell stands for it.
@@ -674,6 +687,7 @@ impl<H: ContentLike> StackPage<H> for Page {
     /// DS4: the removed tile fades where it stood, under the survivors that spring over its cell.
     fn paint_ghosts(&self, _k: Sec, grid: &Grid, f: &mut DrawFrame<'_, '_, H>, p: Painter) {
         let ghosts = GhostTitles {
+            policy: crate::registry::captions::policy_for(H::screen_inputs(f.cx)),
             tiles: grid.ghost_keys().map(|key| self.ghosts.get(&key)).collect(),
             #[cfg(test)]
             drawn: &self.ghost_draws,
@@ -684,8 +698,8 @@ impl<H: ContentLike> StackPage<H> for Page {
     }
 
     /// The grid's focused band follows the Under posters setting, as the Library's does.
-    fn caption_policy(&self, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
-        (k == Sec::Items).then(caption::policy)
+    fn caption_policy(&self, cx: &Cx<'_, H>, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
+        (k == Sec::Items).then(|| crate::registry::captions::status_policy(&crate::registry::captions::policy_for(H::screen_inputs(cx))))
     }
 
     /// The header section's group is the shared row's (`HeaderFocus::group_spec`: a Control row,
@@ -727,7 +741,8 @@ impl<H: ContentLike> StackPage<H> for Page {
                 // remnant of the head above its rows. It also keeps out of the band the drawn chrome
                 // stands in while the scroll is still bringing it home (`Handoff::clearance`).
                 let p = p.alpha(self.handoff.head_alpha(r.y));
-                self.header_row(f.measure).draw(p, r.y, &self.header_capsules, self.header_pop.scale_with(0, f.press.scale), lifted);
+                let row = self.header_row(f.measure);
+                row.draw(p, r.y, &self.header_capsules, self.header_pop.scale_with(0, f.press), lifted, &self.header_swap.borrow());
                 #[cfg(feature = "devtriggers")]
                 if self.dev_blocked {
                     header::draw_dev_blocked(p, r.y);
@@ -802,7 +817,7 @@ impl WatchlistScreen {
     #[cfg(any(test, feature = "test-support"))]
     pub fn probe_scroll_target(&self) -> f32 { self.stack.target() }
 
-    /// The Sort & Filter pill's value, the text after the dot: what the header draws is built from
+    /// The sort control's criterion, the one text it draws: what the header draws is built from
     /// this one string (`header_row`).
     #[cfg(any(test, feature = "test-support"))]
     pub fn probe_pill_value(&self) -> String { self.page.options.summary() }
@@ -810,6 +825,11 @@ impl WatchlistScreen {
     /// How many header rows this page has built: the build counter of its `RowCache`/`SharedRow`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn probe_header_builds(&self) -> u32 { self.page.header_rows.builds() }
+
+    /// Is the header row carrying anything over from the row it replaced (a criterion cross-fading, a
+    /// read-out dissolving)?
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn probe_header_swap_active(&self) -> bool { self.page.header_swap.borrow().is_active() }
 
     /// The heartbeat word, byte-identical to the route word (`tests/manifest.json` selects on it).
     pub const WORD: &'static str = "watchlist";
@@ -845,6 +865,7 @@ impl WatchlistScreen {
             header_pop: plx_ui::widgets::CtlPop::new(),
             handoff: plx_ui::scroll_chrome::Handoff::new(),
             header_rows: plx_ui::page_header::SharedRow::new(),
+            header_swap: std::cell::RefCell::new(plx_ui::page_header::HeaderSwap::new()),
         };
         page.rebuild();
         Self {
@@ -933,7 +954,7 @@ impl WatchlistScreen {
         let row = self.page.header_row(f.measure);
         let dy = placed.rect.y - row.plate().y;
         let p = f.painter.alpha(f.page_alpha).alpha(self.page.handoff.head_alpha(dy));
-        row.draw_opener(p, dy, self.page.header_pop.scale_with(0, f.press.scale));
+        row.draw_opener(p, dy, self.page.header_pop.scale_with(0, f.press), &self.page.header_swap.borrow());
     }
 
     /// The Sort & Filter control as the focused pill draws it, in the page's document space: the
@@ -1111,6 +1132,8 @@ impl WatchlistScreen {
         }
         self.release_count_hold();
         self.page.header_row(cx.measure).step(self.page.entry, cx.focus.current, &mut self.page.header_capsules, &mut self.page.header_pop, t.dt());
+        // After the row is current: a rebuild this tick began the swap, and it takes its first step now.
+        self.page.header_swap.get_mut().step(t.dt());
         // The stack stepped the scroll on this tick already (`step` runs it first).
         self.page.handoff.step(t.dt(), self.stack.scroll(), self.stack.target(), grid_spec().pitch(), false);
         let held = self.ground_seeded && self.landing_in_flight();
@@ -1356,7 +1379,7 @@ impl WatchlistScreen {
     /// Test support: the grid's content, as the stack reads it.
     #[cfg(test)]
     pub(crate) fn cards_for_test(&self) -> impl ui_cards::CardSource<crate::watchlist::cards_harness::WatchHost> + '_ {
-        Titles { page: &self.page }
+        Titles { page: &self.page, policy: crate::registry::captions::policy() }
     }
 
     /// Test support: the reserved cells drawn since the last call, by index.
@@ -1580,6 +1603,7 @@ impl<H: ContentLike> Screen<H> for WatchlistScreen {
     fn opener_departing(&self, key: FocusKey<u32>) -> bool {
         self.stack.view(&self.page).opener_departing::<H>(key)
     }
+    fn glides(&self) -> bool { true }
     fn name(&self) -> &'static str {
         Self::WORD
     }

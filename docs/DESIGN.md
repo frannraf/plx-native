@@ -69,23 +69,35 @@ keep their control-specific alignment; centering the panel does not center its p
 This is the part most easily broken by accident, so it is the part worth knowing before you change a
 backdrop.
 
-Hero text is protected by a two-dimensional field, and the arithmetic is deliberately pure so a test
-can grade it. `widgets.rs`'s `hero_scrim_a` doc says it plainly: the contract "is graded on it: this
-is the arithmetic the anchor table in this module's tests reads, so the promise and the paint cannot
-come from two different curves."
+Catalog protects hero text with a shade that follows the content.
+[`HeroShade`](../rust-modules/ui/src/hero_shade.rs) builds a feathered block from each piece of
+drawn content, using its measured ink width. The blocks follow the title, copy and controls as
+their positions change.
 
-- Vertical ramp, [rust-modules/ui/src/landing_hero.rs](rust-modules/ui/src/landing_hero.rs):
-  zero above `HERO_BASE_SCRIM_Y0` (0.34 of the screen, 367), `foot * MID_WEIGHT` at `KNEE_Y` (0.65
-  of the screen, 702), and `foot = 0.30 + 0.64 * hero_a` at the bottom. The text stack builds upward
-  from `TEXT_BOTTOM` 692 in a column of `COL_W` 660.
-- Horizontal wedge plus a feathered bottom-right corner, `widgets.rs`: `hero_scrim_a` and
-  `hero_scrim_right_a`, painted as three quads whose quad 0 to quad 1 seam is host-gradeable because
-  it is the one structural bug the component can have.
+- Home uses one edge-anchored field that stays still through a carousel flip. It eases in from
+  the upper left and fades toward the center of the artwork. The field joins the full-width
+  shelf ramp with a soft maximum to keep the crossing from darkening like two overlays.
+  The shelf ramp follows the first tile's live top and reaches `SHELF_FOOT_A` at the
+  Continue Watching caption line. The whole field fades with the hero.
+- Home's movie row shows type, year, runtime, up to two genres, quality, and the content rating.
+  Episodes show their season and episode number, air date, runtime, quality, and rating. Shows
+  use the series runtime or season count when runtime is missing, plus year, genres, and rating.
+  Movies and shows read this band whether or not they have been played; only a season or a
+  collection falls back to the first sentence of its summary.
+  The Resume pill shows the play glyph, progress rail, and localized time remaining.
+- Detail uses the same continuous renderer. Its wider left fade supports the synopsis and the
+  full-width lower ramp supports the credits. The left fade shifts up with the preview logo and
+  both strengths ease out for the full-screen trailer.
+- The horizontal wedge and feathered corner that stood behind the heroes (`widgets::hero_scrim` and its
+  closed forms) are deleted; the catalog page (`screens::catalog`), the last to draw them, builds a
+  `HeroShade` from the rects it draws (the title, the copy under it, the pill) and lays it over its art
+  as a scrim layer.
 
-Both halves scale by the screen's own hero fade, so the field leaves with the hero instead of
-lingering over the shelves.
+The shade scales by the screen's own hero fade, so it leaves with the hero instead of lingering over
+the shelves.
 
-**Anything that changes what sits behind hero text must re-grade the anchor table.** Still artwork
+**Anything that changes what sits behind hero text must re-grade the legibility tables**
+(`screens/src/home/hero_shade_tests.rs` for Home, `widgets_hero_scrim_tests.rs` for Detail). Still artwork
 has a knowable worst case, which is what the PMS `blur` hash is for. Video does not.
 
 For text sitting directly on a piece of artwork, the answer is `art_scrim`: `STILL_SCRIM_H` 112 px
@@ -109,11 +121,72 @@ Card rows come from `plx_ui::cards::Shelf` with a named `RowStyle`:
 
 - `HOME` for poster shelves, and the single source of shelf motion
 - `EPISODE` 420x236, gap 28, `focus_scale` 1.09, the 16:9 landscape still
+- `STILL` is `EPISODE` at `theme::STILL_RADIUS` (12) and `theme::STILL_GAP` (40): the Continue Watching
+  row's tile. The focused tile only pops (1.09, in place); no neighbour moves, so the spacing between
+  tiles never changes (the pop grows a 420 px tile ~19 px a side, inside the 40 px gap). Its slot pitch
+  is `STILL.w + gap` (460) and the row stands whole at `consts::PEEK_Y` + `consts::CARD_DY` (768) on the
+  hero's page
 - `CAST` 190 circles, gap 40, `focus_scale` 1.13
 - `PROFILES` big circles, `focus_scale` 1.18
 
 The focus pop values differ on purpose and each carries the reasoning at its definition: a lone row
 of widely spaced circles needs a bigger pop than a tight poster shelf to read as selected at all.
+
+### The Continue Watching still
+
+A Continue Watching deck is ONE object, so it has one look wherever it appears: Home's row and the
+Library > Recommended page's landscape Continue Watching row are both a row of `RowStyle::STILL` stills
+with **no label block under them** (`captions::NOTHING_UNDER_STILLS`, band 0, one policy both screens
+hand their shelf; Recommended's `Row::still_deck` picks it, `hub_style` the style and `shelf_pitch` the
+pitch from it, `tile_facts::deck_overlay` draws the footer for both): everything a still says it says on
+itself. The Recommended page's other landscape rows (Recently Released Episodes) are not decks and keep
+the episode strip's `EPISODE` look, its caption band and `StillFooter::Shelf`.
+
+- **Clean art, one footer line off it.** The deck's tile has no scrim (`card_named_led` skips
+  `still_ground` for a clean tile); the footer is one `still_footer::FOOTER_LINE_H` (24 px) line UNDER
+  the tile (`Place::Below`): its top `theme::STILL_FOOTER_DROP` (8 px) below the tile's foot, inset
+  `FOOTER_BELOW_INSET` (4 px) each side, the text group and the mark at its right `FOOTER_GAP` (12 px)
+  apart, standing on the backdrop with the shelf fade darkening it to near-black behind (no plate, no
+  block). The Detail strip's footer keeps the old place in
+  the art (`Place::InArt`): `widgets::art_scrim` darkens the bottom `STILL_SCRIM_H` (112 px), and the line
+  stands `FOOTER_RISE` (12 px) above the card's bottom edge, inset `widgets::STILL_LINE_INSET` (16 px).
+- **What the line says**: `S2 E4 · 38m left` and the amber bar `FOOTER_BAR_W` (100 px) wide,
+  `FOOTER_BELOW_BAR_H` (6 px, radius 3) high under the art (`FOOTER_BAR_H`, 4 px, in it); an unstarted episode `S2 E1 · New episode` (the same `S2 E1` tag a started
+  one wears, `core.footer_tag`, then the catalogue's `widgets.card.new_episode`) and no bar, since nothing is
+  played yet. The fit rule is one pure function,
+  `still_footer::footer_geometry`: the bar shrinks from 100 toward `FOOTER_BAR_MIN_W` (64 px) before
+  anything is cut, and the tag fades only when even 64 px does not fit; the time unit is never cut. With no
+  bar the tag is kept while the whole text fits the line, cue included; `New episode` is never cut or dropped
+  (a test fits the worst tag, S12 E24, in every shipped language: all keep the tag, at rest and with the cue open).
+- **The row's heading** has a small baseline rise and uses the same focus lift as the other shelves.
+  `card_row::heading_lift_of` takes the larger of the two. The gap below the footer keeps the
+  Continue Watching heading clear of the nav when the next shelf is focused, while
+  `ShelfColumn::block_overrun` keeps that shelf's caption inside overscan.
+- **The focus cue** is a white play glyph (OK plays, `DeckPress::Play`) or an info glyph (OK opens the
+  page) at the left of the focused card's line, in a `FOOTER_CUE_SLOT` (28 px) that is collapsed at rest
+  and opened by the card's own pop progress (`cards::Tile::pop`, never a timer of its own): the text
+  moves right by exactly the slot and the bar shrinks toward 64. The Detail episode strip's footer has
+  no cue (its OK always opens or plays the episode). **There is no amber triangle anywhere**: the old
+  caption mark was removed from the code (`TileLabel::glyph` and its draw path), not only from the
+  captions.
+- **The art falls back cover -> baked composite -> title in type** (`card_art::pick`). Plex's own 16:9
+  cover has the title baked in; our composite is the server's background with its clearLogo baked in
+  once by the poster worker; with neither, the title is set in type at the logo slot
+  (`card_art::needs_type_title`, drawn by `still_overlay` through `hero_logo::draw_title`). Baked card
+  art is a bitmap drawn as an ordinary still, **never a live logo** (twenty cards would each hold a
+  clearLogo texture and a per-frame blend). An opted-in card (`tile_facts::for_deck`) carries its title
+  in its art, so the footer repeats none.
+- **Home's page scroll.** Home rests at the hero's page or the grid's (`HomeScreen::on_grid_page`,
+  `holds_page`): focus coming onto the Continue Watching row, by key, hover or click, scrolls nothing;
+  Down from the row reaches the grid with the stills still on top, and the grid's shelves rest as every
+  shelf does (`ui_cards::grid_rest_scroll`, `consts::GRID_TOP_Y`). The pointer's edge-glide bands are
+  `app::input::EDGE_BAND` (= `consts::MARGIN_Y`, 54 px), and one wheel notch is one Up/Down key
+  (`app::bridge::wheel_input`). **The billboard rotates only while focus is on the hero** (or on nothing):
+  the 8 s countdown (`HERO_AUTO_S`) counts while the page rests at the hero and no shelf or shelf heading
+  holds focus (`HomeScreen::row_holds_focus`), and it restarts at its full length when focus returns to the
+  hero. A page that rests at the hero while a Continue Watching card is focused (the row scrolls nothing)
+  therefore keeps its billboard still and presents nothing once settled, as it always did when focus on a
+  row scrolled the page off the hero (the `home-idle` scene grades it).
 
 Tile text is `TileLabel::title(t)` or `TileLabel::titled(t, caption)`, with the focused-label band
 driven by `line_reveal_for` and `under_band` (a line shows once the room under its card holds its
@@ -128,7 +201,7 @@ underlay field the modal dim latched, windowed to the panel's rect and graded to
 material under its frost. Backdrop-blur glass (`Glass::DYNAMIC_BACKDROP`) is chrome-only — the top
 bar's track and the profile chip — plus two non-interactive standing notes in the page layer: the "Hold OK for options"
 capsule (`ui::hold_hint`: standing once per install on the card screens, and once on the Detail season pill) and the Library's
-scroll capsule (`ui::scroll_capsule`: the library's name and size once the chrome has tucked away on a page whose header names two
+scroll capsule (`ui::scroll_capsule`: the library's name, size and sort ("Films 1,284 · Date viewed") once the chrome has tucked away on a page whose header names two
 or more libraries; the nav pill's own glass, asked for by the owner in place of its frozen-ground form). The guard is the file
 list in `widgets_glass_budget_tests`, not this paragraph. See `docs/liquid-glass.md`.
 
@@ -155,7 +228,7 @@ Its contextual answer verbs share one horizontal row, separated from BODY-sized 
 | adding a screen | `docs/ui-system-migration.md` section (E) |
 | a colour | `rust-modules/ui/src/theme.rs` |
 | a size | `rust-modules/gfx/src/gfx/tokens.rs` (`mod size`, re-exported as `theme::size`) |
-| anything behind hero text | `rust-modules/ui/src/landing_hero.rs` and `widgets.rs`'s scrim section, then re-grade the anchor table |
+| anything behind hero text | `rust-modules/ui/src/landing_hero.rs` (Home and Detail), `hero_shade.rs` (Catalog), `theme::shade` and `gfx/scrim.rs`, then re-grade `widgets_hero_shade_tests.rs` and `widgets_hero_scrim_tests.rs` |
 | a horizontal row | `rust-modules/ui/src/card_row.rs` |
 | playback UI | `rust-modules/media/src/player/CLAUDE.md` |
 | Plex data feeding UI | `rust-modules/plex/src/plex/CLAUDE.md` and `docs/pms-api.md` |

@@ -18,6 +18,16 @@ impl ScreenArg for Arg {
     fn same_instance(&self, other: &Self) -> bool { self == other }
 }
 struct TestHost;
+impl crate::registry::ScreenInputsLike for TestHost {
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::empty_fixture() }
+}
+
+impl crate::registry::PlayerLike for TestHost {
+    fn session<'a>(_cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession {
+        plx_media::route::idle_session_for_test()
+    }
+    fn transport_paused(_cx: &Cx<'_, Self>) -> bool { false }
+}
 impl Host for TestHost {
     type Arg = Arg;
     type Fx = AppFx;
@@ -54,6 +64,7 @@ impl crate::registry::MetadataLike for TestHost {
 // container lifecycle seams, without requiring a configured server or a graphics context.
 fn body(entry: EntryId, rk: &str) -> DetailScreen {
     DetailScreen {
+        caption_policy: crate::registry::captions::policy(),
         entry, sid: ServerId::UNSET, rk: rk.into(), pending_season: None,
         keys: vec![], next_elem: FIRST_ITEM_ELEM, key_by_local: Default::default(),
         local_by_key: Default::default(), prev_by_key: Default::default(), gone: Default::default(), return_pending: false,
@@ -74,16 +85,16 @@ fn body(entry: EntryId, rk: &str) -> DetailScreen {
         restore_intent: None, teardown_cleared: false, withdrawn: false, scroll: Spring::at(0.0),
         refresh: DetailRefreshPhase::None,
         refresh_gen: 0,
-        scroll_target: 0.0, episode_scroll: Spring::at(0.0), tab_scroll: Spring::at(0.0),
+        scroll_target: 0.0, free: false, episode_free: false, episode_scroll: Spring::at(0.0), tab_scroll: Spring::at(0.0),
         episode_cells: episodes::Cells::new(),
             ep_want: Default::default(),
             strip_seat: Default::default(),
         about_card_lift: plx_ui::text_lift::TextLift::new(),
         about_lang_lift: plx_ui::text_lift::TextLift::new(),
-        related: plx_ui::cards::Shelf::new(entry, &plx_ui::cards::RowStyle::HOME), collection: plx_ui::cards::Shelf::new(entry, &plx_ui::cards::RowStyle::HOME),
-        extras: plx_ui::cards::Shelf::new(entry, &plx_ui::cards::RowStyle::EPISODE),
-        cast: plx_ui::cards::Shelf::new(entry, &plx_ui::cards::RowStyle::CAST), tabs: TabStrip::new(), season_pop: CtlPop::new(),
-        ctl_pop: CtlPop::new(), disc_unfurl: [Spring::at(0.0); 3], watchlist: plx_appkit::watchlist_disc::Disc::new(plx_data::catalog::Membership::Unknown), watchlist_hex: None,
+        related: plx_ui::cards::Shelf::new(entry, plx_ui::cards::RowStyle::HOME), collection: plx_ui::cards::Shelf::new(entry, plx_ui::cards::RowStyle::HOME),
+        extras: plx_ui::cards::Shelf::new(entry, plx_ui::cards::RowStyle::EPISODE),
+        cast: plx_ui::cards::Shelf::new(entry, plx_ui::cards::RowStyle::CAST), tabs: TabStrip::new(), season_pop: CtlPop::new(),
+        ctl_pop: CtlPop::new(), disc_unfurl: [Spring::at(0.0); hero::DISCS], watchlist: plx_appkit::watchlist_disc::Disc::new(plx_data::catalog::Membership::Unknown), watchlist_hex: None,
         season_metrics: season::Metrics::new(), about_rows: about::Rows::new(),
         ground: AmbientWash::flat(theme::SURFACE_APP), selected: None, spin_ms: 0.0,
         spin_phase: plx_machine::motion::Phase::default(),
@@ -110,13 +121,25 @@ impl Rig<TestHost> for TestRig {
     }
     fn deliver(&mut self, _: MachineId, _: &AppMsg, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) -> Handled { Handled::No }
     fn timer(&mut self, _: MachineId, _: TimerId, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) {}
-    fn app_fx(&mut self, _: MachineId, effect: AppFx, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) {
-        match effect {
-            AppFx::Content(ContentReq::Push(arg)) => self.opened.push(arg),
-            AppFx::Content(ContentReq::Back) => self.backs += 1,
-            AppFx::Store(StoreId::Metadata, StoreCmd::Metadata(cmd)) => self.asked.push(cmd),
+    fn app_fx(&mut self, _: MachineId, effect: crate::registry::InlineAppFx, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) {
+        if let crate::registry::InlineAppFx::Store(StoreId::Metadata, StoreCmd::Metadata(cmd)) = effect {
+            self.asked.push(cmd);
+        }
+    }
+    fn run_yielded_app_command(&mut self, d: &mut Dispatcher<TestHost>,
+        report: &mut plx_ui::dispatch::FrameReport, tap: &mut dyn plx_ui::dispatch::Tap<TestHost>) -> Option<u32> {
+        let command = d.take_app_command()?;
+        let outcome = match &command.effect {
+            Ok(_) => plx_machine::machine::AppCommandOutcome::Completed,
+            Err(outcome) => *outcome,
+        };
+        match command.effect {
+            Ok(crate::registry::ExternalAppFx::Content(ContentReq::Push(arg))) => self.opened.push(arg),
+            Ok(crate::registry::ExternalAppFx::Content(ContentReq::Back)) => self.backs += 1,
             _ => {}
         }
+        Some(d.resume_app_command(self, command.id, outcome,
+            vec![], report, tap).unwrap())
     }
     fn log(&mut self, _: &str) {}
     fn prepare(&mut self, _: &mut Budget, _: &mut Present) {}
@@ -182,6 +205,7 @@ fn first(d: &Dispatcher<TestHost>, group: GroupId) -> FocusKey<u32> {
     let s = screen(d);
     let measure = FixtureMeasure;
     let cx = Cx::<TestHost> { views: (), tick: tick(16), measure: &measure,
+        modal: d.modal_presentation().read, page_image: d.page_image_read(), hold_hint: d.input.hold_hint,
         press: Default::default(), focus: Default::default(), owner: InputOwner::Entry(s.entry) };
     let r = Rect::new(0.0, 0.0, 1.0, 1.0);
     Focusable::<TestHost>::seat(s, group, Placed { rect: r, rest_rect: r, clip: Rect::FULL, index: Some(0) }, &cx)
@@ -238,14 +262,14 @@ fn retained_detail_back_keeps_the_engine_key_until_its_own_landing() {
     frame(&mut d, &mut rig, 48);
     assert_eq!(d.nav.top_page().unwrap().inst.as_ref().unwrap().id, instance);
     assert_eq!(d.focus(), Some(key), "unresolved return must not fall back to Hero");
-    assert!(!{ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(__s, __a, ServerId::UNSET, "wrong", request, Some(item("wrong", false))) });
+    assert!(!{ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, ServerId::UNSET, "wrong", request, Some(item("wrong", false))) });
     d.store_changed(StoreId::Metadata.ord(), 64);
     frame(&mut d, &mut rig, 64);
     assert_eq!(d.focus(), Some(key), "another item's notice cannot complete restoration");
     assert_eq!(test_store().view().detail_request_status(ServerId::UNSET, "a"), Some(true));
     // The wrong-key completion was discarded; retry under a fresh admitted address.
     let request = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), ServerId::UNSET, "a");
-    assert!({ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(__s, __a, ServerId::UNSET, "a", request, Some(item("a", true))) });
+    assert!({ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, ServerId::UNSET, "a", request, Some(item("a", true))) });
     d.store_changed(StoreId::Metadata.ord(), 80);
     frame(&mut d, &mut rig, 80);
     assert_eq!(d.focus(), Some(key));
@@ -305,7 +329,7 @@ fn retained_detail_back_hydrates_saved_season_before_episode_focus() {
     let mut landed = item("a", true);
     landed.cur_season = 0; // reversed seasons: season 2 is now at index zero
     landed.episodes = landed.episodes.iter_loaded().map(|(_, ep)| plx_data::metadata::Episode { season: 2, ..ep.clone() }).collect();
-    assert!({ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(__s, __a, ServerId::UNSET, "a", request, Some(landed)) });
+    assert!({ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, ServerId::UNSET, "a", request, Some(landed)) });
     d.store_changed(StoreId::Metadata.ord(), 80);
     frame(&mut d, &mut rig, 80);
     assert_eq!(d.focus(), Some(key));
@@ -351,7 +375,7 @@ fn a_failed_addressed_return_retires_the_intent_and_falls_back() {
     assert_eq!(d.focus(), Some(key));
     assert_eq!(test_store().view().detail_request_status(ServerId::UNSET, "a"), Some(true));
     assert_eq!(test_store().view().detail_request_status(ServerId::UNSET, "b"), None);
-    assert!(!{ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(__s, __a, ServerId::UNSET, "a", request, None) });
+    assert!(!{ let (__s, __a) = test_store().split_for_test(); plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, ServerId::UNSET, "a", request, None) });
     assert_eq!(test_store().view().detail_request_status(ServerId::UNSET, "a"), Some(false));
     d.store_changed(StoreId::Metadata.ord(), 64);
     frame(&mut d, &mut rig, 64);
@@ -423,6 +447,7 @@ fn stray_runs(detail: Detail, server_values: &[&str]) -> Vec<String> {
         let inst = entry.inst.as_mut().expect("mounted detail");
         let measure = FixtureMeasure;
         let cx = Cx::<TestHost> { views: (), tick: tick(32), measure: &measure,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             press: Default::default(), focus: Default::default(), owner };
         let mut f = DrawFrame::new(&cx, plx_ui::Painter::recording());
         plx_gfx::gfx::without_frame_clear(|| inst.screen.draw(&mut f));
@@ -492,6 +517,7 @@ fn census(detail: Detail) -> std::collections::BTreeMap<(u64, bool), usize> {
         let inst = entry.inst.as_mut().expect("mounted detail");
         let measure = FixtureMeasure;
         let cx = Cx::<TestHost> { views: (), tick: tick(32), measure: &measure,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             press: Default::default(), focus: Default::default(), owner };
         let mut f = DrawFrame::new(&cx, plx_ui::Painter::recording());
         plx_gfx::gfx::without_frame_clear(|| inst.screen.draw(&mut f));
@@ -578,7 +604,7 @@ fn a_reread_of_the_page_leaves_focus_on_the_same_related_card() {
     fresh.related_tail.end = 24;
     let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), ServerId::UNSET, "a");
     let (state, adapter) = test_store().split_for_test();
-    assert!(plx_data::metadata::land_detail_for_test(state, adapter, ServerId::UNSET, "a", generation, Some(fresh)));
+    assert!(plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, ServerId::UNSET, "a", generation, Some(fresh)));
     d.store_changed(StoreId::Metadata.ord(), 32);
     frame(&mut d, &mut rig, 32);
     assert_eq!(d.focus(), Some(key), "the focused card keeps its key through the re-read");
@@ -635,7 +661,7 @@ fn back_from_deep_over(
     (fresh.related_tail.positions, fresh.related_tail.offset, fresh.related_tail.end) = (Vec::new(), 0, 0);
     {
         let (state, adapter) = test_store().split_for_test();
-        assert!(plx_data::metadata::land_detail_for_test(state, adapter, ServerId::UNSET, "a", generation, Some(fresh)));
+        assert!(plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, ServerId::UNSET, "a", generation, Some(fresh)));
     }
     d.store_changed(StoreId::Metadata.ord(), 64);
     // Pump until settled. Focus is on a card the user left, or on no card, on every frame: it is
@@ -909,6 +935,7 @@ fn a_press_never_crosses_the_cards_between_the_head_and_a_window_that_slid_away(
     let step = |d: &Dispatcher<TestHost>, from: FocusKey<u32>, dir: Dir| {
         let measure = FixtureMeasure;
         let cx = Cx::<TestHost> { views: (), tick: tick(16), measure: &measure,
+            modal: d.modal_presentation().read, page_image: d.page_image_read(), hold_hint: d.input.hold_hint,
             press: Default::default(), focus: Default::default(), owner: InputOwner::Entry(from.entry) };
         Focusable::<TestHost>::neighbour(screen(d), from, dir, &cx)
     };
@@ -957,7 +984,7 @@ fn a_refused_way_back_read_is_repeated_while_focus_stands_at_the_leading_edge() 
 fn related_cards_are_named_in_head_then_listing_order() {
     let global = |d: &Detail, which, i| {
         let keys = std::collections::HashMap::new();
-        plx_ui::cards::CardSource::<TestHost>::global(&cards::Cards::new(which, d, &keys, &keys), i)
+        plx_ui::cards::CardSource::<TestHost>::global(&cards::Cards::new(which, d, crate::registry::captions::policy(), &keys, &keys), i)
     };
     let (opening, slid) = (with_tail(0), with_tail(12));
     assert_eq!(global(&opening, cards::Which::Related, 2), 2, "the last head card");

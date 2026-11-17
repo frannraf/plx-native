@@ -65,8 +65,9 @@ pub(super) fn hub_source(state: &PmsState, i: usize) -> &str {
     hubs(state).get(i).map(|h| h.source.as_str()).unwrap_or("")
 }
 
-/// whether hub `i` is the merged Continue Watching shelf (its tiles play on OK and wear the ▶ only
-/// under `DeckPress::Play`). Matched on the locale-independent hubIdentifier, through the one identity function the publication itself uses.
+/// whether hub `i` is the merged Continue Watching shelf (its tiles play on OK under `DeckPress::Play`,
+/// which the focused still's footer cue shows as a play glyph; the default opens the page and shows an
+/// info glyph). Matched on the locale-independent hubIdentifier, through the one identity function the publication itself uses.
 pub(super) fn hub_is_continue(state: &PmsState, i: usize) -> bool {
     hubs(state)
         .get(i)
@@ -80,7 +81,7 @@ pub(super) fn sid(slot: u16) -> ServerId {
 
 /// One source of the table, seeded directly. `handle` empty = a server of our own.
 pub(super) fn src(slot: u16, handle: &str, state: HubState, last: Option<SourceBuild>) -> Src {
-    let mut s = Src::new(sid(slot), handle.into());
+    let mut s = Src::new(sid(slot), handle.into(), &registry_keys_for_test());
     s.state = state;
     s.last = last;
     // a Ready fixture is a source that answered
@@ -95,8 +96,9 @@ pub(super) fn seed(state: &mut PmsState, mut srcs: Vec<Src>) {
     let build = merge(&srcs);
     state.srcs = srcs;
     // leave `sync_roster` idle — both halves, see `seed_for_test`
-    remember_roster(state, &BrowseScope::standalone());
-    state.seen_facts = facts_key();
+    let scope = BrowseScope::standalone();
+    remember_roster(state, &scope);
+    state.seen_facts = facts_key(&scope);
     commit(state, build);
 }
 

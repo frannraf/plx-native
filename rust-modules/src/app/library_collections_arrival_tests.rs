@@ -43,30 +43,21 @@ fn trace(frames: usize, land: Option<(usize, usize)>, command: Option<(usize, pl
     let shared = plx_plex::plex::register_for_test("coll-shared", "127.0.0.1", 10, "synthetic", "fixture");
     plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::with_transition(Box::new(plx_ui::containers::transition::PageDip::new()));
-    let mut rig = Bridge::for_test(|| 0);
+    let mut owner = crate::app::runtime_owners::Harness::new(|| 0);
+    let mut rig = owner.bridge();
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
     rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     rig.stores.browse.borrow_mut().seed_shelves_for_test(0, &[], 4);
-    let mut image = plx_ui::containers::transition::PageImage::default();
-    let mut valid = false;
+
+    let mut dip = DipImage::default();
     let mut ms = 0u32;
     let mut step = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, rows: Option<&mut Vec<Row>>| {
         ms += 16;
-        plx_machine::idle::frame_begin(0.016);
+        plx_machine::motion::report::frame_begin(0.016);
         super::frame(d, rig, Tick { ms, dt_us: 16_000 }, vec![]);
-        use plx_ui::containers::transition::PagePaint;
-        let transition = &d.nav.tabs.stack.transition;
-        let Some(entry) = d.nav.top_page().map(|e| e.id) else { return };
-        let quiescent = !plx_machine::idle::page_layout_moving();
-        let paint = image.plan(entry, transition.in_flight(), transition.page_alpha(), ms, valid, quiescent);
-        match paint {
-            PagePaint::Capture => { image.captured(entry); valid = true; }
-            PagePaint::ReplacementCapture => { image.replacement_captured(entry); valid = true; }
-            PagePaint::Live => { image = Default::default(); valid = false; }
-            PagePaint::Held(_) => {}
-        }
+        let Some(paint) = dip.plan(d, ms) else { return };
         if let (Some(rows), Some(content)) = (rows, library_content(d)) {
             rows.push(Row { on_top: d.top_arg() == Some(&AppArg::LibraryCollections { section: 0 }), captured: paint.captures_page(), content,
                 seat: Bridge::library_grid_position(d) });

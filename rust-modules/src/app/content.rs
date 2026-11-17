@@ -16,19 +16,105 @@ use plx_ui::screen::{ReturnState, ScreenEvent};
 // (`node` stood here — `ContentArg` → `ui::trail::Node`, one of the two conversions the trail
 // needed. A `ContentArg` IS the page's identity; there is nothing to convert it to.)
 
-/// Drain the real bridge queue after menu activation. Resource injection is below the shared
-/// performer, so production and tests consume precisely the same emitted requests.
-pub(super) fn drain_item_menu_requests<R: super::playback::PlaybackResources>(
-    ps: &mut plx_media::route::PlaybackSession,
-    pa: &mut plx_media::player::adapter::PlayerAdapter,
-    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
-    bridge: &mut super::bridge::Bridge,
-    resources: &mut R,
-    menu_play_await: &mut Option<super::input::MenuPlayAwait>,
-    now: u32,
-) {
-    for req in bridge.take_item_menu_reqs() {
-        unsafe { super::input::apply_item_action(ps, pa, req, pages, bridge, resources, menu_play_await, now); }
+
+
+
+/// Main-thread resources borrowed only while one yielded screen command executes.
+pub(crate) struct CommandResources<'a> {
+    pub(crate) player: &'a mut plx_media::player::machine::Player,
+    pub(crate) adapters: &'a mut Adapters,
+    pub(crate) menu_play_await: &'a mut Option<super::input::MenuPlayAwait>,
+    pub(super) playback: &'a mut dyn super::playback::PlaybackResources,
+    pub(crate) repause_at: &'a mut i64,
+    pub(crate) refresh_hubs: &'a mut bool,
+    pub(crate) ptr: &'a mut super::input::Pointer,
+    pub(crate) rec: &'a mut super::recorder::Recplay,
+    pub(crate) boot_initial: &'a mut Option<super::bootstrap::Initial>,
+}
+
+struct ScreenCommandApp<'a, 'owners> {
+    pages: &'a mut plx_ui::dispatch::Dispatcher<bridge::AppHost>,
+    bridge: &'a mut bridge::Bridge<'owners>,
+    player: &'a mut plx_media::player::machine::Player,
+    adapters: &'a mut Adapters,
+    menu_play_await: &'a mut Option<super::input::MenuPlayAwait>,
+}
+
+impl ScreenCommandApp<'_, '_> {
+    fn route(&self) -> AppArg { self.pages.top_arg().cloned().unwrap_or(AppArg::Home) }
+}
+
+#[cfg(test)]
+pub(crate) fn content_command_label(request: &ContentReq) -> &'static str {
+    match request {
+        ContentReq::Push(_) => "content:Push", ContentReq::Present(_) => "content:Present",
+        ContentReq::Back => "content:Back", ContentReq::Play { .. } => "content:Play",
+        ContentReq::PreviewStart { .. } => "content:PreviewStart", ContentReq::PreviewStop => "content:PreviewStop",
+        ContentReq::PreviewTransport(_) => "content:PreviewTransport", ContentReq::PreviewSeek(_) => "content:PreviewSeek",
+        ContentReq::Panel(_) => "content:Panel", ContentReq::ItemMenu => "content:ItemMenu",
+    }
+}
+
+// Sized adapter around the shared injectable playback port; records explicit admission refusal.
+struct CommandPlayback<'a> {
+    inner: &'a mut dyn super::playback::PlaybackResources,
+    refused: bool,
+}
+impl super::playback::PlaybackResources for CommandPlayback<'_> {
+    fn request_movie(&mut self, ps: &mut plx_media::route::PlaybackSession,
+        meta: &mut plx_data::stores::metadata::MetadataStore, item: &plx_data::pms::PmsMovie,
+        version: Option<plx_plex::plex::MediaId>) -> bool {
+        let accepted = self.inner.request_movie(ps, meta, item, version);
+        self.refused |= !accepted;
+        accepted
+    }
+    fn request_episode(&mut self, ps: &mut plx_media::route::PlaybackSession,
+        meta: &mut plx_data::stores::metadata::MetadataStore, rk: &str,
+        version: Option<plx_plex::plex::MediaId>) -> bool {
+        let accepted = self.inner.request_episode(ps, meta, rk, version);
+        self.refused |= !accepted;
+        accepted
+    }
+    fn describe_movie(&mut self, meta: &mut plx_data::stores::metadata::MetadataStore,
+        sid: plx_plex::plex::ServerId, rk: &str) { self.inner.describe_movie(meta, sid, rk); }
+    fn prepare_start(&mut self, ps: &mut plx_media::route::PlaybackSession,
+        pa: &mut plx_media::player::adapter::PlayerAdapter, resume_ns: i64) -> bool {
+        let accepted = self.inner.prepare_start(ps, pa, resume_ns);
+        self.refused |= !accepted;
+        accepted
+    }
+}
+
+/// The resource-backed half of the same FIFO runner used by Search and Watchlist.
+pub(crate) fn execute_resource_command(
+    pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>, bridge: &mut bridge::Bridge,
+    resources: &mut CommandResources<'_>, source: MachineId, effect: plx_screens::registry::ResourceAppFx,
+    ret: ReturnState<u32, PageMemory>, now: u32,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
+    use plx_screens::registry::ResourceAppFx;
+    let mut app = ScreenCommandApp { pages, bridge, player: resources.player,
+        adapters: resources.adapters, menu_play_await: resources.menu_play_await };
+    match effect {
+        ResourceAppFx::Library(request) => library_command(&mut app, source, request, ret, now),
+        ResourceAppFx::Home(request) => home_command(&mut app, source, request, ret, now),
+        ResourceAppFx::Content(request) => content_command(&mut app, source, request, ret, now),
+        ResourceAppFx::LiveTv(request) => live_tv_command(&mut app, source, request, ret),
+        ResourceAppFx::ItemMenu(request) => {
+            let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+            let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+            let closing_menu = app.pages.nav.modals.surfaces.iter().any(|surface|
+                surface.entry.id == entry && surface.phase == plx_ui::containers::modal::Phase::Closing);
+            if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) && !closing_menu {
+                return AppCommandOutcome::Refused;
+            }
+            let mut playback = CommandPlayback { inner: resources.playback, refused: false };
+            // Dismiss preceded this effect; the live closing surface is still its addressed sender.
+            unsafe { super::input::apply_item_action(&mut app.player.session, &mut app.adapters.player,
+                request, app.pages, app.bridge, &mut playback, app.menu_play_await, now); }
+            if playback.refused { AppCommandOutcome::Refused } else { AppCommandOutcome::Completed }
+        }
+
     }
 }
 
@@ -96,12 +182,21 @@ pub(super) fn halt_preview_now(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
 ) {
+    #[cfg(feature = "play-feed")]
     plx_media::player::preview::halt(ps, pa);
+    #[cfg(not(feature = "play-feed"))]
+    {
+        // PreviewStart is declined below without Feed. An already marked preview still owns an
+        // addressed attempt and must be retired through the common playback stop door.
+        if plx_media::route::is_preview(ps) {
+            plx_media::player::stop_playback(ps, pa);
+        }
+    }
 }
 
 /// Queue a play for [`drain_held_feature`] to perform once a still-abandoning preview's Load
 /// thread has actually released the engine. `halt_preview`/`halt_preview_now` only STARTS
-/// abandonment — the preview may still hold `pa.engine()` installed for a moment after, and
+/// abandonment — the preview may still hold a physical feed session installed for a moment after, and
 /// starting a second Load against that installed engine hits the double-start conflict guard
 /// and refuses instead of queuing. Every caller that can reach a still-occupied preview
 /// (an ordinary page Play, and the item menu's Play Trailer) must hold through here rather
@@ -143,18 +238,19 @@ pub(super) fn request_play_intent(
 ) -> bool {
     match play {
         plx_screens::registry::PlayIntent::Item {
-            sid, rk, part, vcodec, acodec, title, context,
+            sid, rk, part, vcodec, acodec, title, context, version, show_rk,
         } => {
             let ok = plx_media::route::request_play(
-                session, meta, *sid, rk, part, vcodec, acodec, title, context,
+                session, meta, super::playback::start_caps(), *sid, rk, part, vcodec, acodec, title, context, *version,
+                show_rk,
             );
             if ok {
                 note_extra_now_playing(meta, *sid, rk, context);
             }
             ok
         }
-        plx_screens::registry::PlayIntent::Movie(m) =>
-            plx_media::route::request_play_movie(session, meta, m, &super::playback::movie_ctx(m)),
+        plx_screens::registry::PlayIntent::Movie { item, version } =>
+            plx_media::route::request_play_movie(session, meta, super::playback::start_caps(), item, &super::playback::movie_ctx(item), *version),
     }
 }
 
@@ -198,7 +294,7 @@ pub(super) fn clear_engine_for_play(
     halt_preview_now(ps, pa);
     match play_clearance(
         plx_media::player::preview::occupies(),
-        pa.is_live(),
+        pa.playback_needs_teardown(ps),
         plx_media::route::is_preview(ps),
         player_mounted,
     ) {
@@ -206,7 +302,7 @@ pub(super) fn clear_engine_for_play(
         PlayClearance::Clear => true,
         PlayClearance::RetireOrphan => {
             log("play: stopping an off-route engine nothing owns before the new Load");
-            plx_media::player::stop_bufferfeed(ps, pa);
+            plx_media::player::stop_playback(ps, pa);
             true
         }
     }
@@ -222,7 +318,8 @@ fn drain_held_feature(app: &mut App) {
     }
     let held = HELD_FEATURE.with(|slot| slot.borrow_mut().take());
     let Some(held) = held else { return };
-    if !request_play_intent(&mut app.player.session, app.bridge.metadata_mut(), &held.play) {
+    let mut bridge = app.runtime.bridge(&mut app.bridge);
+    if !request_play_intent(&mut app.player.session, bridge.metadata_mut(), &held.play) {
         return;
     }
     start_playback(
@@ -233,7 +330,7 @@ fn drain_held_feature(app: &mut App) {
         held.hud_ms,
         held.ret,
         &mut app.pages,
-        &mut app.bridge,
+        &mut bridge,
     );
 }
 
@@ -327,6 +424,7 @@ mod held_feature_tests {
         plx_data::metadata::NowPlaying {
             is_episode: true,
             is_real_episode: true,
+            is_movie: false,
             title: "Show".into(),
             ep_title: "Pilot".into(),
             season: 1,
@@ -349,6 +447,8 @@ mod held_feature_tests {
             acodec: String::new(),
             title: "Official Trailer".into(),
             context: context.into(),
+            version: None,
+            show_rk: String::new(),
         }
     }
 
@@ -469,68 +569,52 @@ mod held_feature_tests {
     }
 }
 
-pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
+/// Maintain playback continuations and refresh the frame's authoritative control row after
+/// ordered commands may have retired a marker. Never copy the preceding frame's screen slot.
+pub(crate) fn content_requests(app: &mut App, fr: &mut Frame) {
     halt_preview_off_its_page(app);
     drain_held_feature(app);
-    home_requests(app, fr.now);
-    library_requests(app, fr.now);
-    search_requests(app);
-    watchlist_requests(app);
-    live_tv_requests(app);
-    // The player's overlays are surfaces on its own stack, so what they decide reaches the
-    // loop the same way every other owned screen's decision does — as requests, drained here,
-    // after the dispatcher and before the frame's own arms (`playback::player_requests`).
-    let mut player_reqs = app.bridge.take_player_reqs();
-    if remove_replayed_repairs(&mut player_reqs,
-        matches!(app.rec, super::recorder::Recplay::Replaying(_)), app.bridge.is_controlled_replay()) {
-        app.rec.refuse("replay cannot authorize sandbox repair");
-    }
-    if !player_reqs.is_empty() {
-        super::playback::player_requests(&mut app.player.repair, &mut app.player.session,
-            &mut app.adapters.player,
-            player_reqs,
-            fr.now,
-            &mut app.refresh_hubs,
-            &mut app.pages,
-            &mut app.bridge,
-            &mut app.ok_armed,
-            &mut app.input.press,
-        );
-    }
-    // …and the item context menu's committed row, for the same reason and at the same moment: it
-    // is a surface on the shared stack, so what it decides reaches the loop as a request. The
-    // dispatch asks the container for a navigation and takes the playback session's `&mut`,
-    // neither of which a screen may name (§2.1).
-    drain_item_menu_requests(&mut app.player.session, &mut app.adapters.player,
-        &mut app.pages, &mut app.bridge, &mut super::playback::LivePlaybackResources,
-        &mut app.menu_play_await, fr.now);
-    for (source, request, ret) in app.bridge.take_content_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        // A delayed effect cannot navigate for an instance that has already been covered.
-        if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { continue; }
-        match request {
+    live_tv_frame(app);
+    let bridge = app.runtime.bridge(&mut app.bridge);
+    fr.ctrl = plx_appkit::player_hud::slot_with_preferences(&app.player.session,
+        bridge.metadata_view(), bridge.marker_preferences());
+}
+
+fn halt_screen_preview(app: &mut ScreenCommandApp<'_, '_>) {
+    halt_preview_now(&mut app.player.session, &mut app.adapters.player);
+}
+
+fn content_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, request: ContentReq,
+    ret: ReturnState<u32, PageMemory>, now: u32,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
+    #[cfg(not(feature = "play-feed"))]
+    let _ = now;
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { return AppCommandOutcome::Refused; }
+    match request {
             ContentReq::Push(arg) => {
-                halt_preview(app);
+                halt_screen_preview(app);
                 // The page's own press frame captured `ret`, so it rides the request rather than
                 // being re-read at the commit: the user can still move focus during the dip, and
                 // BACK must return them to where they pressed.
                 bridge::nav_push_with_return(&mut app.pages, AppArg::Content(arg), ret);
             }
             ContentReq::Present(arg) => {
-                halt_preview(app);
+                halt_screen_preview(app);
                 app.pages.nav.next_style = plx_ui::containers::modal::Style::Opaque { snapshot: true };
                 app.pages.request_with_return(source, NavOp::Present(AppArg::Content(arg)), ret);
             }
             ContentReq::Back => {
-                halt_preview(app);
+                halt_screen_preview(app);
                 content_back(&mut app.pages, source, entry, ret);
             }
             ContentReq::Play { play, resume_ns } => {
                 let mounted = bridge::player(&app.pages).is_some();
                 if !clear_engine_for_play(&mut app.player.session, &mut app.adapters.player, mounted) {
                     hold_feature(play, resume_ns, Some(ret));
-                    continue;
+                    return AppCommandOutcome::Completed;
                 }
                 // The PAGE decided which item; the LOOP performs the request, because
                 // `route::request_play` takes the playback session's `&mut` and a screen is only
@@ -539,7 +623,7 @@ pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
                 // is what the page's own discarded `started` bool used to decide.
                 // Held-feature drain uses this same helper: a trailer Play pressed while a
                 // preview still occupies must install the Info-card descriptor too.
-                if !request_play_intent(&mut app.player.session, app.bridge.metadata_mut(), &play) { continue; }
+                if !request_play_intent(&mut app.player.session, app.bridge.metadata_mut(), &play) { return AppCommandOutcome::Refused; }
                 // The page's own `ReturnState` rides the push, so BACK out of the playback finds
                 // the spot the Play was pressed from. It was `Trail::set_top_spot` plus a
                 // second, hand-written `NavOp::Push` after the fact.
@@ -549,19 +633,26 @@ pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
                     Some(ret), &mut app.pages, &mut app.bridge);
             }
             ContentReq::PreviewStart { sid, rk, part, vcodec, acodec, title } => {
+                #[cfg(not(feature = "play-feed"))]
+                {
+                    let _ = (sid, rk, part, vcodec, acodec, title);
+                    // Hero previews have no URI qualification.
+                    return AppCommandOutcome::Refused;
+                }
+                #[cfg(feature = "play-feed")]
+                {
                 if part.is_empty() {
                     plx_media::player::preview::note_no_extra(sid, &rk);
-                    continue;
+                    return AppCommandOutcome::Completed;
                 }
                 if !matches!(
-                    plx_media::player::preview::request_start(sid, &rk, fr.now),
+                    plx_media::player::preview::request_start(sid, &rk, now),
                     plx_media::player::preview::Start::Accepted
-                ) {
-                    continue;
-                }
+                ) { return AppCommandOutcome::Refused; }
                 let ok = plx_media::route::request_preview(
                     &mut app.player.session,
                     app.bridge.metadata_mut(),
+                    super::playback::start_caps(),
                     sid,
                     &rk,
                     &part,
@@ -573,30 +664,38 @@ pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
                     PREVIEW_HOST.with(|h| h.set(Some(instance)));
                 } else {
                     plx_media::player::preview::note_admission_refused();
+                    return AppCommandOutcome::Refused;
+                }
                 }
             }
-            ContentReq::PreviewStop => halt_preview(app),
+            ContentReq::PreviewStop => halt_screen_preview(app),
             // Full-trailer mode's transport. Unlike every neighbour here it does NOT halt the
             // preview — it is the one request whose whole point is that the session survives it.
             ContentReq::PreviewTransport(play) => {
+                #[cfg(feature = "play-feed")]
                 plx_media::player::preview::transport(
                     &mut app.player.session,
                     &mut app.adapters.player,
                     play,
                 );
+                #[cfg(not(feature = "play-feed"))]
+                let _ = play;
             }
             // Full-trailer mode's LEFT/RIGHT scrub commit. Also does not halt the preview on its
             // own — `player::preview::seek` decides that (a refused/failed seek's own outcome),
             // exactly as `PreviewTransport` above never halts on a bare pause.
             ContentReq::PreviewSeek(target_ns) => {
+                #[cfg(feature = "play-feed")]
                 plx_media::player::preview::seek(
                     &mut app.player.session,
                     &mut app.adapters.player,
                     target_ns,
                 );
+                #[cfg(not(feature = "play-feed"))]
+                let _ = target_ns;
             }
             ContentReq::Panel(panel) => {
-                halt_preview(app);
+                halt_screen_preview(app);
                 // **The SUBJECT is the page's item, and a page need not have one.** A panel that
                 // needs `(sid, rk)` — *Also available*, whose store is addressed by it — is
                 // refused rather than presented against whatever item happened to land last; a
@@ -611,23 +710,22 @@ pub(crate) fn content_requests(app: &mut App, fr: &Frame) {
                 bridge::open_content_panel(&mut app.pages, instance, subject, panel);
             }
             ContentReq::ItemMenu => {
-                halt_preview(app);
+                halt_screen_preview(app);
                 // The ROUTE does not move: a surface is presented over the top page and never
                 // replaces it, which is the whole of what `Route::ItemMenu { over: MenuHost }`
                 // was arranging by hand.
                 if let Some(arg) = app.bridge.content_menu_arg(&app.pages, entry, &ret) {
                     bridge::open_item_menu(&mut app.pages, arg);
-                    app.ok_armed = false;
+
                 }
             }
-        }
     }
+    AppCommandOutcome::Completed
 }
 
 /// **Home's BACK fold, performed**: the screen owns the fold (its dive), the input engine owns the
 /// hero group's last control. Restore that cursor without introducing a Home-local focus copy. The
-/// loop runs this from [`home_requests`] and the route-test world's pump from its own, so a BACK on a
-/// shelf lands focus on the billboard in both.
+/// FIFO runner invokes this for product and fixture frames, so a BACK on a shelf lands focus on the billboard.
 pub(crate) fn fold_to_hero(pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>, source: MachineId, entry: EntryId) {
     let remembered = pages.input.engine.remembered_for(entry).into_iter()
         .find(|(group, _)| *group == plx_machine::machine::GroupId(0)).map(|(_, elem)| elem);
@@ -640,51 +738,46 @@ pub(crate) fn fold_to_hero(pages: &mut plx_ui::dispatch::Dispatcher<super::bridg
 
 /// Home chooses an action and a stable item; only the application performs navigation,
 /// playback or legacy-modal work. Recheck the emitting entry before every queued action.
-fn home_requests(app: &mut App, now: u32) {
-    for (source, request, ret) in app.bridge.take_home_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry))
-            || !matches!(app.route(), AppArg::Home) { continue; }
-        match request {
-            HomeReq::FoldToHero => fold_to_hero(&mut app.pages, source, entry),
-            HomeReq::Account => chip_activate(&mut app.pages),
-            HomeReq::Tab(tab) => {
-                // A pointer may name the last presented map after favourites changed. The
-                // stable key must not resurrect a destination the current strip withdrew.
-                if !home_tab_available(app.bridge.browse_directory(), tab) { continue; }
-                match tab {
-                    // The Home pill ON Home: nothing to navigate to, but a transition queued a
-                    // moment ago is still withdrawable, and focus drops into the hero like every
-                    // other pill's arrival.
-                    HomeTab::Home => {
-                        bridge::nav_cancel(&mut app.pages);
-                        bridge::nav_home_pill(&mut app.pages, &mut app.bridge, None);
-                    }
-                    other => bridge::nav_tab(&mut app.pages, &mut app.bridge, other, None, Some(ret)),
+fn home_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, request: HomeReq,
+    ret: ReturnState<u32, PageMemory>, now: u32,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) || app.route() != AppArg::Home {
+        return AppCommandOutcome::Refused;
+    }
+    match request {
+        HomeReq::FoldToHero => fold_to_hero(app.pages, source, entry),
+        HomeReq::Account => chip_activate(app.pages),
+        HomeReq::Tab(tab) => {
+            // A stale presented map cannot resurrect a withdrawn destination.
+            if !home_tab_available(app.bridge.browse_directory(), tab) { return AppCommandOutcome::Refused; }
+            match tab {
+                HomeTab::Home => {
+                    bridge::nav_cancel(app.pages);
+                    bridge::nav_home_pill(app.pages, app.bridge, None);
                 }
-            }
-            HomeReq::Play { sid, rk, resume_ns } =>
-                activate_home_item(app, source, entry, sid, &rk, Some(resume_ns), ret, now),
-            HomeReq::Detail { sid, rk } =>
-                activate_home_item(app, source, entry, sid, &rk, None, ret, now),
-            HomeReq::ItemMenu { sid, rk } => {
-                let snapshot = app.bridge.hubs_snapshot();
-                let Some(item) = home_item(snapshot.view(), sid, &rk)
-                    .filter(|item| plx_screens::item_menu::has_actions(item)) else { continue };
-                let from_deck = home_menu_from_deck(&ret);
-                let opener = app.bridge.home_opener(&app.pages, entry, ret.focus);
-                // `from_home: true` is the ONE thing `MenuHost::Home` still decided by phase 10;
-                // since D1 it carries no navigation of its own — the container is the only history
-                // there is, and a menu opened on the root leaves onto the root's own stack.
-                let mut arg = bridge::card_menu_arg(item, from_deck, true, entry, ret.focus, opener.rect);
-                app.bridge.watchlist_open_if_idle();
-                arg.watchlist = app.bridge.watchlist_card_face(item);
-                bridge::open_item_menu(&mut app.pages, arg);
-                app.ok_armed = false;
+                other => bridge::nav_tab(app.pages, app.bridge, other, None, Some(ret)),
             }
         }
+        HomeReq::Play { sid, rk, resume_ns } =>
+            return activate_home_item(app, source, entry, sid, &rk, Some(resume_ns), ret, now),
+        HomeReq::Detail { sid, rk } =>
+            return activate_home_item(app, source, entry, sid, &rk, None, ret, now),
+        HomeReq::ItemMenu { sid, rk } => {
+            let snapshot = app.bridge.hubs_snapshot();
+            let Some(item) = home_item(snapshot.view(), sid, &rk)
+                .filter(|item| plx_screens::item_menu::has_actions(item)) else { return AppCommandOutcome::Refused };
+            let from_deck = home_menu_from_deck(&ret);
+            let opener = app.bridge.home_opener(app.pages, entry, ret.focus);
+            let mut arg = bridge::card_menu_arg(item, from_deck, true, entry, ret.focus, opener.rect);
+            app.bridge.watchlist_open_if_idle();
+            arg.watchlist = app.bridge.watchlist_card_face(item);
+            bridge::open_item_menu(app.pages, arg);
+        }
     }
+    AppCommandOutcome::Completed
 }
 
 fn home_item<'a>(view: plx_data::pms::HubsView<'a>, sid: plx_plex::plex::ServerId, rk: &str) -> Option<&'a plx_data::pms::PmsMovie> {
@@ -713,62 +806,71 @@ fn search_target(item: &plx_data::search::Item, request: &plx_screens::registry:
     }
 }
 
-fn search_requests(app: &mut App) {
+/// One Search command, at its original FIFO slot with the emission-time bookmark.
+pub(crate) fn execute_search_command(
+    pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>, rig: &mut bridge::Bridge,
+    source: MachineId, request: plx_screens::registry::SearchReq, ret: ReturnState<u32, PageMemory>,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
     use plx_screens::registry::SearchReq;
-    for (source, request, ret) in app.bridge.take_search_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        if app.route() != AppArg::Search || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { continue; }
-        match &request {
-            SearchReq::Back => bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, None, Some(ret)),
-            SearchReq::Tab(tab) => {
-                if !app.bridge.search_tab_available(*tab) { continue; }
-                if matches!(tab, HomeTab::Search) { continue }
-                match tab {
-                    HomeTab::Home => bridge::nav_home_pill(&mut app.pages, &mut app.bridge, Some(ret)),
-                    other => bridge::nav_tab(&mut app.pages, &mut app.bridge, *other, None, Some(ret)),
-                }
-            }
-            SearchReq::Account => {
-                // The owned screen releases its keyboard before emitting this request. Do not
-                // call chip_activate's legacy Search editing-state teardown a second time.
-                bridge::open_account_menu(&mut app.pages);
-            }
-            SearchReq::Detail { .. } | SearchReq::Person { .. } | SearchReq::Collection { .. } => {
-                let Some((item, _)) = app.bridge.search_selection(&app.pages, entry, ret.focus) else { continue };
-                let Some(target) = search_target(&item, &request) else { continue };
-                bridge::nav_push_with_return(&mut app.pages, target, ret);
-            }
-            SearchReq::ItemMenu { sid, rk } => {
-                let Some((plx_data::search::Item::Media(item), opener)) = app.bridge.search_selection(&app.pages, entry, ret.focus) else { continue };
-                if item.sid != *sid || item.rk != *rk || !plx_screens::item_menu::has_actions(&item) { continue; }
-                let mut arg = bridge::card_menu_arg(&item, false, false, entry, ret.focus, opener.rect);
-                app.bridge.watchlist_open_if_idle();
-                arg.watchlist = app.bridge.watchlist_card_face(&item);
-                bridge::open_item_menu(&mut app.pages, arg);
-                app.ok_armed = false;
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    if pages.top_arg() != Some(&AppArg::Search)
+        || pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { return AppCommandOutcome::Refused; }
+    match &request {
+        SearchReq::Back => bridge::nav_tab(pages, rig, HomeTab::Home, None, Some(ret)),
+        SearchReq::Tab(tab) => {
+            if !rig.search_tab_available(*tab) { return AppCommandOutcome::Refused; }
+            if matches!(tab, HomeTab::Search) { return AppCommandOutcome::Completed; }
+            match tab {
+                HomeTab::Home => bridge::nav_home_pill(pages, rig, Some(ret)),
+                other => bridge::nav_tab(pages, rig, *other, None, Some(ret)),
             }
         }
+        SearchReq::Account => {
+            // Search already released its keyboard before emitting this command.
+            bridge::open_account_menu(pages);
+        }
+        SearchReq::Detail { .. } | SearchReq::Person { .. } | SearchReq::Collection { .. } => {
+            let Some((item, _)) = rig.search_selection(pages, entry, ret.focus) else { return AppCommandOutcome::Refused };
+            let Some(target) = search_target(&item, &request) else { return AppCommandOutcome::Refused };
+            bridge::nav_push_with_return(pages, target, ret);
+        }
+        SearchReq::ItemMenu { sid, rk } => {
+            let Some((plx_data::search::Item::Media(item), opener)) = rig.search_selection(pages, entry, ret.focus)
+                else { return AppCommandOutcome::Refused };
+            if item.sid != *sid || item.rk != *rk || !plx_screens::item_menu::has_actions(&item) {
+                return AppCommandOutcome::Refused;
+            }
+            let mut arg = bridge::card_menu_arg(&item, false, false, entry, ret.focus, opener.rect);
+            rig.watchlist_open_if_idle();
+            arg.watchlist = rig.watchlist_card_face(&item);
+            bridge::open_item_menu(pages, arg);
+        }
     }
+    AppCommandOutcome::Completed
 }
 
 /// What the Watchlist page and its Sort & Filter surface asked (`screens::watchlist`). The page
 /// names no sibling, so every navigation it makes is a request here: the strip's tabs and chip,
 /// BACK, the hold menu, the options surface.
-fn watchlist_requests(app: &mut App) {
+pub(crate) fn execute_watchlist_command(
+    pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>,
+    rig: &mut bridge::Bridge, source: MachineId,
+    request: plx_screens::watchlist::page::WatchlistOut, ret: ReturnState<u32, PageMemory>,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
     use plx_screens::watchlist::page::WatchlistOut;
-    for (source, request, ret) in app.bridge.take_watchlist_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        // The Sort & Filter value comes from the surface over the page, not from the page, so it
-        // is not gated on the asking page holding input.
-        if !matches!(request, WatchlistOut::SetOptions(_))
-            && (app.route() != AppArg::Watchlist || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)))
-        {
-            continue;
-        }
-        watchlist_request(&mut app.pages, &mut app.bridge, entry, request, ret, &mut app.ok_armed);
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    // Options come from a surface over the page, so its live sender need not be the page.
+    if !matches!(request, WatchlistOut::SetOptions(_))
+        && (pages.top_arg() != Some(&AppArg::Watchlist)
+            || pages.nav.input_owner() != Some(InputOwner::Entry(entry))) {
+        return AppCommandOutcome::Refused;
     }
+    watchlist_request(pages, rig, entry, request, ret);
+    AppCommandOutcome::Completed
 }
 
 /// **One request the Watchlist page or its Sort & Filter surface made, performed**, after the loop's
@@ -777,7 +879,7 @@ fn watchlist_requests(app: &mut App) {
 /// [`library_navigation`] is: a test that presses OK on the pill sees the menu the TV opens.
 pub(crate) fn watchlist_request(
     pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>, rig: &mut bridge::Bridge, entry: EntryId,
-    request: plx_screens::watchlist::page::WatchlistOut, ret: ReturnState<u32, PageMemory>, ok_armed: &mut bool,
+    request: plx_screens::watchlist::page::WatchlistOut, ret: ReturnState<u32, PageMemory>,
 ) {
     use plx_screens::watchlist::page::WatchlistOut;
     match request {
@@ -797,7 +899,7 @@ pub(crate) fn watchlist_request(
         WatchlistOut::Hold { guid, state, copy, .. } => {
             let Some(arg) = rig.watchlist_hold_arg(pages, entry, ret.focus, &guid, state, copy) else { return };
             bridge::open_item_menu(pages, arg);
-            *ok_armed = false;
+
         }
         // The catalog page of a title no server holds, by the tile's guid (a guid the service
         // does not form as `plex://movie|show/<hex>` has no page to open).
@@ -876,31 +978,33 @@ mod search_action_tests {
     }
 }
 
-fn library_requests(app: &mut App, now: u32) {
+fn library_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId,
+    request: plx_screens::registry::LibraryReq, ret: ReturnState<u32, PageMemory>, now: u32,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
     use plx_screens::registry::LibraryReq;
-    for (source, request, ret) in app.bridge.take_library_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        if let LibraryReq::PublishShelves { target, hidden_page, at_head } = request {
-            library_publish_shelves(&app.pages, &mut app.bridge, entry, target, hidden_page, at_head);
-            continue;
-        }
-        // The full grid and the two pages its header pushes (Collections, Recommended) are all the
-        // library screen, so they answer the same requests.
-        let library_page = app.route().is_library_family();
-        if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) || !library_page { continue; }
-        let Some(ret) = library_navigation(&mut app.pages, &mut app.bridge, &request, ret) else { continue };
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    if let LibraryReq::PublishShelves { target, hidden_page, at_head } = request {
+        library_publish_shelves(app.pages, app.bridge, entry, target, hidden_page, at_head);
+        return AppCommandOutcome::Completed;
+    }
+    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) || !app.route().is_library_family() {
+        return AppCommandOutcome::Refused;
+    }
+    if let Some(ret) = library_navigation(app.pages, app.bridge, &request, ret) {
         unsafe {
-            library_page_request(&mut app.player.session, &mut app.adapters.player, &mut app.menu_play_await,
-                &mut app.ok_armed, now, &mut app.pages, &mut app.bridge, instance, entry, request, ret);
+            library_page_request(&mut app.player.session, &mut app.adapters.player, app.menu_play_await,
+                now, app.pages, app.bridge, instance, entry, request, ret);
         }
     }
+    AppCommandOutcome::Completed
 }
 
 /// **A Library page's shelf publication, performed**: the store may land the hubs it staged quietly
 /// when the asking page is the one on top. The grid and the Recommended page both publish: the hubs
 /// are the Recommended page's whole content, so its route must be let through too. The loop
-/// (`library_requests`) and the app-tier tests' pump both call this.
+/// (`library_command`) invokes this for product and fixture frames.
 pub(crate) fn library_publish_shelves(
     pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>,
     bridge: &mut bridge::Bridge,
@@ -921,15 +1025,15 @@ pub(crate) fn library_publish_shelves(
 /// **The rest of a Library-family page's requests, performed** — the ones [`library_navigation`] left
 /// undone: the "+N" and Sort & Filter menus (`Menu`), a held poster's card menu (`ItemMenu`) and a
 /// poster press (`Detail`, `Play`), the last two through `Bridge::library_selection`, which reads the
-/// card from whichever Library-family page asked. The loop (`library_requests`) and the app-tier
-/// tests' pump (`test_support::Pump`) both call this, so a test that presses OK on a poster drives
+/// card from whichever Library-family page asked. The shared runner (`library_command`) calls this
+/// in both product and fixture frames, so a test that presses OK on a poster drives
 /// the routing the TV runs, not a copy of it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn library_page_request(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     menu_play_await: &mut Option<super::input::MenuPlayAwait>,
-    ok_armed: &mut bool,
+
     now: u32,
     pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>,
     bridge: &mut bridge::Bridge,
@@ -941,7 +1045,7 @@ pub(crate) unsafe fn library_page_request(
     use plx_screens::registry::{LibraryReq, LibraryMenuArg};
     let source = MachineId::Instance(instance);
     match request {
-        LibraryReq::PublishShelves { .. } => unreachable!("`library_requests` publishes them"),
+        LibraryReq::PublishShelves { .. } => unreachable!("`library_command` publishes them"),
         LibraryReq::OpenListing { .. } | LibraryReq::BackToHome { .. } | LibraryReq::Tab(_) | LibraryReq::Account =>
             unreachable!("`library_navigation` performed it"),
         LibraryReq::Menu { kind, anchor, target, folded, control } => {
@@ -958,7 +1062,7 @@ pub(crate) unsafe fn library_page_request(
             bridge.watchlist_open_if_idle();
             arg.watchlist = bridge.watchlist_card_face(&item);
             bridge::open_item_menu(pages, arg);
-            *ok_armed = false;
+
         }
         LibraryReq::Detail { sid, ref rk, .. } | LibraryReq::Play { sid, ref rk, .. } => {
             let Some((mut item, _)) = bridge.library_selection(pages, entry, ret.focus) else { return };
@@ -973,7 +1077,7 @@ pub(crate) unsafe fn library_page_request(
 
 /// **The page moves a Library-family page asks for** — its header's Collections / Recommended links
 /// pushing a page over it, BACK off the grid to Home, a strip pill, the account chip. The loop
-/// (`library_requests`) and the app-tier tests' pump (`test_support::pump_navigation`) both call
+/// (`library_command`) invokes this in both product and fixture frames, calling
 /// this, so a test drives the routing the TV runs rather than a copy of it. A request that is not
 /// one of these comes back with its `ret` for the caller to act on.
 pub(crate) fn library_navigation(
@@ -1043,26 +1147,29 @@ pub(crate) fn watchlist_navigation(
     None
 }
 
-/// **The Live TV page's requests, and a landed tune.** A tune is played only while its page is the
-/// one on screen (a press whose page was covered meanwhile is handed back to be released); the
-/// strip, BACK and the chip navigate as the Watchlist's do; everything else is the store's.
-fn live_tv_requests(app: &mut App) {
-    use plx_screens::live_tv::LiveTvOut;
+/// **The Live TV store's landings, once a frame**: a landed tune is played only while its page is
+/// the one on screen (a press whose page was covered meanwhile is handed back to be released), a
+/// failed CH▲/CH▼ is answered, the program on the channel playing rolls with the clock, and a
+/// channel in the guide's corner goes when the guide does. The page's own requests are commands
+/// ([`live_tv_command`]).
+pub(crate) fn live_tv_frame(app: &mut App) {
+    let route = app.route();
+    let mut bridge = app.runtime.bridge(&mut app.bridge);
     // A step is dropped however the player was left (STOP, BACK, the end of the stream).
-    if app.route() != AppArg::Player {
-        app.bridge.live_tv_abandon_step();
+    if route != AppArg::Player {
+        bridge.live_tv_abandon_step();
     }
-    app.bridge.live_tv_pump(app.route() == AppArg::Player, app.route() == AppArg::LiveTv);
+    bridge.live_tv_pump(route == AppArg::Player, route == AppArg::LiveTv);
     // A CH▲/CH▼ whose tune failed: a DVR channel left has handed its tuner back and its picture is
     // dying, so the player goes back to the guide, whose notice says why; one of Plex's channels
     // keeps its own picture, and the notice is forgotten.
-    if let Some(step) = app.bridge.live_tv_take_failure() {
-        if step && app.route() == AppArg::Player {
+    if let Some(step) = bridge.live_tv_take_failure() {
+        if step && route == AppArg::Player {
             if plx_media::route::live_lease_held(&app.player.session) {
-                app.bridge.live_tv_clear_tune_failure();
+                bridge.live_tv_clear_tune_failure();
                 plx_media::route::set_live_context(&mut app.player.session, None);
             } else {
-                super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+                super::playback::exit_player(&mut app.player, &mut app.adapters.player, &mut app.repause_at, &mut app.refresh_hubs, &mut app.pages);
             }
         }
     }
@@ -1070,7 +1177,7 @@ fn live_tv_requests(app: &mut App) {
     // follow (they were fixed at tune time, so at the top of the hour the bar read full and the
     // title was the last program's).
     if plx_media::route::is_live(&app.player.session) {
-        if let Some(a) = app.bridge.live_tv_program_now() {
+        if let Some(a) = bridge.live_tv_program_now() {
             if plx_media::route::roll_live_program(&mut app.player.session, &a.title, &a.show_title, a.begins_at, a.ends_at) {
                 plx_base::eventlog::log("livetv: the program on the channel playing moved on");
             }
@@ -1078,81 +1185,90 @@ fn live_tv_requests(app: &mut App) {
     } else {
         // No channel plays (STOP, the stream's end, a tune that failed): the guide is no longer
         // kept fresh for one, and a record press has nothing to record.
-        app.bridge.live_tv_forget_watching();
+        bridge.live_tv_forget_watching();
     }
-    if let Some(tuned) = app.bridge.live_tv_take_tuned() {
+    if let Some(tuned) = bridge.live_tv_take_tuned() {
         // The landing answers the Watch last asked; it plays only over the screen that asked it.
-        match app.bridge.live_tv_take_asked() {
-            Some(asked) if !asked.step && app.route() == AppArg::LiveTv => {
-                if start_live(app, tuned) {
-                    app.bridge.live_tv_now_watching(&asked);
+        match bridge.live_tv_take_asked() {
+            Some(asked) if !asked.step && route == AppArg::LiveTv => {
+                if start_live(&mut app.player, &mut app.adapters.player, &mut app.pages, &mut bridge, tuned) {
+                    bridge.live_tv_now_watching(&asked);
                 }
             }
-            Some(asked) if asked.step && app.route() == AppArg::Player && plx_media::route::is_live(&app.player.session) => {
+            Some(asked) if asked.step && route == AppArg::Player && plx_media::route::is_live(&app.player.session) => {
                 // a CH▲/CH▼ from the live player: the new channel replaces the old in place
                 super::playback::stop_live_for_step(&mut app.player.session, &mut app.adapters.player);
-                if start_live(app, tuned) {
-                    app.bridge.live_tv_now_watching(&asked);
+                if start_live(&mut app.player, &mut app.adapters.player, &mut app.pages, &mut bridge, tuned) {
+                    bridge.live_tv_now_watching(&asked);
                 } else {
-                    super::playback::exit_player(&mut app.player.session, &mut app.adapters.player, &mut app.refresh_hubs, &mut app.pages);
+                    super::playback::exit_player(&mut app.player, &mut app.adapters.player, &mut app.repause_at, &mut app.refresh_hubs, &mut app.pages);
                 }
             }
-            _ => app.bridge.live_tv_drop_tuned(tuned),
+            _ => bridge.live_tv_drop_tuned(tuned),
         }
     }
     // A channel playing on in the guide's corner goes when the guide does.
-    if !matches!(app.route(), AppArg::LiveTv | AppArg::Player) {
+    if !matches!(route, AppArg::LiveTv | AppArg::Player) {
         super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
     }
-    for (source, request, ret) in app.bridge.take_live_tv_reqs() {
-        let MachineId::Instance(instance) = source else { continue };
-        let Some(entry) = app.pages.nav.entry_of_instance(instance) else { continue };
-        if app.route() != AppArg::LiveTv || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) {
-            continue;
-        }
-        plx_base::eventlog::log(&format!("livetv: page asked {}", live_tv_request_word(&request)));
-        // leaving the guide ends a channel in its corner; OK on that channel brings it back
-        let corner = plx_media::player::video_window_is_mini() && plx_media::route::is_live(&app.player.session);
-        match &request {
-            LiveTvOut::Back | LiveTvOut::Tab(_) | LiveTvOut::Account => {
-                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
-            }
-            LiveTvOut::Watch { row, .. } if corner => {
-                if app.bridge.live_tv_is_watching(*row) {
-                    super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
-                    continue;
-                }
-                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
-            }
-            LiveTvOut::WatchHub { identifier, vcn, .. } if corner => {
-                if app.bridge.live_tv_is_watching_card(identifier, vcn) {
-                    super::playback::restore_live_corner(&mut app.pages, &mut app.bridge);
-                    continue;
-                }
-                // a card naming no channel read here plays nothing: the corner's stays
-                if !app.bridge.live_tv_knows_card(identifier, vcn) {
-                    plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's");
-                    continue;
-                }
-                super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
-            }
-            _ => {}
-        }
-        match request {
-            LiveTvOut::Back => bridge::nav_tab(&mut app.pages, &mut app.bridge, HomeTab::Home, None, Some(ret)),
-            LiveTvOut::Tab(tab) => {
-                if !app.bridge.search_tab_available(tab) || tab == HomeTab::LiveTv {
-                    continue;
-                }
-                match tab {
-                    HomeTab::Home => bridge::nav_home_pill(&mut app.pages, &mut app.bridge, Some(ret)),
-                    other => bridge::nav_tab(&mut app.pages, &mut app.bridge, other, None, Some(ret)),
-                }
-            }
-            LiveTvOut::Account => chip_activate(&mut app.pages),
-            other => app.bridge.live_tv_request(other),
-        }
+}
+
+/// **One request the Live TV page made**, at the FIFO head: the asking page must still hold input
+/// on the Live TV route. The strip, BACK and the chip navigate as the Watchlist's do; everything
+/// else is the store's.
+fn live_tv_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, request: plx_screens::live_tv::LiveTvOut,
+    ret: ReturnState<u32, PageMemory>,
+) -> plx_machine::machine::AppCommandOutcome {
+    use plx_machine::machine::AppCommandOutcome;
+    use plx_screens::live_tv::LiveTvOut;
+    let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
+    let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
+    if app.route() != AppArg::LiveTv || app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) {
+        return AppCommandOutcome::Refused;
     }
+    plx_base::eventlog::log(&format!("livetv: page asked {}", live_tv_request_word(&request)));
+    // leaving the guide ends a channel in its corner; OK on that channel brings it back
+    let corner = plx_media::player::video_window_is_mini() && plx_media::route::is_live(&app.player.session);
+    match &request {
+        LiveTvOut::Back | LiveTvOut::Tab(_) | LiveTvOut::Account => {
+            super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+        }
+        LiveTvOut::Watch { row, .. } if corner => {
+            if app.bridge.live_tv_is_watching(*row) {
+                super::playback::restore_live_corner(app.pages, app.bridge);
+                return AppCommandOutcome::Completed;
+            }
+            super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+        }
+        LiveTvOut::WatchHub { identifier, vcn, .. } if corner => {
+            if app.bridge.live_tv_is_watching_card(identifier, vcn) {
+                super::playback::restore_live_corner(app.pages, app.bridge);
+                return AppCommandOutcome::Completed;
+            }
+            // a card naming no channel read here plays nothing: the corner's stays
+            if !app.bridge.live_tv_knows_card(identifier, vcn) {
+                plx_base::eventlog::log("livetv: that What's On card names no channel of this DVR or of Plex's");
+                return AppCommandOutcome::Completed;
+            }
+            super::playback::stop_live_corner(&mut app.player.session, &mut app.adapters.player);
+        }
+        _ => {}
+    }
+    match request {
+        LiveTvOut::Back => bridge::nav_tab(app.pages, app.bridge, HomeTab::Home, None, Some(ret)),
+        LiveTvOut::Tab(tab) => {
+            if !app.bridge.search_tab_available(tab) || tab == HomeTab::LiveTv {
+                return AppCommandOutcome::Completed;
+            }
+            match tab {
+                HomeTab::Home => bridge::nav_home_pill(app.pages, app.bridge, Some(ret)),
+                other => bridge::nav_tab(app.pages, app.bridge, other, None, Some(ret)),
+            }
+        }
+        LiveTvOut::Account => super::input::chip_activate(app.pages),
+        other => app.bridge.live_tv_request(other),
+    }
+    AppCommandOutcome::Completed
 }
 
 /// What a Live TV page request was, for the event log: the kind and a row, never a title.
@@ -1190,31 +1306,24 @@ fn live_tv_request_word(request: &plx_screens::live_tv::LiveTvOut) -> String {
 /// Play a landed tune: the route takes the stream (and with it the tuner's release), then the one
 /// start ritual pushes the player over the Live TV page, which is where Stop and BACK return.
 /// `false` when the route or the player refused it (the tune is released).
-fn start_live(app: &mut App, tuned: plx_data::live_tv::Tuned) -> bool {
+fn start_live(player: &mut plx_media::player::machine::Player, pa: &mut plx_media::player::adapter::PlayerAdapter,
+    pages: &mut plx_ui::dispatch::Dispatcher<bridge::AppHost>, rig: &mut bridge::Bridge, tuned: plx_data::live_tv::Tuned,
+) -> bool {
     // A trailer still playing would hold the engine the Load needs.
-    halt_preview_now(&mut app.player.session, &mut app.adapters.player);
+    halt_preview_now(&mut player.session, pa);
     // No library item is playing: the player's Info card must not describe the last one, nor its
     // track menus offer the last one's subtitles and audio (and its chapters tab goes with them).
     // What they read instead is the channel's own: its caption streams, as subtitles.
-    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
-    app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(bridge::live_playing_item(&tuned))));
-    if !plx_media::route::install_live(&mut app.player.session, bridge::live_route(tuned)) {
+    rig.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::SetNowPlaying(None));
+    rig.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(bridge::live_playing_item(&tuned))));
+    if !plx_media::route::install_live(&mut player.session, bridge::live_route(tuned)) {
         plx_base::eventlog::log("livetv: the route refused the live stream's declaration (tune released)");
         return false;
     }
     plx_base::eventlog::log("livetv: starting live playback");
-    if !start_playback(
-        &mut app.player.session,
-        &mut app.adapters.player,
-        0,
-        Origin::Here,
-        HUD_LINGER_MS,
-        None,
-        &mut app.pages,
-        &mut app.bridge,
-    ) {
+    if !super::playback::start_playback(&mut player.session, pa, 0, Origin::Here, HUD_LINGER_MS, None, pages, rig) {
         plx_base::eventlog::log("livetv: the player refused the live stream");
-        plx_media::route::release_live(&mut app.player.session);
+        plx_media::route::release_live(&mut player.session);
         return false;
     }
     true
@@ -1258,20 +1367,21 @@ fn library_publication_command(
 /// is the page on top and the dip is not holding it dark. The store decides in data
 /// ([`plx_data::stores::hubs::HubsCmd::Publish`]); the press check and the command are adjacent,
 /// like [`library_publication_command`].
-fn home_publication_command(app: &App) -> plx_data::stores::hubs::HubsCmd {
+fn home_publication_command(app: &mut App) -> plx_data::stores::hubs::HubsCmd {
     let visible = app.route() == AppArg::Home && !app.pages.nav.tabs.stack.transition.floor_held();
+    let bridge = app.runtime.bridge(&mut app.bridge);
     plx_data::stores::hubs::HubsCmd::Publish {
         home_top_visible: visible,
-        focused_hub: app.bridge.home_focused_hub(&app.pages),
+        focused_hub: bridge.home_focused_hub(&app.pages),
         press_live: app.pages.input.press.is_live(),
     }
 }
 
 /// Once a frame, beside the other Home store work.
 pub(super) fn publish_staged_hubs(app: &mut App) {
-    if !app.bridge.hubs_have_staged() { return; }
+    if !app.runtime.bridge(&mut app.bridge).hubs_have_staged() { return; }
     let command = home_publication_command(app);
-    let _ = app.bridge.hubs_run(command);
+    let _ = app.runtime.bridge(&mut app.bridge).hubs_run(command);
 }
 
 #[cfg(test)]
@@ -1289,6 +1399,7 @@ mod library_publication_tests {
         }, Vec::new());
         *frame_no += 1;
         pages.prune(&report.unmounted);
+        rig.assert_no_store_jobs_left_for_test();
     }
 
     fn seed_detail_return(
@@ -1382,16 +1493,17 @@ mod library_publication_tests {
         detail: Option<plx_data::metadata::Detail>,
     ) -> bool {
         let (state, adapter) = rig.metadata_mut().split_for_test();
-        plx_data::metadata::land_detail_for_test(state, adapter, sid, rk, gen, detail)
+        plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, sid, rk, gen, detail)
     }
 
-    /// Complete every detail fetch the rig admitted and install the landings. Deterministic: under
-    /// `cfg(test)` those fetches are held rather than threaded (see
-    /// `MetadataAdapter::run_held_detail_fetches_for_test`); this helper used to spin a hundred
-    /// `yield_now`s hoping a real worker had finished, which a loaded CI runner did not honour.
+    /// Complete every detail fetch the rig admitted and install the landings. Deterministic: a
+    /// test Bridge's store runner holds those fetches rather than threading them (see
+    /// `adapters::stores::StoreRunner::Held` and `Bridge::run_held_store_jobs_for_test`); this
+    /// helper used to spin a hundred `yield_now`s hoping a real worker had finished, which a loaded
+    /// CI runner did not honour.
     fn drain_detail_workers(rig: &mut bridge::Bridge) {
-        rig.metadata_mut().adapter_ref().run_held_detail_fetches_for_test();
-        rig.metadata_mut().pump_detail();
+        rig.run_held_store_jobs_for_test();
+        rig.metadata_mut().pump_detail(&plx_plex::plex::ClientKeys::default(), false);
     }
 
     struct SettleDetailBeforeRestoredEnter {
@@ -1420,6 +1532,7 @@ mod library_publication_tests {
             let store = unsafe { &mut *self.store };
             let (state, adapter) = store.split_for_test();
             let fresh = plx_data::metadata::land_detail_for_test(
+                &plx_plex::plex::ClientKeys::default(), false,
                 state,
                 adapter,
                 self.sid,
@@ -1551,7 +1664,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "origin".into() });
         let b = AppArg::Content(ContentArg::Detail { sid, rk: "later".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         bridge::show_page(&mut pages, a);
         frame(&mut pages, &mut rig, &mut frame_no);
@@ -1593,7 +1707,8 @@ mod library_publication_tests {
         let sid = plx_plex::plex::ServerId::UNSET;
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "detail-a".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         let before = plx_data::metadata::detail_generation_for_test(rig.metadata_mut().adapter_ref());
@@ -1603,8 +1718,8 @@ mod library_publication_tests {
 
         // Each `RequestDetail` admission bumps the generation exactly once (`begin_detail_request`),
         // whether or not it is later superseded — so the generation delta is a direct count of how
-        // many detail fetches this one open issued, even though a superseded one is consumed
-        // synchronously under `cfg(test)` and never shows up as still "parked" in `held_detail`.
+        // many detail fetches this one open issued, even though a superseded one is answered when
+        // the next job reaches the test runner and never shows up as still held there.
         assert_eq!(after - before, 1,
             "opening a fresh Detail page must issue exactly one detail fetch, not one per mount \
              plus one per Enter");
@@ -1630,7 +1745,8 @@ mod library_publication_tests {
         let sid = plx_plex::plex::ServerId::UNSET;
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "detail-a".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         // Home never touches the metadata store's detail slot, so it is the underlying page the
@@ -1706,7 +1822,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid: sa, rk: "42".into() });
         let b = AppArg::Content(ContentArg::Detail { sid: sb, rk: "42".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         let full = |sid, title: &str| plx_data::metadata::Detail {
             sid, rk: "42".into(), title: title.into(), summary: "synopsis".into(), ..Default::default()
@@ -1753,7 +1870,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid: sa, rk: "42".into() });
         let b = AppArg::Content(ContentArg::Detail { sid: sb, rk: "42".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         let full = |sid, title: &str| plx_data::metadata::Detail {
             sid, rk: "42".into(), title: title.into(), summary: "synopsis".into(), ..Default::default()
@@ -1831,7 +1949,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid: sa, rk: "42".into() });
         let b = AppArg::Content(ContentArg::Detail { sid: sb, rk: "42".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         let full = |sid, title: &str| plx_data::metadata::Detail {
             sid, rk: "42".into(), title: title.into(), summary: "synopsis".into(), ..Default::default()
@@ -1880,7 +1999,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid: sa, rk: "42".into() });
         let b = AppArg::Content(ContentArg::Detail { sid: sb, rk: "42".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         let full = |sid, title: &str| plx_data::metadata::Detail {
             sid, rk: "42".into(), title: title.into(), summary: "synopsis".into(), ..Default::default()
@@ -1939,7 +2059,8 @@ mod library_publication_tests {
         let _servers = Servers;
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "movie-a".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut ps = plx_media::route::PlaybackSession::default();
         let mt = unsafe { plx_base::task::MainThread::assume() };
         let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
@@ -2006,7 +2127,7 @@ mod library_publication_tests {
         // and wait its worker out, or the next test to read the player's state finds it Resolving.
         plx_media::route::cancel_play(&mut ps);
         let _ = plx_media::route::wait_resolve_workers_for_test(std::time::Duration::from_secs(10));
-        plx_media::player::stop_bufferfeed(&mut ps, &mut pa);
+        plx_media::player::stop_playback(&mut ps, &mut pa);
         let played = rig.metadata_mut().view().now_playing()
             .map(|n| (n.title.clone(), n.ep_title.clone()));
 
@@ -2047,7 +2168,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid: sa, rk: "42".into() });
         let b = AppArg::Content(ContentArg::Detail { sid: sb, rk: "42".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
         let full = |sid, title: &str| plx_data::metadata::Detail {
             sid, rk: "42".into(), title: title.into(), summary: "synopsis".into(), ..Default::default()
@@ -2096,7 +2218,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "detail-a".into() });
         let b = AppArg::Content(ContentArg::Detail { sid, rk: "detail-b".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         bridge::show_page(&mut pages, a.clone());
@@ -2189,7 +2312,8 @@ mod library_publication_tests {
             thumb: String::new(),
         });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         bridge::show_page(&mut pages, a.clone());
@@ -2291,7 +2415,8 @@ mod library_publication_tests {
         let a = AppArg::Content(ContentArg::Detail { sid, rk: "detail-a".into() });
         let b = AppArg::Content(ContentArg::Detail { sid, rk: "detail-b".into() });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         bridge::show_page(&mut pages, a.clone());
@@ -2432,12 +2557,9 @@ mod library_publication_tests {
             detail_key(&mut pages, &mut rig, &mut frame_no, plx_machine::machine::Key::Ok,
                 plx_machine::machine::Edge::Up);
             for _ in 0..20 { frame(&mut pages, &mut rig, &mut frame_no); }
-            let requests = rig.take_content_reqs();
-            assert_eq!(requests.len(), 1, "the Related press emits exactly one activation");
-            let (_, request, ret) = requests.into_iter().next().unwrap();
-            let ContentReq::Push(arg) = request else { panic!("Related activation must push Detail B") };
-            assert!(AppArg::Content(arg.clone()) == b);
-            bridge::nav_push_with_return(&mut pages, AppArg::Content(arg), ret);
+            assert_eq!(rig.retained.completed_screen_commands.iter().filter(|label| *label == "content:Push").count(),
+                1, "the Related press executes exactly one activation");
+            assert!(pages.top_arg() == Some(&b), "the product runner opens Detail B");
         } else {
             bridge::nav_push(&mut pages, b.clone());
         }
@@ -2451,11 +2573,8 @@ mod library_publication_tests {
         if navigate {
             detail_key(&mut pages, &mut rig, &mut frame_no, plx_machine::machine::Key::Back,
                 plx_machine::machine::Edge::Down);
-            let requests = rig.take_content_reqs();
-            assert_eq!(requests.len(), 1);
-            let (_, request, ret) = requests.into_iter().next().unwrap();
-            assert!(matches!(request, ContentReq::Back));
-            bridge::nav_pop_with_return(&mut pages, ret);
+            assert_eq!(rig.retained.completed_screen_commands.iter().filter(|label| *label == "content:Back").count(),
+                1, "the product runner executes Back once");
         } else {
             let ret = pages.return_state();
             bridge::nav_pop_with_return(&mut pages, ret);
@@ -2557,7 +2676,8 @@ mod library_publication_tests {
             thumb: String::new(),
         });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         bridge::show_page(&mut pages, a.clone());
@@ -2646,7 +2766,8 @@ mod library_publication_tests {
             thumb: String::new(),
         });
         let mut pages = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
-        let mut rig = bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         let mut frame_no = 0;
 
         bridge::show_page(&mut pages, a.clone());
@@ -2736,10 +2857,13 @@ fn home_menu_from_deck(ret: &ReturnState<u32, PageMemory>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn activate_home_item(app: &mut App, source: MachineId, entry: EntryId,
-    sid: plx_plex::plex::ServerId, rk: &str, resume_ns: Option<i64>, ret: ReturnState<u32, PageMemory>, now: u32) {
+fn activate_home_item(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, entry: EntryId,
+    sid: plx_plex::plex::ServerId, rk: &str, resume_ns: Option<i64>, ret: ReturnState<u32, PageMemory>, now: u32,
+) -> plx_machine::machine::AppCommandOutcome {
     let snapshot = app.bridge.hubs_snapshot();
-    let Some(mut item) = home_item(snapshot.view(), sid, rk).cloned() else { return };
+    let Some(mut item) = home_item(snapshot.view(), sid, rk).cloned() else {
+        return plx_machine::machine::AppCommandOutcome::Refused;
+    };
     if let Some(resume_ns) = resume_ns { item.resume_ms = resume_ns.max(0) / 1_000_000; }
     // Home is the container's ROOT and a card press is the user acting on it, so there is nothing
     // above it to spend — `Trail::reset()` stood here and was a no-op in the only case that could
@@ -2749,6 +2873,7 @@ fn activate_home_item(app: &mut App, source: MachineId, entry: EntryId,
     unsafe { activate_deck_card(&mut app.player.session, &mut app.adapters.player, &item, from_deck,
         resume_ns.is_some(), HUD_LINGER_MS, Some(ret), &mut app.pages, &mut app.bridge,
         &mut app.menu_play_await, now); }
+    plx_machine::machine::AppCommandOutcome::Completed
 }
 
 // (`cancel_content_navigation` and `freeze_request` stood here. The first re-checked the queued
@@ -2775,7 +2900,7 @@ pub(crate) fn restore_played_entry(app: &mut App) {
     let Some(instance) = entry.inst.as_ref().map(|i| i.id) else { return };
     let PageMemory::Detail(memory) = &entry.ret.memory else { return };
     let mut spot = memory.spot.clone();
-    let meta = app.bridge.metadata_view();
+    let meta = app.runtime.stores.machines.metadata_view();
     let episode = meta.playing().filter(|p| p.sid == *sid)
         .and_then(|_| meta.now_playing())
         .filter(|n| n.is_episode && n.detail_rk == *rk)
@@ -2840,6 +2965,7 @@ pub(crate) fn reconcile_details(
 }
 
 /// Refuse privileged replay before any request reaches the live PlayerAdapter.
+#[cfg(test)]
 fn remove_replayed_repairs(reqs: &mut Vec<plx_screens::registry::PlayerReq>, legacy: bool, controlled: bool) -> bool {
     if !legacy && !controlled { return false; }
     let before = reqs.len();

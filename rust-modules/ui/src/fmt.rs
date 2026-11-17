@@ -53,7 +53,7 @@ pub fn secs_short(ms: i64) -> String {
 #[cfg(test)]
 mod one_shape_tests {
     use super::*;
-    use plx_platform::i18n::{language_on_this_thread_for_test, Preference};
+    use plx_platform::i18n::{language_on_this_thread_for_test, Preference, SHIPPED};
 
     const MINUTE: i64 = 60_000;
 
@@ -76,8 +76,9 @@ mod one_shape_tests {
     /// the unit marks every other length on screen wears ("6m", "2h 14m"), in every shipped language.
     #[test]
     fn time_left_wears_the_unit_marks_of_a_duration_in_every_language() {
-        for tag in ["en", "de", "es", "fr", "hu", "it", "pt", "be"] {
-            let _g = language_on_this_thread_for_test(Preference::from_tag(tag));
+        for language in SHIPPED {
+            let tag = language.tag();
+            let _g = language_on_this_thread_for_test(language);
             let cx = plx_platform::i18n::current();
             for minutes in [8, 62] {
                 let (left, length) = (time_left_minutes_in(cx, minutes), duration_minutes_in(cx, minutes));
@@ -88,8 +89,9 @@ mod one_shape_tests {
 
     #[test]
     fn every_shipped_language_tells_a_duration_with_both_numbers() {
-        for tag in ["en", "de", "es", "fr", "hu", "it", "pt", "be"] {
-            let _g = language_on_this_thread_for_test(Preference::from_tag(tag));
+        for language in SHIPPED {
+            let tag = language.tag();
+            let _g = language_on_this_thread_for_test(language);
             let (hours, minutes) = (duration(134 * MINUTE), duration(14 * MINUTE));
             assert!(hours.contains('2') && hours.contains("14"), "{tag}: {hours}");
             assert!(minutes.contains("14") && !minutes.contains('0'), "{tag}: {minutes}");
@@ -104,8 +106,9 @@ mod one_shape_tests {
         for bad in ["", "tomorrow", "2027-13-40", "2027-02-30", "2027-03", "2027-03-12-01"] {
             assert_eq!(coming_on(bad, MonthWidth::Medium), None, "{bad:?}");
         }
-        for tag in ["en", "de", "es", "fr", "hu", "it", "pt", "be"] {
-            let _g = language_on_this_thread_for_test(Preference::from_tag(tag));
+        for language in SHIPPED {
+            let tag = language.tag();
+            let _g = language_on_this_thread_for_test(language);
             let lead = msg::watchlist_state_coming_on("");
             let (medium, long) = (coming_on("2027-03-12", MonthWidth::Medium).unwrap(), coming_on("2027-03-12", MonthWidth::Long).unwrap());
             assert!(medium.starts_with(lead.trim_end()), "{tag}: {medium} vs {lead:?}");
@@ -128,7 +131,16 @@ fn seconds_scale_durations_keep_the_distinctions_that_matter() {
 /// Time-remaining for a Continue-Watching item — "8m left" / "1h 2m left" (rounded up to
 /// the next whole minute, floored at 1). `remaining_ms` is duration − viewOffset.
 pub fn time_left(remaining_ms: i64) -> String {
-    time_left_minutes_in(plx_platform::i18n::current(), (remaining_ms + 59_999) / 60_000)
+    time_left_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
+}
+
+fn remaining_minutes(remaining_ms: i64) -> i64 {
+    (remaining_ms.saturating_add(59_999) / 60_000).max(1)
+}
+
+/// Time remaining inside a playback control: the compact duration without the word “left”.
+pub fn remaining_duration(remaining_ms: i64) -> String {
+    duration_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
 }
 
 /// [`time_left`] from whole minutes, in a given context; at least a minute (the line promises
@@ -136,6 +148,39 @@ pub fn time_left(remaining_ms: i64) -> String {
 pub fn time_left_minutes_in(cx: &LocaleContext, mins: i64) -> String {
     let (h, m) = split_hours(mins.max(1));
     if h > 0 { msg::core_time_left_hours_in(cx, h, m) } else { msg::core_time_left_minutes_in(cx, m) }
+}
+
+/// **Time left as a still's one-line footer says it** — "38m left", "1h 12m left", the SHORTEST
+/// form each language has (`core.footer_left_*`, not [`time_left`]'s caption wording: a footer line
+/// shares 388 px with an episode tag and a progress bar). Rounded up to the next whole minute and
+/// never zero, as [`time_left`] is. The Home Resume pill uses [`remaining_duration`].
+pub fn footer_left(remaining_ms: i64) -> String {
+    footer_left_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
+}
+
+/// [`footer_left`] from whole minutes, in a given context.
+pub fn footer_left_minutes_in(cx: &LocaleContext, mins: i64) -> String {
+    let (h, m) = split_hours(mins.max(1));
+    if h > 0 { msg::core_footer_left_hours_in(cx, h, m) } else { msg::core_footer_left_minutes_in(cx, m) }
+}
+
+/// **The episode tag that leads a still's footer line**, with its trailing middle dot: `"S2 E4 ·"`
+/// (`core.footer_tag`, so a language spells the letters and the order itself). A number that is not
+/// positive is no number ([`episode_address_in`]'s rule), so an episode with only one of the two
+/// reads `"E4 ·"` or `"S2 ·"`, and with neither the tag is empty and the footer is the time alone
+/// (a film).
+pub fn footer_tag_in(cx: &LocaleContext, season: i64, index: i64) -> String {
+    match (season > 0, index > 0) {
+        (true, true) => msg::core_footer_tag_in(cx, index, season),
+        (true, false) => format!("{} \u{b7}", msg::core_season_in(cx, season)),
+        (false, true) => format!("{} \u{b7}", msg::core_episode_in(cx, index)),
+        (false, false) => String::new(),
+    }
+}
+
+/// [`footer_tag_in`] in the thread's language.
+pub fn footer_tag(season: i64, index: i64) -> String {
+    footer_tag_in(plx_platform::i18n::current(), season, index)
 }
 
 /// **The one release-date phrase** — "Coming 12 Mar" — for an unreleased title: the Watchlist's focus
@@ -326,13 +371,18 @@ pub fn shared_by(handle: &str) -> Option<String> {
     (!handle.is_empty()).then(|| plx_platform::i18n::msg::core_shared_by(handle))
 }
 
+/// The separator between the episode's numbering and its title in [`episode_kicker`] (`"S2, E3 · Laura"`):
+/// shared so a caller that measures the numbering alone (the HUD lint's app-text fit) measures the same prefix
+/// the kicker draws.
+pub const KICKER_SEPARATOR: &str = " \u{b7} ";
+
 /// The episode kicker — `"S2, E3 · Laura"`, the [`episode_ordinal`] with the episode's title after
 /// it. ONE formatter, because this string is drawn by the transport HUD (the now-playing item), the
 /// route's pre-roll ctx line and the Up Next caption, and the whole point of the last two is that
 /// they read identically to the first. It was three separate literals before, with nothing keeping
 /// them in step.
 pub fn episode_kicker(season: i64, index: i64, title: &str) -> String {
-    join_present(&[&episode_ordinal(season, index), title], " \u{b7} ")
+    join_present(&[&episode_ordinal(season, index), title], KICKER_SEPARATOR)
 }
 
 /// The media badge for a video version — `"4K"` / `"1080p"` / `"SD"`, or None when the item has no
@@ -415,16 +465,20 @@ mod tests {
 
     /// **The collection page's heading uses the noun its count uses** (design review N-g), in every
     /// shipped language: "Films" over "6 films", "Shows" over "3 shows", "Items" over "12 items".
+    /// A singular stem may match where an inflected plural does not: Russian "Фильмы" shares
+    /// "фильм" with "1 фильм", but not the whole noun with "2 фильма" or "5 фильмов".
     #[test]
     fn the_collection_heading_names_the_noun_the_count_uses() {
         use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
         for language in SHIPPED {
             let _g = language_on_this_thread_for_test(language);
             for subtype in [Some("movie"), Some("show"), Some("episode"), None] {
-                let count = collection_count(subtype, 2);
-                let noun = count.split_once(' ').map(|(_, noun)| noun.to_lowercase()).unwrap();
                 let heading = collection_noun(subtype);
-                assert!(heading.to_lowercase().starts_with(&noun), "{} {subtype:?}: {heading:?} over {count:?}", language.tag());
+                let counts: Vec<_> = [1, 2, 5].into_iter().map(|n| collection_count(subtype, n)).collect();
+                assert!(counts.iter().any(|count| {
+                    let noun = count.split_once(' ').map(|(_, noun)| noun.to_lowercase()).unwrap();
+                    heading.to_lowercase().starts_with(&noun)
+                }), "{} {subtype:?}: {heading:?} over {counts:?}", language.tag());
                 assert!(heading.chars().next().is_some_and(char::is_uppercase), "{heading:?} is a heading");
             }
         }
@@ -489,6 +543,20 @@ mod tests {
 /// pass 0 when there is none, and an unparseable date yields the empty string rather than a
 /// half-formatted one — every caller draws a date line only when it is non-empty.
 pub fn pretty_date(iso: &str, year: i64) -> String {
+    pretty_date_with(iso, year, false)
+}
+
+/// A calendar date with the locale's abbreviated month, retaining [`pretty_date`]'s validation.
+pub fn pretty_date_medium(iso: &str, year: i64) -> String {
+    pretty_date_with(iso, year, true)
+}
+
+/// Hero facts share the localized abbreviated-month formatter, including regional date order.
+pub fn hero_date(iso: &str, year: i64) -> String {
+    pretty_date_medium(iso, year)
+}
+
+fn pretty_date_with(iso: &str, year: i64, named_month: bool) -> String {
     let parts: Vec<&str> = iso.split('-').collect();
     if parts.len() == 3 {
         if let (Ok(y), Ok(mo), Ok(da)) = (
@@ -497,7 +565,8 @@ pub fn pretty_date(iso: &str, year: i64) -> String {
             parts[2].parse::<i64>(),
         ) {
             if let (Ok(y), Ok(m), Ok(d)) = (i32::try_from(y), u8::try_from(mo), u8::try_from(da)) {
-                if let Some(date) = plx_platform::i18n::current().date(y, m, d) { return date; }
+                let cx = plx_platform::i18n::current();
+                if let Some(date) = if named_month { cx.date_medium(y, m, d) } else { cx.date(y, m, d) } { return date; }
             }
         }
     }
@@ -530,8 +599,8 @@ pub fn rating_score(scale: RatingScale, value: f64) -> String {
     }
 }
 
-/// A whole percentage in the UI locale: the catalog pattern owns the sign's placement (Spanish and
-/// Belarusian set it off with a no-break space; English does not).
+/// A whole percentage in the UI locale: the catalog pattern owns the sign's placement (German,
+/// Spanish and Belarusian set it off with a no-break space; English does not).
 pub fn percent(value: i64) -> String {
     plx_platform::i18n::msg::core_percent(&plx_platform::i18n::current().number(value))
 }

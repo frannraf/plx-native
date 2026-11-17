@@ -6,6 +6,9 @@
   or runs pull request code and holds nothing but `actions: write`;
 * the nightly's and the release candidate's Sentry debug-file upload is skipped on a pull
   request's dry run and nowhere else (a release, the schedule and a dispatched dry run keep it);
+* every shipped build creates its Sentry release with its commits, under the name the binary
+  reports, without ever failing the build, and each publishing workflow finalizes it and records
+  the deploy only once the package is really out (`SentryReleases`);
 * the tests against the bundled FFmpeg and libass run in a job of their own, beside the replays,
   and still run;
 * the host FFmpeg and libass builds in the simulator jobs are CACHED where the build scripts really
@@ -17,6 +20,8 @@
   repository-metadata-only change (issue forms, a PR template, prose, images) starts no run, while
   every file a gate reads (PRIVACY.md, the credits pair, an `include_str!` target, the workflows)
   still does, and no other workflow carries a catch-all `'**'` filter;
+* the HUD parser fuzzing workflow (`FuzzWorkflow`): path-filtered on a PR, weekly otherwise, read-only, a dated
+  nightly, every action pinned, and every target the tool lists is a bin of the package and a file;
 * the nightly Homebrew Channel repository: the nightly build generates its manifest (and debug never
   does), a real nightly can only be cut from main, the manifest reaches the release, and the site
   stages the repository and the guide.
@@ -25,6 +30,7 @@ Text-level on purpose, like ci/test_ci_timeouts.py (no YAML library on a stock r
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -101,6 +107,78 @@ class SentryUpload(unittest.TestCase):
         self.assertIn("ci/check-debug-files.py", step)
         self.assertLess(step.index("ci/check-debug-files.py"), step.index('"$UPLOAD" != true'))
         self.assertLess(step.index('"$UPLOAD" != true'), step.index("debug-files upload"))
+
+
+class SentryReleases(unittest.TestCase):
+    """Commits, finalize and deploy all fail silently when they are skipped: Sentry still groups
+    the crashes, and only the suspect commits, "resolve in next release" and the regression check
+    quietly stop working."""
+
+    PUBLISHERS = {"release.yml": None,
+                  "rc.yml": "needs.prepare.outputs.dry != 'true'",
+                  "nightly.yml": "${{ needs.plan.outputs.dry != 'true' }}"}
+
+    def step(self):
+        build = code("build-package.yml")
+        return build[build.index("Create the Sentry release and attach its commits"):build.index("webosbrew tooling")]
+
+    def test_the_release_is_created_after_the_package_is_graded_and_never_fails_the_build(self):
+        build = code("build-package.yml")
+        self.assertLess(build.index("Upload debug files to Sentry"), build.index("ELF + packaging assertions"))
+        self.assertLess(build.index("ELF + packaging assertions"),
+                        build.index("Create the Sentry release and attach its commits"))
+        step = self.step()
+        self.assertIn("if: inputs.sentry-release && inputs.upload-debug-files && inputs.flavor != 'debug'", step)
+        self.assertIn("continue-on-error: true", step)
+        self.assertRegex(build, r"sentry-release:\n(?:        .*\n)*?        type: boolean\n        default: false\n")
+
+    def test_only_a_run_that_publishes_creates_the_release(self):
+        self.assertEqual(re.findall(r"sentry-release: (\$\{\{.*)", code("release.yml")),
+                         ["${{ !inputs.rebuild_tag }}"])
+        self.assertIn("sentry-release: ${{ needs.prepare.outputs.dry != 'true' }}", code("rc.yml"))
+        self.assertIn("sentry-release: ${{ needs.plan.outputs.dry != 'true' }}", code("nightly.yml"))
+
+    def test_the_name_is_the_reported_version_and_the_binary_must_carry_it(self):
+        step = self.step()
+        self.assertIn("--print-nightly-label pkg/.build-config", step)
+        self.assertIn("--print-rc pkg/.build-config", step)
+        self.assertIn('release="plxnative@${nightly_label:-$version${rc:+-rc.$rc}}"', step)
+        self.assertLess(step.index('grep -qaF "$release" pkg/plxnative'), step.index("releases new"))
+
+    def test_the_commits_come_from_this_repository_at_the_built_commit(self):
+        step = self.step()
+        self.assertIn('releases set-commits "$release" --commit "$GITHUB_REPOSITORY@$range"', step)
+        # The range starts at the last final release below this version, never at a candidate.
+        self.assertIn("rc.last_release(", step)
+        self.assertIn('range="$base_sha..$head"', step)
+        # The outputs are written once the release exists, so the deploy still runs if only the
+        # commit lookup failed.
+        self.assertLess(step.index('releases new "$release"'), step.index('echo "release=$release"'))
+        self.assertLess(step.index('echo "release=$release"'), step.index("releases set-commits"))
+        build = code("build-package.yml")
+        for out in ("release", "org", "project", "environment"):
+            self.assertIn(f"sentry-{out}: ${{{{ steps.sentry.outputs.{out} }}}}", build)
+            self.assertIn(f"value: ${{{{ jobs.build.outputs.sentry-{out} }}}}", build)
+
+    def test_each_publisher_marks_the_release_shipped_after_publishing(self):
+        for name, cond in self.PUBLISHERS.items():
+            publish = job_body(name, "publish")
+            self.assertEqual(publish.count("uses: ./.github/actions/sentry-deploy"), 1, name)
+            deploy = publish[publish.index("Mark the Sentry release as shipped"):]
+            self.assertLess(publish.index("gh release create") if "gh release create" in publish
+                            else publish.index("Verify what the public downloads"),
+                            publish.index("Mark the Sentry release as shipped"), name)
+            self.assertIn("continue-on-error: true", deploy.split("\n      - ")[0], name)
+            self.assertIn("release: ${{ needs.build.outputs.sentry-release }}", deploy, name)
+            if cond:
+                self.assertIn(f"if: {cond}", deploy.split("\n      - ")[0], name)
+
+    def test_the_action_skips_an_empty_release_and_runs_the_pinned_cli(self):
+        action = (ROOT / ".github/actions/sentry-deploy/action.yml").read_text()
+        self.assertIn("if: inputs.release != ''", action)
+        self.assertIn("npm ci --prefix tools", action)
+        self.assertIn('"$cli" releases finalize "$RELEASE"', action)
+        self.assertIn('"$cli" deploys new --release "$RELEASE" -e "$ENVIRONMENT"', action)
 
 
 class BundledLibrarySymbols(unittest.TestCase):
@@ -191,6 +269,26 @@ class NightlyHomebrewRepository(unittest.TestCase):
         self.assertLess(publish.index("gh release create"),
                         publish.index("--pattern com.beb.plxnative.nightly.manifest.json"))
 
+    def test_a_nightly_is_released_in_the_nightly_repository_and_tagged_here(self):
+        # The release and its assets go to `ci/nightly.py release-repo` with the token scoped to it;
+        # the tag is pushed HERE first, at the built commit, because `plan` and the notes' compare
+        # link read it, and it is taken back if the release fails so a re-run is not refused.
+        publish = job_body("nightly.yml", "publish")
+        create = publish[publish.index("Create and verify the nightly prerelease"):]
+        self.assertIn("GH_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}", create)
+        self.assertIn('release_repo=$(python3 ci/nightly.py release-repo)', create)
+        self.assertIn('gh release create "$TAG" --repo "$release_repo"', create)
+        self.assertLess(create.index('git push origin "refs/tags/$TAG"'), create.index("gh release create"))
+        self.assertLess(create.index("trap "), create.index("gh release create"))
+        self.assertIn('git ls-remote --tags origin "refs/tags/$TAG"', create)
+        for download in re.findall(r"gh release download .*", create):
+            self.assertIn('--repo "$release_repo"', download)
+        refuse = publish[publish.index("Refuse to overwrite an immutable nightly"):publish.index("Create and verify")]
+        self.assertIn('gh release view "$TAG" --repo "$release_repo"', refuse)
+        prune = job_body("nightly.yml", "prune")
+        self.assertIn("NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}", prune)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", prune)
+
     def test_check_package_grades_a_nightly_without_the_build_environment(self):
         # In CI, check-package.py runs as its OWN step, without the PLX_NIGHTLY_DATE the build step
         # had. It must take the date from the build stamp, or flavor.control_for dies at import and
@@ -216,6 +314,25 @@ class NightlyHomebrewRepository(unittest.TestCase):
         # the repository files must land AFTER the guide page, in the same directory
         self.assertLess(pages.index("docs/nightly-builds.md > _site/nightly/index.html"),
                         pages.index("ci/nightly.py repo-json"))
+
+    def test_the_site_stamps_the_hero_version_from_the_package(self):
+        pages = code("pages.yml")
+        self.assertIn('"pkg/appinfo.json"', pages)
+        self.assertIn('json.load(open("pkg/appinfo.json"))["version"]', pages)
+        # the stamp edits the staged copy, after it is copied, and fails unless it hit exactly one line
+        self.assertLess(pages.index("cp site/index.html _site/index.html"), pages.index('path = "_site/index.html"'))
+        self.assertIn("if n != 1:", pages)
+        # the pattern it rewrites is still the source's hero line
+        hero = re.findall(r"Version \d+\.\d+\.\d+(?=<span)", (ROOT / "site/index.html").read_text())
+        self.assertEqual(len(hero), 1, hero)
+
+
+class HudAuthoringPublication(unittest.TestCase):
+    def test_the_public_schema_and_examples_are_staged_by_pages(self):
+        # The files can pass every golden test while Pages silently omits the whole directory.
+        # Editors then receive 404 at the $schema URL embedded in every starter package.
+        self.assertIn("cp -R site/hud _site/", code("pages.yml"))
+        self.assertIn("site/hud/**", code("ci.yml"))
 
 
 class HostToolTests(unittest.TestCase):
@@ -527,7 +644,7 @@ class BuildBenchWorkflow(unittest.TestCase):
     def test_it_runs_only_for_this_repository_and_its_default_branch(self):
         for job in ("measure", "gate"):
             body = job_body(self.NAME, job)
-            self.assertIn("github.repository == 'GLinnik21/plx-native'", body, job)
+            self.assertIn("github.repository == 'plxnative/plx-native'", body, job)
             self.assertIn("github.ref_name == github.event.repository.default_branch", body, job)
 
     def test_the_workflow_grants_nothing_and_only_publish_may_write(self):
@@ -589,7 +706,7 @@ class BuildBenchWorkflow(unittest.TestCase):
         # a leg that left no document records nothing, rather than a day without half its rows
         self.assertIn("left no document: nothing recorded", publish)
         self.assertRegex(publish, r"python3 \.\./tools/build-history\.py")
-        self.assertRegex(publish, r"python3 \.\./tools/ci-summary\.py --history ci-history\.json --bench build-history\.json --out ci-summary\.json")
+        self.assertRegex(publish, r"python3 \.\./tools/ci-summary\.py --history ci-history\.json --bench build-history\.json --quarantine \.\./ci/flaky\.txt --out ci-summary\.json")
 
     def test_measurements_do_not_overlap_and_a_lost_push_race_is_retried(self):
         body = code(self.NAME)
@@ -801,6 +918,66 @@ class RequiredChecksReportOnEveryPr(unittest.TestCase):
         self.assertIn("=success$", host)
 
 
+class ReleaseLines(unittest.TestCase):
+    """Every release is cut from a `release/vX.Y` line (cut-line.yml), never from `main`."""
+
+    def test_release_and_candidate_refuse_to_bump_without_a_release_line(self):
+        prepare = job_body("release.yml", "prepare")
+        self.assertIn("if ! [[ \"$line\" =~ ^release/v[0-9]+\\.[0-9]+$ ]]; then", prepare)
+        self.assertNotIn("inputs.line || 'main'", prepare)
+        self.assertIn('python3 ci/bump-version.py "$spec" --line "$line"', prepare)
+        rc = job_body("rc.yml", "prepare")
+        self.assertIn('python3 ci/bump-version.py "$SPEC" --line "$LINE"', rc)
+        # the first release of a line writes its RELEASE_LINE marker, so the bump commit carries it
+        for body in (prepare, rc):
+            self.assertIn("rust-modules/Cargo.lock RELEASE_LINE", body)
+
+    def test_a_tag_push_or_rebuild_resolves_its_own_line_and_falls_back_to_main(self):
+        guard = job_body("release.yml", "guard")
+        self.assertIn('line="release/v$major.$minor"', guard)
+        self.assertIn('git ls-remote --exit-code --heads', guard)
+        self.assertIn("line=main", guard)
+
+    def test_a_line_release_forwards_its_completed_audit_to_main(self):
+        publish = job_body("release.yml", "publish")
+        step = publish[publish.index("Forward the completed audit to main"):]
+        self.assertIn("needs.guard.outputs.line != 'main'", step)
+        self.assertIn('ci/bot-pr.sh main "release-docs/$TAG"', step)
+        self.assertIn("pull-requests: write", publish)
+
+    def test_cut_line_branches_from_main_and_moves_main_on_through_a_pull_request(self):
+        cut = job_body("cut-line.yml", "cut")
+        self.assertIn("if: github.ref == 'refs/heads/main'", cut)
+        self.assertIn("ssh-key: ${{ secrets.MAIN_PUSH_KEY }}", cut)
+        self.assertLess(cut.index('git push origin "HEAD:refs/heads/$LINE"'),
+                        cut.index('python3 ci/bump-version.py "$VERSION"'))
+        self.assertIn('gh label create "backport $LINE"', cut)
+        self.assertIn('ci/bot-pr.sh main "cut/${LINE#release/}"', cut)
+        # main's own bump never touches RELEASE_LINE: main is not a line
+        self.assertNotIn("--line", cut)
+
+    def test_backport_never_runs_pull_request_code(self):
+        body = code("backport.yml")
+        self.assertIn("pull_request_target:", body)
+        # the checkout is the base branch (the event's default), never the pull request's head
+        self.assertNotIn("head.sha", body)
+        self.assertNotIn("head.ref", body)
+        self.assertIn("github.event.pull_request.merged == true", body)
+        self.assertIn('git cherry-pick -x "$SHA"', body)
+        # untrusted text reaches the script through env only
+        run = body[body.index("run: |"):]
+        self.assertNotIn("${{", run)
+
+    def test_bot_pull_requests_start_ci_themselves(self):
+        script = (ROOT / "ci/bot-pr.sh").read_text(encoding="utf-8")
+        self.assertIn('gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"', script)
+        self.assertIn("workflow_dispatch:", code("ci.yml"))
+        for wf, job in (("cut-line.yml", "cut"), ("backport.yml", "backport")):
+            body = job_body(wf, job)
+            self.assertIn("actions: write", body)
+            self.assertIn("pull-requests: write", body)
+
+
 class SiteVideoRelease(unittest.TestCase):
     """The site's film refreshes after a STABLE release and never blocks one (docs/agent-reference.md, "The site
     demo video"). A hole in any of these stays green: a schedule would render hourly-long jobs for nothing, a
@@ -852,7 +1029,12 @@ class SiteVideoRelease(unittest.TestCase):
         publish = job_body("site-video.yml", "publish")
         self.assertEqual(publish.count("persist-credentials: true"), 1)
         self.assertEqual(publish.count("persist-credentials: false"), 1)
-        self.assertNotIn("secrets.", body)
+        # the one secret is the deploy key main's ruleset lets push, and only a publish's checkout of main holds it
+        self.assertEqual(re.findall(r"secrets\.\w+", body), ["secrets.MAIN_PUSH_KEY"])
+        with_key = [c for c in self.checkouts("publish") if "secrets.MAIN_PUSH_KEY" in c]
+        self.assertEqual(len(with_key), 1)
+        self.assertRegex(with_key[0], r"(?m)^\s+ref: main\s*$")
+        self.assertIn("env.PUBLISH == 'true'", with_key[0])
 
     def checkouts(self, job):
         """[(step text)] for each `actions/checkout` step of a job."""
@@ -1000,15 +1182,22 @@ class SiteVideoRelease(unittest.TestCase):
         self.assertIn("continue-on-error: true", hook)
         self.assertIn("needs: [guard, publish]", hook)
         self.assertIn("needs.publish.result == 'success'", hook)
-        self.assertIn("needs.guard.outputs.line == 'main'", hook)
+        # Every release comes from a release line, so "from main" no longer names the newest release:
+        # only the highest vX.Y.Z tag replaces the film, never a patch of an older line.
+        self.assertNotIn("needs.guard.outputs.line == 'main'", hook)
+        self.assertIn('[ "$newest" = "$TAG" ]', hook)
+        self.assertIn("sort -V", hook)
         self.assertIn("release-ref", hook)
         # dispatched ON THE TAG: the run renders its own checkout, and its caches are the tag's, never main's
         self.assertIn('gh workflow run site-video.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f publish=true', hook)
         self.assertNotIn("--ref main", hook)
         self.assertIn("actions: write", hook)
         self.assertNotIn("contents: write", hook)
-        # the release's own jobs gained no new permission, and the new one exists once
-        self.assertEqual(code("release.yml").count("actions: write"), 1)
+        # Only the two post-publication dispatch jobs, and `publish` (which starts CI on the pull
+        # request forwarding the completed audit to main), may hold Actions write permission.
+        self.assertEqual(code("release.yml").count("actions: write"), 3)
+        self.assertEqual(job_body("release.yml", "publish").count("actions: write"), 1)
+        self.assertEqual(job_body("release.yml", "hud-simulator").count("actions: write"), 1)
         self.assertEqual(code("site-video.yml").count("actions: write"), 1)
         # candidates and nightlies never refresh the film
         for name in ("rc.yml", "nightly.yml"):
@@ -1016,6 +1205,189 @@ class SiteVideoRelease(unittest.TestCase):
         # `publish` is the job that creates the release; the hook must come after it, never gate it
         self.assertNotIn("site-video", job_body("release.yml", "publish"))
         self.assertNotIn("site-video", job_body("release.yml", "build"))
+
+
+class HudSimulatorRelease(unittest.TestCase):
+    def test_only_a_supported_published_tree_dispatches_the_simulator_on_its_tag(self):
+        hook = job_body("release.yml", "hud-simulator")
+        self.assertIn("needs: [guard, publish]",hook)
+        self.assertIn("needs.publish.result == 'success'",hook)
+        self.assertIn("HTTP 404",hook)
+        self.assertIn("/contents/.github/workflows/hud-simulator.yml",hook)
+        self.assertLess(hook.index("HTTP 404"),hook.index("'workflow','run'"))
+        self.assertIn("'--ref',tag",hook)
+        self.assertNotIn("contents: write",hook)
+
+    def test_pull_requests_cannot_publish_and_development_publication_is_explicit(self):
+        attach = job_body("hud-simulator.yml","attach")
+        self.assertIn("github.event_name != 'pull_request'",attach)
+        self.assertIn("inputs.publish_development",attach)
+        self.assertIn("--development",attach)
+        self.assertIn("if: inputs.release_tag != ''",attach)
+        self.assertNotIn("continue-on-error",attach)
+        self.assertRegex(code("hud-simulator.yml"),r"publish_development:[\s\S]*?default: false")
+        self.assertNotIn("contents: write",job_body("hud-simulator.yml","build"))
+
+
+class ReleaseMainPushKey(unittest.TestCase):
+    """main's required-checks ruleset rejects the workflow token, so the two jobs that push a line check out with the
+    MAIN_PUSH_KEY deploy key; the release TAG must still go over the token, or it fires `push: tags` a second time."""
+
+    def test_the_pushing_checkouts_carry_the_deploy_key(self):
+        for job in ("prepare", "publish"):
+            self.assertIn("ssh-key: ${{ secrets.MAIN_PUSH_KEY }}", job_body("release.yml", job))
+        self.assertEqual(code("release.yml").count("secrets.MAIN_PUSH_KEY"), 2)
+
+    def test_the_tag_is_pushed_with_the_token_not_the_key(self):
+        prepare = job_body("release.yml", "prepare")
+        pushes = re.findall(r"(?m)^\s+git push .*$", prepare)
+        self.assertEqual(len(pushes), 2, pushes)
+        tag_push = [p for p in pushes if "$tag" in p]
+        self.assertEqual(len(tag_push), 1, pushes)
+        self.assertIn("x-access-token:${GH_TOKEN}@", tag_push[0])
+        self.assertNotIn("origin", tag_push[0])
+        self.assertIn("GH_TOKEN: ${{ github.token }}", prepare)
+        self.assertIn("tags: ['v*']", code("release.yml"))
+
+
+class PerTestResults(unittest.TestCase):
+    """The flaky-test pipeline (tools/ci-test-results.py -> artifact -> tools/ci-history.py -> tools/ci-summary.py).
+    Every link of it is silent when it breaks: a job that stops uploading, an artifact name the collector no
+    longer matches, or a summary that stops reading the quarantine list just leaves the page empty."""
+
+    JOBS = {"host-unit-default": "host unit tests (default features)", "host-unit-hostsim": "host unit tests (hostsim)"}
+
+    def test_both_host_unit_jobs_record_and_upload_their_results_under_a_name_the_collector_reads(self):
+        history = importlib.util.spec_from_file_location("ci_history", ROOT / "tools/ci-history.py")
+        module = importlib.util.module_from_spec(history)
+        history.loader.exec_module(module)
+        for job, name in self.JOBS.items():
+            body = job_body("ci.yml", job)
+            self.assertIn(f"name: {name}", body, "the job renamed: the page's job label must follow")
+            self.assertIn(f'--job "{name}"', body)
+            self.assertIn('--log "$RUNNER_TEMP/make-check.log"', body)
+            m = re.search(r"name: (test-results-[a-z-]+-)\$\{\{ github\.run_attempt \}\}", body)
+            self.assertTrue(m, f"{job} must upload test-results-<slug>-<run_attempt>")
+            self.assertRegex(m.group(1) + "1", module.RESULTS_ARTIFACT.pattern)
+            # a red job is the one whose results matter, and a job that died before `make` has no log to read
+            step = body[body.index("Record the per-test results"):]
+            self.assertIn("if: always()", step)
+            self.assertIn("if-no-files-found: ignore", body)
+
+    def test_the_collector_reads_the_quarantine_list_from_main_in_both_writers_of_the_summary(self):
+        metrics = code("ci-metrics.yml")
+        self.assertIn("ci/flaky.txt", metrics)
+        self.assertIn("--quarantine ci/flaky.txt", metrics)
+        self.assertIn("ci/flaky.txt", code("build-bench.yml"))
+        # artifacts are listed through the same token that lists the jobs: no new permission
+        self.assertRegex(metrics, r"(?m)^      actions: read ")
+        self.assertNotIn("actions: write", metrics)
+
+
+class FuzzWorkflow(unittest.TestCase):
+    """The `cargo fuzz` package over the HUD parsers (fuzz/, fuzz.yml, tools/fuzz-hud.py).
+
+    The package is outside the rust-modules workspace, so `ci.yml` never compiles it: this workflow is the only
+    thing that does, and a drift between the workflow, the tool's target table and the package's own bins
+    would leave a target nobody builds, or a path nobody fuzzes, with everything else still green.
+    """
+
+    NAME = "fuzz.yml"
+
+    def targets(self):
+        out = subprocess.run([sys.executable, str(ROOT / "tools/fuzz-hud.py"), "list"], capture_output=True,
+                             text=True, check=True).stdout
+        return out.split()
+
+    def test_the_triggers_are_a_filtered_pull_request_a_weekly_schedule_and_a_dispatch_only(self):
+        body = code(self.NAME)
+        on = body[body.index("\non:\n") + 1:body.index("\npermissions:")]
+        self.assertEqual(re.findall(r"(?m)^  ([a-z_]+):", on), ["pull_request", "schedule", "workflow_dispatch"])
+        self.assertEqual(len(re.findall(r"(?m)^    paths:", on)), 1, "a PR runs it only for the files it fuzzes or builds from")
+        self.assertRegex(on, r"(?m)^    - cron: '\d+ \d+ \* \* \d'$")   # weekly, not daily
+        for trigger in ("pull_request_target", "push", "workflow_run", "issue_comment"):
+            self.assertNotIn(trigger, on)
+        for path in ("fuzz/**", "tools/fuzz-hud.py", "rust-modules/appkit/src/hud_format/**",
+                     "rust-modules/data/src/hudpacks/**", "rust-modules/ui/src/rec/strict_json.rs"):
+            self.assertIn(f"'{path}'", on, path)
+
+    def test_it_reads_the_repository_and_nothing_else(self):
+        body = code(self.NAME)
+        self.assertEqual(re.findall(r"(?m)^permissions:\n((?:  .*\n)+)", body + "\n"), ["  contents: read\n"])
+        self.assertEqual(len(re.findall(r"(?m)^\s+(?:[a-z-]+): write\b", body)), 0)
+        self.assertIn("persist-credentials: false", body)
+
+    def test_the_toolchain_is_a_dated_nightly_and_cargo_fuzz_is_an_exact_version(self):
+        body = code(self.NAME)
+        self.assertRegex(body, r"(?m)^  FUZZ_TOOLCHAIN: nightly-\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(body, r"(?m)^  CARGO_FUZZ_VERSION: \d+\.\d+\.\d+$")
+        self.assertIn('cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"', body)
+        # the fuzz tree is 3 GiB with debuginfo and the Actions cache is already evicting: not cached
+        self.assertIn("cache-targets: false", body)
+
+    def test_every_action_is_pinned_to_a_commit(self):
+        for line in code(self.NAME).splitlines():
+            m = re.match(r"\s*(?:- )?uses: (\S+)", line)
+            if m and not m.group(1).startswith("./"):
+                self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
+
+    def test_a_crash_fails_the_run_and_keeps_its_input(self):
+        body = code(self.NAME)
+        self.assertIn("run: make fuzz-hud", body)
+        self.assertRegex(body, r"(?s)if: failure\(\)\n\s+uses: actions/upload-artifact@[0-9a-f]{40}.*?path: fuzz/artifacts/")
+
+    def test_a_dispatch_that_asks_for_too_long_fails_the_step_not_the_job(self):
+        # A timed-out JOB is cancelled, and the corpus save and the crash upload (`!cancelled()`, `failure()`)
+        # are then skipped: the run step must give up first, with the time to save and upload left over.
+        body = code(self.NAME)
+        job = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", body).group(1))
+        step = re.search(r"(?s)- name: Build every target, then run each for a bounded time\n\s+timeout-minutes: (\d+)\n", body)
+        self.assertIsNotNone(step, "the run step needs its own timeout-minutes")
+        self.assertLessEqual(int(step.group(1)) + 10, job)
+
+    def test_rust_cache_reads_the_fuzz_package_not_the_repository_root(self):
+        # The root has no Cargo.toml, so `cargo metadata` there fails and the cache keys on, and prunes to, nothing.
+        body = code(self.NAME)
+        self.assertRegex(body, r"(?m)^          workspaces: fuzz -> \.\./rust-modules/target-fuzz$")
+        self.assertLess(body.index("tools/fuzz-hud.py lock"), body.index("Swatinem/rust-cache@"))
+
+    def test_the_signed_index_seeds_come_from_a_signer_that_matches_rfc_8032(self):
+        # The standard library has no Ed25519, so the tool carries the RFC's reference signer to sign the
+        # registry-index seeds with the TEST ONLY keys; two of the RFC's own vectors pin it.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fuzz_hud", ROOT / "tools/fuzz-hud.py")
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        for seed, message, public, signature in (
+            ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", b"",
+             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+            ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", b"\x72",
+             "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+             "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ):
+            got = tool.ed25519_sign(bytes.fromhex(seed), message)
+            self.assertEqual((got[0].hex(), got[1].hex()), (public, signature))
+        # and what it reads from the data layer is the contract's: two shipped keys, three TEST ONLY seeds
+        self.assertEqual(len(tool.real_key_ids()), 2)
+        self.assertEqual(tool.test_only_seeds(), {"PRIMARY": 7, "STANDBY": 8, "STRANGER": 9})
+
+    def test_a_pull_request_never_reads_or_writes_the_corpus_cache(self):
+        steps = re.split(r"(?m)^      - ", code(self.NAME))
+        for action in ("restore", "save"):
+            step = next(s for s in steps if f"actions/cache/{action}@" in s)
+            self.assertIn("github.event_name != 'pull_request'", step, action)
+
+    def test_every_target_is_a_bin_of_the_package_a_file_and_offered_to_a_dispatch(self):
+        manifest = (ROOT / "fuzz/Cargo.toml").read_text()
+        bins = re.findall(r'(?ms)^\[\[bin\]\]\nname = "(\w+)"\npath = "([^"]+)"', manifest)
+        listed = self.targets()
+        self.assertEqual(sorted(name for name, _ in bins), sorted(listed))
+        for name, path in bins:
+            self.assertEqual(path, f"fuzz_targets/{name}.rs")
+            self.assertTrue((ROOT / "fuzz" / path).is_file(), path)
+            self.assertIn(name, text(self.NAME), f"{name} is not in the dispatch input's list")
+        self.assertEqual(sorted(p.stem for p in (ROOT / "fuzz/fuzz_targets").glob("*.rs")), sorted(listed))
 
 
 if __name__ == "__main__":

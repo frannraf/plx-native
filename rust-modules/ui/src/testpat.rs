@@ -33,7 +33,8 @@
 //! between runs and between packages. The comparison stops being a matching problem.
 //!
 //! **The pattern is drawn as PAGE CONTENT** — after the hero and the grid, before the chrome — so
-//! it is exactly what `gfx::sample_ground` reads and exactly what the backdrop blur sources. It
+//! it is exactly what the backdrop blur sources, and so exactly what `gfx::sample_ground` reads (it
+//! takes its taps from the bar's band image, which is that blur of the page under the bar). It
 //! rides the page's own transition alpha, so a route change still dips it like anything else.
 use crate::{Painter, Rect};
 use std::cell::Cell;
@@ -171,7 +172,7 @@ pub fn set(spec: &str) -> bool {
     let p = match spec {
         "off" | "" => {
             CURRENT.set(None);
-            plx_machine::idle::invalidate();
+            // Success returns an effect for the app's owned presentation boundary.
             return true;
         }
         "ramp" => Pattern::Ramp,
@@ -209,9 +210,8 @@ pub fn set(spec: &str) -> bool {
         }
     };
     CURRENT.set(Some(p));
-    // A pattern change is discrete damage: nothing is moving, so without this the present gate
-    // would hold the old ground on screen until something else asked for a frame.
-    plx_machine::idle::invalidate();
+    // A pattern change is discrete damage: the caller applies this successful
+    // outcome to its owned Present, never through a global cache notification.
     true
 }
 

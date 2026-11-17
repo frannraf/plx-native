@@ -52,6 +52,21 @@
 
 pub(crate) mod scenarios;
 
+/// The URI-mode probe's driver, the application's half of media's probe port (issue #1064).
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uriprobe;
+
+/// The URI dev route (`plxnative-uridev`): the production URI backend, ACB-bound, playing a URL a
+/// developer names. The application's composition reads it once, at `install_uri_product`.
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uri_product;
+
+/// The exported-window override (`plxnative-uriexported`): the production URI backend bound to the
+/// exported window on a webOS 5+ set the evidence table has not admitted. The application's
+/// composition reads it once, at `install_uri_product`.
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uri_exported;
+
 /// The demo video's frame dump (simulator only): see the module doc.
 #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
 pub(crate) mod framedump;
@@ -66,8 +81,10 @@ pub(crate) mod framedump;
 // `test` as well as the feature: `any_trigger_present` is the only caller and it is cfg'd out of a
 // release build, but the test below asserts this list's contents and runs with default features.
 #[cfg(any(feature = "devtriggers", test))]
-const DIAG: [&str; 40] = [
+const DIAG: [&str; 49] = [
     "plxnative-diag.log",
+    "plxnative-hud-text-metrics",
+    "plxnative-hud-text-metrics.json",
     "plxnative-events.log",
     "plxnative-stderr.log",
     "plxnative-crash.log",
@@ -92,8 +109,8 @@ const DIAG: [&str; 40] = [
     // `fx=` on Home's fingerprint (the focused card's drawn x) and, on every page that draws a
     // card section, the `cd*` fields (`plx_ui::card_probe`): a pure observer of `focus`.
     "plxnative-focusx",
-    // The two OVERDRAW surfaces, the resting-card split's off switch and the hero-ground fold
-    // ([`plx_gfx::overdraw`], `docs/backdrop-blur-profiling.md` Part 5). All four are measurement knobs whose whole
+    // The two OVERDRAW surfaces and the resting-card split's off switch
+    // ([`plx_gfx::overdraw`], `docs/backdrop-blur-profiling.md` Part 5). All three are measurement knobs whose whole
     // method is an A/B against an unmasked control leg — and a non-DIAG trigger suppresses the
     // who's-watching picker, so the control leg and the masked leg would boot to DIFFERENT
     // SCREENS and the difference between them would be the screen, not the class being priced.
@@ -101,7 +118,12 @@ const DIAG: [&str; 40] = [
     "plxnative-overdraw",
     "plxnative-drawmask",
     "plxnative-nocardsplit",
-    "plxnative-heroground",
+    // The region texture cache ([`plx_gfx::gfx::region_paint`]: the Under posters preview and Home's
+    // parked backdrop): off draws them live every frame again, snap puts the cached quad on whole
+    // pixels. The same A/B
+    // control-leg argument as the card split above: both legs must boot to the SAME screen.
+    "plxnative-nopreviewcache",
+    "plxnative-previewsnap",
     // The FRAME BUDGET's A/B control leg (`ui/frame/budget.rs`, spec §8.1): admission as it was
     // before phase 11 — quota only, no time ceiling, no solo rule. DIAG for exactly the argument
     // the three above make: its whole method is an A/B against an unmasked control leg, and a
@@ -114,6 +136,7 @@ const DIAG: [&str; 40] = [
     // from under the very session being measured.
     "plxnative-gstlog",
     "plxnative-gst.log",
+    "plxnative-playback.log",
     // The forced Stats-for-nerds overlay. It only changes presentation, and grading a playback
     // case without the read-out risks a failure whose evidence was never put on screen.
     "plxnative-stats",
@@ -121,6 +144,9 @@ const DIAG: [&str; 40] = [
     // one is moot — but leaving it out of this list would be a silent inconsistency for the next
     // reader, and the honest reading is that it changes no screen.
     "plxnative-crashtest",
+    // The deliberate FREEZE (`freeze_on_purpose`): it stalls the main loop and changes no screen,
+    // and its whole use is watching the freeze report come back from the screen it froze.
+    "plxnative-freeze",
     // The FRAME-DROP DETECTOR (`app.rs`, the `FRAMEDROP` line and `worstframe=`). It observes the
     // frame it is armed on and changes no screen; the harness's `worst_ceiling_ms` /
     // `stall_ceiling_ms` gates arm it under every fps scene, and a scene whose gate moved the boot
@@ -129,6 +155,13 @@ const DIAG: [&str; 40] = [
     // The compositor frame-callback probe (`system.rs`): extra fields on that same line, from one
     // `wl_surface.frame` request per present. An observer for the reason `framedrop` is.
     "plxnative-framecb",
+    // The post-120-present `EGL_BUFFER_AGE` re-ask (`plx_gfx::egl::late_probe`, off unless armed).
+    // It changes nothing on screen, which is what DIAG membership means: a boot that arms it stays
+    // on the screen it was going to, where a non-DIAG trigger would move it off the who's-watching
+    // picker. It is NOT free: that one query blocks a swap 13-16 ms on the T820 at present 120, so
+    // never arm it for a smoothness run. The two EGL triggers that DO change something (`eglprobe`,
+    // `egldamage`) are deliberately not here.
+    "plxnative-eglage",
     // The detector's context ring: which of the same lines are written, never which screen they
     // are written about.
     "plxnative-framering",
@@ -160,11 +193,29 @@ const DIAG: [&str; 40] = [
     // variants must not move the boot screen out from under the playback being compared.
     "plxnative-av1obu",
     // Send VP9's sourceInfo envelope as the pipeline made it, without the container-derived HDR10
-    // declaration (`media::player::vp9_hdr`): the A/B for whether the television switches to HDR.
+    // declaration (`plx_play_feed::vp9_hdr`): the A/B for whether the television switches to HDR.
     "plxnative-novp9hdr",
-    // The side subtitle reader (`media::player::subside`): content = the 0-based position of the
+    // The side subtitle reader (`plx_play_feed::side_reader`, `media::player::subside`): content = the 0-based position of the
     // embedded subtitle stream to draw over a plain remux, read at each playback start.
     "plxnative-subside",
+    // The URI-mode probe (`dev::uriprobe`, the application's half of `media::player::uriprobe_drive`, issue #1064): content = `load`, `late`
+    // or `none` (empty = `load`), read at each playback start. It changes how ONE play is carried
+    // out and nothing about the boot: the tester signs in and picks a profile as always, then
+    // plays a title. A non-DIAG trigger would suppress the who's-watching picker and move that
+    // boot away from the one the probe is meant to run on.
+    "plxnative-uriprobe",
+    // The URI dev route (`dev::uri_product`): content = `acb part=<N> pms=<dotted-quad:port>
+    // url=<http://dotted-quad:port/path>`, read once at boot. It changes which source one play is
+    // certified for and nothing about the boot, so a test run still signs in and boots as always;
+    // a non-DIAG trigger would suppress the who's-watching picker. It is listed here so that
+    // `ci/check-package.py` greps the shipped bytes for the name.
+    "plxnative-uridev",
+    // The exported-window override (`dev::uri_exported`): presence arms it, read once at boot. It
+    // changes which display path one play's backend is composed with and nothing about the boot, so
+    // the tester signs in and picks a profile as always; a non-DIAG trigger would suppress the
+    // who's-watching picker, and a stale file would keep suppressing it. Listed so that
+    // `ci/check-package.py` greps the shipped bytes for the name.
+    "plxnative-uriexported",
 ];
 
 /// **Turn on the TELEVISION'S OWN GStreamer logging** — `/tmp/plxnative-gstlog`.
@@ -365,6 +416,52 @@ pub(crate) fn crash_on_purpose() {
 #[cfg(not(feature = "devtriggers"))]
 pub(crate) fn crash_on_purpose() {}
 
+/// **Freeze the main loop on purpose** — `plxnative-freeze=<seconds>` (1 to 120).
+///
+/// The instrument for the freeze probe, as [`crash_on_purpose`] is for the fault tracer: nothing a
+/// person does reliably stalls the loop for five seconds on demand, and a freeze report nobody has
+/// seen arrive is not known to work. Called from the once-a-second heartbeat, so it runs ON the
+/// main thread and the stall is exactly what the watchdog watches; it waits [`FREEZE_AFTER_TICKS`]
+/// beats first, which is how it knows the first present has armed the watchdog.
+///
+/// It reads the trigger ONCE, on that beat (never per frame: a trigger read is a `stat`), and
+/// **removes the file when it fires**, so one arming is one freeze and a relaunch is not frozen
+/// again without being asked. `std::thread::sleep` restarts after `EINTR`, so the probe signal
+/// cannot cut the stall short.
+///
+/// **With the default `threadcheck` feature the developer watchdog is armed**, and it aborts the
+/// process once the main thread has made no progress for `HANG_FATAL_MS` (2 s), well before the 5 s
+/// freeze probe. To see a freeze report come back, write `log` into `/tmp/plxnative-guard` before
+/// launching (that file turns the abort into a log line), or build without `threadcheck`.
+///
+/// **Compiled out of a release build** with the rest of `devtriggers`.
+#[cfg(feature = "devtriggers")]
+pub(crate) fn freeze_on_purpose() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static BEATS: AtomicU32 = AtomicU32::new(0);
+    if BEATS.fetch_add(1, Ordering::Relaxed) != FREEZE_AFTER_TICKS {
+        return;
+    }
+    let Some(text) = plx_base::devtrig::read("freeze") else {
+        return;
+    };
+    let _ = std::fs::remove_file(plx_base::devtrig::path("freeze"));
+    let Ok(secs) = text.parse::<u64>() else {
+        plx_base::eventlog::log(&format!("freezetest: {text:?} is not a number of seconds — not freezing"));
+        return;
+    };
+    let secs = secs.clamp(1, 120);
+    plx_base::eventlog::log(&format!("freezetest: DELIBERATE freeze of the main thread, {secs}s"));
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    plx_base::eventlog::log("freezetest: the deliberate freeze is over");
+}
+#[cfg(not(feature = "devtriggers"))]
+pub(crate) fn freeze_on_purpose() {}
+
+/// Heartbeats to let pass before [`freeze_on_purpose`] looks at its trigger.
+#[cfg(feature = "devtriggers")]
+const FREEZE_AFTER_TICKS: u32 = 8;
+
 /// `plxnative-softfloat`: the ARM half of `plx_machine::motion`'s differential claim (spec §4.2). Runs the
 /// 4,096-operand table through this binary's own arithmetic, logs its hash beside the host's
 /// pinned one, and writes the words to `plxnative-softfloat.tbl` in the runtime root so a
@@ -500,9 +597,12 @@ pub(crate) fn quality_switch_script() -> Option<(u32, Vec<plx_plex::plex::sessio
 /// ordinary six-second dev gate and stay paused. A non-empty script may delay that edge and name a
 /// finite accepted hold. `at` also holds the edge until the PUBLISHED playhead has reached that
 /// media position (and, in the simulator, stops the clock sink exactly on it, so the pause freezes
-/// that position: `ffi_host.rs::stop_clock_at`): a wall-clock delay pauses wherever the host's
+/// that position: `HostSink::stop_clock_at`): a wall-clock delay pauses wherever the host's
 /// scheduling has got playback to, which moves from run to run, and the documentation's player
-/// figure wants the same frame and the same clock every time. Unknown/duplicate/invalid fields fail the whole trigger closed; silently
+/// figure wants the same frame and the same clock every time. The simulator's settled capture
+/// (`PLXNATIVE_SHOT_SETTLE`) waits for the Pause to land (`scenarios::screenshot::PauseDebt`): the
+/// edge arms six seconds in, and a slow host can leave the player still for longer than the
+/// capture's quiet meanwhile. Unknown/duplicate/invalid fields fail the whole trigger closed; silently
 /// substituting a duration would exercise a different interleaving from the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PauseScript {
@@ -1238,6 +1338,38 @@ mod tests {
     #[test]
     fn servers_trigger_is_not_diagnostic() {
         assert!(!super::DIAG.contains(&"plxnative-servers"));
+    }
+
+    // ---- plxnative-uriprobe (the URI-mode probe, issue #1064) ----
+
+    /// The probe changes how one play is carried out, never which screen the app boots to: a tester
+    /// signs in through the normal boot, then plays. Out of DIAG, the file would suppress the
+    /// who's-watching picker and the probe would run on a different boot than the one it is meant
+    /// to be run on.
+    #[test]
+    fn uriprobe_trigger_is_diagnostic() {
+        assert!(super::DIAG.contains(&"plxnative-uriprobe"));
+    }
+
+    // ---- plxnative-uridev (the URI dev route) ----
+
+    /// The dev route changes which source one play is certified for, never which screen the app
+    /// boots to (a test run signs in with the dev token and plays, as always). It is listed so the
+    /// release check (`ci/check-package.py`) greps the shipped bytes for the name, and so a stale
+    /// file in `/tmp` cannot move a later boot off the screen it was going to.
+    #[test]
+    fn uridev_trigger_is_diagnostic() {
+        assert!(super::DIAG.contains(&"plxnative-uridev"));
+    }
+
+    // ---- plxnative-uriexported (the exported-window override) ----
+
+    /// The override changes the display path one play's backend is composed with, never which screen
+    /// the app boots to: a tester arms it before launch, then signs in and picks a profile as always.
+    /// Out of DIAG, the file would suppress the who's-watching picker on every boot it stays in `/tmp`.
+    #[test]
+    fn uriexported_trigger_is_diagnostic() {
+        assert!(super::DIAG.contains(&"plxnative-uriexported"));
     }
 
     // ---- plxnative-playurl (the pipeline test tier's one trigger) ----

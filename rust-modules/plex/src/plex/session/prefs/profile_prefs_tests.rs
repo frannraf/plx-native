@@ -1,12 +1,12 @@
-//! The ten player settings and hero trailer autoplay per profile: the record and its soft parse, the fallback read, the
+//! Per-profile playback and display settings: the record and its soft parse, the fallback read, the
 //! write that always records an own value and prunes foreign stamps, and the seat a publication
 //! seats. The live half (cells, the door, the restore) is `media::route::prefs_tests`; the seat
 //! trigger is the app's `restore_characterisation_tests`.
 use super::super::{
-    current_seat, AudioEnhancementsPref, CurrentProfile, DeckPress, DeckPressPref, UnderPosters, UnderPostersDetails, DirectPlayMode, DirectPlayModePref,
+    DolbyVisionMode, InstantDpadSeeking, UriEngine, current_seat, AudioEnhancementsPref, CurrentProfile, DeckPress, DeckPressPref, UnderPosters, DetailPart, DetailParts, DirectPlayMode, DirectPlayModePref,
     HdrOverlayBrightness, HdrOverlayBrightnessPref, NextEpisodeMode, NextEpisodeModePref, PlaybackQuality, QualityPref, Seat, Session, SkipInterval, SkipIntervalPref,
     SubtitlePosition, SubtitlePositionPref, SubtitleSize, SubtitleSizePref, SubtitleTone, SubtitleTonePref, TempSession,
-    TrailerAutoplayPref, UserRef,
+    TrailerAutoplayPref, HudEndTimePref, UserRef,
 };
 use super::profile_prefs::*;
 use super::{Fallback, Parse, Preferences, Scope, Setting, DESCRIPTORS};
@@ -43,8 +43,8 @@ fn the_row_declares_a_profile_scoped_account_bound_soft_list() {
 }
 
 /// **T-fields.** `ProfilePrefs` has a field for exactly the settings whose `FALLBACK` is the legacy
-/// install key, under the same name: the ten player settings and `trailer_autoplay` (P1c), and no
-/// more. A twelfth Profile row without a field (or a field without its row) fails here.
+/// install key, under the same name. A Profile row without a field (or a field without its row)
+/// fails here.
 #[test]
 fn the_record_has_one_field_for_each_setting_with_a_legacy_fallback() {
     let full = ProfilePrefs {
@@ -56,10 +56,17 @@ fn the_record_has_one_field_for_each_setting_with_a_legacy_fallback() {
         hdr_overlay_brightness: Some(HdrOverlayBrightness::Half),
         next_episode_mode: Some(NextEpisodeMode::AfterCredits),
         skip_interval: Some(SkipInterval::Seconds30),
+        instant_dpad_seeking: Some(InstantDpadSeeking::On),
+        uri_engine: Some(UriEngine::On),
+        dolby_vision_mode: Some(DolbyVisionMode::Off),
+        intro_skip: Some(crate::plex::session::MarkerSkipMode::Automatic),
+        credits_skip: Some(crate::plex::session::MarkerSkipMode::Disabled),
         deck_press: Some(DeckPress::Play),
-        under_posters: Some(UnderPosters { title: true, details: UnderPostersDetails::Video }),
+        under_posters: Some(UnderPosters { title: true, details: DetailParts::of(&[DetailPart::VideoQuality]), show_details: DetailParts::SHOW_DEFAULT, sort_value: false }),
         audio_enhancements: Some(AudioEnhancements { boost_dialog: true, normalize_loudness: true }),
         trailer_autoplay: Some(false),
+        hud_end_time: Some(false),
+        hud_selection: Some("com.example.hud".into()),
     };
     let fields: BTreeSet<String> = serde_json::to_value(&full).unwrap().as_object().unwrap().keys().cloned().collect();
     let rows: BTreeSet<String> = DESCRIPTORS
@@ -67,8 +74,10 @@ fn the_record_has_one_field_for_each_setting_with_a_legacy_fallback() {
         .filter(|d| d.fallback == Fallback::LegacyInstallKey)
         .map(|d| d.key.to_string())
         .collect();
-    assert_eq!(rows.len(), 12, "the ten player settings, hero trailer autoplay and Under posters fall back to a legacy key");
+    assert_eq!(rows.len(), 19, "every per-profile setting has a legacy fallback");
     assert_eq!(fields, rows, "ProfilePrefs and the rows with a legacy fallback drifted");
+    assert!(effective::<HudEndTimePref>(&Preferences::default(), None), "a profile with no pick defaults the end-time label on");
+    assert!(!effective::<HudEndTimePref>(&Preferences::default(), Some(&full)), "a profile's explicit OFF overrides the default");
     assert!(DESCRIPTORS.iter().filter(|d| d.fallback == Fallback::LegacyInstallKey).all(|d| d.scope == Scope::Profile));
 }
 
@@ -163,13 +172,22 @@ fn own_value_then_legacy_then_default() {
     let seat = Seat::Seated { user: "kid".into(), stamp: STAMP.into() };
     assert_eq!(stored_effective::<SubtitleSizePref>(&fresh, &seat), SubtitleSize::Medium, "a fresh install reads the default");
     assert_eq!(stored_effective::<QualityPref>(&fresh, &seat), PlaybackQuality::Original, "an absent quality is Original");
+    assert!(stored_effective::<HudEndTimePref>(&fresh, &seat), "a fresh profile shows the end-time estimate by default");
 
     let mut tv = Session::default();
     SubtitleSizePref::put(&mut tv.prefs, SubtitleSize::Large);
+    tv.prefs.hud_end_time = Some(false);
     assert_eq!(stored_effective::<SubtitleSizePref>(&tv, &seat), SubtitleSize::Large, "a profile with no record reads the TV's value");
+    assert!(!stored_effective::<HudEndTimePref>(&tv, &seat), "a profile with no own pick reads the legacy OFF value");
 
-    tv.prefs.profile_prefs = prefs_with(json!([record("kid", STAMP, json!({ "subtitle_size": "small" }))])).profile_prefs;
+    tv.prefs.profile_prefs = prefs_with(json!([
+        record("kid", STAMP, json!({ "subtitle_size": "small", "hud_end_time": true })),
+        record("sibling", STAMP, json!({ "hud_end_time": false })),
+    ])).profile_prefs;
     assert_eq!(stored_effective::<SubtitleSizePref>(&tv, &seat), SubtitleSize::Small, "its own value wins");
+    assert!(stored_effective::<HudEndTimePref>(&tv, &seat), "kid's own ON overrides the legacy OFF");
+    let sibling = Seat::Seated { user: "sibling".into(), stamp: STAMP.into() };
+    assert!(!stored_effective::<HudEndTimePref>(&tv, &sibling), "sibling's independent OFF is not shared");
     assert_eq!(stored_effective::<SubtitlePositionPref>(&tv, &seat), SubtitlePosition::Low, "an unpicked setting still falls back");
     let other = Seat::Seated { user: "sibling".into(), stamp: STAMP.into() };
     assert_eq!(stored_effective::<SubtitleSizePref>(&tv, &other), SubtitleSize::Large, "another profile's pick is not seen");
@@ -529,4 +547,91 @@ fn hdr_overlay_brightness_defaults_to_three_quarters_and_round_trips() {
     );
     let install: Preferences = serde_json::from_value(json!({ "hdr_overlay_brightness": "half" })).unwrap();
     assert_eq!(HdrOverlayBrightnessPref::get(&install), HdrOverlayBrightness::Half);
+}
+
+// ---- the chosen player HUD (a String, so a Row and not a Setting) -----------------------------
+
+/// A profile's own pick, else the install-wide key, else the built-in (empty). Garbage reads as unset.
+#[test]
+fn the_hud_selection_reads_own_then_legacy_then_empty() {
+    let none = prefs_with(json!([]));
+    assert_eq!(effective_hud(&none, None), "", "nothing anywhere is the built-in");
+    let legacy: Preferences = serde_json::from_value(json!({ "hud_selection": "com.example.tv" })).unwrap();
+    assert_eq!(effective_hud(&legacy, None), "com.example.tv");
+    let own = prefs_with(json!([record("kid", STAMP, json!({ "hud_selection": "com.example.kid" }))]));
+    let mine = own_prefs(&own.profile_prefs, "kid", STAMP);
+    assert_eq!(effective_hud(&legacy, mine), "com.example.kid", "the profile's pick beats the TV's");
+    let other = own_prefs(&own.profile_prefs, "sib", STAMP);
+    assert_eq!(effective_hud(&legacy, other), "com.example.tv", "a profile that never picked reads the TV's");
+    let garbage = prefs_with(json!([record("kid", STAMP, json!({ "hud_selection": 17 }))]));
+    assert_eq!(effective_hud(&legacy, own_prefs(&garbage.profile_prefs, "kid", STAMP)), "com.example.tv", "garbage is no pick");
+}
+
+/// **The pick is per profile, survives a reload, and never writes the frozen install key.** Profile A picks a
+/// package; B keeps reading the TV's value; A reads its own back from disk.
+#[test]
+fn a_hud_pick_is_per_profile_durable_and_never_the_install_key() {
+    let _g = plx_base::testlock::serial();
+    let session = TempSession::new("hud-pick");
+    let stamp = session.seated("a", "account-token");
+    let before = stored();
+    let w = ProfileWrite::capture().expect("a seated profile");
+    assert!(persist_profile_hud(&w, "com.example.a"));
+    assert!(persist_profile_hud(&w, "com.example.a"), "an unchanged pick is saved without a write");
+
+    let after = stored();
+    assert_eq!(without_profile_prefs(&before), without_profile_prefs(&after), "the install-wide key is not written");
+    let a = Seat::Seated { user: "a".into(), stamp: stamp.clone() };
+    let b = Seat::Seated { user: "b".into(), stamp: stamp.clone() };
+    assert_eq!(stored_effective_hud(&after, &a), "com.example.a");
+    assert_eq!(stored_effective_hud(&after, &b), "", "a second profile keeps its own (here: the built-in)");
+    assert_eq!(stored_effective_hud(&after, &Seat::Unseated), "");
+
+    let reloaded = stored();
+    assert_eq!(stored_effective_hud(&reloaded, &a), "com.example.a", "the pick survives a reload");
+}
+
+/// A pick made while nobody is seated captures no write, and the stamp rule refuses an unreadable record.
+#[test]
+fn a_hud_pick_needs_a_stamp() {
+    let mut records = Vec::new();
+    assert!(!put_own_hud(&mut records, "a", "", "com.example.a"));
+    assert!(records.is_empty());
+    assert!(put_own_hud(&mut records, "a", STAMP, "com.example.a"));
+    assert!(!put_own_hud(&mut records, "a", STAMP, "com.example.a"), "equal is no change");
+    assert!(put_own_hud(&mut records, "a", STAMP, ""), "going back to the built-in is an own pick of empty");
+}
+
+/// **Both profiles pick, and both picks survive**: profile A's record is not rewritten by B's pick, and the other way
+/// round, in the records and on disk. (`put_own_hud` ignoring the user would leave one record holding the last pick.)
+#[test]
+fn two_profiles_each_keep_their_own_hud_pick() {
+    let _g = plx_base::testlock::serial();
+    let session = TempSession::new("hud-two-profiles");
+    let stamp = session.seated("a", "account-token");
+    let w_a = ProfileWrite::capture().expect("profile a is seated");
+    assert!(persist_profile_hud(&w_a, "com.example.a"));
+    session.seated("b", "account-token");
+    let w_b = ProfileWrite::capture().expect("profile b is seated");
+    assert_eq!((w_b.user(), w_b.stamp()), ("b", stamp.as_str()));
+    assert!(persist_profile_hud(&w_b, "com.example.b"));
+
+    let stored = stored();
+    let seat = |user: &str| Seat::Seated { user: user.into(), stamp: stamp.clone() };
+    assert_eq!(stored_effective_hud(&stored, &seat("a")), "com.example.a", "b's pick did not rewrite a's");
+    assert_eq!(stored_effective_hud(&stored, &seat("b")), "com.example.b");
+    assert_eq!(stored.prefs.profile_prefs.len(), 2, "one record each");
+
+    // a changes its mind: b's record is untouched
+    assert!(persist_profile_hud(&w_a, "com.example.a2"));
+    let stored = crate::plex::session::load();
+    assert_eq!(stored_effective_hud(&stored, &seat("a")), "com.example.a2");
+    assert_eq!(stored_effective_hud(&stored, &seat("b")), "com.example.b");
+
+    // the same in the pure half
+    let mut records = Vec::new();
+    assert!(put_own_hud(&mut records, "a", STAMP, "x"));
+    assert!(put_own_hud(&mut records, "b", STAMP, "y"));
+    assert_eq!(own_prefs(&records, "a", STAMP).and_then(|p| p.hud_selection.as_deref()), Some("x"));
+    assert_eq!(own_prefs(&records, "b", STAMP).and_then(|p| p.hud_selection.as_deref()), Some("y"));
 }

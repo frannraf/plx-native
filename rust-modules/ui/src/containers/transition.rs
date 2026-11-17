@@ -28,9 +28,13 @@
 //!   image, then switches to identical live output on the following frame. No VISIBLE frame draws a live
 //!   page under a full-screen image. [`PAGE_QUIESCENCE_HOLD_MAX_MS`] bounds a page that never
 //!   settles. Screen/input/lifecycle state continues ticking behind the held image.
-//! - [`RoutePush`] — the Settings family's push: commit is immediate, BOTH levels are drawn, and a
-//!   k=200 spring carries the incoming level in from −0.35 and the outgoing one out to +0.22 (in
-//!   fractions of the width).
+//! - [`RoutePush`] — a `NavStack` push as a transition: commit is immediate, BOTH levels are drawn,
+//!   and a k=200 spring carries the incoming level in from −0.35 and the outgoing one out to +0.22
+//!   (in fractions of the width). Only the test bundle's `FixtureModal` runs it as a stack
+//!   transition. The Settings family's own push is `route_screen::RoutePush`, a spring the surface
+//!   drives itself (it must keep drawing a popped page); that one waits at its start while the
+//!   destination's text is made resident (`route_screen::RoutePush::begin_warm`), and this one
+//!   does not.
 //!
 //! Motion and image policy are pure: no static, no clock but the frame tick, no GL. The one fact they
 //! read besides the tick is the frame dump's: `PageDip::tick` and `PageImage::plan` read
@@ -138,6 +142,13 @@ pub const DIP_IN_MS: f32 = 140.0;
 /// Maximum rasterise+upload time borrowed from one cheap dip-out frame.
 pub const TEXT_PREWARM_BUDGET_US: u64 = 6_000;
 
+/// **The dip's curve**: smoothstep of a linear `0..=1` ramp (clamped). The route dip's alpha and a
+/// surface's entry dip ([`super::modal::EntryMotion::Dip`]) both read it, so they cannot disagree.
+pub fn dip_eased(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DipPhase {
     Idle,
@@ -182,8 +193,7 @@ impl PageDip {
     }
 
     fn eased(&self) -> f32 {
-        let t = self.t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+        dip_eased(self.t)
     }
 }
 
@@ -325,7 +335,8 @@ impl Transition for PageDip {
     }
 }
 
-/// The Settings family's push (`RouteLayout`'s numbers): immediate commit, both levels drawn.
+/// A push as a stack transition (`RouteLayout`'s numbers): immediate commit, both levels drawn.
+/// The Settings family's own push is `route_screen::RoutePush`.
 pub struct RoutePush {
     pos: f32,
     vel: f32,
@@ -399,6 +410,8 @@ impl Transition for RoutePush {
 #[derive(Clone, Copy, Default)]
 pub struct PageImage {
     entry: Option<plx_machine::machine::EntryId>,
+    /// The body whose pixels were captured. A remount of the same entry cannot inherit them.
+    instance: Option<plx_machine::machine::InstanceId>,
     settle_since: Option<u32>,
     replacement_ready: bool,
     /// The paint the last [`PageImage::plan`] step returned: what a frame dump's held repeat of
@@ -406,25 +419,6 @@ pub struct PageImage {
     /// have a held repeat (the dev instruments and tests); a shipping struct does not carry it.
     #[cfg(any(feature = "devtriggers", feature = "test-support", test))]
     last: Option<PagePaint>,
-}
-
-thread_local! {
-    /// The page was shown as a held image on the last frame the dispatcher painted.
-    static PAGE_IMAGE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The dispatcher's statement about the page it painted this frame: `held` is whether it was shown
-/// as a captured image rather than drawn live (a dip's Out and In halves and the hold after it). A
-/// screen reads it through [`page_image_held`] on its NEXT tick, so a layout animation it started
-/// is not stepped under an image that hides it and then stretches the hold (`cards::Shelf`'s
-/// animated landings).
-pub fn set_page_image_held(held: bool) {
-    PAGE_IMAGE_HELD.with(|h| h.set(held));
-}
-
-/// Was the page a held image on the last frame the dispatcher painted ([`set_page_image_held`])?
-pub fn page_image_held() -> bool {
-    PAGE_IMAGE_HELD.with(|h| h.get())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -446,11 +440,13 @@ impl PagePaint {
 impl PageImage {
     pub fn captured(&mut self, entry: plx_machine::machine::EntryId) {
         self.entry = Some(entry);
+        self.instance = None;
         self.settle_since = None;
         self.replacement_ready = false;
     }
     pub fn replacement_captured(&mut self, entry: plx_machine::machine::EntryId) {
         self.entry = Some(entry);
+        self.instance = None;
         self.replacement_ready = true;
     }
     /// One planning step per FRAME. In a frame dump ([`plx_gfx::dump::held_repeat`]) an iteration
@@ -543,6 +539,30 @@ impl PageImage {
         }
         *self = Self::default();
         PagePaint::Live
+    }
+
+    /// Bind only after a successful visible capture (or the owned headless snapshot port).
+    pub fn bind_instance(&mut self, instance: plx_machine::machine::InstanceId) {
+        self.instance = Some(instance);
+    }
+
+    /// Derive policy from this owner's captured image and the CURRENT mounted body, not GPU TLS.
+    pub fn read(&self, entry: plx_machine::machine::EntryId, instance: plx_machine::machine::InstanceId)
+        -> plx_machine::machine::PageImageRead {
+        if self.entry == Some(entry) && self.instance == Some(instance) {
+            plx_machine::machine::PageImageRead::held(entry, instance)
+        } else { Default::default() }
+    }
+
+    /// At the dip floor the incoming page hears Enter/Tick BEFORE its capture draw. The same
+    /// owner's outgoing image still hides it during that interval, so project the live destination
+    /// identity from navigation. This does NOT validate outgoing pixels for drawing the new page.
+    /// A remount at the SAME entry is different: its old body's image is rejected until recaptured.
+    pub fn transition_read(&self, entry: plx_machine::machine::EntryId,
+        instance: plx_machine::machine::InstanceId, active: bool) -> plx_machine::machine::PageImageRead {
+        if active && self.instance.is_some() && self.entry.is_some_and(|old| old != entry) {
+            plx_machine::machine::PageImageRead::held(entry, instance)
+        } else { self.read(entry, instance) }
     }
 
     pub fn held_entry(&self) -> Option<plx_machine::machine::EntryId> {

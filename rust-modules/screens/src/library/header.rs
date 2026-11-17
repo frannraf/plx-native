@@ -1,5 +1,8 @@
-//! The library page header (redesign spec, "Header"): the library names, the "+N" overflow and the
-//! page's three controls (on the Collections page, the crumb and its Sort) on the ui
+//! The library page header (redesign spec, "Header"): the library names, the Library options and the
+//! page's controls (Collections › and Recommended › as places, a divider, then the sort control:
+//! icon, the chosen criterion, a down chevron, with "Sort & Filter" as its unshown name
+//! ([`HeaderItem::sort_control`], which the Collections page's Sort and the Watchlist's wear too); on the Collections page, the
+//! crumb and its Sort) on the ui
 //! [`PageHeader`], one focus row at y 148.
 //!
 //! This file DECLARES the row: which names, which controls, which element each focusable item is.
@@ -12,10 +15,23 @@
 //! controls inside the cluster stand by what they draw, one gap apart. The row's MOTION (`header_capsules`, `header_pop`) lives on the screen, not in the
 //! row: a library switch replaces the whole row, and the pill must travel across it.
 use super::*;
+use plx_machine::machine::Measure;
 use plx_ui::hstack::{self, Align, HStack};
 use plx_ui::page_header::{self, HeaderFocus, HeaderItem, HeaderRow, PageHeader, PageHeaderSpec, Slot};
+use plx_ui::theme;
 
-/// The width the names `picks` (then, with `more_w`, the "+N" after them) stand in, one
+/// A shared library's owner credit is atomic. An oversized credit gives its room back to the
+/// title, which uses the ordinary single-line fit.
+pub(super) fn fit_name(title: &str, owner: &str, room: f32, measure: &dyn Measure) -> String {
+    let size = theme::size::BODY;
+    let full = super::toolbar::joined_name(title, owner);
+    if measure.width_str(&full, size, false) <= room {
+        return full;
+    }
+    measure.fit_line(title, room, size, false).to_string_lossy().into_owned()
+}
+
+/// The width the names `picks` (then, with `more_w`, the options after them) stand in, one
 /// [`page_header::GAP`] apart: the ui's own [`HStack::width`]. `PageHeader::layout` places the names
 /// with the same stack and the same gap, so what is packed here and where the names stand share the
 /// gap rule (not one construction: this takes measured widths, the layout takes spec items).
@@ -25,32 +41,45 @@ fn names_w(widths: &[f32], picks: &[usize], more_w: Option<f32>) -> f32 {
 }
 
 /// Which of `n` names show when the row cannot hold them all (`budget` is text edge to text edge
-/// for names plus "+N"). The picked library takes the LAST visible slot: names keep their order
-/// from the front, and a selected one past the cut replaces the final name. Always at least the
-/// selected name; every name when they all fit under `cap`.
-pub(super) fn pack_names(widths: &[f32], selected: usize, budget: f32, more_w: f32, cap: usize) -> Vec<usize> {
-    let n = widths.len();
-    if n == 0 || cap == 0 { return Vec::new(); }
-    let selected = selected.min(n - 1);
-    let all: Vec<usize> = (0..n).collect();
-    if n <= cap && names_w(widths, &all, None) <= budget { return all; }
-    // "+N" takes the end of the row, one gap after the last name.
-    let with_more = |picks: &[usize]| names_w(widths, picks, Some(more_w));
-    for k in (1..n.min(cap)).rev() {
-        let mut picks: Vec<usize> = (0..k).collect();
-        if selected >= k { picks[k - 1] = selected; }
-        if with_more(&picks) <= budget { return picks; }
+/// for names plus options). Keep a stable prefix of favorites, reserving room for the options
+/// action. Choosing another library never reorders these shortcuts.
+pub(super) fn pack_names(widths: &[f32], _selected: usize, budget: f32, more_w: f32, cap: usize) -> Vec<usize> {
+    let mut picks = Vec::new();
+    for i in 0..widths.len().min(cap) {
+        let mut next = picks.clone();
+        next.push(i);
+        if names_w(widths, &next, Some(more_w)) > budget { break; }
+        picks = next;
     }
-    vec![selected]
+    picks
+}
+
+/// What the read-out's filtered count was taken under: the library listing (the key `unfiltered`
+/// carries) and the filter terms in force. A count is only ever shown for the key it was counted under.
+#[derive(Clone, PartialEq)]
+pub(super) struct FilterKey {
+    library: (LibrarySectionIdentity, u32, plx_data::browse::LibraryType),
+    genre: Option<String>,
+    unwatched: bool,
 }
 
 fn item(label: impl Into<String>) -> HeaderItem {
     HeaderItem { label: label.into(), focusable: true, ..Default::default() }
 }
 
+/// A control that opens a page (Collections, Recommended): the row draws a chevron after it.
+fn place(label: impl Into<String>) -> HeaderItem {
+    HeaderItem { place: true, ..item(label) }
+}
+
+/// The hairline between the places and the sort control. Not a stop.
+fn divider() -> HeaderItem {
+    HeaderItem { divider: true, ..Default::default() }
+}
+
 impl LibraryScreen {
-    /// Every focusable element of the header row in focus order: the library names, "+N", then
-    /// the controls (on the Collections page, the crumb's root, then Sort).
+    /// Every focusable element of the header row in focus order: favorite shortcuts, options, the
+    /// current visit when present, then the controls (on Collections, the crumb's root, then Sort).
     pub(super) fn header_elems(&self) -> Vec<u32> {
         self.header.row().map_or_else(Vec::new, |row| row.stops.iter().map(|(elem, _)| *elem).collect())
     }
@@ -59,15 +88,17 @@ impl LibraryScreen {
         self.header_focus().is_some_and(|focus| focus.contains(elem))
     }
 
-    /// The Sort & Filter control's value: the sort in force, a queued edit included.
-    fn sort_value<H: LibraryLike>(&self, cx: &Cx<'_, H>) -> String {
+    /// The Sort & Filter control's value: the sort in force, a queued edit included. The scroll
+    /// capsule carries the same string. Borrowed from the listing (or the catalogue), so the capsule,
+    /// which asks every frame it is up, allocates nothing for it.
+    pub(super) fn sort_value<'a, H: LibraryLike>(&self, cx: &Cx<'a, H>) -> &'a str {
         let listing = H::listing(cx);
         let queued = self.pending.grid().filter(|(target, _)| target.matches(listing)).map(|(_, action)| action);
         let sort = match queued {
             Some(GridAction::Sort { key, .. }) => listing.sorts().iter().find(|sort| &sort.key == key),
             _ => listing.sorts().get(listing.sort_index()),
         };
-        sort.map_or(plx_platform::i18n::msg::browse_library_title(), |sort| sort.label()).to_owned()
+        sort.map_or(plx_platform::i18n::msg::browse_library_title(), |sort| sort.label())
     }
 
     /// Is a genre or Unwatched filter in force (a queued edit included)? Only then does the row
@@ -86,18 +117,41 @@ impl LibraryScreen {
         genre || unwatched
     }
 
-    /// Remember the total of the unfiltered listing the page last saw: the data layer publishes
-    /// only the filtered total, and the read-out needs both.
-    fn note_unfiltered<H: LibraryLike>(&mut self, cx: &Cx<'_, H>) {
+    /// What a filtered total belongs to: this listing's library and the filter terms it was asked
+    /// with. `None` while the listing has no identity or the page no section.
+    fn filter_key<H: LibraryLike>(&self, cx: &Cx<'_, H>) -> Option<FilterKey> {
         let listing = H::listing(cx);
-        let (Some(id), Some(section)) = (listing.id(), self.section.clone()) else { return };
-        if listing.total() < 0 || listing.fetch() != SecFetch::Ready { return; }
-        let unfiltered = !listing.unwatched() && listing.genre().is_none();
-        let key = (section, id.epoch, listing.library_type());
-        if unfiltered {
-            self.unfiltered = Some((key, listing.total()));
-        } else if self.unfiltered.as_ref().is_some_and(|(seen, _)| *seen != key) {
-            self.unfiltered = None;
+        let (id, section) = (listing.id()?, self.section.clone()?);
+        Some(FilterKey {
+            library: (section, id.epoch, listing.library_type()),
+            genre: listing.genre().map(|genre| genre.id.clone()),
+            unwatched: listing.unwatched(),
+        })
+    }
+
+    /// Remember the totals the read-out is made of: the data layer publishes only the filtered
+    /// total, and the read-out needs the unfiltered one beside it.
+    ///
+    /// **The filtered total is held across a reload that keeps its terms.** A sort pick forgets the
+    /// listing (`reset_listing`: loading, no total) under the same genre and Unwatched terms, and
+    /// the count of what those terms match has not changed; so the read-out keeps saying it, and
+    /// stays on the row to glide with its neighbours instead of leaving and coming back when the
+    /// listing lands. The held count is dropped the first time the page sees any other library or
+    /// other terms, and when the listing lands unfiltered, so it is never shown for a filter it
+    /// was not counted under.
+    fn note_totals<H: LibraryLike>(&mut self, cx: &Cx<'_, H>) {
+        let listing = H::listing(cx);
+        let Some(key) = self.filter_key(cx) else { return };
+        if listing.total() < 0 || listing.fetch() != SecFetch::Ready {
+            if self.filtered.as_ref().is_some_and(|(held, _)| *held != key) { self.filtered = None; }
+            return;
+        }
+        if key.genre.is_none() && !key.unwatched {
+            self.unfiltered = Some((key.library, listing.total()));
+            self.filtered = None;
+        } else {
+            if self.unfiltered.as_ref().is_some_and(|(seen, _)| *seen != key.library) { self.unfiltered = None; }
+            self.filtered = Some((key, listing.total()));
         }
     }
 
@@ -108,10 +162,18 @@ impl LibraryScreen {
         if !self.filter_active(cx) { return None; }
         let listing = H::listing(cx);
         let (_, total) = self.unfiltered.as_ref()?;
-        if listing.total() < 0 || listing.fetch() != SecFetch::Ready { return None; }
+        // The listing's own count once it has one; while it reloads under the same terms, the count
+        // held for them (see [`Self::note_totals`]).
+        let matching = if listing.total() >= 0 && listing.fetch() == SecFetch::Ready {
+            listing.total()
+        } else {
+            let (held, matching) = self.filtered.as_ref()?;
+            if self.filter_key(cx).as_ref() != Some(held) { return None; }
+            *matching
+        };
         let locale = plx_platform::i18n::current();
         let of_total = listing.library_type().count_label(self.kind, *total);
-        Some(plx_platform::i18n::msg::library_header_filtered_of(&locale.number(listing.total()), &of_total))
+        Some(plx_platform::i18n::msg::library_header_filtered_of(&locale.number(matching), &of_total))
     }
 
     /// The right cluster as it is now, and in its widest case (every value at its longest), which
@@ -137,7 +199,7 @@ impl LibraryScreen {
         // must not repack between the two (the room they pack into is measured once and never
         // moves).
         let slot_of = |count: u32| Some(locale.number(i64::from(count.max(999))));
-        let control = |value, slot| HeaderItem { value, value_slot: slot, ..item(msg::library_header_collections()) };
+        let control = |value, slot| HeaderItem { value, value_slot: slot, ..place(msg::library_header_collections()) };
         match self.collections {
             CollectionsControl::Count(count) => {
                 let slot = slot_of(count);
@@ -151,15 +213,20 @@ impl LibraryScreen {
             }
         }
         right.push(HeaderItem { selected_plate: self.listing == Listing::Recommended,
-            ..item(msg::library_header_recommended()) });
-        widest.push(item(msg::library_header_recommended()));
+            ..place(msg::library_header_recommended()) });
+        widest.push(place(msg::library_header_recommended()));
+        // The divider and the sort control draw what the criterion says, with no slot for it: the
+        // control ends at the row's edge and the places slide as the criterion's width changes. The
+        // widest criterion only sizes the room the library names may use.
+        right.push(divider());
+        widest.push(divider());
         let sort = self.sort_value(cx);
-        let longest = H::listing(cx).sorts().iter().map(|sort| sort.label()).chain([sort.as_str()])
-            .max_by(|a, b| page_header::cluster_width(&[item(*a)], cx.measure)
-                .total_cmp(&page_header::cluster_width(&[item(*b)], cx.measure)))
-            .unwrap_or_default().to_owned();
-        right.push(HeaderItem { value: Some(sort), fold_glyph: true, ..item(msg::library_header_sort_filter()) });
-        widest.push(HeaderItem { value: Some(longest), fold_glyph: true, ..item(msg::library_header_sort_filter()) });
+        let longest = H::listing(cx).sorts().iter().map(|sort| sort.label()).chain([sort])
+            .map(|label| (page_header::cluster_width(&[HeaderItem::sort_control("", label)], cx.measure), label))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or("", |(_, label)| label).to_owned();
+        right.push(HeaderItem::sort_control(msg::library_header_sort_filter(), sort));
+        widest.push(HeaderItem::sort_control(msg::library_header_sort_filter(), longest));
         (right, widest)
     }
 
@@ -182,7 +249,8 @@ impl LibraryScreen {
         for (id, source) in directory.sources() { (id.raw(), source.handle.as_str()).hash(&mut h); }
         (listing.id().map(|id| (id.epoch, id.section, id.query)), listing.sort_index(), listing.sort_desc(),
             listing.unwatched(), listing.genre().map(|genre| genre.id.as_str()), listing.total(),
-            listing.fetch() == SecFetch::Ready, listing.sorts().len(), self.unfiltered.as_ref().map(|(_, total)| *total)).hash(&mut h);
+            listing.fetch() == SecFetch::Ready, listing.sorts().len(), self.unfiltered.as_ref().map(|(_, total)| *total),
+            self.filtered.as_ref().map(|(_, total)| *total)).hash(&mut h);
         match self.pending.grid().filter(|(target, _)| target.matches(listing)).map(|(_, action)| action) {
             Some(GridAction::Sort { key, desc }) => (1u8, key.as_str(), *desc).hash(&mut h),
             Some(GridAction::Unwatched { desired }) => (2u8, *desired).hash(&mut h),
@@ -217,7 +285,7 @@ impl LibraryScreen {
             (CollectionsControl::Unknown, held @ CollectionsControl::Count(_)) if of == self.header_of => held,
             (read, _) => read,
         };
-        self.note_unfiltered(cx);
+        self.note_totals(cx);
         // `sync` runs every frame; the row (text measurement, packing) is rebuilt only when one
         // of the things it is made of changed.
         let key = self.header_key(cx);
@@ -227,6 +295,7 @@ impl LibraryScreen {
             // The same library's row changing fades what comes and goes; a row for ANOTHER library
             // is the new page's own, and shows nothing of the one left (see `HeaderSwap::begin_switch`).
             if of == self.header_of { self.header_swap.begin(old, &row); } else { self.header_swap.begin_switch(old, &row); }
+            row.reflow_selection(old, &mut self.header_capsules);
         }
         self.header_of = of;
         self.header.install(key, row);
@@ -241,65 +310,81 @@ impl LibraryScreen {
 
         self.libraries.clear();
         self.folded.clear();
-        let mut overflow = 0;
         let current = self.view_section(cx);
         let mut left = Vec::new();
         if let Some(current) = current {
             let directory = H::directory(cx);
             let mut all: Vec<(u32, usize)> = Vec::new();
-            for (index, section) in directory.favorite_sections_for(current) {
+            for (index, section) in directory.favorite_sections_for(current).filter(|(_, section)| section.row.pinned) {
                 let Some(sid) = section.sid else { continue };
                 let elem = self.keys.register(
                     LibraryIdentity::Library(LibrarySectionIdentity { sid, key: section.key }),
                     LIBRARY_GROUP, all.len());
                 all.push((elem, index));
             }
-            // A SINGLE candidate never draws a name, whatever owns the section it names: a lone
-            // library carries nothing to disambiguate for ANY profile (issue #100/#165), so only
-            // the candidate COUNT decides, and only 2+ ever reaches the packing below.
-            if all.len() > 1 {
-                let labels: Vec<String> = all.iter()
-                    .map(|(_, section)| self.library_label(*section, cx)).collect();
-                let widths: Vec<f32> = labels.iter().map(|label| page_header::cluster_width(&[item(label.as_str())], measure)).collect();
-                let selected = all.iter().position(|(_, index)| *index == current).unwrap_or(0);
-                let more_w = page_header::cluster_width(&[item(format!("+{}", all.len() - 1))], measure);
-                let picks = pack_names(&widths, selected, budget, more_w, layout::MAX_LIBRARY_PILLS);
-                overflow = all.len() - picks.len();
-                self.folded = all.iter().enumerate().filter(|(i, _)| !picks.contains(i))
-                    .filter_map(|(_, (_, section))| u32::try_from(*section).ok()).collect();
-                for &pick in &picks {
-                    left.push(HeaderItem { selected_plate: all[pick].1 == current, ..item(labels[pick].as_str()) });
-                    self.libraries.push(all[pick]);
+            let more = HeaderItem { glyph: Some(plx_ui::icons::Icon::More), value_only: true,
+                ..item(plx_platform::i18n::msg::browse_library_libraries()) };
+            let more_w = page_header::cluster_width(&[more.clone()], measure);
+            // Reserve a current-library slot whenever the roster can require one. The same
+            // reservation applies while a favorite is selected, so a visit never shifts or
+            // displaces the favorite shortcuts. Shared measurement/elision bounds every label.
+            let visit_slot = all.len() > 2 || directory.sections().iter().any(|section|
+                section.kind == directory.sections()[current].kind && !section.row.pinned);
+            let slots = if visit_slot { 3.0 } else { 2.0 };
+            let name_budget = ((budget - more_w - slots * page_header::GAP) / slots).max(0.0);
+            let label = |section, room| {
+                let (title, owner) = self.library_name(section, cx);
+                fit_name(title, owner, room, measure)
+            };
+            let labels: Vec<String> = all.iter().map(|(_, section)| label(*section, name_budget)).collect();
+            let widths: Vec<f32> = labels.iter().map(|label|
+                page_header::cluster_width(&[item(label.as_str())], measure)).collect();
+            let reserve = if visit_slot { name_budget + page_header::GAP } else { 0.0 };
+            let picks = pack_names(&widths, 0, budget - reserve, more_w, layout::MAX_LIBRARY_PILLS);
+            let current_room = (budget - names_w(&widths, &picks, Some(more_w)) - page_header::GAP).max(0.0);
+            let current_label = label(current, current_room);
+            self.folded = all.iter().enumerate().filter(|(i, (_, section))|
+                !picks.contains(i) && *section != current)
+                .filter_map(|(_, (_, section))| u32::try_from(*section).ok()).collect();
+            for &pick in &picks {
+                left.push(HeaderItem { selected_plate: all[pick].1 == current, ..item(labels[pick].as_str()) });
+                self.libraries.push(all[pick]);
+            }
+            // The menu belongs to the fixed shortcuts. Keep its opener in that same slot while
+            // the active visit comes and goes beside it.
+            left.push(more);
+            self.libraries.push((MORE, usize::MAX));
+            if !self.libraries.iter().any(|(_, index)| *index == current) {
+                if let Some(sid) = directory.sections()[current].sid {
+                    let elem = self.keys.register(LibraryIdentity::Library(LibrarySectionIdentity {
+                        sid, key: directory.sections()[current].key,
+                    }), LIBRARY_GROUP, self.libraries.len());
+                    left.push(HeaderItem { selected_plate: true, ..item(current_label) });
+                    self.libraries.push((elem, current));
                 }
-                if overflow > 0 { self.libraries.push((MORE, usize::MAX)); }
             }
         }
-
-        let page = PageHeader::new(PageHeaderSpec { left, overflow, right, ..Default::default() }, &widest, measure);
-        let mut layout = page.layout(SCR_W, measure);
-        if self.libraries.is_empty() {
-            // One library: no names, and the three controls sit centred between the nav and the
-            // grid (the board's row top is y 158, ten under the multi-library row's 148).
-            for it in &mut layout.items {
-                it.text.y += layout::SINGLE_LIBRARY_DY;
-                it.plate.y += layout::SINGLE_LIBRARY_DY;
-            }
-        }
+        let page = PageHeader::new(PageHeaderSpec { left, right, ..Default::default() }, &widest, measure);
+        let layout = page.layout(SCR_W, measure);
         self.header_row(page, layout)
     }
 
-    /// The built row: which element each focusable item of `layout` is. The names and "+N" are
+    /// The built row: which element each focusable item of `layout` is. The names and options are
     /// `self.libraries`, the controls are [`Self::toolbar_elems`] (the first focusable right item is
     /// the first control, a read-out before it is no stop), the crumb's root is [`CRUMB_ROOT`] and
     /// its page name, the title, is none.
     fn header_row(&self, page: PageHeader, layout: page_header::HeaderLayout) -> HeaderRow {
         let controls = self.toolbar_elems();
-        let first_control = page.spec().right.iter().position(|it| it.focusable).unwrap_or(0);
         let stops = layout.items.iter().enumerate().filter(|(_, rect)| rect.focusable).filter_map(|(index, rect)| {
             let elem = match rect.slot {
                 Slot::Left(i) => self.libraries.get(i).map(|(elem, _)| *elem),
                 Slot::Overflow => Some(MORE),
-                Slot::Right(i) => i.checked_sub(first_control).and_then(|i| controls.get(i).copied()),
+                // The n-th FOCUSABLE right item is the n-th control: a read-out before them and the
+                // divider among them are no stops.
+                Slot::Right(i) => {
+                    let rank = page.spec().right[..i].iter().filter(|it| it.focusable).count();
+                    controls.get(rank).copied()
+                }
                 Slot::CrumbRoot => Some(CRUMB_ROOT),
                 Slot::CrumbPage => None,
             };
@@ -316,7 +401,7 @@ impl LibraryScreen {
         // to the collections listing, `sorts()` is still the films' list.
         let declared = if self.listed == plx_data::browse::LibraryType::Collections { H::listing(cx).sorts().len() } else { 0 };
         let library = self.view_section(cx).map(|index| self.library_label(index, cx)).unwrap_or_default();
-        let spec = super::collections_page::header_spec(&library, self.kind, declared, &self.sort_value(cx));
+        let spec = super::collections_page::header_spec(&library, self.kind, declared, self.sort_value(cx));
         self.collections_sort = super::collections_page::sort_visible(declared);
         let page = PageHeader::new(spec, &[], cx.measure);
         let layout = page.layout(SCR_W, cx.measure);
@@ -359,15 +444,20 @@ impl LibraryScreen {
         // the control's whole menu-open stretch, during which the engine's focus is on the menu's
         // rows and the row's motion HOLDS.
         let lifted = f.lifted.filter(|key| key.entry == self.entry).map(|key| key.elem);
-        row.draw_with(p, self.scroll.pos, &self.header_capsules, self.header_pop.scale_with(0, f.press.scale), lifted, &self.header_swap);
+        row.draw_with(p, self.scroll.pos, &self.header_capsules, self.header_pop.scale_with(0, f.press), lifted, &self.header_swap);
     }
 
     /// **The opener lift for a header control** (`Screen::redraw_focused`): `elem`, the control a
     /// menu opened from, painted as the focused one above the menu's scrim, where the page pass
     /// left it out. Nothing is drawn for an element that is no stop of this row (a card).
+    ///
+    /// **It paints through the row's swap**, as the page's pass does: a sort picked from the menu
+    /// rebuilds the row on the frame the menu is dismissed, and until the menu is gone this lift is
+    /// the only thing that draws the sort control, so a lift that ignored the swap drew the new
+    /// criterion whole from the first frame and popped when it stood down mid-slide.
     pub(super) fn draw_header_opener<H: LibraryLike>(&self, f: &DrawFrame<'_, '_, H>, elem: u32) {
         let Some(row) = self.header.row() else { return };
         let p = f.painter.alpha(f.page_alpha * self.page_fade.alpha() * self.handoff.clearance(layout::HEADER_Y - self.scroll.pos));
-        row.draw_opener(p, self.scroll.pos, self.header_pop.scale_with(0, f.press.scale), elem);
+        row.draw_opener_with(p, self.scroll.pos, self.header_pop.scale_with(0, f.press), elem, &self.header_swap);
     }
 }

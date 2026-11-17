@@ -21,6 +21,11 @@ fn p8_without_confirmed_dv_support_uses_base_layer() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     for bl_compat in [1, 2, 4] {
         let dovi = Dovi {
@@ -61,6 +66,11 @@ fn p5_without_confirmed_dv_support_requires_video_encode() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     for capability in [
         plx_platform::devcaps::dv::DvCapability::Unknown,
@@ -178,6 +188,11 @@ fn a_profile_5_source_does_not_direct_play_undeclared() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     // the live P5 item's own shape: 3840x1602 hevc, well inside the bound
     assert!(
@@ -221,6 +236,11 @@ fn declaring_dolby_vision_inverts_the_profile_5_refusal() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     let dv = p5().presentation(DECLARED, plx_platform::devcaps::dv::DvCapability::Supported, true);
     assert!(
@@ -271,6 +291,11 @@ fn a_cross_compatible_profile_7_source_direct_plays_as_profile_8() {
         av1_row: (0, 0, 0),
         audio: "eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     for signal in [SILENT, DECLARED] {
         let dv = p7().presentation(signal, Supported, true);
@@ -341,6 +366,11 @@ fn profile_8_and_plain_files_are_unaffected() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     for signal in [SILENT, DECLARED] {
         assert!(
@@ -492,6 +522,11 @@ fn the_direct_play_gate_and_the_payload_node_can_never_disagree() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     for capability in [
         plx_platform::devcaps::dv::DvCapability::Unknown,
@@ -574,6 +609,7 @@ fn the_preview_calls_a_profile_5_item_a_conversion() {
     let part = "/library/parts/1/2/movie.mp4";
     assert_eq!(
         playback_preview_of(
+            &plx_platform::devcaps::caps(),
             part,
             "hevc",
             1920,
@@ -588,6 +624,7 @@ fn the_preview_calls_a_profile_5_item_a_conversion() {
     // reading the new field and not something else that happens to differ
     assert_eq!(
         playback_preview_of(
+            &plx_platform::devcaps::caps(),
             part,
             "hevc",
             1920,
@@ -599,6 +636,7 @@ fn the_preview_calls_a_profile_5_item_a_conversion() {
     );
     assert_eq!(
         playback_preview_of(
+            &plx_platform::devcaps::caps(),
             part,
             "hevc",
             1920,
@@ -612,6 +650,7 @@ fn the_preview_calls_a_profile_5_item_a_conversion() {
     // route no longer performs — the preview reads the same predicate the gate does
     assert_eq!(
         playback_preview_of(
+            &plx_platform::devcaps::caps(),
             part,
             "hevc",
             1920,
@@ -642,6 +681,11 @@ fn a_source_beyond_the_device_bound_does_not_direct_play() {
         av1_row: (0, 0, 0),
         audio: "aac,ac3,eac3".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     // the codec agrees; the frame size must still refuse — on either codec
     assert!(!video_direct_plays(
@@ -692,6 +736,11 @@ fn unknown_dimensions_fail_open_and_the_codec_half_still_gates() {
         av1_row: (0, 0, 0),
         audio: "aac".into(),
         audio_channels: Default::default(),
+        native_ceiling: Default::default(),
+        video_ceiling: Default::default(),
+        app_lossy: plx_platform::devcaps::AppLossy::Off,
+        app_lossy_in_force: Default::default(),
+        dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
     };
     assert!(video_direct_plays(
         "h264",
@@ -750,6 +799,52 @@ fn decision_copies_video_follows_the_lane_then_the_contract() {
     }
 }
 
+/// **`decision_lanes` is each lane's own word and never the contract.** The recovery ladder's proof
+/// rule reads it, so a body that states nothing is `Unstated` on both lanes (where
+/// [`decision_copies_video`] would follow the contract), and `copy`, `transcode` and `directplay`
+/// map to their lanes; the FIRST stream of each type speaks for its lane.
+#[test]
+fn decision_lanes_reads_each_lane_and_never_the_contract() {
+    use crate::player::recovery::{Lane, Lanes};
+    let body = |streams: &str| -> plx_plex::plex::MediaContainer {
+        serde_json::from_str(&format!(
+            r#"{{"Metadata":[{{"Media":[{{"Part":[{{"decision":"transcode","Stream":{streams}}}]}}]}}]}}"#
+        ))
+        .expect("a decision body")
+    };
+    let lanes = |video, audio| Lanes { video, audio };
+    let silent = lanes(Lane::Unstated, Lane::Unstated);
+    let nothing: plx_plex::plex::MediaContainer = serde_json::from_str("{}").expect("an empty body");
+    assert_eq!(decision_lanes(&nothing), silent, "no Metadata");
+    assert_eq!(decision_lanes(&body("[]")), silent, "no streams");
+    assert_eq!(decision_lanes(&body(r#"[{"streamType":1},{"streamType":2}]"#)), silent, "lanes without a decision");
+    assert_eq!(
+        decision_lanes(&body(r#"[{"streamType":1,"decision":""},{"streamType":2,"decision":"ignore"}]"#)),
+        silent,
+        "an empty or unknown word states nothing"
+    );
+    for (video, audio, want) in [
+        ("copy", "transcode", lanes(Lane::Copy, Lane::Transcode)),
+        ("directplay", "copy", lanes(Lane::DirectPlay, Lane::Copy)),
+        ("transcode", "directplay", lanes(Lane::Transcode, Lane::DirectPlay)),
+    ] {
+        let streams = format!(r#"[{{"streamType":1,"decision":"{video}"}},{{"streamType":2,"decision":"{audio}"}}]"#);
+        assert_eq!(decision_lanes(&body(&streams)), want, "{video} / {audio}");
+    }
+    assert_eq!(
+        decision_lanes(&body(r#"[{"streamType":2,"decision":"copy"}]"#)),
+        lanes(Lane::Unstated, Lane::Copy),
+        "a lane with no stream is unstated beside one that speaks"
+    );
+    assert_eq!(
+        decision_lanes(&body(
+            r#"[{"streamType":1,"decision":"copy"},{"streamType":1,"decision":"transcode"},{"streamType":2,"decision":"transcode"},{"streamType":2,"decision":"copy"}]"#
+        )),
+        lanes(Lane::Copy, Lane::Transcode),
+        "the first stream of each type speaks for its lane"
+    );
+}
+
 /// The one rule every server-built route asks: the file's declaration rides a COPY of a usable
 /// base layer, and nothing else. A missing `/decision` follows the contract, so a burn re-encode
 /// whose decision failed never declares Dolby Vision over a stream the server re-encoded.
@@ -774,4 +869,152 @@ fn copied_video_dv_declares_only_a_copy_of_a_usable_base_layer() {
         "a burn re-encode with no decision body must not declare (prepare_original_remux used to assume remux=true)",
     );
     assert_eq!(copied_video_dv(None, &contract(true, true), src.0, src.1), none);
+}
+
+/// The decision a route freezes stores the SET's answer as its `capability` and applies the
+/// profile's Dolby Vision setting to the `presentation` only. Diagnostics and the `dv:` log lines
+/// print that capability, so an Off profile on a Supported set must not read `unsupported`: a
+/// quoted line has to tell it from a failed probe and from a set without Dolby Vision.
+#[test]
+fn off_on_a_supported_set_keeps_the_probe_answer_and_plays_the_base_layer() {
+    use plx_plex::plex::session::DolbyVisionMode;
+
+    let off = frozen_dv_decision(DolbyVisionMode::Off, DvCapability::Supported, p8(), "hevc");
+    assert_eq!(off.capability, DvCapability::Supported, "the probe's answer, whatever the setting");
+    assert_eq!(off.presentation, DvPresentation::NotDv, "Off plays the base layer");
+
+    let auto = frozen_dv_decision(DolbyVisionMode::Auto, DvCapability::Supported, p8(), "hevc");
+    assert_eq!(auto.capability, DvCapability::Supported);
+    assert!(auto.presentation.declared().is_some(), "Auto trusts the probe and declares");
+
+    for probed in [DvCapability::Unknown, DvCapability::Unsupported, DvCapability::Supported] {
+        for mode in DolbyVisionMode::LADDER {
+            assert_eq!(
+                frozen_dv_decision(mode, probed, p8(), "hevc").capability,
+                probed,
+                "{mode:?} must not rewrite what the set said",
+            );
+        }
+        // Off derives its presentation as an unsupported set would, on every answer the set gave.
+        assert_eq!(
+            frozen_dv_decision(DolbyVisionMode::Off, probed, p5(), "hevc").presentation,
+            frozen_dv_decision(DolbyVisionMode::Auto, DvCapability::Unsupported, p5(), "hevc").presentation,
+            "{probed:?}",
+        );
+    }
+}
+
+// -- withdrawing a declaration mid-play (#1166) --------------------------------------------------
+//
+// On a firmware whose Dolby Vision splitter skips a non-IDR first picture, the player takes the node
+// out of the Load for the rest of the play. The route does it in one function, to exactly what Dolby
+// Vision Off would have planned, so every later Load of the route reads the base layer.
+
+/// A direct play of `dovi` declared on a Supported set, the file's own declaration planted too.
+fn declared_route(dovi: Dovi) -> crate::route::PlaybackSession {
+    use plx_plex::plex::session::DolbyVisionMode;
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    assert!(crate::route::set_stream_declaration_for_test(
+        &mut ps, "hevc", "eac3", 23.976, dovi, false, DvCapability::Supported,
+    ));
+    crate::route::set_source_declaration_for_test(
+        &mut ps,
+        dovi,
+        frozen_dv_decision(DolbyVisionMode::Auto, DvCapability::Supported, dovi, "hevc"),
+    );
+    ps
+}
+
+#[test]
+fn dv_withdraw_p81_leaves_the_base_layer_and_keeps_the_capability() {
+    let mut ps = declared_route(p8());
+    assert!(crate::route::stream_dv_presentation(&ps).declared().is_some(), "the premise: declared");
+    assert!(crate::route::dv_withdrawable(&ps));
+    assert!(crate::route::withdraw_dv_presentation(&mut ps, "test"), "a Profile 8.1 declaration is withdrawn");
+    let now = crate::route::stream_dv_decision(&ps);
+    assert_eq!(crate::route::stream_dv_presentation(&ps), DvPresentation::NotDv);
+    assert_eq!(now.capability, DvCapability::Supported, "the probe's answer is kept, so Diagnostics still says supported");
+    // The file's own declaration follows, so a rebuild that re-derives a copied stream's declaration keeps it off.
+    let (src_dovi, src) = crate::route::source_dv_for_test(&ps);
+    assert_eq!(src_dovi, p8(), "the raw record is not rewritten");
+    assert_eq!(src.presentation, DvPresentation::NotDv);
+    assert_eq!(src.capability, DvCapability::Supported);
+}
+
+#[test]
+fn dv_withdraw_refuses_profile_5() {
+    // Dolby Vision Off would REFUSE a Profile 5 (no usable base layer), so there is nothing to fall back to.
+    let mut ps = declared_route(p5());
+    let before = crate::route::stream_dv_decision(&ps);
+    assert!(before.presentation.declared().is_some(), "the premise: a Profile 5 is declared on a supported set");
+    assert!(!crate::route::dv_withdrawable(&ps));
+    assert!(!crate::route::withdraw_dv_presentation(&mut ps, "test"));
+    assert_eq!(crate::route::stream_dv_decision(&ps), before, "nothing was rewritten");
+}
+
+#[test]
+fn dv_withdraw_twice_is_a_no_op() {
+    let mut ps = declared_route(p8());
+    assert!(crate::route::withdraw_dv_presentation(&mut ps, "first"));
+    let after = crate::route::stream_dv_decision(&ps);
+    assert!(!crate::route::dv_withdrawable(&ps), "no node is left to withdraw");
+    assert!(!crate::route::withdraw_dv_presentation(&mut ps, "second"));
+    assert_eq!(crate::route::stream_dv_decision(&ps), after);
+    // A route that never declared anything has nothing to withdraw either.
+    let mut idle = crate::route::PlaybackSession::IDLE;
+    assert!(!crate::route::dv_withdrawable(&idle) && !crate::route::withdraw_dv_presentation(&mut idle, "none"));
+}
+
+#[test]
+fn dv_withdraw_then_a_copied_rebuild_declares_nothing() {
+    let mut ps = declared_route(p8());
+    assert!(crate::route::withdraw_dv_presentation(&mut ps, "test"));
+    let (src_dovi, src_decision) = crate::route::source_dv_for_test(&ps);
+    let copy = decision_body(Some("copy"));
+    // An audio switch, a seek or an Original recovery that copies the video hands the source's
+    // declaration on again: it must be the withdrawn one.
+    let (dovi, decision) = copied_video_dv(Some(&copy), &contract(true, false), src_dovi, src_decision);
+    assert_eq!(dovi, p8(), "the copy still carries the DOVI record");
+    assert!(decision.presentation.declared().is_none(), "but declares no node: {decision:?}");
+}
+
+#[test]
+fn dv_withdraw_downgrades_the_stored_original_candidate_too() {
+    use plx_plex::plex::session::DolbyVisionMode;
+    // The stored Auto Original candidate is installed verbatim when a play that fell to HLS (or to a
+    // fixed rung, or an enhanced remux) goes back to Original: if it still declared the node, the
+    // withdrawn play would send it again and meet the same landing.
+    let declared = frozen_dv_decision(DolbyVisionMode::Auto, DvCapability::Supported, p8(), "hevc");
+    let mut ps = declared_route(p8());
+    assert!(crate::route::auto_original_dv_for_test(&ps).is_none(), "the premise: nothing stored yet");
+    crate::route::set_auto_original_dv_for_test(&mut ps, p8(), declared);
+    assert!(
+        crate::route::auto_original_dv_for_test(&ps).unwrap().1.presentation.declared().is_some(),
+        "the premise: the candidate declares the node"
+    );
+    assert!(crate::route::withdraw_dv_presentation(&mut ps, "test"));
+    let (dovi, now) = crate::route::auto_original_dv_for_test(&ps).expect("the candidate is kept, not dropped");
+    assert_eq!(dovi, p8(), "the raw record is not rewritten");
+    assert_eq!(now.presentation, DvPresentation::NotDv, "the way back declares no node: {now:?}");
+    assert_eq!(now.capability, DvCapability::Supported, "the probe's answer is kept");
+
+    // A refused withdrawal (Profile 5: no base layer to fall back to) leaves the candidate as it was.
+    let p5_declared = frozen_dv_decision(DolbyVisionMode::Auto, DvCapability::Supported, p5(), "hevc");
+    let mut ps = declared_route(p5());
+    crate::route::set_auto_original_dv_for_test(&mut ps, p5(), p5_declared);
+    assert!(!crate::route::withdraw_dv_presentation(&mut ps, "test"));
+    assert_eq!(crate::route::auto_original_dv_for_test(&ps).unwrap().1, p5_declared);
+}
+
+#[test]
+fn dv_withdraw_first_picture_reads_the_attempt_caps() {
+    use plx_platform::devcaps::{apply_exclusions, Caps, DvFirstPicture, EXCLUSIONS};
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    assert_eq!(crate::route::dv_first_picture(&ps), DvFirstPicture::AnyIrap, "no attempt: the assumed value");
+    let mut c = Caps::assumed();
+    apply_exclusions(&mut c, "jhericurl-jervisbay", false, EXCLUSIONS);
+    crate::route::begin_attempt_for_test(&mut ps, std::sync::Arc::new(c));
+    assert_eq!(crate::route::dv_first_picture(&ps), DvFirstPicture::IdrOnly, "the attempt's row, not a global");
+    crate::route::begin_attempt_for_test(&mut ps, std::sync::Arc::new(Caps::assumed()));
+    assert_eq!(crate::route::dv_first_picture(&ps), DvFirstPicture::AnyIrap, "a new attempt starts from its own value");
 }

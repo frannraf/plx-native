@@ -120,7 +120,10 @@ impl std::fmt::Debug for CloudAuth {
 impl CloudAuth {
     /// MAIN THREAD. `None` with no plex.tv identity (signed out, a managed profile with no token).
     pub fn capture() -> Option<CloudAuth> {
-        crate::watchlist::WatchlistAuth::capture().map(|a| CloudAuth { client_id: a.client_id, credential: a.credential })
+        let profile = plx_plex::plex::session::current_snapshot();
+        let credential = profile.user.as_ref().and_then(plx_plex::plex::session::plex_tv_credential)?;
+        let client_id = plx_plex::plex::session::peek().client_id.clone();
+        (!client_id.is_empty()).then_some(CloudAuth { client_id, credential })
     }
     pub fn client(&self) -> plx_plex::plex::account::AccountClient {
         plx_plex::plex::account::AccountClient::new(&self.client_id, Some(&self.credential))

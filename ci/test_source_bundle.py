@@ -5,6 +5,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -207,6 +208,18 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_fonts.c'):
             self.check()
         self.contents['src/ass_fonts.c'] = b'fixture', 0o644
+        self.refresh()
+        self.check()
+
+    def test_the_ui_text_source_is_required_when_the_recipe_compiles_it(self):
+        self.test_ass_source_requires_every_static_dependency()
+        for name in ['ci/build-libass.sh', 'ci/deps.py', 'include/ass.h', 'src/ass.c']:
+            self.contents[name] = b'fixture recipe', 0o644
+        self.contents['ci/build-libass.py'] = b"str(ROOT / 'src/ass_text.c')\n", 0o644
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_text.c'):
+            self.check()
+        self.contents['src/ass_text.c'] = b'fixture', 0o644
         self.refresh()
         self.check()
 
@@ -549,6 +562,19 @@ class RepositoryTreeScan(unittest.TestCase):
                 failures.append(str(error))
         self.assertGreater(count, 100)
         self.assertEqual(failures, [])
+
+    def test_vendored_sample_exemptions_name_crates_the_lock_pins(self):
+        """An exemption for a vendored crate the lock no longer holds is a dead hole in the scan.
+
+        (The converse, a crate with a sample key that has no entry yet, shows only when the release
+        step vendors the lock; nightly.yml's pull-request dry run is the first place that runs.)
+        """
+        from source_bundle import PUBLIC_SAMPLE_FILES
+        lock = (Path(__file__).resolve().parents[1] / 'rust-modules/Cargo.lock').read_text()
+        pinned = set(re.findall(r'^name = "([^"]+)"$', lock, re.M))
+        vendored = {name.split('/')[1] for name in PUBLIC_SAMPLE_FILES if name.startswith('cargo-vendor/')}
+        self.assertIn('ed25519-compact', vendored)
+        self.assertEqual(sorted(vendored - pinned), [])
 
 
 if __name__ == '__main__':

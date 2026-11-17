@@ -8,7 +8,7 @@ use crate::label::{HAlign, Label, VAlign};
 use crate::text_view::TextView;
 use crate::theme;
 use crate::tile::{TileFacts, TileKind};
-use crate::{Env, Painter, Rect, Spring, View};
+use crate::{Env, GroundInk, Painter, Rect, Spring, View};
 use plx_gfx::text::{InkClip, InkShape, Keep};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -337,6 +337,10 @@ pub fn warm_tex_on(
 /// Source art for a [`card`]: a catalog poster (resolved 250×375, dark gradient skeleton), any
 /// keyed thumbnail at an explicit resolution (flat placeholder skeleton), or a person's headshot
 /// (the same thumbnail, but its EMPTY case draws a person glyph rather than a blank tile).
+///
+/// `Copy`: it is borrowed values all through (a tile's facts, a path, a size), so a caller that
+/// asks for a tile's art ahead of drawing it ([`lead_card_art`]) and draws it later holds it twice.
+#[derive(Clone, Copy)]
 pub enum Art<'a> {
     /// The facts a poster tile reads of its catalog row — see [`TileFacts`], which the caller (a
     /// screen) fills from the row; the library never names the row's own type.
@@ -371,6 +375,12 @@ pub enum Art<'a> {
 }
 
 impl Art<'_> {
+    /// A credential-free PNG whose filename is its SHA-256. Resolved by the shared image cache,
+    /// never through a media server; the source verifies both network responses and disk hits.
+    pub fn content_png(url: &str) -> Art<'_> {
+        Art::Thumb { sid: crate::tex::CONTENT_SOURCE, key: url, res: (1920, 1080) }
+    }
+
     fn motion_identity(&self) -> Option<crate::card_motion::Identity> {
         use std::hash::{Hash, Hasher};
         let (owner, sid, key, kind) = match self {
@@ -386,6 +396,161 @@ impl Art<'_> {
     }
 }
 
+/// A display-only cycle of equivalent, content-addressed PNGs. The owner supplies the frames
+/// and Tick time; image requests still use the shared card source. Holds are quiet, hidden
+/// owners pause, and a slow next image never replaces the current picture with a skeleton.
+#[derive(Default)]
+pub struct ArtCycle {
+    frames: Vec<String>,
+    current: usize,
+    clock: plx_machine::motion::Ramp,
+    mix: f32,
+    fading: bool,
+    ready: std::cell::Cell<bool>,
+}
+
+impl ArtCycle {
+    const HOLD_MS: u32 = 6000;
+    const FADE_MS: u32 = 1200;
+
+    /// Return discrete resource replacement for the owner's typed UI effect.
+    pub fn set_frames(&mut self, frames: &[&str]) -> bool {
+        let mut unique = Vec::new();
+        for frame in frames {
+            if !unique.contains(frame) { unique.push(*frame); }
+        }
+        if self.frames.iter().map(String::as_str).eq(unique.iter().copied()) { return false; }
+        self.frames = unique.into_iter().map(str::to_owned).collect();
+        self.current = 0;
+        self.clock = plx_machine::motion::Ramp::default();
+        self.mix = 0.0;
+        self.fading = false;
+        self.ready.set(false);
+        // Resource replacement is landed by the owning UI/result boundary.
+        true
+    }
+
+    pub fn is_empty(&self) -> bool { self.frames.is_empty() }
+
+    /// Pause at the lifecycle event itself; no ticks are required while suspended.
+    pub fn pause(&mut self, t: plx_machine::machine::Tick) { self.clock.pause(t); }
+
+    pub fn tick(&mut self, t: plx_machine::machine::Tick, active: bool,
+        present: &mut plx_machine::machine::PresentHandle<'_>) {
+        if !active || self.frames.len() < 2 || !self.ready.get() {
+            self.clock.pause(t);
+            return;
+        }
+        self.clock.resume(t);
+        if self.clock.len_ms == 0 { self.clock.start(t, Self::HOLD_MS); }
+        if !self.fading {
+            if self.clock.sample(t) < 1.0 { return; }
+            self.fading = true;
+            self.clock.start(t, Self::FADE_MS);
+        }
+        self.mix = self.clock.advance(t, present);
+        if self.mix >= 1.0 {
+            self.current = (self.current + 1) % self.frames.len();
+            self.clock = plx_machine::motion::Ramp::default();
+            self.mix = 0.0;
+            self.fading = false;
+            self.ready.set(false);
+            present.note(plx_machine::present::PresentEvent::Motion);
+        }
+    }
+
+    pub fn draw(&self, p: Painter, r: Rect, radius: f32) {
+        let Some(url) = self.frames.get(self.current) else { return };
+        let art = Art::content_png(url);
+        if p.is_recording() {
+            card(p, r, art, radius, false, 1.0, 0.0);
+            return;
+        }
+        let image = resolve_card_art(p, r, &art);
+        let next_url = &self.frames[(self.current + 1) % self.frames.len()];
+        let next_art = Art::content_png(next_url);
+        let next = if self.frames.len() > 1 { resolve_card_art(p, r, &next_art) } else { image };
+        let ready = image.tex != 0 && next.tex != 0 && image.w == next.w && image.h == next.h;
+        self.ready.set(ready);
+        if self.fading && ready && p.tex_carded_blend(image.tex, next.tex,
+            crate::xfade::smooth(self.mix), art_uv(&art, image.w, image.h, r), r, radius) { return; }
+        card_named_led(p, r, art, None, radius, false, 1.0, 0.0, Some(image));
+    }
+}
+
+#[cfg(test)]
+mod art_cycle_tests {
+    use super::ArtCycle;
+    use plx_machine::machine::{PresentHandle, Tick};
+    use plx_machine::present::Present;
+
+    fn tick(ms: u32) -> Tick { Tick { ms, dt_us: 16_000 } }
+
+    fn presented(present: &mut Present) -> bool {
+        let admitted = present.take(0);
+        if admitted { present.acknowledge(0); }
+        admitted
+    }
+
+    #[test]
+    fn equivalent_frames_cycle_without_changing_the_owners_scene() {
+        let _g = plx_base::testlock::serial();
+        let mut cycle = ArtCycle::default();
+        let mut present = Present::new();
+        cycle.set_frames(&["coast", "painted", "city"]);
+        cycle.ready.set(true);
+        let _ = presented(&mut present);
+        cycle.tick(tick(16), true, &mut PresentHandle(&mut present));
+        cycle.tick(tick(5000), true, &mut PresentHandle(&mut present));
+        assert_eq!(cycle.current, 0);
+        assert!(!cycle.fading);
+        assert!(!presented(&mut present), "the hold must not redraw at 60 FPS");
+        cycle.tick(tick(6000), true, &mut PresentHandle(&mut present));
+        assert!(cycle.fading);
+        assert!(presented(&mut present), "the first fade frame must wake the idle gate");
+        for frame in 1..60 {
+            cycle.tick(tick(6000 + frame * 16), true, &mut PresentHandle(&mut present));
+            assert!(presented(&mut present), "every overlapping frame must be presented");
+        }
+        cycle.tick(tick(7300), true, &mut PresentHandle(&mut present));
+        assert_eq!(cycle.current, 1);
+        assert!(!cycle.fading);
+        assert!(presented(&mut present), "the final frame must be presented too");
+        cycle.ready.set(true);
+        cycle.tick(tick(7316), true, &mut PresentHandle(&mut present));
+        assert!(!presented(&mut present));
+    }
+
+    #[test]
+    fn slow_images_hidden_owners_and_single_frames_never_animate() {
+        let _g = plx_base::testlock::serial();
+        let mut cycle = ArtCycle::default();
+        let mut present = Present::new();
+        cycle.set_frames(&["one", "two"]);
+        let _ = presented(&mut present);
+        cycle.tick(tick(1000), true, &mut PresentHandle(&mut present));
+        assert_eq!(cycle.clock.len_ms, 0);
+        assert!(!presented(&mut present));
+        cycle.ready.set(true);
+        cycle.tick(tick(1016), true, &mut PresentHandle(&mut present));
+        cycle.pause(tick(1100));
+        cycle.tick(tick(20000), false, &mut PresentHandle(&mut present));
+        cycle.tick(tick(21000), true, &mut PresentHandle(&mut present));
+        assert!(!cycle.fading, "suspension must not consume the hold");
+        assert!(!presented(&mut present));
+        cycle.set_frames(&["one", "one"]);
+        let _ = presented(&mut present);
+        cycle.ready.set(true);
+        cycle.tick(tick(100000), true, &mut PresentHandle(&mut present));
+        assert_eq!(cycle.frames.len(), 1);
+        assert!(!presented(&mut present));
+        cycle.set_frames(&["two", "three"]);
+        assert_eq!(cycle.current, 0);
+        assert_eq!(cycle.clock.len_ms, 0);
+        assert!(!cycle.ready.get(), "a new pack cannot inherit readiness");
+    }
+}
+
 /// The one art-tile draw op. Resolves `art` to a texture (or a dark skeleton) and draws it at `frame`,
 /// scaled about its centre when `focused`. Textured tiles share the CARD COMPOSITE
 /// ([`Painter::tex_carded`], with [`Painter::tex_carded_still`] folding a still's label ground):
@@ -394,7 +559,7 @@ impl Art<'_> {
 /// `f` (the shelves compute it from their per-cell spring; the episode/chapters strips from `scale`).
 /// The size a landscape still is transcoded at — [`crate::card_row::RowStyle::EPISODE`]'s tile,
 /// so the server scales once and the texture is 1:1 on the panel.
-const STILL_RES: (c_int, c_int) = (420, 236);
+pub const STILL_RES: (c_int, c_int) = (420, 236);
 /// The box a portrait poster card asks the transcoder for. The collection fan baker requests its
 /// members at this box too, so a member already fetched for a card is a disk hit, not a refetch.
 pub const POSTER_RES: (c_int, c_int) = (250, 375);
@@ -408,7 +573,14 @@ pub const POSTER_RES: (c_int, c_int) = (250, 375);
 /// whole tile exists to replace. Falling back to it at all is still right for the last resort: a
 /// poster, cover-cropped to the tile ([`art_uv`]), answers "which show" even when it cannot answer
 /// "which episode".
+///
+/// **A facts value that opted in to the deck card's artwork** ([`TileFacts::deck`] is `Some`) is
+/// walked by [`crate::card_art::pick`] instead: Plex's cover, our composite, then the Type rung's
+/// plain art in the deck order. The chain above is what every other card draws, unchanged.
 pub fn still_key<'a>(m: &TileFacts<'a>) -> &'a str {
+    if let Some(art) = crate::card_art::pick(m, &crate::card_art::TexProbe) {
+        return art.path;
+    }
     if !m.still.is_empty() {
         m.still
     } else if !m.thumb.is_empty() {
@@ -424,98 +596,55 @@ pub fn still_key<'a>(m: &TileFacts<'a>) -> &'a str {
     }
 }
 
-/// **The state label a landscape STILL wears on its scrim** — up to TWO lines, drawn directly on
-/// the artwork with no capsule behind it. Draw [`art_scrim`] first; that is what makes text on a
-/// picture safe.
+/// **The two-line state label a landscape STILL wears on its scrim** — the SHELF shape: up to TWO
+/// lines, drawn directly on the artwork with no capsule behind it. Draw [`art_scrim`] first; that is
+/// what makes text on a picture safe.
 ///
 /// `label` is the upper line (`size::LABEL` bold, primary) and `sub` the lower one
-/// (`size::CAPTION`, `TEXT_SECONDARY`) with the action glyph at its head. **The hierarchy is size
+/// (`size::CAPTION`, `TEXT_SECONDARY`), with the watched tick at its head. **The hierarchy is size
 /// and ink rather than position**, which is what makes the pair read as one label instead of two
 /// things — `Library Screens.dc.html` E, revised 2026-09-05, and secondary rather than tertiary
 /// because 24px at ten feet needs the contrast.
 ///
-/// An empty `label` collapses the pair to the sub line alone, which is not a degenerate case but
-/// the detail filmstrip's own shape: it is inside one season of one show, in order, under the
-/// show's name in 72px type, so it has nothing to disambiguate and prints only its runtime.
+/// An empty `label` collapses the pair to the sub line alone.
 ///
-/// `has_bar` lifts the whole block from 14px off the bottom to 22 so a resume bar keeps its own
-/// band clear. It is a parameter and not a look at the item, because [`still_overlay`] is the one
-/// place that knows whether a bar is about to be drawn.
+/// `has_bar` lifts the whole block from 14px off the bottom to 22 so a full-bleed resume bar keeps
+/// its own band clear. It is a parameter and not a look at the item, because [`still_overlay`] is the
+/// one place that knows whether a bar is about to be drawn.
 ///
-/// It was `detail::ep_state_line`, private to the episode filmstrip, until the Library grew a shelf
-/// of the same object. Promoted rather than copied — `ui/CLAUDE.md`'s improve-don't-fork rule, and
-/// the same reasoning that made the resume bar `card_row::resume_bar`'s: two screens drawing "how
-/// far into this am I" as two different objects is exactly the drift this system exists to kill.
-///
-/// **The callers pass different LABELS by SURFACE and that is the design, not drift** — name the
-/// rule rather than counting them, because the count has already gone stale once. The detail
-/// filmstrip's line carries the runtime (`▶ 48 min`), because on a page that already names the show
-/// in 72px type the missing fact is how long the episode is. Every SHELF surface — the Library's
-/// episode shelves and Search's episode tiles — carries the SHOW NAME instead, because there a
-/// still is the one tile in the app with no title of its own: a poster prints its show's name inside
-/// the artwork, so the still must too, or the shelf is a row of anonymous frames of television
-/// (`Library Screens.dc.html` E).
+/// **Who draws this shape and who draws the one-line footer** ([`crate::still_footer`]): this pair is
+/// what every SHELF surface wears, because there a still is the one tile in the app with no title of
+/// its own — the Library's episode shelves and Search's episode tiles carry the SHOW NAME above the
+/// episode's address (`Library Screens.dc.html` E). The Continue Watching deck and the detail page's
+/// episode strip wear the one-line footer instead; [`StillFooter`] is how [`still_overlay`] chooses.
+/// A shelf's tile NAVIGATES to the episode, so it draws no play indicator at all, and no still
+/// anywhere draws the amber triangle any more (nobody read it as "playback starts"): the cue that
+/// OK plays is the footer's white play glyph on the focused Continue Watching card.
 ///
 /// `card` is the rect actually DRAWN — the scaled one while the tile is popped — so the line rides
 /// the focus pop without resizing.
 ///
-/// **`press_plays` is the whole of the app's play-indicator rule, at this one draw**, and
-/// [`still_glyph`] is the rule itself: the amber ▶ is a PROMISE — this press starts the video — so
-/// it is drawn on a surface whose press does that and on no other. The detail page's episode
-/// filmstrip always plays, and a Continue Watching deck plays only while the Playback setting says
-/// OK plays it (`DeckPress::Play`; by default OK opens the page and the deck draws no triangle,
-/// so its caller passes `press_plays = false`); a discovery shelf ("Recently Released Episodes", "Recently
-/// Added…") and a Search result NAVIGATE to the episode, so they draw no triangle and the line is
-/// the show's name alone.
-///
-/// The other two marks are not promises. `✓` is a STATE — this episode is finished — and the resume
-/// BAR is a fact about how far in you are, drawn wherever there is progress to report, on a shelf
-/// that plays and a shelf that does not: hiding it would hide something true, and it was never the
-/// thing that read as "this will play". The triangle beside it was. Which is exactly why the bar
-/// cannot stand IN for the triangle either — see [`still_glyph`] for the cell where it tried to.
-/// The leading glyph on a [`still_line`], as a pure decision — one slot, two things that want it.
-///
-/// Both are plain masks in ONE box, and the tick takes the line's own ink rather than a hue:
-/// a watched line is a statement about the past while an unstarted one is an invitation, and only
-/// the invitation earns the amber.
-///
-/// **The ACTION wins the slot when there is one**, which is the rule the owner asked for on
-/// 2026-09-05 stated as a biconditional: *a play indicator means the press plays, a progress bar
-/// means progress, and a card with no play indicator navigates.* This function used to hand the
-/// slot to `PosterMark` first and consult `press_plays` only in the `None` arm — so an IN-PROGRESS
-/// tile drew no glyph at all, and on a shelf that plays (the Library's Continue Watching deck,
-/// where nearly every tile is in progress) that is a card announcing nothing and then playing. The
-/// resume bar under it is not the announcement: that bar is drawn on shelves that navigate too,
-/// which is exactly the conflation being removed.
-///
-/// **`Watched` is the one exception and it is bounded rather than forgotten.** The tick is the only
-/// carrier of "you have seen this" — the bar is absent by definition and the dimmed run is a hint,
-/// not a statement — so it keeps the slot even where the press plays. The residual is a watched
-/// tile on a playing shelf showing no ▶, and it is reachable on exactly one surface: the detail /
-/// season episode filmstrip, where EVERY row plays and no navigating card is drawn beside it, so
-/// there is no pair for a viewer to confuse. On the surface that does mix the two kinds — the
-/// Library, deck shelf above discovery shelf — a watched item in Continue Watching is not a state
-/// the server produces.
-fn still_glyph(mark: PosterMark, press_plays: bool) -> Option<(crate::icons::Icon, [f32; 4])> {
+/// **The watched tick is a STATE, not a promise**: this episode is finished. The resume BAR is a fact
+/// about how far in you are, drawn wherever there is progress to report.
+fn still_glyph(mark: PosterMark) -> Option<(crate::icons::Icon, [f32; 4])> {
     match mark {
-        // the bounded exception, above the action: see the note above
         PosterMark::Watched => Some((crate::icons::Icon::Check, theme::TEXT_SECONDARY)),
-        // the invitation, wherever the press accepts it — progress does not withdraw it
-        _ if press_plays => Some((crate::icons::Icon::Play, theme::RESUME_FILL)),
         PosterMark::None | PosterMark::InProgress => None,
     }
 }
 
-pub fn still_line(
+/// **The label stack of a still's line**: the show's name (`size::LABEL`, bold, primary, elided to
+/// the tile's own right inset) standing one pair gap above the line whose cap band ends at `bottom`.
+/// Returns the TEXT ORIGIN y of the line under it (its cap band's top less `sct`), which the caller
+/// draws at. The one placement both [`still_line`] and [`crate::still_footer::draw_footer`] use, so
+/// the show's name sits the same distance over either line.
+pub(crate) fn still_label_over(
     p: Painter,
     card: Rect,
-    mark: PosterMark,
     label: &str,
-    sub: &str,
-    press_plays: bool,
-    has_bar: bool,
+    bottom: f32,
     measure: &dyn plx_machine::machine::Measure,
-) {
+) -> f32 {
     // The pair is one bottom-anchored VStack of cap bands, because that is what the two insets are
     // about: the sub line's baseline sits at the tile's own bottom inset and the label stacks above
     // it. The band heights come from the cap bands (a font swap cannot silently close the pair up); a
@@ -526,32 +655,46 @@ pub fn still_line(
     let (lsz, ssz) = (theme::size::LABEL, theme::size::CAPTION);
     let (sct, scb) = plx_gfx::text::text_cap_band(ssz, 0);
     let (lct, lcb) = plx_gfx::text::text_cap_band(lsz, 1);
+    let pair = [
+        if label.is_empty() { HItem::absent() } else { HItem::new(lcb - lct) },
+        HItem::new(scb - sct).before(STILL_PAIR_GAP + 2.0 * sct),
+    ];
+    let pair = VStack::new(&pair, STILL_PAIR_GAP, VAnchor::Bottom(bottom));
+    let sy = pair.span(1).map_or(0.0, |(y, _)| y) - sct;
+    // The SHOW, above: LABEL bold in primary ink, elided to the tile's own right inset.
+    if let Some((y, _)) = pair.span(0) {
+        let x0 = card.x + STILL_LINE_INSET;
+        let run = measure.fit_line(label, card.x + card.w - STILL_LINE_INSET - x0, lsz, true);
+        p.text(run.as_ptr(), x0, y - lct, lsz, theme::TEXT_PRIMARY, 0, 1);
+    }
+    sy
+}
+
+pub fn still_line(
+    p: Painter,
+    card: Rect,
+    mark: PosterMark,
+    label: &str,
+    sub: &str,
+    has_bar: bool,
+    measure: &dyn plx_machine::machine::Measure,
+) {
+    let ssz = theme::size::CAPTION;
+    let (sct, scb) = plx_gfx::text::text_cap_band(ssz, 0);
     let bot = if has_bar {
         STILL_LINE_BOT_BAR
     } else {
         STILL_LINE_BOT
     };
-    let pair = [
-        if label.is_empty() { HItem::absent() } else { HItem::new(lcb - lct) },
-        HItem::new(scb - sct).before(STILL_PAIR_GAP + 2.0 * sct),
-    ];
-    let pair = VStack::new(&pair, STILL_PAIR_GAP, VAnchor::Bottom(card.y + card.h - bot));
-    let sy = pair.span(1).map_or(0.0, |(y, _)| y) - sct;
+    let sy = still_label_over(p, card, label, card.y + card.h - bot, measure);
     let x0 = card.x + STILL_LINE_INSET;
     let right = card.x + card.w - STILL_LINE_INSET;
 
-    // The SHOW, above: LABEL bold in primary ink, elided to the tile's own right inset.
-    if let Some((y, _)) = pair.span(0) {
-        let ly = y - lct;
-        let run = measure.fit_line(label, right - x0, lsz, true);
-        p.text(run.as_ptr(), x0, ly, lsz, theme::TEXT_PRIMARY, 0, 1);
-    }
-
-    // …and the IDENTIFIER under it, with the action glyph at its head. One flow: the glyph stands
+    // …and the IDENTIFIER under it, with the watched tick at its head. One flow: the glyph stands
     // by its INK (so STILL_LINE_GAP is the gap the eye reads, not the gap to the asset's empty
     // margin), and the sub line one gap after it. The sub's own width is not needed to place it.
     let mut flow = crate::hstack::Flow::new(x0, STILL_LINE_GAP);
-    let glyph = still_glyph(mark, press_plays);
+    let glyph = still_glyph(mark);
     let glyph_span =
         flow.push(glyph.map_or(crate::hstack::Item::absent(), |(icon, _)| crate::hstack::Item::glyph(icon, STILL_GLYPH_D)));
     if let (Some((icon, tint)), Some(span)) = (glyph, glyph_span) {
@@ -564,6 +707,21 @@ pub fn still_line(
     let lx = flow.push(crate::hstack::Item::new(0.0)).map_or(x0, |s| s.x);
     let run = measure.fit_line(sub, right - lx, ssz, false);
     p.text(run.as_ptr(), lx, sy, ssz, theme::TEXT_SECONDARY, 0, 0);
+}
+
+/// **Which footer a landscape still wears** ([`still_overlay`]'s choice).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StillFooter {
+    /// The two-line shelf shape ([`still_line`]): the show's name over the episode's address, and a
+    /// full-bleed resume bar. The Library's episode shelves and Search's episode tiles.
+    Shelf,
+    /// The Continue Watching card's one-line footer ([`crate::still_footer`]): `S2 E4 · 38m left`
+    /// and the amber bar, with the focus cue of what OK does — `cue` — opening with the card's focus
+    /// pop `pop` (`cards::Tile::pop`). **It stands BELOW the art** ([`crate::still_footer::Place::Below`]:
+    /// the art above it is clean, four rounded corners, no scrim) and carries no show name: a deck
+    /// card ([`TileFacts::deck`]) has its title in its cover, its composite or, with neither, in type
+    /// ([`crate::card_art::needs_type_title`], drawn by [`still_overlay`]), and the footer never repeats it.
+    Continue { cue: crate::still_footer::Cue, pop: f32 },
 }
 
 /// A landscape still's labels and resume bar. [`Art::Still`] supplies their ground as part of the
@@ -583,18 +741,24 @@ pub fn still_line(
 /// nor to an FPS scene, which never opens the popover. One function is the fix that generalises;
 /// remembering harder is not.
 ///
+/// The bar belongs to the card's own bottom EDGE and goes LAST only for [`StillFooter::Shelf`]; a
+/// [`StillFooter::Continue`] still draws its bar inside its one footer line (`still_footer`).
+///
 /// `rad` is the tile's OWN radius at its current scale (`RowStyle::tile_radius`), not a constant:
 /// `card_row` scales the corner with the focus pop, so a fixed 14 clips the scrim to a different
 /// silhouette than the artwork under it at 1.09.
 ///
 /// The label is the SHOW's name, falling back to the item's own title when the server sent none —
-/// see [`still_line`] for why a shelf surface names the show rather than the episode.
+/// see [`still_line`] for why a shelf surface names the show rather than the episode. **Except on a
+/// card that opted in to the deck's art walk** ([`TileFacts::deck`]): its title is in its art (the
+/// cover, the composite, or in type at the logo slot when neither exists: drawn here, once, by
+/// [`crate::hero_logo::draw_title`]) and both footers carry only the address, the status and the bar.
 pub fn still_overlay(
     p: Painter,
     m: &TileFacts<'_>,
     card: Rect,
     rad: f32,
-    press_plays: bool,
+    footer: StillFooter,
     measure: &dyn plx_machine::machine::Measure,
 ) {
     let show = if m.show_title.is_empty() {
@@ -602,19 +766,69 @@ pub fn still_overlay(
     } else {
         m.show_title
     };
-    let bar = m.resume.map(|r| r.frac);
-    still_line(
-        p,
-        card,
-        poster_mark(m),
-        show,
-        &crate::fmt::episode_address(m.season_index as i64, m.ep_index as i64),
-        press_plays,
-        bar.is_some(),
-        measure,
-    );
-    if let Some(frac) = bar {
-        crate::card_row::resume_bar(p, card, frac, rad);
+    // **A deck card's title is drawn ONCE, and in its art.** Plex's cover and our composite carry
+    // it in the picture; with neither (the Type rung) it is drawn here in type, at the slot a logo
+    // would stand in, and never by a live logo. Either way the footer below carries no title of its
+    // own: only a card that did not opt in (a bare still or poster) keeps the show's name above it.
+    // A Continue card that did not opt in (a frame between a publication and its projection) has
+    // neither a deck's art nor a footer line on the art to hold its name, so the name is set in type
+    // at the same slot, on the scrim that card's art keeps ([`crate::card_art::art_is_clean`]).
+    let label = if m.deck.is_some() { "" } else { show };
+    let continue_without_deck = matches!(footer, StillFooter::Continue { .. }) && m.deck.is_none();
+    if continue_without_deck || crate::card_art::needs_type_title(m, &crate::card_art::TexProbe) {
+        let inset = STILL_LINE_INSET;
+        let band_h = crate::hero_logo::band_h(crate::hero_logo::LogoRung::Card);
+        let slot = Rect::new(card.x + inset, card.y + card.h - theme::logo::CARD_BOTTOM_INSET - band_h, card.w - 2.0 * inset, band_h);
+        crate::hero_logo::draw_title(p, crate::hero_logo::LogoRung::Card, show, slot, crate::label::HAlign::Center, measure);
+    }
+    match footer {
+        StillFooter::Shelf => {
+            let bar = m.resume.map(|r| r.frac);
+            still_line(
+                p,
+                card,
+                poster_mark(m),
+                label,
+                &crate::fmt::episode_address(m.season_index as i64, m.ep_index as i64),
+                bar.is_some(),
+                measure,
+            );
+            if let Some(frac) = bar {
+                crate::card_row::resume_bar(p, card, frac, rad);
+            }
+        }
+        StillFooter::Continue { cue, pop } => {
+            // In progress: the episode tag and the time left, with the bar on the right. A finished
+            // episode keeps the address and the tick. Anything else on a deck card (an on-deck
+            // episode nobody has started) has no time to tell: it wears the SAME tag a started one
+            // does, then the catalogue's "New episode", and no bar (nothing is played yet). An
+            // unstarted card with no address to tag has nothing to say.
+            let tag_of = || crate::fmt::footer_tag(m.season_index as i64, m.ep_index as i64);
+            let (tag, status, right) = match (m.resume, poster_mark(m)) {
+                (Some(r), _) => (
+                    tag_of(),
+                    crate::fmt::footer_left(r.left_ms),
+                    crate::still_footer::Right::Bar(r.frac),
+                ),
+                (None, PosterMark::Watched) => (
+                    String::new(),
+                    crate::fmt::episode_address(m.season_index as i64, m.ep_index as i64),
+                    crate::still_footer::Right::Tick,
+                ),
+                (None, _) => {
+                    let tag = tag_of();
+                    let status = if tag.is_empty() { String::new() } else { plx_platform::i18n::msg::widgets_card_new_episode().to_owned() };
+                    (tag, status, crate::still_footer::Right::None)
+                }
+            };
+            crate::still_footer::draw_footer(
+                p,
+                card,
+                label,
+                &crate::still_footer::Footer { tag: &tag, status: &status, right, cue: Some(cue), focus: pop, place: crate::still_footer::Place::Below },
+                measure,
+            );
+        }
     }
 }
 
@@ -651,7 +865,7 @@ pub fn poster_label(
 /// still a gradient, still full width, still never a pill.
 ///
 /// [`STILL_SCRIM_H_1`] is the one-line band, kept rather than folded into the bigger number: the
-/// detail filmstrip prints its runtime alone, and giving it the pair's gradient would darken a
+/// detail filmstrip's footer shows the length alone for an unstarted episode, and giving it the pair's gradient would darken a
 /// third of every still to clear a line that is not there. [`Art::Still`] chooses the band from
 /// the same show/title fallback as [`still_overlay`].
 pub const STILL_SCRIM_H: f32 = 112.0;
@@ -892,7 +1106,14 @@ pub fn card_named_led(p: Painter, frame: Rect, art: Art, fan_name: Option<&str>,
                 if m.show_title.is_empty() && m.title.is_empty() { STILL_SCRIM_H_1 } else { STILL_SCRIM_H }
             });
             if t != 0 && shown < 1.0 { crate::placeholder::skeleton_under(p, r, rad); }
-            let fused = !tile_glass_armed()
+            // **A deck card's art is clean.** Its footer line stands BELOW the tile
+            // ([`crate::still_footer::Place::Below`], owner's board CW-13 v2), so there is no footer
+            // text on the art for a bottom scrim to keep legible: the picture, four rounded corners,
+            // nothing over it. The exception is a title set in live type on the art (the Type rung,
+            // [`crate::card_art::art_is_clean`]): that keeps the scrim it stood on before.
+            let clean = m.is_some_and(|m| crate::card_art::art_is_clean(&m, &crate::card_art::TexProbe));
+            let fused = !clean
+                && !tile_glass_armed()
                 && pa.tex_carded_still(t, art_uv(&art, tw, th, r), r, rad, f, band, theme::scrim(STILL_SCRIM_A));
             if !fused {
                 if t != 0 {
@@ -904,7 +1125,7 @@ pub fn card_named_led(p: Painter, frame: Rect, art: Art, fan_name: Option<&str>,
                     crate::placeholder::skeleton(p, crate::placeholder::Reason::CardSkeleton,
                         m.map_or("", |m| still_key(&m)), r, rad);
                 }
-                if m.is_some() { still_ground(pa, r, rad, band, STILL_SCRIM_A); }
+                if m.is_some() && !clean { still_ground(pa, r, rad, band, STILL_SCRIM_A); }
             }
             // **No watched DISC.** `Library Screens.dc.html` E: "the watched disc is suppressed
             // whenever a stateLine is present — one mark per tile, and the line is it." Every
@@ -949,11 +1170,21 @@ pub fn card_named_led(p: Painter, frame: Rect, art: Art, fan_name: Option<&str>,
 /// counted. A key behind an unresolved texture is a fetch in flight, and is a placeholder.
 fn person_ground(p: Painter, key: &str, r: Rect, rad: f32) {
     if key.is_empty() {
-        // placeholder-exempt: absence, a person the server has no headshot of; nothing will arrive
-        p.rrect_sheened(r, rad, theme::CARD_ABSENT);
+        absent_card(p, r, rad);
     } else {
         crate::placeholder::ground(p, crate::placeholder::Reason::CardGround, key, r, rad);
     }
+}
+
+/// **A finished poster-shaped face for a title that has NO artwork**, for a caller that knows so
+/// (a picture of "a movie" and "a show" when the cache holds none of one kind): the sheened
+/// never-sentinel [`theme::CARD_ABSENT`] ground, uncounted. It is ABSENCE, not a wait, so it is
+/// never a skeleton (`placeholder`): nothing will arrive, the harness does not hold for it, and it
+/// carries no ring, tick or label. A poster ROW goes through [`card`] instead; its `Art::Poster(None)`
+/// is the skeleton of a card still loading, which this is not.
+pub fn absent_card(p: Painter, r: Rect, rad: f32) {
+    // placeholder-exempt: absence, a title with no artwork anywhere; nothing will arrive
+    p.rrect_sheened(r, rad, theme::CARD_ABSENT);
 }
 
 /// Which state mark a poster wears — the pure half of [`card`]'s corner, split out for exactly the
@@ -1100,8 +1331,8 @@ static VEIL_TEX: AtomicU32 = AtomicU32::new(0);
 /// renderer has no radial gradient, and the two alternatives both fail on this shape: a `grad4` quad
 /// is bilinear and, worse, square — it would spill past the tile's 14px corner ARC onto the shelf at
 /// full strength, exactly where the mark is strongest; and stepping it as N rounded-rect bands (the
-/// `art_scrim` fallback) is what `hero_scrim`'s doc already rejected for a field this wide, at a visible
-/// alpha staircase with `GL_DITHER` off. `Painter::tex` takes a corner radius, so ONE draw of this
+/// `art_scrim` fallback) is what the retired hero wedge's doc rejected for a field this wide, at a
+/// visible alpha staircase with `GL_DITHER` off. `Painter::tex` takes a corner radius, so ONE draw of this
 /// gets the tile's own silhouette for free — the veil's other three corners live in fully
 /// transparent territory, so rounding them changes nothing.
 fn veil_tex() -> std::os::raw::c_uint {
@@ -1277,7 +1508,7 @@ pub const CONTROL_GAP: f32 = 20.0;
 /// same event at the same rate, which is the thing that was actually worth sharing. What still
 /// belongs to `press` is the click, and that is folded in by [`scale`](Self::scale) below.
 ///
-/// [`scale`](Self::scale) folds in [`press::scale`](crate::press::scale) for the PRESSED control. The
+/// [`scale`](Self::scale) folds in the supplied `PressRead` for the PRESSED control. The
 /// dip is a FACTOR on top of the focus scale — that is what makes a press read the same on a 1.07
 /// capsule as on a 1.09 poster. Unlike a card's dip (`cards::press_scale`, which matches
 /// `PressRead::owner`) a row of controls has no element keys, so the pressed control is LATCHED
@@ -1294,7 +1525,7 @@ pub struct CtlPop<const N: usize> {
 /// keys to match `PressRead::owner` against, so the dip latches the FOCUSED index the first time
 /// the press reads off rest and holds it until the press is back at exactly rest: focus moving
 /// away (a direction key abandons the press) then leaves the spring-back on the pressed control.
-/// The latch also remembers WHICH press it was taken for ([`press::arm_id`](crate::press::arm_id)),
+/// The latch also remembers WHICH press it was taken for (`PressRead::identity`),
 /// so a row that was not drawn when the last press returned to rest (the press committed a page or
 /// a popover) or a press armed inside the previous one's spring-back re-latches to the control
 /// holding focus when the new press arms, instead of dipping the old one. A draw-side cache, not
@@ -1304,16 +1535,18 @@ pub struct DipLatch(std::cell::Cell<Option<(u32, usize)>>);
 impl DipLatch {
     /// The dip factor for control `i` given the press scale `press` (`0.0` = no press read) and
     /// the control holding focus (`None` for none).
-    pub fn factor(&self, i: usize, focused: Option<usize>, press: f32) -> f32 {
-        let press = if press > 0.0 { press } else { 1.0 };
-        if press == 1.0 {
+    pub fn factor<K: Copy>(&self, i: usize, focused: Option<usize>, read: plx_machine::machine::PressRead<K>) -> f32 {
+        let press = read.dip();
+        if !read.active {
             self.0.set(None);
             return 1.0;
         }
-        let arm = crate::press::arm_id();
+        let arm = read.identity;
         match self.0.get() {
             Some((a, _)) if a == arm => {}
-            _ => self.0.set(focused.map(|f| (arm, f))),
+            // A cancelled spring may keep its latch, never acquire another row.
+            _ if read.live => self.0.set(focused.map(|f| (arm, f))),
+            _ => self.0.set(None),
         }
         if self.0.get().is_some_and(|(_, l)| l == i) { press } else { 1.0 }
     }
@@ -1356,8 +1589,8 @@ impl<const N: usize> CtlPop<N> {
     /// Control `i`'s drawn scale this frame, press dip included. Out-of-range asks answer 1.0 rather
     /// than panicking: a row whose control COUNT changes with the item (`detail::hero_ctls`) indexes
     /// this by a position that can outrun `N` for a frame while the set is being rebuilt.
-    pub fn scale(&self, i: usize) -> f32 {
-        self.scale_with(i, crate::press::scale())
+    pub fn scale<K: Copy>(&self, i: usize, press: plx_machine::machine::PressRead<K>) -> f32 {
+        self.scale_with(i, press)
     }
     /// How far control `i` is into its focus, 0 (resting) to 1 (focused), read off the SAME lift
     /// spring [`scale`](Self::scale) reads: the fill of a control cross-fades on this (its ink flips on
@@ -1367,11 +1600,10 @@ impl<const N: usize> CtlPop<N> {
         let pos = self.sp.get(i).map(|sp| sp.pos).unwrap_or(1.0);
         ((pos - 1.0) / (CTRL_FOCUS_SCALE - 1.0)).clamp(0.0, 1.0)
     }
-    /// Captured-input counterpart for owned screens: paint and placement use the same frame's
-    /// press value, without consulting the legacy global press machine. Zero means no press read.
-    pub fn scale_with(&self, i: usize, press_scale: f32) -> f32 {
+    /// Paint and placement use the same explicit press, including its arm identity.
+    pub fn scale_with<K: Copy>(&self, i: usize, press: plx_machine::machine::PressRead<K>) -> f32 {
         let s = self.sp.get(i).map(|sp| sp.pos).unwrap_or(1.0);
-        s * self.dip.factor(i, self.focused, press_scale)
+        s * self.dip.factor(i, self.focused, press)
     }
     /// Drop every pop to rest with no motion in between — for a page being torn down or re-mounted,
     /// so the next mount does not open on a control already popped (`detail::reset_view_state`).
@@ -1515,8 +1747,8 @@ const KEYLINE_PAD_X: f32 = 7.0;
 const KEYLINE_PAD_Y: f32 = 6.0;
 const KEYLINE_RAD: f32 = 5.0;
 const KEYLINE_W: f32 = 1.5;
-/// The chip's label weight — the mock's `font-weight:600`. See [`keyline_chip`] for why it is bold.
-const KEYLINE_BOLD: std::os::raw::c_int = 1;
+/// Fine-print keylines use regular CAPTION, matching the hero identity and episode date family.
+const KEYLINE_BOLD: std::os::raw::c_int = 0;
 
 /// The width [`keyline_chip`] will occupy for `text` — the measure-first companion.
 pub fn keyline_chip_w(text: &str, measure: &dyn plx_machine::machine::Measure) -> f32 {
@@ -1541,9 +1773,8 @@ pub fn keyline_chip_w(text: &str, measure: &dyn plx_machine::machine::Measure) -
 /// ink is what makes a 1.5px ring exist at all here, and it is what shipped before this was
 /// briefly "corrected" to the mock's literal value.
 ///
-/// The label is BOLD for the same reason the mock sets `font-weight:600` on it: two or three caps
-/// at `CAPTION` inside a ring have to hold their own against it, and regular weight is what made
-/// this chip read as an empty frame in the first device photograph of the identity line.
+/// Regular CAPTION keeps the outlined label at the identity line's weight. The ring retains
+/// opaque ink so its thin SDF edge survives television rasterization.
 pub fn keyline_chip(p: Painter, x: f32, cy: f32, text: &str, col: [f32; 4], measure: &dyn plx_machine::machine::Measure) -> f32 {
     let lc = match std::ffi::CString::new(text) {
         Ok(c) => c,
@@ -1569,6 +1800,143 @@ pub fn keyline_chip(p: Painter, x: f32, cy: f32, text: &str, col: [f32; 4], meas
     w
 }
 
+/// The identity band shared by both full-bleed heroes. The text run yields room to the
+/// outlined resolution/accessibility chips, and overlong metadata elides within its column.
+/// Returns the width drawn, from `r.x` to the last chip's edge.
+pub fn hero_identity(p: Painter, r: Rect, parts: &[&str], resolution: Option<&str>, chips: &[&str], measure: &dyn plx_machine::machine::Measure) -> f32 {
+    identity_row(Some(p), r, parts, resolution, chips, theme::TEXT_SECONDARY, measure)
+}
+
+/// The width [`hero_identity`] draws in `r`, asking the same measurements and drawing nothing: the
+/// extent the hero shade stands behind ([`crate::hero_shade::HeroShade::add_ink`]).
+pub fn hero_identity_w(r: Rect, parts: &[&str], resolution: Option<&str>, chips: &[&str], measure: &dyn plx_machine::machine::Measure) -> f32 {
+    identity_row(None, r, parts, resolution, chips, theme::TEXT_SECONDARY, measure)
+}
+
+/// Home's metadata band uses brighter reading ink over the hero art and reserves room for the rating.
+pub fn hero_metadata(p: Painter, r: Rect, parts: &[&str], quality: Option<&str>, rating: &str, measure: &dyn plx_machine::machine::Measure) {
+    let rating = (!rating.is_empty() && keyline_chip_w(rating, measure) <= r.w * 0.5).then_some(rating);
+    let chips = rating.as_ref().map_or(&[][..], std::slice::from_ref);
+    identity_row(Some(p), r, parts, quality, chips, theme::TEXT_READING, measure);
+}
+
+/// The one layout of the identity band, painted with `paint` or only measured without it.
+fn identity_row(paint: Option<Painter>, r: Rect, parts: &[&str], resolution: Option<&str>, chips: &[&str], ink: [f32; 4], measure: &dyn plx_machine::machine::Measure) -> f32 {
+    use crate::hstack::{Flow, Item};
+    let labels: Vec<&str> = resolution.into_iter().chain(chips.iter().copied()).collect();
+    let widths: Vec<Item> = labels.iter().map(|s| Item::new(keyline_chip_w(s, measure))).collect();
+    let chip_w = HStack::new(&widths, theme::space::XS, StackAlign::Leading(0.0)).width();
+    let budget = (r.w - chip_w - if labels.is_empty() { 0.0 } else { theme::space::SM }).max(0.0);
+    let cy = r.y + r.h * 0.5;
+    let y = plx_gfx::text::text_vcenter_y(theme::hero::IDENTITY_SIZE, 0, cy);
+    let run = DottedRun::new(theme::hero::IDENTITY_SIZE, ink, theme::space::SM).measured(measure);
+    let natural = run.width(measure, parts);
+    let text_w = if natural > budget {
+        let joined = parts.iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ");
+        let elided = plx_gfx::text::elide_by(&joined, budget, false,
+            |text| measure.width_str(text, theme::hero::IDENTITY_SIZE, false));
+        if let (Some(p), Ok(text)) = (paint, CString::new(elided.as_str())) {
+            p.text(text.as_ptr(), r.x, y, theme::hero::IDENTITY_SIZE, ink, 0, 0);
+        }
+        measure.width_str(&elided, theme::hero::IDENTITY_SIZE, false)
+    } else if let Some(p) = paint {
+        run.draw(p, parts, r.x, y)
+    } else {
+        natural
+    };
+    let mut flow = Flow::new(r.x, theme::space::XS);
+    flow.push(if text_w > 0.0 { Item::new(text_w).after(theme::space::SM) } else { Item::absent() });
+    for label in labels {
+        flow.place(|x| Item::new(match paint {
+            Some(p) => keyline_chip(p, x, cy, label, ink, measure),
+            None => keyline_chip_w(label, measure),
+        }));
+    }
+    flow.end() - r.x
+}
+
+#[cfg(test)]
+#[test]
+fn pdf_proposal_identity_uses_regular_caption_for_fitting_and_elided_metadata() {
+    let measure = crate::fixture::FixtureMeasure;
+    for (width, parts) in [(943.0, vec!["Movie", "Drama", "PG"]),
+        (260.0, vec!["An exceptionally long edition name that must be elided", "Movie", "Drama", "PG"])] {
+        let r = Rect::new(96.0, 582.0, width, BADGE_H);
+        let mut drawn = 0.0;
+        let runs = crate::draw_census::capture_runs(|| {
+            drawn = hero_identity(Painter::recording(), r, &parts, Some("4K"), &["CC"], &measure);
+        });
+        assert!(!runs.is_empty());
+        assert!(drawn > 0.0);
+        assert_eq!(hero_identity_w(r, &parts, Some("4K"), &["CC"], &measure), drawn,
+            "the measured-only width is the width the draw gives, elided or not");
+        for run in runs {
+            assert_eq!(run.size, theme::size::CAPTION, "PDF identity is 24 px, including {:?}", run.text);
+            assert!(!run.bold, "PDF metadata and chips use regular weight");
+        }
+    }
+}
+
+/// The year/episode date and length/remaining-time band, with source attribution last.
+/// Resuming time is primary ink; the surrounding facts remain secondary. Every run is bounded.
+/// Returns the width drawn, from `r.x` to the last run's edge.
+pub fn hero_facts(p: Painter, r: Rect, date: &str, length: &str, resumes: bool, source: &str, measure: &dyn plx_machine::machine::Measure) -> f32 {
+    facts_row(Some(p), r, date, length, resumes, source, measure)
+}
+
+/// The width [`hero_facts`] draws in `r`, asking the same measurements and drawing nothing: the
+/// extent the hero shade stands behind ([`crate::hero_shade::HeroShade::add_ink`]).
+pub fn hero_facts_w(r: Rect, date: &str, length: &str, resumes: bool, source: &str, measure: &dyn plx_machine::machine::Measure) -> f32 {
+    facts_row(None, r, date, length, resumes, source, measure)
+}
+
+/// The one layout of the facts band, painted with `paint` or only measured without it.
+fn facts_row(paint: Option<Painter>, r: Rect, date: &str, length: &str, resumes: bool, source: &str, measure: &dyn plx_machine::machine::Measure) -> f32 {
+    use crate::hstack::{Flow, Item};
+    let cy = r.y + r.h * 0.5;
+    let y = plx_gfx::text::text_vcenter_y(theme::size::CAPTION, 0, cy);
+    let mut flow = Flow::new(r.x, theme::space::SM);
+    let mut any = false;
+    for (text, ink) in [(date, theme::TEXT_SECONDARY), (length, if resumes { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }), (source, theme::TEXT_SECONDARY)] {
+        if text.is_empty() { continue; }
+        let prefix = if any { measure.width(c"\u{b7}", theme::size::CAPTION, false) + theme::space::SM } else { 0.0 };
+        let budget = (r.x + r.w - flow.next_x() - prefix).max(0.0);
+        if budget <= 0.0 { break; }
+        let text = plx_gfx::text::elide_by(text, budget, false, |s| measure.width_str(s, theme::size::CAPTION, false));
+        let run = DottedRun::new(theme::size::CAPTION, ink, theme::space::SM).measured(measure);
+        let run = if any { run.lead_dot() } else { run };
+        flow.place(|x| Item::new(match paint {
+            Some(p) => run.draw(p, &[text.as_str()], x, y),
+            None => run.width(measure, &[text.as_str()]),
+        }));
+        any = true;
+    }
+    flow.end() - r.x
+}
+
+#[cfg(test)]
+#[test]
+fn pdf_proposal_facts_keep_air_on_both_sides_of_each_dot() {
+    let m = crate::fixture::FixtureMeasure;
+    let r = Rect::new(96.0, 668.0, theme::hero::TEXT_W, theme::hero::FACTS_H);
+    let mut drawn = 0.0;
+    let runs = crate::draw_census::capture_runs(|| {
+        drawn = hero_facts(Painter::recording(), r, "2024", "38 min left", true, "Shared by friend", &m);
+    });
+    assert!(drawn > 0.0);
+    assert_eq!(hero_facts_w(r, "2024", "38 min left", true, "Shared by friend", &m), drawn,
+        "the measured-only width is the width the draw gives");
+    assert_eq!(runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+        ["2024", "·", "38 min left", "·", "Shared by friend"]);
+    use plx_machine::machine::Measure;
+    for pair in runs.windows(2) {
+        let right = pair[0].at.x + m.width_str(&pair[0].text, theme::size::CAPTION, false);
+        assert!((pair[1].at.x - right - theme::space::SM).abs() < 0.01);
+    }
+    assert_eq!(runs[2].ink, theme::TEXT_PRIMARY);
+    assert_eq!(runs[4].ink, theme::TEXT_SECONDARY);
+}
+
 // ---- Key cap + key hint: a REMOTE BUTTON named in running prose --------------------------------
 //
 // "Press [BACK] to return" — the line every read-only alert panel closes with (`Alert Views.dc.html`
@@ -1581,7 +1949,7 @@ pub fn keyline_chip(p: Painter, x: f32, cy: f32, text: &str, col: [f32; 4], meas
 // read-out's whole output format, and a keyline survives a phone camera's chroma subsampling where
 // a colour or weight change does not.
 //
-// The idiom was written first as a private `draw_hint_with_keycap` in `player_hud.rs`, screen-local
+// The idiom was written first as a private `draw_hint_with_keycap` in the player HUD (`appkit/player_hud/`), screen-local
 // and centred on `SCR_W`. It is here because the alert panels want the same object RIGHT-aligned
 // inside a panel, and the guide's rule 4 answers that: promote the widget, don't fork it. Three
 // alert lanes reached for it independently and all three rejected the HUD's CONSTRUCTION for the
@@ -1893,13 +2261,13 @@ pub const HAIRLINE_H: f32 = 1.0;
 /// buy you. The height is 1.0 and is not a parameter: a divider that is two pixels somewhere is a
 /// different object, and both files that made it a named constant gave it the same value.
 pub fn hairline(p: Painter, x: f32, y: f32, w: f32) {
-    p.rect(
-        Rect::new(x, y, w, HAIRLINE_H),
-        0.0,
-        theme::HAIRLINE,
-        theme::HAIRLINE,
-        0.0,
-    );
+    hairline_in(p, x, y, w, theme::HAIRLINE);
+}
+
+/// [`hairline`] in another ink: a HUD package's `rule` cell names its own token. The height is still
+/// [`HAIRLINE_H`].
+pub fn hairline_in(p: Painter, x: f32, y: f32, w: f32, ink: [f32; 4]) {
+    p.rect(Rect::new(x, y, w, HAIRLINE_H), 0.0, ink, ink, 0.0);
 }
 
 /// One dotted run: fine-print parts left to right, joined by a **`·` in
@@ -2149,7 +2517,7 @@ pub fn skeleton_phase(ms: u32) -> f32 {
 /// something keeps drawing one.
 fn skeleton_sheen(p: Painter, r: Rect, rad: f32, phase: f32) {
     // placeholder-exempt: the sweep is paint over a skeleton its caller (`skeleton_bar`, `skeleton_sheet`) counted first
-    plx_machine::idle::invalidate();
+    plx_machine::motion::report::note_motion();
     let band = (r.w * SKEL_BAND).max(1.0);
     // travel from fully off the left edge to fully off the right, so the block is clean at both
     // ends of the cycle rather than starting mid-flash
@@ -2364,278 +2732,17 @@ pub fn art_scrim(p: Painter, card: Rect, rad: f32, h: f32, a: f32) {
     p.clip_clear();
 }
 
-// ---- The hero corner scrim: the wedge that makes hero copy legible over ARTWORK ---------------
+// ---- The hero's atmospheric ramp ----------------------------------------------------------------
 //
-// A **sibling** of `art_scrim`, deliberately not a direction flag on it: the rounded card's
-// bottom band and the full-bleed hero have different geometry and axes. What they share is
-// the rule: a label sits directly on
-// artwork only where something has bought it the contrast to.
+// What stands behind a hero's copy is the content-following shade ([`crate::hero_shade`]); the ramp
+// below is the frame-wide mood under it that Detail still paints.
 
-/// How far the hero wedge reaches before it is gone entirely: it peaks at x=0 and is exactly 0
-/// here. Four fifths of the panel, because it has to still be carrying weight under the RIGHT END
-/// of the longest lines, not just at the margin — detail's synopsis column runs to x=990
-/// (`MARGIN_X` + its `HERO_TEXT_W`) and its facts line to ~1270. A tighter falloff strands exactly
-/// the ends of the lines a long title or blurb produces. The last fifth of the frame is left
-/// completely alone: that is the side of the picture the composition is usually about.
-const HERO_SCRIM_W: f32 = 0.80 * crate::consts::SCR_W; // 1536
-
-/// Where the wedge starts feathering in. Clears the tab track's own band ([`TOP_BAR_Y`] 62 +
-/// [`TAB_PILL_H`] 60 + [`TAB_TRACK_PAD`] 8 = 130) by 32px: the top chrome owns its legibility with
-/// its own dark capsule (`draw_tab_row`) and must not get a second treatment stacked under it.
-const HERO_SCRIM_TOP: f32 = 0.15 * crate::consts::SCR_H; // 162
-/// Where the wedge reaches full strength — and the seam between its two quads, named once so the
-/// pair is watertight by construction. It sits above every hero TEXT anchor, which is what lets
-/// [`hero_scrim_a`] be a function of x alone: both heroes baseline their title on the bottom of a
-/// `hero_logo::band_h` band (home's stack bottoms out at y≈528, detail's on `TITLE_BOTTOM` 566), so
-/// the highest cap top on either screen is ~479, and every line below it is lower still.
+/// Where the frame-wide ATMOSPHERIC ramp starts: nothing above this line, running to the foot of the
+/// panel. Detail paints it under its hero shade (`detail::draw_backdrop`); Home paints none (board
+/// CW-13 v2: Home's art stands unramped and the shade carries the legibility).
 ///
-/// What DOES cross this line is a clearLogo, which is art: the band is a layout floor and a squarer
-/// mark spills upward out of it as paint, to y=298 on detail and y=260 on home. Up there the wedge
-/// is still feathering in (~0.27 of its peak at y=260) rather than absent, which is the reason nit
-/// 2's taller logos were sequenced AFTER this component; the clearance that binds them is the top
-/// chrome's ([`TOP_BAR_BOTTOM`]), asserted in `home.rs`, not this knee.
-const HERO_SCRIM_KNEE: f32 = 0.39 * crate::consts::SCR_H; // 421.2
-
-/// The mirrored RIGHT wedge — for a hero with a right-aligned column, which today means detail's
-/// "Starring" block at x 1270..1830, the one piece of hero copy the left wedge by definition cannot
-/// reach. Weaker and shorter than the left one because the bottom-up ramp is already ~0.65 across
-/// that band: this closes the gap, it does not carry the load. It is also the component's banding
-/// risk (`GL_DITHER` is deliberately off) — ~1 8-bit code per 4–5px near its origin. If it bands,
-/// make these SMALLER (steeper = fewer codes per pixel); never re-enable dithering.
-const HERO_SCRIM_R_W: f32 = 700.0;
-const HERO_SCRIM_R_TOP: f32 = 0.65 * crate::consts::SCR_H; // 702
-const HERO_SCRIM_R_A: f32 = 0.50;
-
-/// Where the frame-wide ATMOSPHERIC ramp starts — the treatment's other half, which both heroes
-/// paint under this wedge (`screens::home`'s `Backdrop::draw` / `detail::draw_backdrop`): nothing above this
-/// line, running to the foot of the panel. It sits here with the wedge's own stops because it is
-/// one treatment's first stop, and it was declared verbatim, under the same name, in two screens.
-///
-/// The two screens' CURVES below it are deliberately **not** unified — home's is a two-stop ramp
-/// with a midpoint knee, detail's a single linear stop, and they land within ~0.05 alpha of each
-/// other everywhere. Retuning the atmospheric floor is a different decision from sharing its
-/// origin, and only the panel can judge it; the curves stay as `ui::landing_hero::base_scrim_a` /
-/// `detail::base_scrim_a`, which is also what the legibility table below grades.
-pub const HERO_BASE_SCRIM_Y0: f32 = 0.34 * crate::consts::SCR_H; // 367.2
-
-/// The hero wedge's alpha at `x`, at or below [`HERO_SCRIM_KNEE`] — which is where every hero text
-/// anchor sits, by construction (see that const). Pure, because the legibility contract is graded
-/// on it: this is the arithmetic the anchor table in this module's tests reads, so the promise and
-/// the paint cannot come from two different curves.
-///
-/// `strength` is the screen's own hero fade (home's `env.hero_a`, detail's
-/// `hero_alpha(scroll, HERO_FADE)`), multiplied by [`crate::landing_hero::PREVIEW_FIELD`]
-/// while a preview picture is bound. Everything scales by it, so the wedge leaves with the hero
-/// rather than lingering over the shelves. The clamp is that video-bound ceiling, not 1, so the
-/// raised row stays on this curve.
-pub fn hero_scrim_a(x: f32, strength: f32) -> f32 {
-    let u = (x.max(0.0) / HERO_SCRIM_W).min(1.0);
-    theme::SCRIM_TEXT_A
-        * (1.0 - u)
-        * strength.clamp(0.0, crate::landing_hero::PREVIEW_FIELD)
-}
-
-/// The mirrored right wedge's alpha at `(x, y)` — [`hero_scrim_a`]'s sibling, and the only part of
-/// the field that is two-dimensional, since it feathers in from its left edge AND from its top and
-/// peaks only in the bottom-right corner. Pure for the same reason.
-pub fn hero_scrim_right_a(x: f32, y: f32, strength: f32) -> f32 {
-    let u = ((x - (crate::consts::SCR_W - HERO_SCRIM_R_W)).max(0.0) / HERO_SCRIM_R_W).min(1.0);
-    let v =
-        ((y - HERO_SCRIM_R_TOP).max(0.0) / (crate::consts::SCR_H - HERO_SCRIM_R_TOP)).min(1.0);
-    HERO_SCRIM_R_A * strength.clamp(0.0, crate::landing_hero::PREVIEW_FIELD) * u * v
-}
-
-/// The wedge's quads as `(rect, [tl, tr, br, bl])`, built pure so the seam between quad 0 and
-/// quad 1 — the one structural bug this component can have — is host-gradeable. `n` is how many
-/// entries are live: 2, or 3 when `right`.
-///
-/// The whole field is **one ink at four alphas** ([`theme::scrim`]), which is [`Painter::grad4`]'s
-/// stated precondition: straight (non-premultiplied) rgba only interpolates exactly across a quad
-/// when the corners share an rgb.
-///
-/// | # | rect | field it produces |
-/// |---|---|---|
-/// | 0 | `(0, TOP, W, KNEE−TOP)` | feather-in: 0 along the whole top edge, the full wedge along the bottom |
-/// | 1 | `(0, KNEE, W, SCR_H−KNEE)` | constant in y → a pure horizontal ramp to the frame's foot |
-/// | 2 | `(SCR_W−R_W, R_TOP, R_W, SCR_H−R_TOP)` | feathers in from the top AND the left, peaking bottom-right |
-///
-/// **Quad 0 and quad 1 abut exactly**, and must keep doing so: quad 0's bottom pair (`bl→br` =
-/// edge→none) is identical to quad 1's top pair (`tl→tr` = edge→none) at every x, and the two share
-/// one float y. The reflex here is to reach for [`plx_gfx::gfx::snap`] — don't. [`art_scrim`]'s fallback snaps
-/// because an integer-truncated *scissor* meets a float *fill*; these are fill-to-fill quads
-/// sharing an edge, where the rasterizer's own fill rule already guarantees neither a gap (one row
-/// of unscrimmed BRIGHT artwork) nor a double-cover (one row of doubled scrim). Snapping would be
-/// cargo cult, and it would move the seam off the shared float.
-///
-/// **The corners are the closed forms EVALUATED AT THE CORNERS**, not a second hand-written copy of
-/// them: a quad's corner alpha is exactly what [`hero_scrim_a`] / [`hero_scrim_right_a`] say at that
-/// `(x, y)`, so at the corners the field the legibility contract is graded on and the field that is
-/// painted cannot drift — the tests below no longer assert that agreement, only the part
-/// construction cannot pin (that the closed forms are affine / bilinear in BETWEEN the corners,
-/// which is the shape `grad4` can actually interpolate). It also gives the two closed forms the
-/// production caller they otherwise lacked. Both clamp `strength` themselves, so it is passed raw.
-pub fn hero_scrim_quads(strength: f32, right: bool) -> ([(Rect, [[f32; 4]; 4]); 3], usize) {
-    let (sw, sh) = (crate::consts::SCR_W, crate::consts::SCR_H);
-    // the wedge peaks at its left margin and is gone by `HERO_SCRIM_W`; the right one peaks in the
-    // bottom-right corner of the panel, which is the corner it is anchored to
-    let none = theme::scrim(hero_scrim_a(HERO_SCRIM_W, strength));
-    let edge = theme::scrim(hero_scrim_a(0.0, strength));
-    let redge = theme::scrim(hero_scrim_right_a(sw, sh, strength));
-    let mut q = [(Rect::new(0.0, 0.0, 0.0, 0.0), [none; 4]); 3];
-    q[0] = (
-        Rect::new(
-            0.0,
-            HERO_SCRIM_TOP,
-            HERO_SCRIM_W,
-            HERO_SCRIM_KNEE - HERO_SCRIM_TOP,
-        ),
-        [none, none, none, edge],
-    );
-    q[1] = (
-        Rect::new(0.0, HERO_SCRIM_KNEE, HERO_SCRIM_W, sh - HERO_SCRIM_KNEE),
-        [edge, none, none, edge],
-    );
-    if right {
-        q[2] = (
-            Rect::new(
-                sw - HERO_SCRIM_R_W,
-                HERO_SCRIM_R_TOP,
-                HERO_SCRIM_R_W,
-                sh - HERO_SCRIM_R_TOP,
-            ),
-            [none, none, redge, none],
-        );
-    }
-    (q, if right { 3 } else { 2 })
-}
-
-/// Draw the hero corner scrim: the darkening for copy that sits directly on a full-bleed backdrop,
-/// along the one axis a bottom-up ramp has nothing to say about.
-///
-/// Both heroes already paint a frame-wide atmospheric ramp, and both bottom-anchor their text
-/// column well ABOVE the band where that ramp reaches strength — the HERO-72 title's cap top gets
-/// ~0.11 of it. The ramp cannot simply be raised, because at any given y it is uniform across all
-/// 1920px: enough alpha to rescue the title would put 60% black over the whole picture at the
-/// title's y. So the corner the text is IN gets its own field instead, and the ramp goes on doing
-/// the job it is good at (mood, and the depth under the shelf line).
-///
-/// `strength` is the screen's own hero fade — see [`hero_scrim_a`]. `right` adds the mirrored wedge
-/// for a hero with a RIGHT-aligned column (detail's "Starring"); home has none and passes `false`.
-///
-/// Call it INSIDE the backdrop, before any hero content is drawn: it exists to darken artwork, and
-/// a wedge over the text would be a dimmer, not a scrim.
-pub fn hero_scrim(p: Painter, strength: f32, right: bool) {
-    if strength <= 0.0 {
-        return;
-    }
-    let (q, n) = hero_scrim_quads(strength, right);
-    for (r, k) in q.iter().take(n) {
-        p.grad4(*r, *k);
-    }
-}
-
-/// [`hero_scrim`] with its knee LIFTED to `knee`: the same wedge, the same feather above it, the
-/// same two closed forms at the corners, standing higher — for a hero whose copy starts above the
-/// billboards' anchors (the Library's Recommended page, whose block starts on the grid's content
-/// line, y 244, while the shared knee is at y 421). The left wedge only: no such hero has a
-/// right-aligned column. Call it where [`hero_scrim`] is called, inside the backdrop.
-pub fn hero_scrim_lifted(p: Painter, strength: f32, knee: f32) {
-    if strength <= 0.0 {
-        return;
-    }
-    let none = theme::scrim(hero_scrim_a(HERO_SCRIM_W, strength));
-    let edge = theme::scrim(hero_scrim_a(0.0, strength));
-    let feather = HERO_SCRIM_KNEE - HERO_SCRIM_TOP;
-    p.grad4(Rect::new(0.0, knee - feather, HERO_SCRIM_W, feather), [none, none, none, edge]);
-    p.grad4(Rect::new(0.0, knee, HERO_SCRIM_W, crate::consts::SCR_H - knee), [edge, none, none, edge]);
-}
-
-/// Is the one-pass hero ground armed? `/tmp/plxnative-heroground`, read once at boot.
-///
-/// EXPERIMENT, not a default. The shipped path is the four blended quads, and it stays reachable
-/// on one binary so the two are an A/B rather than a replacement.
-static HERO_GROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Arm the one-pass hero ground (`app.rs`, from the dev trigger).
-pub fn set_hero_ground(on: bool) {
-    HERO_GROUND.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// May a hero draw its ground in one pass? Both halves must hold: the trigger, and a program that
-/// actually linked (`gfx::hero_ground_ok`) — a driver that refused it keeps the shipped picture.
-pub fn hero_ground_armed() -> bool {
-    HERO_GROUND.load(std::sync::atomic::Ordering::Relaxed) && plx_gfx::gfx::hero_ground_ok()
-}
-
-/// The one-pass ground's WEDGE field, exactly as `fs_hero.frag` evaluates it from the same four
-/// numbers. Pure, and written twice on purpose: a GLSL expression cannot be graded by `make check`,
-/// so this is the copy the tests pin against [`hero_scrim_quads`] — the shipped picture — at every
-/// corner of both its quads. If the shader and this ever disagree, the test is the one that is
-/// right and the shader is the bug.
-pub fn hero_ground_wedge_a(wedge: [f32; 4], x: f32, y: f32) -> f32 {
-    let u = (x / wedge[1]).clamp(0.0, 1.0);
-    let v = ((y - wedge[2]) / (wedge[3] - wedge[2])).clamp(0.0, 1.0);
-    wedge[0] * (1.0 - u) * v
-}
-
-/// The one-pass ground's atmospheric RAMP field, as `fs_hero.frag` evaluates it — two linear
-/// segments meeting at `ramp[1]`, from `(ramp[0], 0)` through `(ramp[1], ramp[2])` to
-/// `(SCR_H, ramp[3])`. Same contract as [`hero_ground_wedge_a`]: the tests pin it against the
-/// screen's own curve.
-pub fn hero_ground_ramp_a(ramp: [f32; 4], y: f32) -> f32 {
-    let t0 = ((y - ramp[0]) / (ramp[1] - ramp[0])).clamp(0.0, 1.0);
-    let t1 = ((y - ramp[1]) / (crate::consts::SCR_H - ramp[1])).clamp(0.0, 1.0);
-    ramp[2] * t0 + (ramp[3] - ramp[2]) * t1
-}
-
-/// The wedge's four shader parameters for a hero at `strength` — the ONE place they are derived,
-/// so the draw and the test cannot read two different geometries.
-pub fn hero_ground_wedge(strength: f32) -> [f32; 4] {
-    [
-        hero_scrim_a(0.0, strength),
-        HERO_SCRIM_W,
-        HERO_SCRIM_TOP,
-        HERO_SCRIM_KNEE,
-    ]
-}
-
-/// THE HERO GROUND IN ONE PASS — the backdrop art carrying both scrim fields, instead of the art
-/// plus [`hero_scrim`]'s two quads plus the screen's own two atmospheric-ramp bands.
-///
-/// **This is the same picture by construction, not a cheaper approximation of it.** Both fields are
-/// closed forms of the authored pixel position, both are [`theme::SCRIM_INK`], and two straight-alpha
-/// layers of one ink compose exactly as `a1 + a2 - a1*a2`; `fs_hero.frag` carries the algebra and
-/// the one thing that does differ (the shipped path quantises the framebuffer three times where
-/// this quantises once).
-///
-/// **Why it is worth a program of its own.** Measured on the dev television with
-/// `/tmp/plxnative-overdraw`: Home's hero submits 5.39M authored pixels against a 2.07M-pixel panel
-/// — 2.60x — and the ramp (1,368,576 px) plus the wedge (1,410,048 px) are 52% of it, for fields
-/// that are three ALU operations each. Their cost is not their shading, it is that they are 2.78M
-/// more fragments through the blender landing on pixels the art has already written.
-///
-/// `art` is the resolved texture and the rect `crate::screens::home` would have drawn it at; `art_a`
-/// its tint alpha; `ramp` is the screen's atmospheric curve as `(y0, knee, a_knee, a_foot)` —
-/// **the screen's, not this module's**, because home's is a two-stop curve with a midpoint knee and
-/// detail's a single linear stop, and unifying them is a design decision nobody has taken.
-/// `strength` is the hero fade the wedge scales with, exactly as [`hero_scrim`] takes it.
-///
-/// The CALLER owns the preconditions, because they are all facts about the screen's own state: the
-/// art must be there and be the only layer (a hero FLIP slides two of them, and one quad cannot
-/// carry a scrim over both), and the wedge must actually be wanted. Anything else falls back.
-pub fn hero_ground(
-    p: Painter,
-    tex: u32,
-    r: Rect,
-    art_a: f32,
-    ramp: [f32; 4],
-    strength: f32,
-) {
-    // The wedge's own geometry, in the same authored units [`hero_scrim_quads`] builds its corners
-    // from — and its peak through the very function the legibility table is graded on, so the one
-    // pass and the four quads cannot be two different curves.
-    p.hero_ground(tex, r, art_a, ramp, hero_ground_wedge(strength));
-}
+/// The start of Detail's three-stop bottom shade (`landing_hero::base_scrim_ramp`).
+pub const HERO_BASE_SCRIM_Y0: f32 = 300.0;
 
 /// The profile chip's diameter: ONE control height with the tab pills and the circle-button
 /// family, so the focused chip's capsule — the avatar plus [`TAB_TRACK_PAD`] all round — is
@@ -2646,9 +2753,15 @@ pub const CHIP_D: f32 = TAB_PILL_H;
 /// 8px inset plus the end pill's 18px label padding).
 const CHIP_NAME_GAP: f32 = 14.0;
 const CHIP_NAME_TAIL: f32 = 24.0;
-/// Name budget — a long profile name elides rather than growing the capsule into the CENTERED tab
-/// track sitting a few hundred px to its right.
+/// The CEILING of the name budget — a long profile name elides rather than growing the capsule
+/// into the CENTERED tab track sitting a few hundred px to its right. It is a ceiling and not the
+/// budget: the strip may be any width, so the budget a given bar allows is [`chip_name_budget`],
+/// which is this or the room the bar leaves, whichever is less.
 const CHIP_NAME_MAX: f32 = 320.0;
+/// The narrowest name budget worth unfurling for — an ellipsis and a glyph or two (three BODY
+/// ems). Under it the bar leaves the chip no name at all ([`chip_name_budget`] answers `0`) and the
+/// capsule stays the closed circle: a name elided to a lone "…" teaches nothing.
+const CHIP_NAME_MIN: f32 = 3.0 * theme::size::BODY as f32;
 /// **The chip's frame — one rect, owned here, for every page that wears the bar.**
 ///
 /// A CONSTANT rather than a rect recorded at draw the way [`tab_pill_at`]'s are, and the asymmetry
@@ -2673,20 +2786,28 @@ pub const CHIP_FRAME: Rect = Rect::new(
 
 /// **The focused capsule's rect — the ONE expression, drawn and priced from the same place.**
 ///
-/// [`profile_chip_with`] draws this and [`CHIP_CAP_MAX_R`] prices it, and until 2026-08-21 they were two
-/// arithmetics that happened to agree: the draw built the rect inline and the constant restated the
-/// same seven terms by hand, in a different file position, so a pad added to one would have left the
-/// other quietly describing a capsule nobody draws. That constant is what [`GLASS_TRACK_MAX`] is
-/// solved against, i.e. what keeps the band's two translucent faces from touching — the design-system
-/// rule for a graded field applies with more force here than it does to a scrim: the drawn shape and
-/// the shape a test grades must be one expression, not two that agree.
+/// [`profile_chip_with`] draws this and the clearance against the track prices it
+/// ([`chip_name_budget`]); until 2026-08-21 they were two arithmetics that happened to agree: the
+/// draw built the rect inline and a constant restated the same seven terms by hand, in a different
+/// file position, so a pad added to one would have left the other quietly describing a capsule
+/// nobody draws. That rect is what [`chip_name_budget`] keeps
+/// clear of the track, i.e. what keeps the band's two translucent faces from touching — the
+/// design-system rule for a graded field applies with more force here than it does to a scrim: the
+/// drawn shape and the shape a test grades must be one expression, not two that agree.
 ///
-/// `e` is the unfurl, 0..1; `name_w` the elided name's measured width ([`CHIP_NAME_MAX`] is its
-/// budget, so `chip_cap(1.0, CHIP_NAME_MAX)` is the widest capsule the control can ever draw).
-/// Only the WIDTH moves — the capsule grows rightward off a fixed left edge.
+/// `e` is the unfurl, 0..1; `name_w` the elided name's measured width ([`CHIP_NAME_MAX`] is the
+/// ceiling of its budget, so `chip_cap(1.0, CHIP_NAME_MAX)` is the widest capsule the control can
+/// ever draw). Only the WIDTH moves — the capsule grows rightward off a fixed left edge. **A chip
+/// with no name (`name_w == 0`) has nothing to unfurl for: it stays the closed circle at every
+/// `e`**, the gap and the tail being the name's air and not the capsule's own width — which is what
+/// a bar too wide to leave the name any room asks of it ([`chip_name_budget`]).
 pub const fn chip_cap(e: f32, name_w: f32) -> Rect {
     let closed = CHIP_D + 2.0 * TAB_TRACK_PAD;
-    let open = closed + CHIP_NAME_GAP + name_w + CHIP_NAME_TAIL;
+    let open = if name_w > 0.0 {
+        closed + CHIP_NAME_GAP + name_w + CHIP_NAME_TAIL
+    } else {
+        closed
+    };
     Rect::new(
         CHIP_FRAME.x - TAB_TRACK_PAD,
         CHIP_FRAME.y - TAB_TRACK_PAD,
@@ -2759,7 +2880,8 @@ pub(crate) fn chip_face(face: plx_gfx::gfx::GlassFace, e: f32) -> plx_gfx::gfx::
     }
 }
 
-/// **The focused chip's capsule, in the BAR's material** — the band's second glass surface.
+/// Standing glass shared by tab tracks, the profile chip and glass-backed circular controls.
+/// The profile chip uses its bar's material as the band's second glass surface.
 ///
 /// Returns whether it drew. `false` is the flat capsule's cue, and it is the answer in every case
 /// the track is also flat: `bar_material` (this frame's
@@ -2781,7 +2903,9 @@ pub(crate) fn chip_face(face: plx_gfx::gfx::GlassFace, e: f32) -> plx_gfx::gfx::
 ///
 /// The tab band publishes the shared face on `GlassPlan`; both surfaces automatically declare
 /// their current rectangles in the same chrome layer. The planner captures their union once,
-/// and separates their z bands automatically if their sampling regions overlap.
+/// and separates their z bands only if their drawn rects overlap: inside each other's sampling
+/// reach they still sample the page, never each other, so they keep one source
+/// (`backdrop::surface_with`).
 ///
 /// **`frozen` is the opener lift's ground** (`lift_profile_chip`, the account menu up): the
 /// capsule then stands on the stack's latched underlay field through `Painter::glass_frozen`, with
@@ -2790,7 +2914,7 @@ pub(crate) fn chip_face(face: plx_gfx::gfx::GlassFace, e: f32) -> plx_gfx::gfx::
 /// is not representable here: [`lift_profile_chip`] draws no lift at all until the field has latched,
 /// because a flat capsule over the bar's own would darken the chip twice. The chip on the tab strip
 /// passes `None` and keeps the live glass.
-fn chip_capsule(
+fn glass_capsule(
     p: Painter,
     cap: Rect,
     e: f32,
@@ -2846,7 +2970,7 @@ fn chip_capsule(
 /// was far too quiet to read as focus against bright hero art — and the name is what the stop is
 /// actually *for*.
 ///
-/// **That capsule is the bar's MATERIAL, not a copy of its weights** ([`chip_capsule`]). The track
+/// **That capsule is the bar's MATERIAL, not a copy of its weights** ([`glass_capsule`]). The track
 /// became solved glass on 2026-08-19 and the chip went on wearing the flat stops it used to share
 /// with it, which is one band drawn in two materials — so it takes the face [`StripRender::draw`]
 /// published this frame ([`BarMaterial`]) and is glass exactly when the track is. Neither surface
@@ -2861,10 +2985,11 @@ fn chip_capsule(
 /// and Search drew them the other way round and got away with it only while the chip could not be
 /// focused there, which is the class of bug that made this a shared control in the first place.
 ///
-/// The two can no longer MEET, which is the third thing that changed: [`GLASS_TRACK_MAX`] is solved
-/// so the widest capsule clears the widest glass track by [`BAND_AIR`]. Overlap had to become
-/// impossible for the bar's design: although the layer mechanism supports stacked glass,
-/// overlapping two halves of one chrome band would still double its material.
+/// The two can no longer MEET, which is the third thing that changed: the name's budget is a
+/// function of the room the bar leaves ([`chip_name_budget`]), so the unfurled capsule clears the
+/// track by [`BAND_AIR`] whatever the strip's width. Overlap had to become impossible for the bar's
+/// design: although the layer mechanism supports stacked glass, overlapping two halves of one
+/// chrome band would still double its material.
 /// Application-owned profile data supplied to the bar. Rendering this view never opens the
 /// session file or asks which profile is current.
 #[derive(Clone, Copy)]
@@ -2886,19 +3011,33 @@ pub struct ChromeRead<'a> {
     pub chip_expand: f32,
 }
 
-/// Measure and own the chip's two glyph runs when the application's captured profile changes.
-/// The result belongs to that captured chrome owner; drawing performs no session read, elision or
-/// global cache lookup.
+/// Measure and own the chip's two glyph runs when the application's captured profile changes, **or
+/// when the strip's widths do**: `name_budget` is [`chip_name_budget`] of the bar's track, so the
+/// owner re-asks here for either. The result belongs to that captured chrome owner; drawing
+/// performs no session read, elision or global cache lookup.
+///
+/// A budget of `0` is the bar leaving the chip no room: the name is empty and measures `0`, which
+/// [`chip_cap`] draws as the closed circle. (It is not passed to `elide_by`, which reads a budget at
+/// or under zero as "no limit".)
 pub fn profile_chip_text(
     label: &str,
     initial: &str,
+    name_budget: f32,
     measure: &dyn plx_machine::machine::Measure,
 ) -> (CString, CString, f32) {
-    let name = CString::new(plx_gfx::text::elide_by(label, CHIP_NAME_MAX, false, |t| {
-        measure.width_str(t, theme::size::BODY, true)
-    }))
-    .unwrap_or_default();
-    let name_w = measure.width(&name, theme::size::BODY, true);
+    let name = if name_budget > 0.0 {
+        CString::new(plx_gfx::text::elide_by(label, name_budget.min(CHIP_NAME_MAX), false, |t| {
+            measure.width_str(t, theme::size::BODY, true)
+        }))
+        .unwrap_or_default()
+    } else {
+        CString::default()
+    };
+    let name_w = if name.as_bytes().is_empty() {
+        0.0
+    } else {
+        measure.width(&name, theme::size::BODY, true)
+    };
     (CString::new(initial).unwrap_or_default(), name, name_w)
 }
 
@@ -2935,16 +3074,16 @@ fn profile_chip_on(
     // every `e`; only the WIDTH moves, which is what `chip_cap` expresses. It was drawn only while
     // focused, faded in with `e`, until 2026-09-01; the resting surround is the design since, and
     // it is real glass again since 2026-09-02 (a flat copy of the face stood in for one day). The
-    // band is priced as the union of both surfaces at rest — `band_region`, `BAND_REGION_X0` —
-    // and measured on the set with the surround up: `home-hero` and `home-fold` both clear 50.
+    // band's grab is the union of both surfaces at rest, measured on the set with the surround up:
+    // `home-hero` and `home-fold` both clear 50.
     let e = expand.clamp(0.0, 1.0);
     {
         // The rect comes from [`chip_cap`] rather than being built here, because it is also what
-        // [`GLASS_TRACK_MAX`] is solved against — see there.
+        // [`chip_name_budget`] keeps clear of the track — see there.
         let cap = chip_cap(e, name_w);
         // the tab track's own material — literally the same material: glass when the track
         // resolved glass this frame, the flat capsule when it did not.
-        if !chip_capsule(p, cap, 1.0, bar_material, frozen) {
+        if !glass_capsule(p, cap, 1.0, bar_material, frozen) {
             p.rect_sheened(
                 cap,
                 cap.h * 0.5,
@@ -3068,10 +3207,11 @@ pub fn lift_profile_chip(
 /// for them instead of smearing across the grow.
 ///
 /// The two differ on ONE policy and deliberately: what happens when the word does not fit. The chip
-/// ELIDES to a fixed `CHIP_NAME_MAX` budget, because a profile name is user data of any length and
-/// a shortened name is still a name. A verb is not — half of "Mark as Unwatched" teaches less than
-/// the tick it was meant to explain — so a control with a hard bound to respect asks
-/// [`CircleButton::label_budget`] and shows the whole word or none of it
+/// ELIDES to [`chip_name_budget`], the room the bar leaves capped at `CHIP_NAME_MAX`, because a
+/// profile name is user data of any length and a shortened name is still a name; only a bar that
+/// leaves no room for a glyph or two takes the name away. A verb is not — half of "Mark as
+/// Unwatched" teaches less than the tick it was meant to explain — so a control with a hard bound
+/// to respect asks [`CircleButton::label_budget`] and shows the whole word or none of it
 /// (`detail::watch_cap_at`). Both are right for their content; neither is the default.
 const DISC_LABEL_LEAD: f32 = 26.0;
 const DISC_LABEL_GAP: f32 = 14.0;
@@ -3094,6 +3234,8 @@ pub struct CircleButton {
     pub ground: ControlGround,
     /// Local page palette. It is copied in by a Hero row and ignored on an unkeyed ground.
     pub palette: ControlPalette,
+    /// Optional standing glass, shared with the container this control belongs to.
+    pub glass: Option<plx_gfx::gfx::GlassFace>,
     /// The FOCUS POP, as a factor on the frame — see [`CircleButton::scale`].
     pub scale: f32,
     /// The unfurled label and how far open it is (0..1) — see [`DISC_LABEL_LEAD`]. `None` is a
@@ -3115,6 +3257,7 @@ impl CircleButton {
             style: ControlStyle::Accent,
             ground: ControlGround::Keyed,
             palette: ControlPalette::default(),
+            glass: None,
             scale: 1.0,
             label: None,
         }
@@ -3192,6 +3335,11 @@ impl CircleButton {
     /// Answer to a page-drawn ground with the palette it published for this control row.
     pub fn palette(mut self, palette: ControlPalette) -> Self {
         self.palette = palette;
+        self
+    }
+    /// Use the enclosing track's standing material. Focus keeps the shared bright control face.
+    pub fn glass(mut self, face: Option<plx_gfx::gfx::GlassFace>) -> Self {
+        self.glass = face;
         self
     }
     /// Give this disc the [UNFURL](DISC_LABEL_LEAD): `text` is the verb the press performs and `e`
@@ -3300,15 +3448,15 @@ impl View for CircleButton {
         if self.focused {
             control_cast_at(p, plate, plate.h * 0.5, self.focus.unwrap_or(1.0));
         }
-        control_rim(
-            p,
-            plate,
-            plate.h * 0.5,
-            face.top,
-            face.body,
-            self.focused,
-            self.ground,
-        );
+        let glass = self.ground == ControlGround::Keyed
+            && glass_capsule(p, plate, 1.0, self.glass, None);
+        if !glass {
+            control_rim(p, plate, plate.h * 0.5, face.top, face.body, self.focused, self.ground);
+        } else if self.focused {
+            let focus = self.focus.unwrap_or(1.0);
+            let bright = self.style.face_at(1.0, self.ground, self.palette);
+            control_rim(p.alpha(focus), plate, plate.h * 0.5, bright.top, bright.body, true, self.ground);
+        }
         // Resolve the unfurl from the FRAME, before anything is placed by it: `cap_label_w` answers
         // `None` for a frame that is not a capsule, and that verdict governs the GLYPH as well as
         // the word. Sliding the icon off the caller's raw `e` was a real defect — a control whose
@@ -3411,6 +3559,9 @@ impl PageDots {
         self.y = y;
         self
     }
+    pub fn centered_y(self, x: f32, cy: f32) -> Self {
+        self.at(x, cy - Self::DOT * 0.5)
+    }
     /// Place the row so it is CENTRED on `cx` — the billboard pager idiom, where the dots belong to
     /// the screen rather than to the control they sit under. Resolves to a left origin through
     /// [`width`](Self::width), so `draw` stays one left-to-right walk.
@@ -3450,7 +3601,7 @@ impl View for PageDots {
                 // tokens, not a raw literal: full-strength white for the current page, dimmed for the rest
                 let col = crate::theme::with_a(
                     crate::theme::TEXT_PRIMARY,
-                    if d == self.active { 1.0 } else { 0.35 },
+                    if d == self.active { 1.0 } else { crate::theme::shade::PAGER_IDLE_A },
                 );
                 let w = if span.i == 1 { span.w } else { Self::DOT };
                 p.rect(
@@ -3565,7 +3716,7 @@ impl View for Spinner {
         // from is then a constant, so the next frame would be identical and a waiting screen
         // (the sign-in QR's "Waiting for you to sign in…") could never come to rest.
         if !plx_machine::motion::phase_clocks_held() {
-            plx_machine::idle::invalidate();
+            plx_machine::motion::report::note_motion();
         }
         #[cfg_attr(feature = "placeholder-sentinel", allow(unused_variables))]
         let t = (self.phase % Self::PERIOD_MS) as f32 / Self::PERIOD_MS as f32;
@@ -3603,7 +3754,7 @@ impl View for Spinner {
 /// hand-rolls them ends up doing index arithmetic over a flat array. Fading a wash toward the app's
 /// own GROUND is the one case the cascade *does* handle, and it belongs to the cascade: an alpha
 /// below 1 mixes the corners toward [`theme::SURFACE_APP`] inside `Painter::ambient`, which is what
-/// lets a whole page — wash included — dip for [`ui::nav`](crate::nav)'s route transition.
+/// lets a whole page — wash included — dip for the owning stack's route transition.
 ///
 /// Blend the corners toward a base surface with [`theme::mix`] before handing them over: a wash
 /// keyed at full strength is a photograph, not a wash, and mixing toward [`theme::SURFACE_APP`]
@@ -3681,8 +3832,9 @@ impl AmbientWash {
     /// difference. ([`theme::SURFACE_APP`] is snapped to exact 8-bit codes for the `GL_DITHER`
     /// reason in its own doc, so that is the unit this is reasoned in.)
     ///
-    /// It lives beside the type rather than in a screen because the skip is worth ~2.07M fragments
-    /// a frame on two different pages, and it was a private `home.rs` constant while `detail.rs`
+    /// It lives beside the type rather than in a screen because the skip is worth a full-screen
+    /// pass a frame on two different pages (~2.07M shaded fragments for a gradient, a clear once
+    /// the corners are four equal codes), and it was a private `home.rs` constant while `detail.rs`
     /// simply lacked the test — one value here is what stops the two from drifting apart again.
     pub const FLAT_EPS: f32 = 1.0 / 255.0;
 
@@ -3733,7 +3885,7 @@ impl AmbientWash {
     /// Dissolve toward `target` at rate `k`. Every channel shares one rate, so the corners move as
     /// one wash rather than twelve independent fades.
     ///
-    /// **A channel that has [`settled`](plx_machine::idle::settled) is landed on its target** (the
+    /// **A channel that has [`settled`](plx_machine::motion::report::settled) is landed on its target** (the
     /// idle gate has stopped asking for frames for it, which is what that function's export is
     /// for), so the wash's last drawn codes are the codes its target maps to, and [`at_rest`](Self::at_rest)
     /// is exact. Without the landing a critically damped tail keeps moving the float's low bits
@@ -3742,7 +3894,7 @@ impl AmbientWash {
         for (c, t) in self.corners.iter_mut().zip(target) {
             for (sp, v) in c.iter_mut().zip(t) {
                 sp.step(v, k, dt);
-                if plx_machine::idle::settled(sp.pos, v, sp.vel) {
+                if plx_machine::motion::report::settled(sp.pos, v, sp.vel) {
                     // Change-guarded, so a wash already at rest reports nothing frame after frame.
                     sp.jump(v);
                 }
@@ -3759,8 +3911,10 @@ impl AmbientWash {
         self.corners.iter().flatten().all(|sp| sp.vel == 0.0)
     }
     /// Is this wash within `eps` of the flat colour `c` on every corner channel? A wash that has
-    /// resolved to the app's own clear colour is a ~2M-fragment full-screen fill that changes
-    /// nothing, and a screen must be able to skip it. (`eps` is naturally one 8-bit code —
+    /// resolved to the app's own clear colour changes nothing, and a screen must be able to skip
+    /// it: drawn, it is a full-screen clear once its four corners are one colour's codes (a wash at
+    /// rest is exactly on its target) and a ~2M-fragment shaded pass until they are, the last frames
+    /// of a settle included. (`eps` is naturally one 8-bit code —
     /// [`theme::SURFACE_APP`] is snapped to exact codes for the `GL_DITHER` reason in its own doc,
     /// so that is the unit this value is reasoned in.) Its own method because the corner springs are
     /// private.
@@ -3792,12 +3946,24 @@ impl AmbientWash {
     pub fn drawn_corners(&self) -> [[f32; 3]; 4] {
         self.corners.map(|c| [code(c[0].pos), code(c[1].pos), code(c[2].pos)])
     }
+    /// **Everything [`draw`](Self::draw) and [`draw_ground`](Self::draw_ground) read of the wash**, as
+    /// the exact bits of its twelve positions in corner order, for a caller that has to NAME the
+    /// picture it paints ([`Painter::cached_ground`]).
+    ///
+    /// Not [`drawn_corners`](Self::drawn_corners): those are the corner codes, but `draw_ground` also
+    /// samples the wash's INTERIOR at the corners of each band it cuts (`sample`, then `code`), and
+    /// two washes with the same corner codes can code an interior point one apart. The positions
+    /// decide every pixel, so they are the name.
+    pub fn paint_bits(&self) -> [u32; 12] {
+        std::array::from_fn(|i| self.corners[i / 3][i % 3].pos.to_bits())
+    }
     /// Paint it over `r`. Opaque — this REPLACES what is under it (see the type docs), so it belongs
     /// at the bottom of a screen's draw, standing in for the flat clear.
     ///
-    /// Always dithered, on every screen and every frame — including under Home's diving hero and
-    /// Detail's scrolling still (`gfx::draw_ambient` records the three gates that were tried and
-    /// why each came back out).
+    /// A gradient is always dithered, on every screen and every frame — including under Home's
+    /// diving hero and Detail's scrolling still (`gfx::draw_ambient` records the three gates that
+    /// were tried and why each came back out). A wash whose four corners are one colour has no
+    /// gradient to band: the renderer draws it as a clear of `r` instead.
     pub fn draw(&self, p: Painter, r: Rect) {
         p.ambient(r, 1.0, self.drawn_corners(), self.at_rest());
     }
@@ -3819,19 +3985,37 @@ impl AmbientWash {
     /// TOOK THE RAMP: when it did not, the ramp is the caller's to draw as before, over all of
     /// this — which is also the answer whenever the ramp would have had to go UNDER an art that
     /// stayed a layer of its own. Every fallback is the layered picture, never a different one.
+    ///
+    /// **The `scrim`** ([`WashScrim`]: a hero's shade over its content rects, a field a ramp cannot
+    /// describe) is carried the same way and on the same conditions, evaluated per vertex of the one
+    /// pass. Because a vertex-evaluated field is linear inside a mesh triangle, a ground that carries
+    /// one is cut into cells of at most [`SCRIM_CELL_W`] x [`SCRIM_CELL_H`] (the mesh is 16 x 16 a
+    /// cell), which is what bounds how far the painted field stands from the closed form the
+    /// legibility contract is graded on ([`HeroShade::at`](crate::hero_shade::HeroShade::at)).
+    /// Returns whether it took the ramp and the scrim — both or
+    /// neither: they ride the same pass under the same conditions — and a caller that gets `false`
+    /// with either given draws it over all of this ([`scrim_layer`] for the scrim).
     pub fn draw_ground(
         &self,
         p: Painter,
         r: Rect,
         art: Option<WashArt>,
         ramp: Option<WashRamp>,
+        scrim: Option<WashScrim>,
     ) -> bool {
         let art = art.filter(|a| a.tex != 0);
         let split = art.and_then(|a| art_wash_split(r, a.rect)).filter(|_| plx_gfx::gfx::art_wash_ok());
         let art_taken = split.is_some();
         let resting = self.at_rest();
-        // The ramp sits over the art: it can only join the wash if the art did (or there is none).
-        let ramp = ramp.filter(|_| plx_gfx::gfx::wash_ink_ok() && (art.is_none() || art_taken));
+        // The ink sits over the art: it can only join the wash if the art did (or there is none).
+        let carries = plx_gfx::gfx::wash_ink_ok() && (art.is_none() || art_taken);
+        let ramp = ramp.filter(|_| carries);
+        let scrim = scrim.filter(|_| carries);
+        let inked = ramp.is_some() || scrim.is_some();
+        debug_assert!(
+            ramp.zip(scrim).is_none_or(|(q, s)| q.ink == s.ink),
+            "a ramp and a scrim in one pass are one ink"
+        );
         let (over, bands) = match split {
             Some((over, bands)) => (Some(over), bands),
             None => (None, [Some(r), None, None, None]),
@@ -3840,13 +4024,17 @@ impl AmbientWash {
             [(b.x, b.y), (b.x + b.w, b.y), (b.x + b.w, b.y + b.h), (b.x, b.y + b.h)]
                 .map(|(x, y)| self.sample(r, x, y).map(code))
         };
-        let knees = ramp.map_or([None, None], |q| [Some(q.stops[0].0), Some(q.stops[1].0)]);
-        let ink = |b: Rect| {
-            ramp.map_or(([0.0; 4], [0.0; 2]), |q| (q.ink, [q.alpha(b.y), q.alpha(b.y + b.h)]))
+        let knees = ramp.map_or([None; 3], |q| q.stops.map(|(y, _)| Some(y)));
+        let (cell_w, cell_h) = if scrim.is_some() { (SCRIM_CELL_W, SCRIM_CELL_H) } else { (f32::INFINITY, f32::INFINITY) };
+        let pieces = |band: Rect| cut_at(band, knees).flat_map(move |b| cut_cells(b, cell_w, cell_h));
+        let ink = |b: Rect| GroundInk {
+            ink: scrim.map(|s| s.ink).or(ramp.map(|q| q.ink)).unwrap_or([0.0; 4]),
+            ramp: ramp.map_or([0.0; 2], |q| [q.alpha(b.y), q.alpha(b.y + b.h)]),
+            scrim: scrim.map_or(plx_gfx::gfx::scrim::GroundShade::NONE, |s| s.field),
         };
         for band in bands.into_iter().flatten() {
-            for b in cut_at(band, knees) {
-                if ramp.is_some() {
+            for b in pieces(band) {
+                if inked {
                     p.ambient_inked(b, corners(b), ink(b), resting);
                 } else {
                     p.ambient(b, 1.0, corners(b), resting);
@@ -3854,7 +4042,7 @@ impl AmbientWash {
             }
         }
         if let (Some(over), Some(a)) = (over, art) {
-            for b in cut_at(over, knees) {
+            for b in pieces(over) {
                 p.ambient_art(b, corners(b), a.tex, a.rect, a.uv, a.tint, ink(b));
             }
         }
@@ -3863,14 +4051,49 @@ impl AmbientWash {
                 p.tex_uv(a.tex, a.uv, a.rect, 0.0, a.tint);
             }
         }
-        ramp.is_some()
+        inked
+    }
+
+    /// **Paint a ground that has NO photograph at all as ONE flat colour** over `r`
+    /// ([`flat_ground`](Self::flat_ground): the wash's mean), which the renderer draws as a clear
+    /// of `r` rather than a shader pass over it (`gfx::draw_ambient`).
+    ///
+    /// **This is not [`draw_ground`](Self::draw_ground)'s fallback for a photograph that is not
+    /// there this frame, and must not be called as one.** A ground whose art is merely pending
+    /// (its texture not resident yet), held, sliding or scrolled to nothing is still a gradient
+    /// with a photograph about to be laid over it, and `draw_ground` with no art draws that gradient
+    /// layered, exactly as before; flattening it for those frames would jump the whole page between
+    /// gradient and one colour in a frame. The caller calls this only once the photograph is gone
+    /// for good: Home's shelves and grid after the hero has left (`sp >= HERO_ART_CULL`), where no
+    /// art is drawn at all and what the page stands on is the wash alone.
+    ///
+    /// It draws no atmospheric ramp, and Home has none by then: the hero has faded out by
+    /// `sp = 0.55`, long before the cull. A caller that did have one would draw it layered over this
+    /// as usual.
+    pub fn draw_flat_ground(&self, p: Painter, r: Rect) {
+        p.ambient(r, 1.0, [self.flat_ground(); 4], self.at_rest());
+    }
+
+    /// **The one colour a ground with no photograph is drawn as**: the wash's mean, snapped to
+    /// exact 8-bit codes ([`code`]) so the clear that draws it never depends on `GL_DITHER` or on
+    /// how the GPU rounds.
+    ///
+    /// The wash is the bilinear of its [`drawn_corners`](Self::drawn_corners), whose mean over any
+    /// rect is the mean of the four corners (the `u*v` term averages to a quarter of its range). A
+    /// wash that is already one colour comes back as exactly that colour.
+    fn flat_ground(&self) -> [f32; 3] {
+        let corners = self.drawn_corners();
+        let mean: [f32; 3] = std::array::from_fn(|i| corners.iter().map(|c| c[i]).sum::<f32>() / 4.0);
+        mean.map(code)
     }
 }
 
 /// A screen's ATMOSPHERIC RAMP as [`AmbientWash::draw_ground`] carries it: `ink` (a scrim colour;
 /// its alpha is ignored) at no alpha above `stops[0].0`, then linear through the three
-/// `(y, alpha)` stops, holding the last below it. Home's is two segments with a midpoint knee;
-/// Detail's is one, which it writes by repeating its foot.
+/// `(y, alpha)` stops, holding the last below it. Home's shelf fade
+/// ([`shelf_fade`](crate::landing_hero::shelf_fade)) is two segments and a held foot, its last
+/// stop above the panel's; Detail's is one segment, which it writes by repeating its foot on the
+/// panel's.
 #[derive(Clone, Copy)]
 pub struct WashRamp {
     pub ink: [f32; 4],
@@ -3878,6 +4101,21 @@ pub struct WashRamp {
 }
 
 impl WashRamp {
+    /// **The ramp as layers of its own**, over whatever is already drawn: for a ground that did not
+    /// carry it (a hero slide's two art layers, a driver without the program). One full-width
+    /// gradient rect a segment, nothing above the first stop, and the last stop's alpha held to the
+    /// panel's foot: the same curve [`alpha`](Self::alpha) gives and the ground draws per vertex.
+    pub fn layer(&self, p: Painter) {
+        for pair in self.stops.windows(2) {
+            let [(top, a), (bottom, b)] = pair else { unreachable!() };
+            p.rect(Rect::new(0.0, *top, crate::consts::SCR_W, bottom - top), 0.0, theme::scrim(*a), theme::scrim(*b), 0.0);
+        }
+        let (last, a) = self.stops[2];
+        if last < crate::consts::SCR_H {
+            p.rect(Rect::new(0.0, last, crate::consts::SCR_W, crate::consts::SCR_H - last), 0.0, theme::scrim(a), theme::scrim(a), 0.0);
+        }
+    }
+
     /// The ramp's alpha at `y` — the curve the layered `rect`s drew, stop to stop.
     pub fn alpha(&self, y: f32) -> f32 {
         let [s0, s1, s2] = self.stops;
@@ -3894,22 +4132,99 @@ impl WashRamp {
     }
 }
 
-/// `r` cut into horizontal strips at the ramp's knees, each on a pixel row (the same
-/// `ceil(y - 0.5)` rule as [`art_wash_split`]), so the ramp is ONE straight segment within every
-/// strip — which is what lets a strip carry it per vertex exactly.
-pub fn cut_at(r: Rect, knees: [Option<f32>; 2]) -> impl Iterator<Item = Rect> {
+/// `r` cut into horizontal strips at the ramp's three stops (its knees, and the foot it holds
+/// below), each on a pixel row (the same `ceil(y - 0.5)` rule as [`art_wash_split`]), so the ramp is
+/// ONE straight segment within every strip, or held flat — which is what lets a strip carry it per
+/// vertex exactly. A stop on the panel's foot (Detail's, Home's old one) or past `r` cuts nothing.
+pub fn cut_at(r: Rect, knees: [Option<f32>; 3]) -> impl Iterator<Item = Rect> {
     let (top, bottom) = (r.y, r.y + r.h);
-    let mut ys = [top, bottom, bottom, bottom];
+    let mut ys = [top, bottom, bottom, bottom, bottom];
     for (i, k) in knees.into_iter().enumerate() {
         if let Some(k) = k {
             ys[i + 1] = (k - 0.5).ceil().clamp(top, bottom);
         }
     }
-    ys[3] = bottom;
     ys.sort_by(f32::total_cmp);
-    (0..3).filter_map(move |i| {
+    (0..4).filter_map(move |i| {
         (ys[i + 1] > ys[i]).then(|| Rect::new(r.x, ys[i], r.w, ys[i + 1] - ys[i]))
     })
+}
+
+/// A screen's SCRIM as [`AmbientWash::draw_ground`] carries it: `ink` (a scrim colour; its alpha is
+/// ignored) at the stacked alpha of `field` (the hero shade, [`HeroShade`](crate::hero_shade::HeroShade)
+/// builds it from the content rects a screen draws), a two-dimensional field no [`WashRamp`] can
+/// describe. The ground evaluates it per vertex in its one pass; [`scrim_layer`] draws the same
+/// field as a layer of its own.
+#[derive(Clone, Copy)]
+pub struct WashScrim {
+    pub ink: [f32; 4],
+    pub field: plx_gfx::gfx::scrim::GroundShade,
+}
+
+impl WashScrim {
+    /// The scrim's alpha at the authored point `(x, y)`.
+    pub fn alpha(&self, x: f32, y: f32) -> f32 {
+        self.field.at(x, y)
+    }
+
+    /// **The scrim by value, as a draw reads it**: the ink, the shader's mode/count and every
+    /// uniform it is uploaded, by bits ([`AmbientWash::paint_bits`] for the wash it rides). Two
+    /// scrims with the same bits draw the same field, cell for cell, so a screen that caches the
+    /// picture a scrim is drawn into (`Painter::cached_ground`) names the scrim by it.
+    pub fn paint_bits(&self) -> ([u32; 4], u32, [[u32; 4]; plx_gfx::gfx::scrim::VEC4S]) {
+        (
+            self.ink.map(f32::to_bits),
+            self.field.shader_count().to_bits(),
+            self.field.uniforms().map(|v| v.map(f32::to_bits)),
+        )
+    }
+}
+
+/// The widest and tallest a scrimmed ground draws as ONE mesh (a 16 x 16 grid of triangles):
+/// 480 x 270 is the panel in a 4 x 4. The vertex-evaluated field is linear inside a triangle, so
+/// this is what bounds its distance from the closed form:
+/// `the_painted_field_is_the_closed_form_under_content_and_close_elsewhere` holds the bound for the hero
+/// shade's own field.
+pub const SCRIM_CELL_W: f32 = 480.0;
+pub const SCRIM_CELL_H: f32 = 270.0;
+
+/// `r` cut into a grid of at most `cell_w` x `cell_h` cells (one cell when either bound is no
+/// smaller than `r`), every edge computed from `r` and the cell index so two neighbours share the
+/// same float and the grid tiles `r` with no crack and no overlap.
+pub fn cut_cells(r: Rect, cell_w: f32, cell_h: f32) -> impl Iterator<Item = Rect> {
+    let n = |len: f32, cell: f32| ((len / cell).ceil() as usize).max(1);
+    let (nx, ny) = (n(r.w, cell_w), n(r.h, cell_h));
+    let edge = move |o: f32, len: f32, i: usize, n: usize| if i == n { o + len } else { o + len * i as f32 / n as f32 };
+    (0..ny).flat_map(move |j| {
+        (0..nx).map(move |i| {
+            let (x0, x1) = (edge(r.x, r.w, i, nx), edge(r.x, r.w, i + 1, nx));
+            let (y0, y1) = (edge(r.y, r.h, j, ny), edge(r.y, r.h, j + 1, ny));
+            Rect::new(x0, y0, x1 - x0, y1 - y0)
+        })
+    })
+}
+
+/// **A scrim drawn as a layer of its own**, over whatever is already drawn: the frames a ground
+/// cannot carry it in its pass — a hero slide (two art layers it must go OVER), and a resting hero
+/// whose opaque photograph covers the wash, so that no ground pass is drawn at all. The same field,
+/// in the same cells ([`SCRIM_CELL_W`]), as [`AmbientWash::draw_ground`] would have carried.
+///
+/// **Every cell is declared, and only the cells the shade reaches are drawn.** A hero's shade is a few
+/// soft blocks and most of the panel's 16 cells hold nothing but zeros; the renderer drops a cell the
+/// field cannot reach (`gfx::draw_scrim_layer`, [`GroundShade::reaches`](plx_gfx::gfx::scrim::GroundShade::reaches):
+/// exact where it says no), so the layer costs the vertices of the cells under the copy, not of the
+/// panel, and a frame with no shade costs none. The skip sits below the declaration on purpose: the
+/// recorded stream (the draw census, the replay anchors) is the same 16 cells whatever the shade is.
+///
+/// **There is no `gfx::scrim_layer_ok` check here, on purpose.** A layer whose program did not link
+/// draws nothing, and the renderer (`gfx::draw_scrim_layer`) already returns for it, below the
+/// declaration like the skip above; a check up here would stop declaring the cells on a GPU without
+/// the program, so the same frame would record differently on a host (no GL, no program) than on the
+/// set, and the replay anchors would diverge between them.
+pub fn scrim_layer(p: Painter, s: WashScrim) {
+    for cell in cut_cells(Rect::FULL, SCRIM_CELL_W, SCRIM_CELL_H) {
+        p.scrim_layer(cell, s.ink, s.field);
+    }
 }
 
 /// The photograph [`AmbientWash::draw_ground`] lays over its wash: exactly the arguments the
@@ -3972,12 +4287,16 @@ pub fn art_wash_split(r: Rect, art: Rect) -> Option<(Rect, [Option<Rect>; 4])> {
 ///   dissolving to the flat surface. One artless poster in a row of colour would otherwise flash the
 ///   whole page grey and back on the way past — the person page states this rule in prose and this
 ///   is it as code, which is why that screen now shares this type.
-/// * **A ground that has resolved to the app's own clear colour is not drawn.** It is a
-///   ~2M-fragment full-screen pass that changes nothing; `AmbientWash::is_flat` is the test and
-///   forgetting it costs a whole screen's fill-rate headroom for an invisible gradient.
-/// * **This ground always dithers** — as every wash does now, the two with artwork sliding over
-///   them included (`gfx::draw_ambient`). A browsing ground has nothing over it, so there is no
-///   frame on which it is not the thing being looked at. [`draw`](Self::draw) takes no flag.
+/// * **A ground that has resolved to the app's own clear colour is not drawn.** It changes nothing,
+///   and drawn it is a full-screen clear once the wash's four corners are one colour's codes (at
+///   rest it is exactly on its target) and a ~2M-fragment shaded pass until they are, the last
+///   frames of a settle included; `AmbientWash::is_flat` is the test and forgetting it costs a
+///   whole screen's fill-rate headroom for an invisible gradient.
+/// * **This ground's gradient always dithers** — as every gradient wash does now, the two with
+///   artwork sliding over them included (`gfx::draw_ambient`). A browsing ground has nothing over
+///   it, so there is no frame on which it is not the thing being looked at. [`draw`](Self::draw)
+///   takes no flag. (A ground resting on four equal 8-bit codes has no gradient to band and is
+///   drawn as a clear.)
 ///
 /// What stays the screen's business is the per-corner SHAPE — how far each corner leans — for the
 /// reason [`AmbientWash::GROUND_W`] gives: one strength, many arrangements. [`CARD_W`](Self::CARD_W)
@@ -4009,6 +4328,9 @@ impl PageGround {
     /// The corner arrangement every item-keyed page ground leans by: [`AmbientWash::GROUND_W`]
     /// across the top, nearly gone by the bottom. Strongest where the page's own subject is and
     /// faint under the content rows, which is what keeps it atmosphere rather than a tint.
+    /// (Home's culled shelves and grid are the one place this does not show: from
+    /// `sp >= HERO_ART_CULL` that wash is drawn flat, at the mean of its four corners
+    /// ([`AmbientWash::draw_flat_ground`]), so there the weights set a single colour.)
     ///
     /// One constant rather than one per screen: the STRENGTH is already shared
     /// ([`AmbientWash::GROUND_W`]), and two browsing screens leaning it in two different directions
@@ -4097,12 +4419,14 @@ impl PageGround {
     /// Paint the ground under everything, standing in for the flat clear — **skipped when it has
     /// resolved to that clear anyway**, which is the whole fill-rate argument in the type's doc.
     ///
-    /// **Dithered on every frame, unconditionally**, like every wash. A browsing screen's ground is
-    /// directly visible in every gutter of the grid standing on it, at rest and while it dissolves,
-    /// and an undithered gradient there bands in slow diagonal treads that CRAWL as the ground
-    /// moves. The fill-rate answer
-    /// this type DOES keep is the one above it: a ground that has resolved to the clear colour is
-    /// not drawn at all, so the frames it costs nothing are the frames it shows nothing.
+    /// **A gradient here is dithered on every frame, unconditionally**, like every gradient wash. A
+    /// browsing screen's ground is directly visible in every gutter of the grid standing on it, at
+    /// rest and while it dissolves, and an undithered gradient there bands in slow diagonal treads
+    /// that CRAWL as the ground moves. (A ground resting on four equal 8-bit codes is not a
+    /// gradient: nothing in it can band, and the renderer draws it as a clear of `r`.) The
+    /// fill-rate answer this type DOES keep is the one above it: a ground that has resolved to the
+    /// clear colour is not drawn at all, so the frames it costs nothing are the frames it shows
+    /// nothing.
     pub fn draw(&self, p: Painter, r: Rect) {
         if self.wash.is_flat(theme::SURFACE_APP, AmbientWash::FLAT_EPS) {
             return;
@@ -4851,9 +5175,57 @@ impl View for StatusOverlay<'_> {
 // ---- TransportButton: circular control button with a runtime-rasterized SVG glyph
 // (0 = subtitles/CC, 1 = audio, 2 = more/overflow). The player supplies Unkeyed, so focused is a
 // flat accent + dark icon and idle is a light film + white icon. ----
-pub struct TransportButton {
+/// A [`TransportButton`]'s RESTING face — what the disc wears while the remote is elsewhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportRest {
+    /// the idle film plate and white glyph every caller had
+    #[default]
+    Film,
+    /// the glyph alone: no plate, no rim (focus still arrives with its own face)
+    Bare,
+    /// the focused colours at rest: the accent plate under the dark glyph, with no cast (the cast
+    /// is what FOCUS adds)
+    Solid,
+}
+
+/// A [`TransportButton`]'s FOCUS face — what the remote's arrival changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportFocus {
+    /// the flat accent plate with a dark glyph, lifted by its cast
+    #[default]
+    Accent,
+    /// the rest face stays and a white ring stands just outside it
+    /// ([`theme::CONTROL_FOCUS_RING`])
+    Ring,
+}
+
+/// Which plate a [`TransportButton`] paints under its glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plate {
+    None,
+    /// the idle film
+    Film,
+    /// the flat accent plate with its dark glyph
+    Accent,
+}
+
+/// What a [`TransportButton`] paints, decided once: the plate, whether that plate casts (focus's
+/// elevation, never a resting colour's) and whether the `ring` stroke stands outside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportLook {
+    plate: Plate,
+    cast: bool,
+    ring: bool,
+}
+
+pub struct TransportButton<'a> {
     pub frame: Rect,
     pub which: i32,
+    /// Optional glyph for additional transport actions; the three original indices stay valid.
+    pub icon: Option<crate::icons::Icon>,
+    /// A glyph from SVG source the app does not ship (a HUD package's asset); wins over `icon`.
+    pub svg: Option<crate::icons::Svg<'a>>,
+    pub enabled: bool,
     pub focused: bool,
     /// WHICH GROUND this disc stands on — see [`ControlGround`]. It defaults to
     /// [`Keyed`](ControlGround::Keyed) like every other control face, even though this family's one
@@ -4865,11 +5237,13 @@ pub struct TransportButton {
     /// The FOCUS POP, as a factor on the frame — see [`CircleButton::scale`], whose contract this
     /// shares (these discs are that same face at 64px).
     pub scale: f32,
+    pub rest: TransportRest,
+    pub focus: TransportFocus,
     /// A live channel's record disc instead of `which`'s glyph: a red dot, ringed once the
     /// recording is asked for (`Some(asked)`).
     pub record: Option<bool>,
 }
-impl TransportButton {
+impl<'a> TransportButton<'a> {
     /// Draw the live record disc (see [`Self::record`]).
     pub fn record(mut self, asked: bool) -> Self {
         self.record = Some(asked);
@@ -4879,13 +5253,26 @@ impl TransportButton {
         Self {
             frame,
             which,
+            icon: None,
+            svg: None,
+            enabled: true,
             focused: false,
             ground: ControlGround::Keyed,
             palette: ControlPalette::default(),
             scale: 1.0,
             record: None,
+            rest: TransportRest::Film,
+            focus: TransportFocus::Accent,
         }
     }
+    pub fn icon(mut self, icon: crate::icons::Icon) -> Self { self.icon = Some(icon); self }
+    pub fn svg(mut self, svg: crate::icons::Svg<'a>) -> Self { self.svg = Some(svg); self }
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+    /// Asks for the focused face. A disabled disc never wears it whatever order the two are set
+    /// in: [`View::draw`] is the one place that decides.
     pub fn focused(mut self, f: bool) -> Self {
         self.focused = f;
         self
@@ -4903,16 +5290,42 @@ impl TransportButton {
         self.scale = s;
         self
     }
+    /// The face the disc wears at rest — [`TransportRest`].
+    pub fn rest_face(mut self, rest: TransportRest) -> Self {
+        self.rest = rest;
+        self
+    }
+    /// The face the remote's arrival gives it — [`TransportFocus`].
+    pub fn focus_face(mut self, focus: TransportFocus) -> Self {
+        self.focus = focus;
+        self
+    }
+    /// The one place the rest face, the focus face and the disabled rule meet. A disabled disc is
+    /// never focused, whatever order the builder ran in.
+    fn look(&self) -> TransportLook {
+        let focused = self.enabled && self.focused;
+        let accent = focused && self.focus == TransportFocus::Accent;
+        let plate = if accent || (self.rest == TransportRest::Solid) {
+            Plate::Accent
+        } else if self.rest == TransportRest::Bare {
+            Plate::None
+        } else {
+            Plate::Film
+        };
+        TransportLook { plate, cast: accent, ring: focused && self.focus == TransportFocus::Ring }
+    }
 }
-impl View for TransportButton {
+impl View for TransportButton<'_> {
     fn draw(&self, _e: &Env, p: Painter) {
         use crate::icons::Icon;
         let r = self.frame.scaled(self.scale);
         // The design system builds this disc AS a `CircleButton` at 64px, so it takes the shared
         // control face rather than spelling one of its own: the two used to be the same three
         // tokens written twice, which is how a ground (or a palette) reaches one and not the other.
-        let face = ControlStyle::Accent.face(self.focused, self.ground, self.palette);
-        let ink = face.ink;
+        // A disabled disc is never focused, however the builder was called ([`Self::look`]).
+        let look = self.look();
+        let face = ControlStyle::Accent.face(look.plate == Plate::Accent, self.ground, self.palette);
+        let ink = if self.enabled { face.ink } else { theme::INK_DISABLED };
         // **The same edge every other control wears** — [`control_rim`], not a bare `rect`. This was
         // the one control family the rim missed: `Button` and `CircleButton` both took it and these
         // discs kept a plain fill, so the transport read as a different material from the disc pair
@@ -4926,18 +5339,17 @@ impl View for TransportButton {
         // in the picture. `ControlGround::Unkeyed` is the answer the HUD passes in, and it holds
         // because the HUD's own ramp is under the disc — the glyph's contrast comes from the ramp
         // plus the film, not from the plate alone.
-        if self.focused {
+        if look.cast {
             control_cast(p, r, r.w * 0.5);
         }
-        control_rim(
-            p,
-            r,
-            r.w * 0.5,
-            face.top,
-            face.body,
-            self.focused,
-            self.ground,
-        );
+        if look.plate != Plate::None {
+            control_rim(p, r, r.w * 0.5, face.top, face.body, look.plate == Plate::Accent, self.ground);
+        }
+        if look.ring {
+            let o = theme::CONTROL_FOCUS_RING_GAP + theme::CONTROL_FOCUS_RING_W * 0.5;
+            let ring = Rect::new(r.x - o, r.y - o, r.w + o * 2.0, r.h + o * 2.0);
+            p.rring(ring, ring.w * 0.5, theme::CONTROL_FOCUS_RING_W, theme::CONTROL_FOCUS_RING);
+        }
         if let Some(asked) = self.record {
             let d = (r.w * 0.34).round();
             p.rrect(Rect::new(r.x + (r.w - d) * 0.5, r.y + (r.h - d) * 0.5, d, d), d * 0.5, d * 0.5, theme::DANGER);
@@ -4947,13 +5359,17 @@ impl View for TransportButton {
             }
             return;
         }
-        let id = match self.which {
+        let s = (r.w * DISC_ICON_RATIO).round();
+        let ir = Rect::new(r.x + (r.w - s) * 0.5, r.y + (r.h - s) * 0.5, s, s);
+        if let Some(svg) = self.svg {
+            crate::icons::draw_svg(p, svg, ir, ink);
+            return;
+        }
+        let id = self.icon.unwrap_or(match self.which {
             1 => Icon::Audio,
             2 => Icon::More,
             _ => Icon::Cc,
-        };
-        let s = (r.w * DISC_ICON_RATIO).round();
-        let ir = Rect::new(r.x + (r.w - s) * 0.5, r.y + (r.h - s) * 0.5, s, s);
+        });
         crate::icons::draw(p, id, ir, ink);
     }
 }
@@ -5595,7 +6011,7 @@ impl View for TabPill {
 /// capsule rides *inside* the strip it marks, and a highlight that settles at a different rate from
 /// the row under it reads as two objects instead of one control. (The detail season row springs its
 /// own scroll at the same 240 — the directive above [`TAB_PILL_H`] covers their motion too.)
-const K_TAB_CAP: f32 = K_TAB_SCROLL;
+pub(crate) const K_TAB_CAP: f32 = K_TAB_SCROLL;
 /// Stiffness of a capsule's ALPHA — the app's shared appear spring
 /// ([`crate::popover::K_APPEAR`]), because entering or leaving a row is a FADE, not a journey.
 const K_TAB_CAP_A: f32 = crate::popover::K_APPEAR;
@@ -5786,6 +6202,14 @@ pub fn strip_span(lays: &[StripLay], i: usize, h: f32) -> Option<(f32, f32)> {
     })
 }
 
+/// The standing track around measured pills, with the top bar's own uniform inset.
+pub fn strip_track_rect(lays: &[StripLay], top: f32, h: f32) -> Option<Rect> {
+    let first = strip_pill_rect(lays.first()?, top, h);
+    let last = strip_pill_rect(lays.last()?, top, h);
+    Some(Rect::new(first.x - TAB_TRACK_PAD, top - TAB_TRACK_PAD,
+        last.x + last.w - first.x + 2.0 * TAB_TRACK_PAD, h + 2.0 * TAB_TRACK_PAD))
+}
+
 /// **Draw a whole strip — both capsules, then every on-screen pill — through ONE scroll offset.**
 ///
 /// This is the one draw path of the strips built from [`StripLay`] pills (the detail page's season
@@ -5817,10 +6241,12 @@ pub fn draw_strip(
         if !crate::on_axis(pill.x + p.dx(), pill.w, crate::consts::SCR_W, 0.0) {
             continue;
         }
-        // The idle ground is the pill's, laid down ONCE at the whole pill's focus coverage (it retires
-        // as the opaque capsule arrives); the label is inked region by region (`pill_ink`).
-        if let Some(fill) = TabPill::idle_fill_at(strip.mixes((pill.x, pill.w)).0) {
-            p.rrect(pill, pill.h * 0.5, pill.h * 0.5, fill);
+        // Standalone pills own an idle face; a tracked row already has its container ground.
+        // The label is inked region by region (`pill_ink`).
+        if !matches!(ground, TabGround::Tracked { .. }) {
+            if let Some(fill) = TabPill::idle_fill_at(strip.mixes((pill.x, pill.w)).0) {
+                p.rrect(pill, pill.h * 0.5, pill.h * 0.5, fill);
+            }
         }
         let ink = strip.pill_ink(pill, ground);
         paint_inked(p, &ink, |fm, sm| {
@@ -5925,12 +6351,12 @@ pub enum SelMark {
 /// press and transform handler it writes on `plated`.
 #[derive(Clone, Copy)]
 pub enum TabGround {
-    /// **The shared top tab bar**, inside its own track. The pills have no ground of their own and
+    /// **A shared tracked tab row** (the top bar or full-image preview), inside its own track. The pills have no ground of their own and
     /// nothing here scales: the capsule TRAVELLING under a row that encloses it is the whole focus
     /// mark, and a pill that also grew would be two answers to one question. `glass` is whether that
     /// track is drawn as the standing glass container this frame (it goes flat behind a panel and
-    /// past `GLASS_TRACK_MAX`), which decides whether the selection plate wears the material's own
-    /// perimeter or is a plain wash.
+    /// under the `flattabs` experiment, never for its width), which decides whether the selection
+    /// plate wears the material's own perimeter or is a plain wash.
     Tracked { glass: bool },
     /// **The detail page's season strip**, bare on artwork with each pill laying its own ground. Its
     /// focused pill is a CONTROL FACE and wears the whole of one: the `CTRL_FOCUS_SCALE` pop (the one
@@ -5973,6 +6399,11 @@ impl TabStrip {
             foc: Capsule::new(),
         }
     }
+    /// Re-enter the selected plate at its new layout position on the next update.
+    pub(crate) fn restart_selection(&mut self) {
+        self.sel = Capsule::new();
+    }
+
     /// Whether either capsule is still travelling, resizing or fading: the strip's own statement of
     /// motion, for an owner that waits for the strip to arrive (the Detail season pill's hold hint).
     pub fn moving(&self) -> bool {
@@ -6029,7 +6460,7 @@ impl TabStrip {
                 // for a TRACKED pill or the selection plate — see the call sites' own comments for
                 // why each of those stays flat.
                 if cast {
-                    control_cast(p, r, h * 0.5);
+                    control_cast_at(p, r, h * 0.5, a);
                 }
                 match rim {
                     // On a GLASS track the selection plate is a piece of the same material, not a
@@ -6422,7 +6853,9 @@ pub const TOP_BAR_BOTTOM: f32 = TOP_BAR_Y + TAB_PILL_H + TAB_TRACK_PAD; // 130
 const TAB_GAP: f32 = 16.0;
 /// How wide the pill strip may grow before it starts scrolling. The row stays CENTERED, but it
 /// must never reach the profile chip (a focus stop of its own at `MARGIN_X`), so the viewport is
-/// the screen less a symmetric chip-clearing margin, less the track's own inset on both ends.
+/// the screen less a symmetric chip-clearing margin, less the track's own inset on both ends. The
+/// track stays glass while the pills scroll inside it ([`tab_glass_on`]): the width never decides
+/// the material.
 const TAB_SIDE_CLEAR: f32 = CHIP_FRAME.x + CHIP_D + theme::space::MD;
 const TAB_VIEW_MAX: f32 = crate::consts::SCR_W - 2.0 * (TAB_SIDE_CLEAR + TAB_TRACK_PAD);
 /// **The shared top bar's outermost drawn chrome, for the overscan audit**
@@ -6615,7 +7048,7 @@ impl StripRender {
     /// through `ChromeSnapshot::pulse`; no screen does.
     pub fn pulse(&mut self, idx: usize) {
         self.pulse = Some(TabPulse { idx, age: 0.0 });
-        plx_machine::idle::invalidate();
+        // The input boundary selects the first pulse frame; step reports its ramp.
     }
 
     /// The running pulse as `(pill index, envelope)`, `None` at rest.
@@ -6683,9 +7116,7 @@ impl Default for StripRender {
 /// | the flat capsule this replaced (`TAB_TRACK_A_TOP` .72) | L\* 27.5 | **9.74:1** |
 /// | the band's face, solved for a dark track | L\* 75.4 | **1.86:1** |
 ///
-/// At L\* 80 it is 2.54:1. Nothing in the app darkens the top band before this — `home`'s
-/// atmospheric ramp starts at `HERO_BASE_SCRIM_Y0` (367) and the hero wedge at `HERO_SCRIM_TOP`
-/// (162) — so those are raw backdrop pixels, and `gfx::sample_ground`'s own note records a census
+/// At L\* 80 it is 2.54:1. Nothing in the app darkens the top band before this — Detail's resting shade leaves the navigation band clear, so those are raw backdrop pixels, and `gfx::sample_ground`'s own note records a census
 /// finding a MEDIAN 26.8 L\* span across five taps of the track alone, a third of heroes over 40.
 /// The band is half again as wide as the track.
 ///
@@ -6695,7 +7126,7 @@ impl Default for StripRender {
 /// which trades this failure for its mirror image. Making the rect follow the unfurl re-solves the
 /// whole bar when focus lands on the chip. Keying `sample_ground` per caller costs far less than
 /// its doc used to claim (see there) but puts two densities on one line — which the lane's own
-/// geometry change makes less dangerous than it was, since `GLASS_TRACK_MAX` now guarantees the two
+/// geometry change makes less dangerous than it was, since `chip_name_budget` now guarantees the two
 /// can never be nearer than `BAND_AIR` and are usually ~300px apart. Settle it by LOOKING, with a
 /// ground that varies in luminance ACROSS the band: `pat:ramp`, `pat:edge`, `pat:orient`. Every
 /// pattern this was verified on (`flat:*`, `hbars`, `rainbow:70`) is uniform across x or uniform in
@@ -6707,8 +7138,8 @@ impl Default for StripRender {
 /// this is ordinary backdrop content rather than a self-reference.
 #[derive(Clone, Copy)]
 enum BarMaterial {
-    /// the flat dark capsule: `flattabs`, a popover open, a strip past [`GLASS_TRACK_MAX`], a
-    /// driver with no render target, or a source pass
+    /// the flat dark capsule: `flattabs`, a popover open, a driver with no render target, or a
+    /// source pass (never the strip's width)
     Flat,
     /// the glass track's solved face; the chip reproduces it locally without sampling the backdrop
     Glass(plx_gfx::gfx::GlassFace),
@@ -6745,8 +7176,9 @@ fn density_k(drawn: f32, want: f32) -> f32 {
 
 /// The weight being drawn, and the one the ground last asked for.
 ///
-/// `want` is published by the DRAW because the ground is framebuffer 0 and only the draw can read
-/// it; [`TabBand::step`] consumes it on the next frame. That one frame of lag is nothing against a
+/// `want` is published by the DRAW because the ground is the band's retained backdrop image and
+/// only the visible walk can see it (`backdrop::member_image` answers `None` anywhere else);
+/// [`TabBand::step`] consumes it on the next frame. That one frame of lag is nothing against a
 /// value that eases over hundreds of milliseconds, and it is the only ordering that does not put a
 /// readback in the update phase.
 ///
@@ -6765,8 +7197,8 @@ impl TrackDensity {
     }
 }
 
-/// The tab track's persistent glass state. `GlassPlan` owns one; the strip borrows it only for
-/// update/prepare/draw, keeping the renderer and the frame scheduler on one state instance.
+/// A standing track's persistent glass state. The chrome's `GlassPlan` and the image preview
+/// each own their instance, sharing the same density solve, spring and material.
 pub struct TabBand {
     material: BarMaterial,
     density: TrackDensity,
@@ -6782,6 +7214,32 @@ impl TabBand {
 
     pub fn step(&mut self, dt: f32) {
         track_density_step(dt, &mut self.density);
+    }
+
+    /// Solve once for a container and publish its face for sibling controls. A caller that
+    /// chooses a flat track never requests a readback; unsettled pages retain their last sample.
+    pub fn prepare(&mut self, p: Painter, track: Rect, settled: bool, glass: bool) -> [f32; 3] {
+        let (r, g, b) = theme::CLEAR_RGB;
+        let flat = [r, g, b];
+        let ground = if glass {
+            let at = p.place(track);
+            plx_gfx::gfx::sample_ground([at.x, at.y, at.w, at.h], settled).unwrap_or(flat)
+        } else { flat };
+        self.material = if glass {
+            let (top, body) = tab_glass_stops(ground, &mut self.density);
+            let (rim, rim_lit) = track_rim(top[3]);
+            BarMaterial::Glass(plx_gfx::gfx::GlassFace {
+                scrim_top: top, scrim_bot: body, rim, rim_lit, rim_w: 1.0,
+            })
+        } else { BarMaterial::Flat };
+        ground
+    }
+
+    /// The shared standing capsule, including the same fallback when no blur source is available.
+    pub fn draw(&self, p: Painter, track: Rect) {
+        if !glass_capsule(p, track, 1.0, self.face(), None) {
+            p.rect_sheened(track, track.h * 0.5, theme::TAB_TRACK_TOP, theme::TAB_TRACK_BOT);
+        }
     }
 
     pub fn face(&self) -> Option<plx_gfx::gfx::GlassFace> {
@@ -7195,130 +7653,77 @@ fn lstar(c: [f32; 4]) -> f32 {
 /// Sixteen is the bar's own rung — [`TAB_GAP`], the air between two pills inside the track. It is
 /// not decoration: the two capsules are one band in one material, and a band whose halves TOUCH
 /// draws its two 1px rims side by side, which reads as a bright seam exactly where the design has
-/// a continuous edge. See [`GLASS_TRACK_MAX`].
+/// a continuous edge. See [`chip_name_budget`].
 const BAND_AIR: f32 = theme::space::SM;
 
 /// **The widest box the profile chip ever draws** — [`chip_cap`] at full unfurl with a name at its
-/// budget, i.e. **the rect the control DRAWS**, not a hand-copy of the terms that build it. The
-/// name is elided to [`CHIP_NAME_MAX`] before it is measured, so this is arithmetic on constants
-/// and needs no font to evaluate, which is what makes every clearance solved against it a host test
-/// rather than a device capture.
+/// ceiling, i.e. **the rect the control DRAWS**, not a hand-copy of the terms that build it. The
+/// name is elided to at most [`CHIP_NAME_MAX`] before it is measured, so this is arithmetic on
+/// constants and needs no font to evaluate, which is what makes every clearance solved against it
+/// a host test rather than a device capture.
 ///
-/// Two of those clearances are HORIZONTAL and live here ([`CHIP_CAP_MAX_R`], and through it
-/// [`GLASS_TRACK_TOUCH_MAX`]). The third is VERTICAL and belongs to another screen: Home's shelf
-/// headings begin at the very margin this capsule sits on, so the grid's resting top (`GRID_TOP_Y`)
-/// is graded against this rect's bottom edge (the home grid's tests). Exported whole rather than as a
-/// second edge constant, for the same reason the `_R` form exists at all — one expression, drawn
-/// and graded from the same place.
+/// The clearance that reads it is VERTICAL and belongs to another screen: Home's shelf headings
+/// begin at the very margin this capsule sits on, so the grid's resting top (`GRID_TOP_Y`) is
+/// graded against this rect's bottom edge (the home grid's tests), and the overscan audit grades
+/// its edges ([`overscan_rects`]). Exported whole rather than as an edge constant, so the drawn and
+/// the graded rect are one expression. (The HORIZONTAL clearance, against the track, is not read
+/// off this rect: it is the name's budget, [`chip_name_budget`].)
 pub const CHIP_CAP_MAX: Rect = chip_cap(1.0, CHIP_NAME_MAX);
 
-/// **Where the unfurled [`profile_chip_with`] capsule's right edge can reach, at its widest** — the one
-/// edge of [`CHIP_CAP_MAX`] the band's own arithmetic asks for, named because the reader there
-/// wants a position rather than a projection.
-const CHIP_CAP_MAX_R: f32 = CHIP_CAP_MAX.x + CHIP_CAP_MAX.w;
-
-/// The widest a track may be and still wear glass — the design system's `--glass-track-max`.
+/// **How wide a profile name the bar leaves room for — the one function that keeps the unfurled
+/// chip and the track apart.** `track_w` is the strip's track ([`tab_track_w`]), centred on the
+/// screen, so its left edge is `(SCR_W - track_w) / 2`; the capsule's right edge, [`chip_cap`] at
+/// full unfurl, is the closed circle's plus the name's gap, the name and the tail. The budget is the
+/// name width that leaves [`BAND_AIR`] between the two, capped at [`CHIP_NAME_MAX`] — and `0` when
+/// that room is under [`CHIP_NAME_MIN`], where the chip shows no name and its capsule stays the
+/// closed circle (see [`chip_cap`]).
 ///
-/// A track is charged by its LENGTH: what a glass surface costs is the blurred RECTANGLE, the
-/// surface grown 88px a side, so a 940-wide one priced at `(940 + 176) x (76 + 176)` = 281k px^2 —
-/// inside the ~300k a MOVING host holds 60 fps under (`docs/glass-hardware-budget.md`) — while a
-/// 1050-wide one was not. It is the one limit here a section table can trip on its own: enough
-/// libraries and the strip outgrows the budget, so the material has to come off by arithmetic
-/// rather than by anyone remembering.
+/// **This replaced a cap on the TRACK.** The track used to be held to a width (`GLASS_TRACK_MAX`,
+/// 672 px at the end) so that the widest capsule could not reach it, and a strip past it drew the
+/// flat capsule: the owner's Belarusian strip (679 px once the Watchlist mark joined the bar) lost
+/// the glass for 7 px. The bar gains entries and its labels vary by language, so its width must
+/// never decide its material, and the clearance moved to the one party whose width is user data
+/// anyway. A 679 px track leaves 394.5 px of room, so the shipped bar keeps the whole 320; the
+/// budget bites once the room falls under `CHIP_NAME_MAX`, past an 828 px track, and is `0` under
+/// `CHIP_NAME_MIN`, past 1300 px, both short of [`TAB_VIEW_MAX`]: one more pill wider than 133 px
+/// on today's widest strip is already in that range, so a change to the strip can shorten the
+/// name.
 ///
-/// **It is no longer the track's own arithmetic, because the track is no longer the only surface in
-/// the band.** [`profile_chip_with`] wears the same material now, and the two are priced and placed
-/// together:
-///
-/// * **The BUDGET is the UNION.** Two glass surfaces in a frame converge on one grab
-///   (`gfx::blur_region_union`), so the bar costs one snapshot — but that snapshot spans both. Its
-///   left edge is the capsule's ([`BAND_REGION_X0`]) and its right is the track's, over
-///   [`BAND_REGION_H`]; solving that for the width is [`GLASS_TRACK_BUDGET_MAX`].
-/// * **And the two must not TOUCH.** The track is centred, so its left edge is `(SCR_W - w) / 2`;
-///   the capsule's right edge stops at [`CHIP_CAP_MAX_R`]. Solving for [`BAND_AIR`] between them is
-///   [`GLASS_TRACK_TOUCH_MAX`] — **848** — written as the expression so that raising
-///   [`CHIP_NAME_MAX`] tightens the cap instead of silently letting the two meet.
-///
-/// **Which of the two BINDS moved on 2026-08-23, and this constant is now the `min` rather than the
-/// touch rule alone.** It was written as the touch expression with a comment saying the budget
-/// reached at 904 — true while the band's blurred region was 200px tall, i.e. while `TOP_BAR_Y` was
-/// 44. Dropping the bar 18px so its track clears the overscan frame (`consts::MARGIN_Y`) makes that
-/// region 218 tall, and 18 more rows of a ~1470-wide grab is 26k px², enough to put the touch width
-/// outside the budget. The two constraints were only ever ordered by coincidence; asserting one and
-/// documenting the other is what let that go unnoticed until the test caught it.
-///
-/// Overlap is what had to be made impossible, rather than handled. There is ONE blur cache: a
-/// second surface over the first gets no second blur, only a second frost and a second rim
-/// composited over material that already carries both — the double-darkening `draw_tab_row`'s
-/// source-pass note measures from the other direction. Nothing in the shader can undo that, so the
-/// geometry has to keep them apart, and the test below is what keeps them apart.
-///
-/// What it costs is stated plainly: the product's own strip is 572px, so the material survives
-/// today's bar with room for one more library and not two. What it buys is that the band is never
-/// two materials and never a doubled one, and never over the budget a measurement set.
-const GLASS_TRACK_MAX: f32 = if GLASS_TRACK_TOUCH_MAX < GLASS_TRACK_BUDGET_MAX {
-    GLASS_TRACK_TOUCH_MAX
-} else {
-    GLASS_TRACK_BUDGET_MAX
-};
-
-/// The widest track that still leaves [`BAND_AIR`] between the unfurled chip and the centred strip.
-const GLASS_TRACK_TOUCH_MAX: f32 = crate::consts::SCR_W - 2.0 * (CHIP_CAP_MAX_R + BAND_AIR);
-
-/// The track's blurred region HEIGHT, in authored px — priced at [`plx_gfx::gfx::BLUR_MARGIN`], the
-/// margin of a glass that RISES. The band's glass never rises, so its real region is grown
-/// [`plx_gfx::gfx::blur_region_for`]'s `BLUR_REACH` (68) only: 20 px less each side. This constant,
-/// [`GLASS_TRACK_BUDGET_MAX`] and the budget tests stay on the wider figure on purpose — an upper
-/// bound, so a width that fits it fits the real region with room to spare, and the track the owner
-/// sees is unchanged.
-///
-/// The top clamps to 0 — the track's own top edge (`TOP_BAR_Y - TAB_TRACK_PAD` = 54) is inside
-/// [`plx_gfx::gfx::BLUR_MARGIN`] 88 of the panel edge — so the whole region is
-/// `0 .. TOP_BAR_BOTTOM + BLUR_MARGIN`. If the bar ever drops far enough that the top stops
-/// clamping, this over-states the region and [`the_whole_bands_glass_fits_one_region_budget`] (which
-/// asks `gfx::blur_region` itself, not this) is what will say so.
-const BAND_REGION_H: f32 = TOP_BAR_BOTTOM + plx_gfx::gfx::BLUR_MARGIN;
-
-/// [`plx_gfx::gfx::GLASS_REGION_BUDGET`], restated here because that constant is `cfg(test)` on a
-/// deliberate argument — *"a number the shipping build never reads should not pretend to"* — and
-/// this one IS read by the shipping build, through [`GLASS_TRACK_MAX`]. The duplication is closed by
-/// an equality ([`tests::the_band_budget_restated_here_is_the_measured_one`]) rather than by a
-/// comment, which is the same trade `CHIP_CAP_MAX_R` makes against the rect `chip_cap` draws.
-const BAND_REGION_BUDGET: f32 = 300_000.0;
-
-/// The band's blurred region LEFT edge — the chip capsule's own left grown [`plx_gfx::gfx::BLUR_MARGIN`],
-/// clamped to the panel. It used to clamp to 0 and no longer does: the capsule starts at `MARGIN_X`
-/// 96 (it was 82 when the chip sat at a 90px margin with no [`TAB_TRACK_PAD`] inset), so the grab
-/// begins at 8. Written out because [`GLASS_TRACK_BUDGET_MAX`] is a closed form of what
-/// `gfx::blur_region_union` computes, and an assumed-0 left edge silently overcharges it by 16px of
-/// track — which is safe but wrong, and wrong in a constant the shipping build reads.
-const BAND_REGION_X0: f32 = {
-    let x = CHIP_FRAME.x - TAB_TRACK_PAD - plx_gfx::gfx::BLUR_MARGIN;
-    if x > 0.0 {
-        x
-    } else {
+/// The owner of the chip's text re-asks when either input changes (`app::chrome::ChromeSnapshot`:
+/// the strip's widths with `tabs_generation`, the label with the profile), because the elision
+/// belongs to its captured publication and drawing measures nothing.
+pub fn chip_name_budget(track_w: f32) -> f32 {
+    let circle = chip_cap(0.0, 0.0);
+    let track_left = (crate::consts::SCR_W - track_w) * 0.5;
+    let room = track_left - BAND_AIR - (circle.x + circle.w) - (CHIP_NAME_GAP + CHIP_NAME_TAIL);
+    if room < CHIP_NAME_MIN {
         0.0
+    } else {
+        room.min(CHIP_NAME_MAX)
     }
-};
-
-/// [`BAND_REGION_BUDGET`] solved for the track width, over the union
-/// `[BAND_REGION_X0, (SCR_W + w) / 2 + BLUR_MARGIN] x BAND_REGION_H`.
-const GLASS_TRACK_BUDGET_MAX: f32 = 2.0
-    * (BAND_REGION_BUDGET / BAND_REGION_H + BAND_REGION_X0
-        - (crate::consts::SCR_W * 0.5 + plx_gfx::gfx::BLUR_MARGIN));
+}
 
 /// Is the shared tab track wearing glass this frame?
 ///
-/// **Glass is the material.** `/tmp/plxnative-flattabs` takes it away, which is how the two are
-/// compared on one television without a second binary — and the one thing that made the flat track
-/// the answer for a while is gone: the density is no longer a constant that had to be legible over
-/// every possible hero at once, so it is not forced up to the flat capsule's own weight. See
-/// [`track_alpha_for`].
+/// **Glass is the material, at ANY width.** The strip's width never decides it: the bar gains
+/// entries as the app grows and its labels change length with the language, and a strip that
+/// outgrows [`TAB_VIEW_MAX`] scrolls inside a track that stays that wide ([`tab_view_w`]). It was
+/// once held to a measured width (the retired `GLASS_TRACK_MAX`, from a 300k px^2 region budget
+/// priced on the capture path), which dropped the owner's Belarusian strip to the flat capsule by
+/// 7 px; `docs/glass-hardware-budget.md` §11 is why that price was the wrong instrument (the shipped
+/// direct path charges the region at 7/16 and the composite area dominates), and the band's real
+/// grab is `blur_region_for(false, ..)`, 68 px past the members and not 88. What keeps the unfurled
+/// chip off the track is [`chip_name_budget`], not a cap on the track.
 ///
-/// The track's geometry budget and the explicit flat-material experiment are the only material
-/// refusals. Occlusion and source eligibility are handled by the frame's layer walk.
-fn tab_glass_on(track_w: f32) -> bool {
-    !flat_tabs_armed() && track_w <= GLASS_TRACK_MAX
+/// `/tmp/plxnative-flattabs` takes the material away, which is how the two are compared on one
+/// television without a second binary — and the one thing that made the flat track the answer for a
+/// while is gone: the density is no longer a constant that had to be legible over every possible
+/// hero at once, so it is not forced up to the flat capsule's own weight. See [`track_alpha_for`].
+///
+/// The explicit flat-material experiment is the only material refusal here. Occlusion and source
+/// eligibility are handled by the frame's layer walk.
+fn tab_glass_on() -> bool {
+    !flat_tabs_armed()
 }
 
 /// Trigger probes are latched; paint must not perform a filesystem stat per surface.
@@ -7463,9 +7868,9 @@ fn tab_stack(widths: &[f32]) -> HStack<'_> {
 fn tab_view_w(widths: &[f32]) -> f32 {
     tab_content_w(widths).min(TAB_VIEW_MAX).max(0.0)
 }
-/// The TRACK's own width — the pill area plus its uniform inset on both sides. What the glass
-/// budget is charged against ([`GLASS_TRACK_MAX`]), and what `draw_tab_row` builds its rect from.
-fn tab_track_w(widths: &[f32]) -> f32 {
+/// The TRACK's own width — the pill area plus its uniform inset on both sides. What the chip's name
+/// budget is solved against ([`chip_name_budget`]), and what `draw_tab_row` builds its rect from.
+pub fn tab_track_w(widths: &[f32]) -> f32 {
     tab_view_w(widths) + 2.0 * TAB_TRACK_PAD
 }
 
@@ -7595,11 +8000,11 @@ impl StripRender {
         // dismissed, and damage under that fading menu re-captured the host and re-latched the
         // dim's field on every one of its frames.
         if let Some(mut pulse) = self.pulse.take() {
-            plx_machine::idle::decorative(|| {
+            plx_machine::motion::report::decorative(|| {
                 pulse.age = pulse.age + dt; // the strip's own step, as its springs take
                 if pulse.age < TAB_PULSE_S {
                     self.pulse = Some(pulse);
-                    plx_machine::idle::note_motion();
+                    plx_machine::motion::report::note_motion();
                 }
             });
         }
@@ -7638,7 +8043,7 @@ impl StripRender {
 /// the legacy Library screen); every caller now owns its captured `TabLabels` and draws through
 /// `Bridge::draw` -> `self.strip.draw(self.chrome.labels(), …)` directly.
 impl StripRender {
-    pub fn draw(&mut self, data: TabLabels<'_>, p: Painter, band: &mut TabBand) {
+    pub fn draw(&mut self, data: TabLabels<'_>, p: Painter, band: &mut TabBand, nav: crate::screen::NavPresentation) {
                    // The band's material resets first: every early
                    // return below must leave [`profile_chip_with`] on the flat capsule rather than on the stops some
                    // previous frame solved. See [`BarMaterial`].
@@ -7668,30 +8073,26 @@ impl StripRender {
         // is also the honest answer on the two screens that really do have it up there.
         // …and never DURING a route transition: `nav` dips the page under this bar while the bar
         // itself holds still, so those pixels are the app ground fading, not the screen's colour.
-        let settled = crate::nav::page_alpha() >= 0.999;
+        let settled = nav.page_alpha >= 0.999 && nav.blur_amount <= 0.001;
         // **Decided BEFORE the ground is sampled, because it decides whether to sample at all.**
-        // `sample_ground` queues five framebuffer copies and reads them back later — so a track
-        // that is about to draw FLAT (a popover is up, `flattabs` is armed, or the strip is wider
-        // than `GLASS_TRACK_MAX`) must not pay for a number only the glass path consumes. It did,
-        // on every screen wearing the bar, for as long as the app was open.
-        let glass_on = tab_glass_on(track.w);
+        // `sample_ground` reads its taps from the retained image of the band this track's glass
+        // draws from — so a track that is about to draw FLAT because the `flattabs` experiment is
+        // armed (the only thing that turns `glass_on` off) has no band and no image, and there is
+        // nothing to read: its ground is the flat app ground, and `groundlog` says so (`src=flat`).
+        // It used to pay five framebuffer copies for a number only the glass path consumes, on every
+        // screen wearing the bar, for as long as the app was open.
+        let glass_on = tab_glass_on();
         let groundlog = ground_log_armed();
-        // …and FASTER while a polarity is being decided: the decision is gated on two independent
-        // readings, so the sampler's rate is the decision's rate, and every frame of it is spent
-        // showing the material the bar is about to stop being.
-        let (cr, cg, cb) = theme::CLEAR_RGB; // the app ground, as the token that names it
-        let flat_ground = [cr, cg, cb];
-        let ground = if glass_on || groundlog {
-            plx_gfx::gfx::sample_ground([track.x, track.y, track.w, track.h], settled)
-                .unwrap_or(flat_ground)
-        } else {
-            flat_ground
-        };
+        let ground = band.prepare(p, track, settled, glass_on);
         // `/tmp/plxnative-groundlog` — the density is now a FUNCTION of something invisible, so the
         // instrument that says what it read and what it chose is not optional. It is how the first
         // version of this was caught reading Plex's `UltraBlurColors`, which gave (0.30,0.23,0.18)
         // for a hero whose top edge is (0.00,0.68,0.91) and left the bar at its floor.
-        if groundlog {
+        // The VISIBLE walk's draw only: the declaration and source walks draw this bar too, and
+        // `sample_ground` refuses them (`blur_source_pass`), so a count landing on one would print
+        // `src=held` for a draw that was never going to read, and with a whole number of draws per
+        // frame the count lands on the same walk every time.
+        if groundlog && !plx_gfx::gfx::blur_source_pass() {
             // A safe atomic rather than `static mut`: a plain sample counter, same shape as
             // the diagnostic counters.
             static LAST: AtomicU32 = AtomicU32::new(0);
@@ -7706,102 +8107,21 @@ impl StripRender {
                 // thing it was armed to watch.
                 let drawn = track_density(ground, &mut band.density);
                 plx_base::eventlog::log(&format!(
-                    "track_ground rgb={:.3},{:.3},{:.3} L*={:.1} span={:.1} want={:.3} drawn={:.3} rect={:.0},{:.0},{:.0},{:.0}",
+                    "track_ground rgb={:.3},{:.3},{:.3} L*={:.1} span={:.1} want={:.3} drawn={:.3} rect={:.0},{:.0},{:.0},{:.0} src={}",
                     ground[0], ground[1], ground[2],
                     lstar([ground[0], ground[1], ground[2], 1.0]),
                     plx_gfx::gfx::ground_span(),
                     track_alpha_for(ground), drawn,
                     track.x, track.y, track.w, track.h,
+                    // where the ground came from: the band's image, nothing found this frame (the
+                    // last reading, or the flat ground before the first), a call refused before it
+                    // looked (the last reading), or no glass at all
+                    if !glass_on { "flat" } else { plx_gfx::gfx::ground_source().word() },
                 ));
             }
             LAST.store(n.wrapping_add(1), Relaxed);
         }
-        if glass_on {
-            // The track never moves, so its drawn rect IS its rest rect — no slide to correct for.
-            // Hoisted out of the call, because it is now the BAND's face and not just this
-            // surface's: [`profile_chip_with`] draws the other half of it from this same `bar_material`
-            // field, at the same stops and the same rim weight, off this one solve. See [`BarMaterial`].
-            let face = {
-                let (gt, gb) = tab_glass_stops(ground, &mut band.density);
-                let (rim, rim_lit) = track_rim(gt[3]);
-                plx_gfx::gfx::GlassFace {
-                    scrim_top: gt,
-                    scrim_bot: gb,
-                    rim,
-                    rim_lit,
-                    rim_w: 1.0,
-                }
-            };
-            // Material choice is independent of capture success. Both members must visit the
-            // same live-source slots even when the renderer falls back for this band.
-            band.material = BarMaterial::Glass(face);
-            if Glass::DYNAMIC_BACKDROP.backdrop(
-                p,
-                track,
-                0.0,
-                track.h * 0.5,
-                [1.0, 1.0, 1.0, 1.0],
-                // The line and the hairline, no ramp — the design system's rule for this container,
-                // and the one the panel treatment gets wrong here: 76px tall has 20px of interior
-                // left once a 28px chamfer has run in from both edges, so the "rim" stops being an
-                // edge and becomes most of the object.
-                plx_gfx::gfx::GlassRim::Standing,
-                face,
-                // The bar is UltraThin by construction: it takes no extra sample, so the page comes
-                // through as sharp as the chain left it. Its FROST is not read from the scale at all
-                // — `tab_glass_stops` above solves it against the ground every frame.
-                theme::Material::UltraThin,
-            ) {
-                // NOTHING IS DRAWN HERE ANY MORE, and that is the fix. The darkening and the edge —
-                // `inset 0 0 0 1px var(--glass-rim), inset 0 1px 0 var(--glass-rim-light)`, the whole
-                // of what the design system puts on this container — used to be a SECOND rounded rect
-                // over the backdrop, and two surfaces of one shape means two antialiased edges, each
-                // blending its own colour against the page. They ride inside the surface now, as its
-                // `GlassFace`; `fs_glass.frag` composites scrim then rim then coverage, in that order.
-                //
-                // The two weights are still one ring: `theme::GLASS_RIM` .14 the whole way round plus
-                // the difference up to `theme::GLASS_RIM_LIGHT` .28 on the edge facing the light,
-                // boosted by the surface NORMAL so it dies out along each cap's arc. It was a second
-                // ring scissored to the top half for one build, and the scissor lands exactly on the
-                // widest point of a cap — a hard step from .28 to .14 in the middle of a curve, which
-                // reads as the outline snapping off. Reported from a screenshot before it was measured.
-                //
-                // And the weight TRAVELS with the ground (`track_rim`), because a lit edge is a
-                // relationship and not a colour — `theme::GLASS_RIM_MAX` carries that measurement.
-                // The ring is white in both weights: it was a PAIR while the track had two
-                // polarities, an ink line for the light one and a light line for the dark, and the
-                // ink half went with the polarity.
-            } else {
-                // …and the same here: the chain refused, so the flat dark material is what draws —
-                // said to the spring, not to the value the spring publishes. See the note below.
-                p.rect_sheened(
-                    track,
-                    track.h * 0.5,
-                    theme::TAB_TRACK_TOP,
-                    theme::TAB_TRACK_BOT,
-                );
-            }
-        } else {
-            // NOT during a blur source pass. `tab_glass_on` is false there by design — the flat
-            // track is the right source pixel — but deactivating on that basis makes the NEXT
-            // frame's `prepare` see an inactive state, call `activate`, and invalidate the
-            // backdrop. The cadence then resets on every source pass instead of following the
-            // configured refresh period. The old every-third experiment measured 50 refreshes/s
-            // against its intended 20 and an 11% whole-frame regression; the shipping period is
-            // now every changed present, but this guard is still what makes the configured policy
-            // authoritative rather than an accidental reactivation loop.
-            // The flat capsule, which is the same material at its ceiling — there is nothing for
-            // this path to say about ink any more. It once wrote the row's POLARITY here, and that
-            // was a reported bug twice over: the write clobbered a value the spring owned, so the
-            // next frame cut it back, and the hysteresis read the same clobbered value and walked
-            // the committed polarity across with it. Both are gone with the polarity itself.
-            p.rect_sheened(
-                track,
-                track.h * 0.5,
-                theme::TAB_TRACK_TOP,
-                theme::TAB_TRACK_BOT,
-            );
-        }
+        band.draw(p, track);
         // A strip wider than its track is a bounded panel, not a scrolling document, so this is the
         // scissor case (see the ui/CLAUDE.md clipping rule): a pill leaving the row is cut at the
         // pill area's edge — which is also the "there is more over there" affordance. Paired below.
@@ -7944,25 +8264,25 @@ pub enum ControlStyle {
 /// The design system states this as a CSS scope (`[data-ground="unkeyed"]`, `tokens/colors.css`):
 /// a surface standing on video sets it and every control inside switches. There is no scope to
 /// inherit through here, so it rides the widget as a builder — [`Button::ground`],
-/// [`CircleButton::ground`], [`TransportButton::ground`] — and the player HUD is the only caller
-/// that sets it.
+/// [`CircleButton::ground`], [`TransportButton::ground`].
 ///
 /// It changes the parts that require KNOWING the ground: `Keyed` accepts a [`ControlPalette`] for
 /// both face levels, while `Unkeyed` drops that palette, uses the HUD's light film and stronger
 /// idle edge at rest, flattens focus back to [`theme::ACCENT`] and raises its rim to pure white.
-/// Focus still means the same
-/// thing on both grounds — bright face, dark ink, pop and cast — but video cannot borrow a hue from
-/// pixels this process never sees.
+/// `VideoPreview` uses the same video fills with the quieter content-page rim. Focus on all
+/// three grounds uses a bright face, dark ink, pop and cast.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ControlGround {
-    /// The app's own pages — a ground we drew and can therefore answer to. Every control that is
-    /// not in the player HUD, and the default.
+    /// The app's own artwork — a ground we drew and can therefore sample. The default.
     Keyed,
     /// The VIDEO PLANE, under the HUD's own ramp: ambient tint is disabled, idle becomes the light
     /// film ([`theme::CONTROL_IDLE_FILL_UNKEYED`]) with its visible idle edge
     /// ([`theme::CONTROL_RIM_IDLE_UNKEYED`]); focus is flat [`theme::ACCENT`] and its edge is the
     /// pure-white line ([`theme::CONTROL_RIM_FOCUS_UNKEYED`]).
     Unkeyed,
+    /// Content-page chrome over a preview. The video fills preserve the picture under the row,
+    /// and the standard card sheen keeps its edge consistent with the poster-backed controls.
+    VideoPreview,
 }
 
 /// The colours a keyed control derives from its page's local ground sample.
@@ -7972,7 +8292,7 @@ pub enum ControlGround {
 /// only OKLCH hue and a fraction of chroma. That is the difference between a white object catching
 /// the scene's light and a white chip averaged toward a dark photograph (which turns muddy). A
 /// screen computes this once for its control row and copies it into every face; the player may
-/// receive one accidentally, but [`ControlGround::Unkeyed`] ignores it by construction.
+/// receive one accidentally, but video grounds ignore it by construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlPalette {
     focus_top: [f32; 4],
@@ -8101,12 +8421,17 @@ fn oklab_to_srgb(c: [f32; 3], alpha: f32) -> [f32; 4] {
 }
 
 impl ControlGround {
+    fn is_video(self) -> bool {
+        matches!(self, Self::Unkeyed | Self::VideoPreview)
+    }
+
     /// The idle control face on this ground. The ONE place the two fills are chosen between, so a
     /// widget can never hand-pick the wrong one.
     fn idle_fill(self) -> [f32; 4] {
-        match self {
-            ControlGround::Keyed => theme::CONTROL_IDLE_FILL,
-            ControlGround::Unkeyed => theme::CONTROL_IDLE_FILL_UNKEYED,
+        if self.is_video() {
+            theme::CONTROL_IDLE_FILL_UNKEYED
+        } else {
+            theme::CONTROL_IDLE_FILL
         }
     }
 }
@@ -8150,11 +8475,11 @@ struct ControlFace {
 /// invisible by construction, which is the sign it is an edge and not a fill.
 ///
 /// **[`ControlGround::Unkeyed`] is the one exception, and it is the ground asking, not the state.**
-/// Over the video plane both states use the 1.25px unkeyed geometry. Idle takes
+/// Over the player's video plane both states use the 1.25px unkeyed geometry. Idle takes
 /// [`theme::CONTROL_RIM_IDLE_UNKEYED`] because the keyed 1px/.22 card edge disappeared between the
 /// light film and the panel's video composition; focus raises that same geometry to
 /// [`theme::CONTROL_RIM_FOCUS_UNKEYED`] — pure white, with no top boost because nothing is brighter
-/// than white. Keyed controls keep the same card edge in both states.
+/// than white. Content-page controls keep the same card edge over artwork and preview video.
 fn control_rim(
     p: Painter,
     r: Rect,
@@ -8223,17 +8548,27 @@ fn face_box(r: Rect) -> Rect {
 /// "the remote is here" over a ground nobody chose — the measured case is an `ACCENT` capsule over
 /// a white frame at ~1.2:1 — and the design's answer is [`theme::CONTROL_CAST_FOCUS`], two stops of
 /// black under the focused face only. Drawn to the stadium radius rather than to the solved
-/// capsule: at a 32px blur the half pixel between the two outlines is far below anything the
-/// penumbra resolves.
+/// capsule: the half pixel between the two outlines falls inside the shadow's cut, whose edge is a
+/// coverage ramp about a pixel wide (`fs_shadow.frag`'s `CUT_AA`), so the face's blended outline
+/// meets a partial shadow there and no hard, aliased strip.
 fn control_cast(p: Painter, r: Rect, rad: f32) {
     control_cast_at(p, r, rad, 1.0);
 }
 
-/// [`control_cast`] at focus progress `t` (see [`ControlStyle::face_at`]): the lift's shadow rides
-/// the same spring as the fill it lifts, so it is not a step either.
+/// [`control_cast`] at focus progress `t` (see [`ControlStyle::face_at`]). Two rules, so the cast
+/// never outstays or shows through the face it lifts:
+///
+/// * it is drawn OUTSIDE the face's outline only ([`Painter::shadow_outside`]), because a fading
+///   face is translucent and an interior-painting shadow would show through it as a dark pill;
+/// * its strength is a smoothstep of `t` over `[0.5, 1]`, so it is whole at rest, gone by the time
+///   the face is half faded, and still continuous (a face that reads as gone must not keep a halo).
 fn control_cast_at(p: Painter, r: Rect, rad: f32, t: f32) {
+    let k = crate::xfade::smooth((t - 0.5) * 2.0);
+    if k <= 0.0 {
+        return;
+    }
     for (dy, blur, a) in theme::CONTROL_CAST_FOCUS {
-        p.shadow(r, rad, blur, dy, theme::with_a(theme::CARD_SHADOW, a * t));
+        p.shadow_outside(r, rad, blur, dy, theme::with_a(theme::CARD_SHADOW, a * k));
     }
 }
 
@@ -8268,7 +8603,7 @@ fn control_rim_spec(focused: bool, ground: ControlGround) -> ([f32; 4], f32, f32
 
 impl ControlStyle {
     /// Full face material for this style and ground. A keyed Accent has two focused stops and a
-    /// palette-derived idle stop; an unkeyed Accent deliberately flattens back to the fixed video
+    /// palette-derived idle stop; a video-ground Accent deliberately flattens to the fixed video
     /// treatment because no colour can be sampled from that plane.
     fn face(self, focused: bool, ground: ControlGround, palette: ControlPalette) -> ControlFace {
         let flat = |fill, ink, spent| ControlFace {
@@ -8278,11 +8613,11 @@ impl ControlStyle {
             spent,
         };
         match self {
-            ControlStyle::Accent if ground == ControlGround::Unkeyed && focused => {
+            ControlStyle::Accent if ground.is_video() && focused => {
                 flat(theme::ACCENT, theme::ACCENT_INK, theme::CONTROL_SPENT_FILL)
             }
-            ControlStyle::Accent if ground == ControlGround::Unkeyed => flat(
-                theme::CONTROL_IDLE_FILL_UNKEYED,
+            ControlStyle::Accent if ground.is_video() => flat(
+                ground.idle_fill(),
                 theme::CONTROL_IDLE_INK,
                 theme::CONTROL_SPENT_FILL,
             ),
@@ -8370,11 +8705,25 @@ impl ControlStyle {
 // centered together as one group (icon + gap + label + gap + accessory is centered in the pill).
 // Colour per `ControlStyle` (default Accent). The one reusable action button — hero Play (Primary),
 // detail/info actions (Accent), etc. ----
-pub struct Button {
+/// The shared button's countdown decoration. Extra draw ops are the conservative worst case priced by HUD lint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonProgress { FillSweep, Ring, Bar }
+
+impl ButtonProgress {
+    pub const fn extra_draw_ops(self) -> usize {
+        match self { Self::FillSweep => 0, Self::Ring => 4, Self::Bar => 2 }
+    }
+}
+
+pub struct Button<'a> {
     pub frame: Rect,
     pub label: *const c_char,
     pub sz: c_int,
     pub icon: Option<crate::icons::Icon>,
+    svg: Option<crate::icons::Svg<'a>>,
+    rest: Option<TransportRest>,
+    focus_face: TransportFocus,
+    enabled: bool,
     /// The TRAILING accessory glyph — a chevron saying the press opens a list rather than acting
     /// (`crate::screens::alt_sources`'s *Also available*). Deliberately its own slot rather than a
     /// second use of [`Button::icon`]: the leading icon is part of the label's own statement (the
@@ -8395,26 +8744,34 @@ pub struct Button {
     pub palette: ControlPalette,
     /// The FOCUS POP, as a factor on the frame — see [`Button::scale`].
     pub scale: f32,
-    /// 0..1 left-to-right FILL sweep across the pill; None = an ordinary button.
+    /// 0..1 countdown progress, in the face selected by the progress builder; None = an ordinary button.
     pub progress: Option<f32>,
+    progress_face: ButtonProgress,
+    inline_progress: Option<f32>,
 }
 /// [`Button`]'s icon box, as a multiple of its type size, and the icon→label gap. Named because
 /// [`Button::pill_w`] measures the same run `Button::draw` lays out — a literal in each would let
 /// the two drift.
 const BTN_ICON_RATIO: f32 = 1.15;
 const BTN_ICON_GAP: f32 = 12.0;
+const BTN_RAIL_W: f32 = 64.0;
+const BTN_RAIL_H: f32 = 6.0;
 /// Total horizontal air a pill carries around its icon+label run.
 pub const BTN_PILL_AIR: f32 = 68.0;
 /// [`ControlStyle::Keyline`]'s stroke width (the design's 1.5 — same weight as [`keyline_chip`]'s).
 const BTN_KEYLINE_W: f32 = 1.5;
 
-impl Button {
+impl<'a> Button<'a> {
     pub fn new(label: *const c_char, sz: c_int, frame: Rect) -> Self {
         Self {
             frame,
             label,
             sz,
             icon: None,
+            svg: None,
+            rest: None,
+            focus_face: TransportFocus::Accent,
+            enabled: true,
             trailing: None,
             focused: false,
             focus: None,
@@ -8423,6 +8780,8 @@ impl Button {
             palette: ControlPalette::default(),
             scale: 1.0,
             progress: None,
+            progress_face: ButtonProgress::FillSweep,
+            inline_progress: None,
         }
     }
     /// The [FOCUS POP](CTRL_FOCUS_SCALE), about the capsule's centre — normally [`CtlPop::scale`],
@@ -8445,6 +8804,27 @@ impl Button {
         self.trailing = Some(i);
         self
     }
+    /// A package glyph beside the label, in the same box and ink as a built-in icon.
+    pub fn svg(mut self, svg: crate::icons::Svg<'a>) -> Self {
+        self.svg = Some(svg);
+        self.icon = None;
+        self
+    }
+    /// Opt into the transport family's declared resting treatment; ordinary buttons keep their existing style.
+    pub fn rest_face(mut self, rest: TransportRest) -> Self {
+        self.rest = Some(rest);
+        self
+    }
+    /// A ring keeps the declared rest face while focused; accent focus lights the plate.
+    pub fn focus_face(mut self, focus: TransportFocus) -> Self {
+        self.focus_face = focus;
+        if self.rest.is_none() { self.rest = Some(TransportRest::Film); }
+        self
+    }
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
     pub fn focused(mut self, f: bool) -> Self {
         self.focused = f;
         self
@@ -8458,7 +8838,18 @@ impl Button {
     }
     /// The face this pill draws now.
     fn face_now(&self) -> ControlFace {
-        self.style.face_at(self.focus.unwrap_or(f32::from(self.focused)), self.ground, self.palette)
+        let mut face = match self.rest {
+            Some(rest) => ControlStyle::Accent.face(
+                rest == TransportRest::Solid || self.accent_focus(), self.ground, self.palette),
+            None => self.style.face_at(if self.enabled { self.focus.unwrap_or(f32::from(self.focused)) } else { 0.0 }, self.ground, self.palette),
+        };
+        if !self.enabled {
+            face.ink = theme::INK_DISABLED;
+        }
+        face
+    }
+    fn accent_focus(&self) -> bool {
+        self.enabled && self.focused && (self.rest.is_none() || self.focus_face == TransportFocus::Accent)
     }
     pub fn style(mut self, s: ControlStyle) -> Self {
         self.style = s;
@@ -8519,20 +8910,33 @@ impl Button {
     }
 
     fn pill_w_from_advance(advance: f32, sz: c_int, icon: bool, trailing: Option<crate::icons::Icon>) -> f32 {
-        HStack::new(&Self::run_items(advance, sz, icon, trailing), BTN_ICON_GAP, StackAlign::Leading(0.0)).width()
+        HStack::new(&Self::run_items(advance, sz, icon, trailing, false), BTN_ICON_GAP, StackAlign::Leading(0.0)).width()
             + BTN_PILL_AIR
     }
 
     /// The pill's one run, which `draw` places and `pill_w_*` sizes: the leading icon's box, the
     /// label, and the trailing accessory standing by its INK. An accessory the pill does not carry
     /// is ABSENT, so it leaves neither its width nor its gap.
-    fn run_items(advance: f32, sz: c_int, icon: bool, trailing: Option<crate::icons::Icon>) -> [HItem; 3] {
+    fn run_items(advance: f32, sz: c_int, icon: bool, trailing: Option<crate::icons::Icon>, rail: bool) -> [HItem; 4] {
         let box_w = sz as f32 * BTN_ICON_RATIO;
         [
             if icon { HItem::new(box_w) } else { HItem::absent() },
+            if rail { HItem::new(BTN_RAIL_W) } else { HItem::absent() },
             HItem::new(advance),
             trailing.map_or_else(HItem::absent, |acc| HItem::glyph(acc, box_w)),
         ]
+    }
+
+    /// Width of the Play glyph, inline progress rail, and duration at this type size.
+    pub fn progress_pill_width(measure: &dyn plx_machine::machine::Measure, label: &std::ffi::CStr, sz: c_int) -> f32 {
+        let items = Self::run_items(measure.width(label, sz, true), sz, true, None, true);
+        HStack::new(&items, BTN_ICON_GAP, StackAlign::Leading(0.0)).width() + BTN_PILL_AIR
+    }
+
+    /// Place a playback progress rail between the leading glyph and the label.
+    pub fn inline_progress(mut self, frac: f32) -> Self {
+        self.inline_progress = Some(frac.clamp(0.0, 1.0));
+        self
     }
 
     /// Turn the pill into its own countdown: `frac` of its width is filled with
@@ -8547,6 +8951,19 @@ impl Button {
     /// state, and only the FILL BEHIND the label changes — the ink never inverts.
     pub fn progress(mut self, frac: f32) -> Self {
         self.progress = Some(frac);
+        self.progress_face = ButtonProgress::FillSweep;
+        self
+    }
+    /// Trace a countdown around this same capsule; the label and its focus face stay independent.
+    pub fn progress_ring(mut self, frac: f32) -> Self {
+        self.progress = Some(frac);
+        self.progress_face = ButtonProgress::Ring;
+        self
+    }
+    /// The shared played-progress rail, clipped to this button's capsule.
+    pub fn progress_bar(mut self, frac: f32) -> Self {
+        self.progress = Some(frac);
+        self.progress_face = ButtonProgress::Bar;
         self
     }
 
@@ -8559,7 +8976,10 @@ impl Button {
         // (`face_box`). A stadium and a disc are returned untouched.
         let b = face_box(r);
         let rad = b.h * 0.5;
-        if matches!(self.style, ControlStyle::Keyline) && !self.focused {
+        let painted = self.rest != Some(TransportRest::Bare) || self.accent_focus();
+        if !painted {
+            // A bare transport button has only its label/glyph until accent focus arrives.
+        } else if matches!(self.style, ControlStyle::Keyline) && !self.accent_focus() {
             let rad = r.h * 0.5;
             // the knockout: stroke colour first, then the interior inset by it — the SDF has no
             // stroke-only mode (`keyline_chip` / `pass_capsule`'s construction); `bg` here is
@@ -8574,14 +8994,25 @@ impl Button {
                 face.top,
             );
         } else {
-            // FOCUS is an elevation as well as a fill — see `control_cast`. Under the face, so the
-            // near-opaque focused plate covers everything the shadow's own interior cut leaves.
-            if self.focused {
+            // FOCUS is an elevation as well as a fill — see `control_cast`. Drawn before the face
+            // for draw order only: `control_cast_at` is outside-only, so nothing of it lies under
+            // the plate, even while the plate fades.
+            if self.accent_focus() {
                 control_cast_at(p, b, rad, self.focus.unwrap_or(1.0));
             }
-            control_rim(p, b, rad, face.top, face.body, self.focused, self.ground);
+            control_rim(p, b, rad, face.top, face.body, self.accent_focus(), self.ground);
+        }
+        if self.enabled && self.focused && self.focus_face == TransportFocus::Ring {
+            let o = theme::CONTROL_FOCUS_RING_GAP + theme::CONTROL_FOCUS_RING_W * 0.5;
+            let ring = Rect::new(b.x - o, b.y - o, b.w + 2.0 * o, b.h + 2.0 * o);
+            p.rring(ring, ring.h * 0.5, theme::CONTROL_FOCUS_RING_W, theme::CONTROL_FOCUS_RING);
         }
         let Some(frac) = self.progress else { return };
+        match self.progress_face {
+            ButtonProgress::Ring => { button_progress_ring(p, b, frac, face.ink); return; }
+            ButtonProgress::Bar => { progress_bar(p, b, rad, theme::space::XS, frac); return; }
+            ButtonProgress::FillSweep => {}
+        }
         let w = b.w * frac.clamp(0.0, 1.0);
         if w <= 0.0 {
             return;
@@ -8606,6 +9037,22 @@ impl Button {
         p.clip_clear();
     }
 }
+/// Trace the existing rounded-ring primitive clockwise from the top centre. Each monotone quadrant is
+/// clipped as it advances; no generated SVG, texture cache entry or renderer-specific drawing path is needed.
+fn button_progress_ring(p: Painter, r: Rect, frac: f32, ink: [f32; 4]) {
+    let half = r.w * 0.5;
+    let phase = frac.clamp(0.0, 1.0) * 4.0;
+    for (i, (right, bottom)) in [(true, false), (true, true), (false, true), (false, false)].into_iter().enumerate() {
+        let w = half * (phase - i as f32).clamp(0.0, 1.0);
+        if w <= 0.0 { continue; }
+        let x = match (right, bottom) { (true, false) => r.cx(), (true, true) => r.x + r.w - w,
+            (false, true) => r.cx() - w, (false, false) => r.x };
+        let clip = Rect::new(x, if bottom { r.cy() } else { r.y }, w, r.h * 0.5);
+        let _clip = crate::screen::ClipScope::open_in(p, clip);
+        p.rring(r, r.h * 0.5, theme::CONTROL_FOCUS_RING_W, ink);
+    }
+}
+
 /// **A standalone control face for a caller outside this module** — the same plate
 /// [`Button::plate`] draws (the capsule outline, the edge sheen, and the focus cast), for a control
 /// whose layout does not fit `Button`'s one-label-two-icons shape and so cannot be a `Button`
@@ -8632,7 +9079,7 @@ pub fn draw_control_face(
     }
     control_rim(p, b, rad, fill, fill, focused, ground);
 }
-impl View for Button {
+impl View for Button<'_> {
     fn draw(&self, _e: &Env, p: Painter) {
         let r = self.frame.scaled(self.scale);
         let face = self.face_now();
@@ -8667,15 +9114,32 @@ impl View for Button {
         // sizing the pill without the chevron and then drawing one would push the label off-centre.
         // The accessory stands by its INK, so the pill's right pad is measured to the mark itself.
         let isz = self.sz as f32 * BTN_ICON_RATIO;
-        let items = Self::run_items(tw, self.sz, self.icon.is_some(), self.trailing);
+        let items = Self::run_items(tw, self.sz, self.icon.is_some() || self.svg.is_some(), self.trailing, self.inline_progress.is_some());
         for span in HStack::new(&items, BTN_ICON_GAP, StackAlign::Centre(r.cx())).placed() {
             match span.i {
                 0 => {
-                    if let Some(icon) = self.icon {
-                        crate::icons::draw(p, icon, Rect::new(span.x, r.y + (r.h - isz) * 0.5, isz, isz), ink);
+                    let rect = Rect::new(span.x, r.y + (r.h - isz) * 0.5, isz, isz);
+                    if let Some(svg) = self.svg {
+                        crate::icons::draw_svg(p, svg, rect, ink);
+                    } else if let Some(icon) = self.icon {
+                        crate::icons::draw(p, icon, rect, ink);
                     }
                 }
                 1 => {
+                    let rail = Rect::new(span.x, r.cy() - BTN_RAIL_H * 0.5, BTN_RAIL_W, BTN_RAIL_H);
+                    let rad = BTN_RAIL_H * 0.5;
+                    p.rrect(rail, rad, rad, theme::with_a(ink, 0.22));
+                    let w = rail.w * self.inline_progress.unwrap_or_default();
+                    if w > 0.0 {
+                        // Switch with the face's contrast-selected ink. A tiny spring tail can
+                        // still set `focused` while the pill already reads as idle.
+                        let idle_ink = self.style.face(false, self.ground, self.palette).ink;
+                        let fill = if self.enabled && ink == idle_ink { theme::RESUME_FILL } else { ink };
+                        let rad = rad.min(w * 0.5);
+                        p.rrect(Rect::new(rail.x, rail.y, w, rail.h), rad, rad, fill);
+                    }
+                }
+                2 => {
                     p.text(self.label, span.x, ty, self.sz, ink, 0, 1); // left-aligned after the icon
                 }
                 _ => {
@@ -8933,7 +9397,7 @@ pub fn badge(
 // behind that provider's own brand mark — Rotten Tomatoes' fruit and popcorn tub as tinted
 // silhouettes, IMDb and TMDB as logotype chips in their brand colours. All of that is gone:
 //
-//   * the RT marks had no licensing route (see `ui/icons.rs`), and
+//   * the RT marks had no public licence and we held no permission (see `ui/icons.rs`), and
 //   * the chips were reproducing two more brands' logotypes to solve a problem — "whose score is
 //     this?" — that a WORD solves for free, and that naming the provider solves *lawfully*, since
 //     referential use needs no licence where a mark does.
@@ -9002,7 +9466,7 @@ fn rating_walk<'a>(
     use crate::hstack::{Flow, Item};
     let mut flow = Flow::new(x, 0.0);
     let item = |w: f32, after: f32| Item::new(w).after(after);
-    if let Some(span) = flow.push(item(measure.width_str(caption, theme::size::MICRO, true), RATING_CAPTION_GAP)) {
+    if let Some(span) = flow.push(item(measure.width_str(caption, theme::size::MICRO, false), RATING_CAPTION_GAP)) {
         each(RatingPart::Caption, span);
     }
     for (i, cell) in cells.iter().enumerate() {
@@ -9012,10 +9476,10 @@ fn rating_walk<'a>(
                 each(RatingPart::Mark(cell.mark), span);
             }
         }
-        if let Some(span) = flow.push(item(measure.width_str(cell.value, theme::size::LABEL, true), 0.0)) {
+        if let Some(span) = flow.push(item(measure.width_str(cell.value, theme::size::LABEL, false), 0.0)) {
             each(RatingPart::Value(cell.value), span);
         }
-        if let Some(span) = flow.push(item(measure.width_str(cell.suffix, theme::size::MICRO, true), next)) {
+        if let Some(span) = flow.push(item(measure.width_str(cell.suffix, theme::size::MICRO, false), next)) {
             each(RatingPart::Suffix(cell.suffix), span);
         }
     }
@@ -9052,10 +9516,10 @@ pub fn rating_group(
     // the number's baseline or it floats. `text::baseline_y` is that rule, shared.
     let base = plx_gfx::text::baseline_y(
         theme::size::MICRO,
-        1,
+        0,
         theme::size::LABEL,
-        1,
-        plx_gfx::text::text_vcenter_y(theme::size::LABEL, 1, cy),
+        0,
+        plx_gfx::text::text_vcenter_y(theme::size::LABEL, 0, cy),
     );
     let text = |s: &str, x: f32, y: f32, sz, ink, bold| {
         if let Ok(c) = std::ffi::CString::new(s) {
@@ -9066,7 +9530,7 @@ pub fn rating_group(
     // returns is the drawn width, not a second measurement (the host test compares it with
     // rating_group_w).
     rating_walk(x, caption, cells, measure, |part, span| match part {
-        RatingPart::Caption => text(caption, span.x, base, theme::size::MICRO, theme::TEXT_TERTIARY, 1),
+        RatingPart::Caption => text(caption, span.x, base, theme::size::MICRO, theme::TEXT_TERTIARY, 0),
         RatingPart::Mark(layers) => {
             // every layer rides the SAME rect, so all of them rasterize at one size from one
             // viewBox and register exactly — see `ui/icons.rs`'s note on the layered marks
@@ -9076,10 +9540,10 @@ pub fn rating_group(
             }
         }
         RatingPart::Value(v) => {
-            let ty = plx_gfx::text::text_vcenter_y(theme::size::LABEL, 1, cy);
-            text(v, span.x, ty, theme::size::LABEL, theme::TEXT_PRIMARY, 1);
+            let ty = plx_gfx::text::text_vcenter_y(theme::size::LABEL, 0, cy);
+            text(v, span.x, ty, theme::size::LABEL, theme::TEXT_PRIMARY, 0);
         }
-        RatingPart::Suffix(s) => text(s, span.x, base, theme::size::MICRO, theme::TEXT_TERTIARY, 1),
+        RatingPart::Suffix(s) => text(s, span.x, base, theme::size::MICRO, theme::TEXT_TERTIARY, 0),
     })
 }
 
@@ -9156,6 +9620,10 @@ mod ambient_ground_tests;
 mod ground_tests;
 
 #[cfg(test)]
+#[path = "widgets_hero_shade_tests.rs"]
+mod hero_shade_tests;
+
+#[cfg(test)]
 #[path = "widgets_hero_scrim_tests.rs"]
 mod hero_scrim_tests;
 
@@ -9194,14 +9662,14 @@ fn a_painted_rating_group_keeps_each_token_gap_between_its_runs() {
 
 #[cfg(test)]
 #[test]
-fn a_painted_still_line_stands_its_sub_line_one_gap_from_the_glyphs_ink() {
+fn a_painted_still_line_stands_its_sub_line_one_gap_from_the_watched_ticks_ink() {
     let _serial = plx_base::testlock::serial();
     let m = LegacyMeasure;
     let card = Rect::new(100.0, 100.0, 300.0, 170.0);
     let mut icons = Vec::new();
     let runs = crate::draw_census::capture_runs(|| {
         icons = crate::draw_census::capture_icons(|| {
-            still_line(Painter::recording(), card, PosterMark::None, "Show", "S1 E2", true, false, &m);
+            still_line(Painter::recording(), card, PosterMark::Watched, "Show", "S1 E2", false, &m);
         });
     });
     let sub = runs.iter().find(|r| r.text == "S1 E2").expect("the sub line");
@@ -9211,7 +9679,156 @@ fn a_painted_still_line_stands_its_sub_line_one_gap_from_the_glyphs_ink() {
     assert!((sub.at.x - (boxr.x + r * boxr.w) - STILL_LINE_GAP).abs() < 0.5, "ink -> sub line is the token");
     // no glyph, no gap: the sub line stands at the inset
     let bare = crate::draw_census::capture_runs(|| {
-        still_line(Painter::recording(), card, PosterMark::None, "Show", "S1 E2", false, false, &m);
+        still_line(Painter::recording(), card, PosterMark::None, "Show", "S1 E2", false, &m);
     });
     assert_eq!(bare.iter().find(|r| r.text == "S1 E2").unwrap().at.x, card.x + STILL_LINE_INSET);
+}
+
+#[cfg(test)]
+mod transport_faces_tests {
+    use super::*;
+    use crate::draw_census;
+
+    const R: Rect = Rect { x: 100.0, y: 100.0, w: 64.0, h: 64.0 };
+    /// `Painter::rring`'s command tag.
+    const RING_TAG: u64 = 3;
+    /// `Painter::face_rimmed`'s.
+    const PLATE_TAG: u64 = 10;
+    fn draw(b: TransportButton<'_>) -> Vec<(u64, Rect)> {
+        draw_census::capture(|| b.draw(&Env::inert(), Painter::recording()))
+    }
+
+    /// The default faces are the ones every caller had: `film` at rest, `accent` on focus. Naming
+    /// them changes no frame.
+    #[test]
+    fn the_default_faces_are_the_films_and_the_accent() {
+        for focused in [false, true] {
+            let plain = TransportButton::new(0, R).ground(ControlGround::Unkeyed).focused(focused);
+            let named = TransportButton::new(0, R)
+                .ground(ControlGround::Unkeyed)
+                .focused(focused)
+                .rest_face(TransportRest::Film)
+                .focus_face(TransportFocus::Accent);
+            assert_eq!(draw(plain), draw(named), "focused={focused}");
+        }
+    }
+
+    /// `bare`: a glyph and no plate. At rest the disc paints no plate and no rim, only the glyph.
+    #[test]
+    fn a_bare_disc_at_rest_paints_no_plate() {
+        let film = draw(TransportButton::new(0, R).ground(ControlGround::Unkeyed));
+        let bare = draw(
+            TransportButton::new(0, R).ground(ControlGround::Unkeyed).rest_face(TransportRest::Bare),
+        );
+        assert!(film.iter().any(|(t, _)| *t == PLATE_TAG), "the film paints a plate: {film:?}");
+        assert!(bare.is_empty(), "a bare disc paints none: {bare:?}");
+        let icons = draw_census::capture_icons(|| {
+            TransportButton::new(0, R)
+                .ground(ControlGround::Unkeyed)
+                .rest_face(TransportRest::Bare)
+                .icon(crate::icons::Icon::More)
+                .draw(&Env::inert(), Painter::recording())
+        });
+        assert_eq!(icons.len(), 1, "its glyph still draws");
+        assert_eq!(icons[0].0, crate::icons::Icon::More);
+    }
+
+    /// A bare disc given the REMOTE takes the focus face (`accent`): the plate arrives with the focus.
+    #[test]
+    fn a_bare_disc_takes_the_accent_plate_on_focus() {
+        let focused = TransportButton::new(0, R)
+            .ground(ControlGround::Unkeyed)
+            .rest_face(TransportRest::Bare)
+            .focused(true);
+        assert_eq!(focused.look().plate, Plate::Accent);
+        assert!(focused.look().cast, "the accent focus lifts");
+        let same = |b: TransportButton<'_>| draw(b);
+        assert_eq!(
+            same(focused),
+            same(TransportButton::new(0, R).ground(ControlGround::Unkeyed).focused(true)),
+            "the focused face does not depend on the rest face"
+        );
+    }
+
+    /// `solid`: the focused colours at rest, so the plate at rest IS the accent plate, without the
+    /// cast that focus adds.
+    #[test]
+    fn a_solid_disc_rests_in_the_focused_colours() {
+        let solid = TransportButton::new(0, R).ground(ControlGround::Unkeyed).rest_face(TransportRest::Solid);
+        assert_eq!(solid.look(), TransportLook { plate: Plate::Accent, cast: false, ring: false });
+        let tags = draw(solid);
+        assert!(tags.iter().any(|(t, _)| *t == PLATE_TAG));
+        assert!(!tags.iter().any(|(t, _)| *t == 4 || *t == 5), "a solid disc at rest casts nothing: {tags:?}");
+        assert_eq!(
+            TransportButton::new(0, R).look(),
+            TransportLook { plate: Plate::Film, cast: false, ring: false },
+            "the default is the film"
+        );
+    }
+
+    /// `ring`: the rest face stays and a ring stands outside it. Disabled discs never wear it.
+    #[test]
+    fn a_ring_focus_keeps_the_rest_face_and_adds_a_ring() {
+        let ring = |b: TransportButton<'static>| b.ground(ControlGround::Unkeyed).focus_face(TransportFocus::Ring);
+        let at_rest = draw(ring(TransportButton::new(0, R)));
+        let focused = draw(ring(TransportButton::new(0, R).focused(true)));
+        let rings = |v: &[(u64, Rect)]| v.iter().filter(|(t, _)| *t == RING_TAG).count();
+        assert_eq!(rings(&focused), rings(&at_rest) + 1, "exactly one ring arrives with the focus");
+        let l = ring(TransportButton::new(0, R).focused(true)).look();
+        assert_eq!(l, TransportLook { plate: Plate::Film, cast: false, ring: true }, "the rest plate stays, uncast");
+        let outer = focused.iter().rev().find(|(t, _)| *t == RING_TAG).unwrap().1;
+        assert!(outer.x < R.x && outer.y < R.y && outer.w > R.w, "the ring stands outside the disc: {outer:?}");
+        assert_eq!(
+            draw(ring(TransportButton::new(0, R).focused(true).enabled(false))),
+            draw(ring(TransportButton::new(0, R).enabled(false))),
+            "a disabled disc wears no ring"
+        );
+    }
+
+    /// A package glyph draws through the same disc: the glyph box is the shared DISC_ICON_RATIO one.
+    #[test]
+    fn a_package_glyph_draws_in_the_discs_glyph_box() {
+        let svg = crate::icons::Svg::new("<svg viewBox='0 0 24 24'><path d='M3 4h18v12H3z'/></svg>");
+        let seen = draw_census::capture_svgs(|| {
+            TransportButton::new(0, R).svg(svg).draw(&Env::inert(), Painter::recording())
+        });
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, svg.key);
+        let builtin = draw_census::capture_icons(|| {
+            TransportButton::new(0, R).icon(crate::icons::Icon::More).draw(&Env::inert(), Painter::recording())
+        });
+        assert_eq!(seen[0].1, builtin[0].1, "the same box a built-in glyph has");
+        assert_ne!(crate::icons::Svg::new("<svg/>").key, svg.key, "the key follows the source");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn transport_button_disabled_never_draws_a_focused_face() {
+    let rect = Rect::new(0.0, 0.0, 64.0, 64.0);
+    let census = |b: TransportButton| crate::draw_census::capture_inks(|| b.draw(&Env::inert(), Painter::recording()));
+    let focused = census(TransportButton::new(0, rect).focused(true));
+    let idle = census(TransportButton::new(0, rect));
+    assert_ne!(focused, idle, "the focused face is distinguishable from idle");
+    for disabled in [TransportButton::new(0, rect).enabled(false).focused(true),
+        TransportButton::new(0, rect).focused(true).enabled(false)] {
+        assert_eq!(census(disabled), census(TransportButton::new(0, rect).enabled(false)),
+            "a disabled disc draws its idle face whatever order the builder ran in");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn button_progress_ring_uses_bounded_quadrants_and_leaves_the_default_face_unchanged() {
+    let _serial = plx_base::testlock::serial();
+    let label = CString::new("Next episode").unwrap();
+    let make = || Button::new(label.as_ptr(), theme::size::BODY, Rect::new(100.0, 800.0, 300.0, 64.0));
+    for (fraction, count) in [(0.0, 0), (0.1, 1), (0.25, 1), (0.5, 2), (1.0, 4), (1.5, 4)] {
+        let rings = crate::draw_census::capture_rings(|| make().progress_ring(fraction).draw(&Env::inert(), Painter::recording()));
+        assert_eq!(rings.len(), count, "fraction {fraction}: one clipped ring per reached quadrant");
+        assert!(rings.len() <= ButtonProgress::Ring.extra_draw_ops(), "the price covers every progress primitive");
+    }
+    let plain = crate::draw_census::capture(|| make().draw(&Env::inert(), Painter::recording()));
+    let zero = crate::draw_census::capture(|| make().progress_ring(0.0).draw(&Env::inert(), Painter::recording()));
+    assert_eq!(plain, zero, "zero progress adds no geometry or alternate resting face");
 }

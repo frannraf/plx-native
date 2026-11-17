@@ -80,12 +80,16 @@ state. Close other WSL work, run `wsl.exe --shutdown`, and retry; accept the run
 `use_gfxredir = 1`.
 
 **Ask for `SIM_W=1920 SIM_H=1080` on any shot you intend to JUDGE.** The window is otherwise sized
-to fit the display (`app::boot::desktop_window_size`), and on a 1x screen that divisor lands on 2, so
+to fit the display (`app::boot::plan_desktop_window`), and on a 1x screen that divisor lands on 2, so
 every screenshot comes back 960x540 — half the canvas the UI is authored at. A 1px edge-sheen, a
 hairline, a snapped glyph and a specular rim are exactly the things that do not survive that
-halving, which makes a shot at the default size evidence about layout and nothing else. The window
-may then be larger than the display; for a headless grab that is fine, because the drawable is the
-window's own framebuffer, not the part of it a compositor happens to show.
+halving, which makes a shot at the default size evidence about layout and nothing else. The size is
+the DRAWABLE, in pixels, on any display: the simulator measures the display's pixel density from
+its window and sizes the window in points for it, so a Retina Mac opens a 960x540-point window for
+the 1920x1080 drawable (`surface: window=960x540 drawable=1920x1080 … scale=1.000`), never a
+3840x2160 one. The window may then be larger than the display on a 1x screen; for a headless grab
+that is fine, because the drawable is the window's own framebuffer, not the part of it a
+compositor happens to show.
 
 ```sh
 make sim-macos-shot SIM_DIR=$D SIM_W=1920 SIM_H=1080 SIM_SHOT=$D/home.png
@@ -287,8 +291,9 @@ make screenshots SHOT_HERO_VARIANTS=1 # also home-hero-<film>.jpg for each hero 
   type of the page's grid; `collections` and `recommended` press the header control that opens that
   page; applied before `libgrid`/`libshelf`/`libmenu` act), `libmenu=<sortfilter|sort|filter|type>,<ms>`, and under `hostsim` `clockstop=<ms>`: the clock sink's clock stops at that
   position while the player stays PLAYING (Up Next only shows while playing; `autopause` would
-  take it down). The settled capture waits for every armed seat, menu and clock stop to land, so
-  a scene that seeks does not rest before it. `stillclock` also holds the Up Next countdown.
+  take it down). The settled capture waits for every armed seat, menu, clock stop and
+  `autopause` pause to land, so a scene that seeks does not rest before it (a busy host can leave a
+  loading player still for longer than the capture's quiet). `stillclock` also holds the Up Next countdown.
 - **The capture is the app's, once the screen is at rest.** `PLXNATIVE_SHOT_SETTLE=<ms>` makes the
   simulator write one PNG after the screen has not changed for that long (and not before
   `PLXNATIVE_SHOT_AFTER`), then exit with `PLXNATIVE_SHOT_EXIT=1`. The driver waits on that
@@ -346,15 +351,22 @@ Report these ONLY from the device, via the **`tv-session`** skill (and `wake-tv`
   `loop=` from a simulator as evidence about performance.
 - **Text rasterization truth.** Different FreeType, so stem/bar weight, hinting and the
   `theme::size` ladder stay device questions — `tools/font-hint-audit.py` and a device capture.
+  Arabic and Hebrew runs are the exception for shape and order: libass-plx draws them with the same
+  pinned FreeType and HarfBuzz in the simulator and on the TV, and `make check-ass` checks their ink.
   The window is no longer at an arbitrary fitted scale (`scale≈0.86` was the old fitted size): it
   opens at an exact divisor of the 1920x1080 canvas and is not resizable, so on a Retina display
-  the drawable is 1920x1080 and `scale` is exactly 1.0. Check the `surface:` line — it prints the
-  drawable and the scale, and a 0.5 there means glyphs are downscaled and softer by construction.
+  the drawable is 1920x1080 and `scale` is exactly 1.0 — whatever the display's size and with or
+  without `SIM_W`/`SIM_H`, since the window is sized in points from the density it measures. Check
+  the `surface:` line — it prints the drawable and the scale, and a 0.5 there means glyphs are
+  downscaled and softer by construction (a 2.0 would be a drawable larger than the canvas, which the
+  render-set ceiling in a debug build refuses by panicking).
 - **Anything about LG's DECODER** — resource-allocation refusals, the Load payload's Dolby
   declaration, `SOUND_ERROR_019`, frame pacing, which codecs the panel takes. The 29-symbol
-  Starfish/ACB seam does not exist off-device, so by default `player::ffi`'s host arm reports the
-  seam's own "no video path" failure and pressing Play lands on the app's real failure read-out —
-  correct behaviour, not a bug, and a convenient way to look at that screen.
+  Starfish/ACB seam does not exist off-device, so by default the simulator's stand-in
+  (`plx_play_feed::ffi_host::HostSink`; a simulator built without `play-feed` installs `NoSink`,
+  see `ci/test_sim_backend.py`) reports the seam's own "no video path" failure and pressing Play
+  lands on the app's real failure read-out — correct behaviour, not a bug, and a convenient way to
+  look at that screen.
 - ~~**Anything about video.**~~ **Narrowed twice, and the second time is recent.** Arm
   **`plxnative-clocksink`** in the instance root and the seam becomes a plant: access units are
   accepted and discarded and a presentation clock advances at real time, clamped to the last fed
@@ -401,20 +413,22 @@ device-verified" is a useful, honest status. "Verified" without a TV is not.
   needs Screen Recording permission — a GUI prompt that silently yields black frames headlessly —
   and it grabs whatever is actually on screen, so an occluded window or two parallel simulators
   corrupt it. The in-app shot needs no permission, works occluded, and is deterministic.
-- The window is not 1:1. `surface::probe` letterboxes 1920×1080 into whatever the drawable is, so
-  shots come out at the viewport size (e.g. 1650×928). Fine for layout, wrong for pixel work.
+- The window is 1:1 only where the display can give a 1920x1080 drawable: a Retina Mac always does,
+  and `SIM_W=1920 SIM_H=1080` asks for it anywhere. A fitted window on a 1x screen is a whole fraction
+  of the canvas (960x540, `scale` 0.5) and `surface::probe` letterboxes 1920×1080 into it, so shots
+  come out at the viewport size — fine for layout, wrong for pixel work. Read the `surface:` line.
 - Without `plxnative-clocksink` there is no `player` route to screenshot beyond the failure
   read-out and the HUD's busy states. With it there is a real one, driven by a real stream — but
   the video PLANE is empty, because the app decodes nothing and the wayland overlay is webOS-only:
   the HUD sits over black. Arm `plxnative-simvideo` as well and a system `ffmpeg` child decodes
-  the stream the clock sink accepts and composites it UNDER the UI (`player/sim_video.rs`). That
+  the stream the clock sink accepts and composites it UNDER the UI (`src/app/adapters/hostsim/sim_video.rs`). That
   is a screenshot facility for the documentation's player figure; it says nothing about LG's
   decoder, the video plane or picture timing on the television.
 
 ## The frame dump (the demo video's renderer)
 
 `make site-video-sim` builds the simulator for the demo-video pipeline (`--no-default-features
---features hostsim,devtriggers,placeholder-sentinel`, release, its own target dir, libass only), and
+--features hostsim,play-feed,devtriggers,placeholder-sentinel`, release, its own target dir, libass only), and
 `python3 tools/site_video.py render --out DIR --storyboard` plays `tests/video/feel.json` (positions and durations, compiled to the driver's key schedule: Home hero, hero paged to the second page and back, down to the Continue Watching shelf, the third card's Detail opened with OK and scrolled with five downs past its Cast & Crew row to the About section, back, the Movies library walked down with arrows only to its All poster grid and across it, walked back up and left with one back, about 30 s; nothing opened from Detail, no modal; shot with the hold hint taught, so card rests and the card OK are not capped: `render --storyboard` sets the `plxnative-hintoff` trigger (`devtriggers` builds only; it calls `hold_hint::teach_all_for_dev`, once, at boot) because the capsule is a one-time teaching overlay and a film has no viewer to teach) and records its sha256, `--extra-holds`, `--trigger`, how far each beat still moved at its end (`storyboard.rest`) and which titles it opened and `hold_hint: suppressed` in `render.json`. Before the film boots the launcher signs the simulator in to the mock's Demo account through the app's own QR sign-in (a prep boot with the `plxnative-login` trigger), so the profile chip, one `left` from the Home pill that `up` from the hero lands on, reads "Demo" and never "Sign in" should a beat press `left` there. A pushed page is filmed LIVE under the dip, never as a held image (`plx_gfx::dump`'s one page rule: every dip frame re-captures the page, `PageImage::step_filmed`), so a page that mounts hidden and fades in (an `Xfade` mount, the Library's) fades in as it does in the product, with its entrance springs playing, and nothing cuts when the dip ends. Either way `render` runs the simulator headless against the mock catalog (without `--storyboard` it holds Home for `--frames`, 180 by default) and leaves
 `master.mkv`, `frames.tsv`, `dump.json` and `render.json`. The simulator side is
 `rust-modules/src/dev/framedump.rs`, armed by `PLXNATIVE_DUMP=<dir>` (its module doc lists the

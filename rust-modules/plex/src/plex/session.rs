@@ -31,16 +31,19 @@
 //! - Only this module writes the session domain of the persisted record; every
 //!   `persistence::commit_*`/`write_session`/`commit_cleared` caller here ends by calling exactly
 //!   a read install, proven-write install, cache drop, or local revocation.
-//! - `peek` never takes `IO`. A miss schedules one refresh on the bounded persistence FIFO and
-//!   returns the last snapshot immediately. The worker reads and installs under `IO`; `CACHE`
-//!   is never held across `IO`. Queued and in-flight reads cannot overwrite a later revocation.
-//!   Cached views poll `VisibleSessionWatch` on Tick; `peek_settled` distinguishes recovery in
-//!   progress from an authoritative empty session, so pending preferences need not flash defaults.
+//! - `peek` is a pure read of memory: it takes no `IO`, submits nothing and reads no clock. A miss
+//!   returns the last snapshot (or the empty session). The refill is the session owner's job:
+//!   `refresh_need` says what the cache lacks, the app's frame step hands it to the owner, and the
+//!   owner's `RefreshCache` effect runs `refresh_cache_job` on the bounded persistence FIFO. The
+//!   job reads and installs under `IO`; `CACHE` is never held across `IO`. Queued and in-flight
+//!   reads cannot overwrite a later revocation (`CACHE_GENERATION` and `replace_cache`'s Revoked
+//!   guard). Cached views poll `VisibleSessionWatch` on Tick; `peek_settled` distinguishes recovery
+//!   in progress from an authoritative empty session, so pending preferences need not flash defaults.
 //! - Writers never read from the cache; they read the authority under `IO` (fence correctness),
 //!   then install their own outcome over it.
-//! - A `Locked`/`Blocked` read or fallback `Ready` during helper unavailability is transient:
-//!   served for `LOCKED_RETRY` (about a second) after it finishes, then re-read on the next call
-//!   rather than latched forever.
+//! - A `Locked`/`Blocked` read or fallback `Ready` during helper unavailability is transient: it
+//!   is served as the last known state, and the owner re-reads it no sooner than `LOCKED_RETRY_MS`
+//!   of frame time later (per generation), rather than latching it forever.
 //! - [`clear`] (sign-out) drops the cached `Arc` immediately — it holds the very account/server
 //!   tokens sign-out means to get rid of.
 //! - Other domains of the same record (consent) are not in this cache and their writes never
@@ -49,20 +52,25 @@
 //!   cache rather than keep a second copy of the session live.
 use super::origin::Origin;
 use super::probe::Location;
-pub use prefs::{HoldHintTaughtPref, effective, own_prefs, persist_profile_pref, put_own, stored_effective, tenure, AudioEnhancementsPref,
+mod playback_options;
+pub use playback_options::{MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking, UriEngine};
+
+pub use prefs::{IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpadSeekingPref, UriEnginePref, HoldHintTaughtPref, effective, effective_hud, own_prefs, persist_profile_hud, persist_profile_pref, put_own, stored_effective, stored_effective_hud, tenure, HudSelectionPref, AudioEnhancementsPref,
     DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsPref,
     ProfilePrefsRecord, ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipIntervalPref,
-    SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, UiResolutionPref, UnderPostersPref};
+    SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, HudEndTimePref, UiResolutionPref, UnderPostersPref};
 use prefs::ProfileMemory;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Mutex;
 use std::collections::BTreeMap;
 use serde_json::Value;
+pub use plx_base::detail_parts::{DetailPart, DetailParts};
 
 /// The signed-in profile, in-memory for the UI (the Home profile chip reads this). Set by the boot
 /// gate (from the stored session) and on every profile switch, so it survives an offline boot.
 static CURRENT: Mutex<Option<std::sync::Arc<CurrentProfile>>> = Mutex::new(None);
+static CURRENT_PUBLICATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Immutable worker publication. Identity and its explicit owner-assigned generation are one
 /// record, so a reader that needs both can retain one snapshot across subsequent publications.
@@ -197,8 +205,9 @@ impl ProfilePublisher {
             return;
         }
         {
-            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(
-                CurrentProfile { user: user.clone(), generation, stamp }));
+            let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+            *current = Some(std::sync::Arc::new(CurrentProfile { user: user.clone(), generation, stamp }));
+            CURRENT_PUBLICATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         warm(user, generation);
     }
@@ -293,7 +302,7 @@ static TEST_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// surviving every run. Three consequences — the first MEASURED, the second and third read off
 /// the code that produced it:
 ///
-/// * **A test's answer was decided by that file.** `browse::append_sections` calls `resolve_pins`,
+/// * **A test's answer was decided by that file.** `browse::append_sections` calls `resolve_pins_from`,
 ///   which reads this module for the current profile's `home_pins` — so EVERY use of
 ///   `browse::seed_two_source_table_for_test` resolved its favourite libraries against whatever
 ///   record happened to be on that developer's disk. A record for the empty profile key naming
@@ -385,7 +394,6 @@ fn redirect_candidates_for_test(v: Option<Vec<std::path::PathBuf>>) {
 #[cfg(any(test, feature = "test-support"))]
 pub fn redirect_for_test(p: Option<std::path::PathBuf>) {
     plx_base::storage_worker::drain_for_test();
-    REFRESH.lock().unwrap_or_else(|e| e.into_inner()).retry_at = None;
     let _io = io();
     *TEST_FILE.lock().unwrap_or_else(|e| e.into_inner()) = p;
     // A test swapping the scratch file changes what `peek` answers just as surely as a write
@@ -499,7 +507,7 @@ impl Drop for TempSession {
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct OpaqueExtensions(pub BTreeMap<String, Value>);
+pub struct OpaqueExtensions(pub BTreeMap<String, ::serde_json::Value>);
 
 impl OpaqueExtensions {
     fn is_empty(&self) -> bool {
@@ -611,8 +619,8 @@ pub struct Session {
     /// Soft-parsed like every list in this struct: an entry costs itself, never the credentials.
     #[serde(default, deserialize_with = "de_profile_cache")]
     pub profiles: Vec<ProfileCreds>,
-    /// Every preference key but `language` (`ui_resolution`, `hold_hint_taught`, `profile_prefs`, the per-profile home of the ten player
-    /// settings and of hero trailer autoplay, and those settings' frozen top-level keys every profile
+    /// Every preference key but `language` (`ui_resolution`, `hold_hint_taught`, `profile_prefs`, the per-profile home of playback
+    /// and display settings, and those settings' frozen top-level keys every profile
     /// falls back to (`trailer_autoplay` among them), `auto_sign_in`,
     /// `last_hero_blur`, `plaintext_consent`, `server_key_pins`, `last_library`,
     /// `library_sorts`, `track_memory`, `subtitle_offsets`), flattened so the keys sit at the top level of the file under
@@ -646,7 +654,7 @@ struct CanonicalSessionAuth {
 struct CanonicalSessionPreferences {
     #[serde(default)]
     language: plx_platform::i18n::Preference,
-    /// Every flattened preference key (the ten player settings, hero trailer autoplay, the A5 rows and the two memory-door
+    /// Every flattened preference key (playback and display settings, the A5 rows and the two memory-door
     /// lists), flattened ahead of `extensions` so a flattened struct takes its keys first and
     /// `extensions` still sees only unknown ones.
     #[serde(flatten)]
@@ -964,15 +972,27 @@ impl PlaybackQuality {
 /// The persisted subtitle tones, lightest first. Like [`PlaybackQuality`] the spelling on disk is
 /// explicit: these strings are a file-format contract and must survive a variant rename.
 ///
-/// A ladder of GREYS rather than a colour wheel, because the job is brightness: over an HDR
+/// Mostly a ladder of GREYS rather than a colour wheel, because the job is brightness: over an HDR
 /// picture the panel maps graphics white far above where it sits in SDR, and the only thing that
-/// makes a caption comfortable there is less light. What each rung looks like is `ui::theme`'s
-/// (`subtitle_ink`); this type only names them.
+/// makes a caption comfortable there is less light. The one exception is a legibility colour,
+/// [`SubtitleTone::Yellow`] (a viewer asks for it for readability, discussion #1193). The greys
+/// are inks `ui::theme` tints a drawn caption with (`SUBTITLE_INKS`); a COLOUR rung has a text
+/// colour, [`SubtitleTone::text_rgb8`]: a synthesized text-subtitle header takes it as its primary
+/// colour (media cannot name `ui::theme`), and an authored ASS/SSA script takes it in the PrimaryColour of
+/// every pure-white style (`plx_media::player::ass_ink`), so a cue's own inline colours and a script's
+/// other-coloured styles are left alone, while the client's own drawn text takes the same colour from the matching
+/// `ui::theme::SUBTITLE_INKS` entry, which a test ties to it. Adding a colour is one variant, one
+/// `LADDER` rung, one arm of `text_rgb8` and that theme entry.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubtitleTone {
     #[default]
     #[serde(rename = "white")]
     White,
+    /// Added after the greys were persisted, so a build from before it reads `"yellow"` as a value
+    /// it cannot parse: the per-profile field falls back to the install's older value and the
+    /// install key to white (both are parsed softly), never a failed load.
+    #[serde(rename = "yellow")]
+    Yellow,
     #[serde(rename = "grey_85")]
     Silver,
     #[serde(rename = "grey_70")]
@@ -987,8 +1007,9 @@ pub enum SubtitleTone {
 
 impl SubtitleTone {
     /// Every rung, lightest first — the order the picker draws them in.
-    pub const LADDER: [SubtitleTone; 6] = [
+    pub const LADDER: [SubtitleTone; 7] = [
         SubtitleTone::White,
+        SubtitleTone::Yellow,
         SubtitleTone::Silver,
         SubtitleTone::LightGrey,
         SubtitleTone::Grey,
@@ -1001,6 +1022,7 @@ impl SubtitleTone {
     pub fn label(self) -> &'static str {
         match self {
             SubtitleTone::White => "White",
+            SubtitleTone::Yellow => "Yellow",
             SubtitleTone::Silver => "Silver",
             SubtitleTone::LightGrey => "Light gray",
             SubtitleTone::Grey => "Gray",
@@ -1017,6 +1039,21 @@ impl SubtitleTone {
 
     pub fn index(self) -> u8 {
         Self::LADDER.iter().position(|&t| t == self).unwrap_or(0) as u8
+    }
+
+    /// The colour this rung paints text in, as 8-bit sRGB, or `None` for white and the greys (which
+    /// only dim: `ui::theme::SUBTITLE_INKS` tints with them). The colour code media's header reads;
+    /// see the type's own doc for the theme entry it is tied to.
+    pub const fn text_rgb8(self) -> Option<[u8; 3]> {
+        match self {
+            SubtitleTone::Yellow => Some([0xff, 0xe6, 0x1a]),
+            SubtitleTone::White
+            | SubtitleTone::Silver
+            | SubtitleTone::LightGrey
+            | SubtitleTone::Grey
+            | SubtitleTone::DarkGrey
+            | SubtitleTone::Charcoal => None,
+        }
     }
 }
 
@@ -1068,7 +1105,7 @@ impl SubtitleSize {
 
 /// The persisted subtitle vertical placements, lowest first — one per profile, like [`SubtitleTone`].
 /// Absence is `Low`, which is where every build before this preference drew the caption
-/// (`media::player::text_style`'s fixed `SUB_BASE_Y`/`SUB_CEIL_Y` baseline). Only the plain-text caption draw
+/// (`media::player::text_style`'s fixed `SUB_BASE_Y` baseline, lifted to the HUD's `HudBand` ceiling). Only the plain-text caption draw
 /// moves with this; image (PGS/VobSub) captions and native ASS/SSA keep their own placement
 /// (`docs/ass-subtitles.md`).
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1227,12 +1264,13 @@ impl DeckPress {
     }
 }
 
-/// Which fact the details line under a focused poster carries (Settings > Libraries > Under
-/// posters > Details). plex's own enum, because plex does not name `ui`: `screens` maps it to the
-/// caption policy's `DetailsKind`. Absence, and any spelling this build does not know, is
-/// `YearLength`.
+/// **The retired single-choice ladder** the Details setting was before it became a set of parts
+/// (Under posters v3): kept only to READ an older profile's record and to WRITE the nearest rung
+/// beside the parts, so a build that predates the parts reads something sensible instead of losing
+/// the choice. plex's own enum, because plex does not name `ui`. Absence, and any spelling this
+/// build does not know, is `YearLength`.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnderPostersDetails {
+pub enum UnderPostersLadder {
     /// "2019 · 2h 14m" (the default).
     #[default]
     #[serde(rename = "year_length")]
@@ -1250,40 +1288,171 @@ pub enum UnderPostersDetails {
     None,
 }
 
-impl UnderPostersDetails {
-    /// Every option, the order the picker lists them in.
-    pub const LADDER: [UnderPostersDetails; 5] = [
-        UnderPostersDetails::YearLength,
-        UnderPostersDetails::Genre,
-        UnderPostersDetails::Video,
-        UnderPostersDetails::AgeRatingScore,
-        UnderPostersDetails::None,
+impl UnderPostersLadder {
+    /// Every rung the old picker listed.
+    pub const LADDER: [UnderPostersLadder; 5] = [
+        UnderPostersLadder::YearLength,
+        UnderPostersLadder::Genre,
+        UnderPostersLadder::Video,
+        UnderPostersLadder::AgeRatingScore,
+        UnderPostersLadder::None,
     ];
 
-    /// An in-memory index back to an option — out of range is the default, for the reason
-    /// [`SubtitleTone::from_index`] gives: the ladder can grow or shrink.
-    pub fn from_index(i: u8) -> UnderPostersDetails {
-        Self::LADDER.get(i as usize).copied().unwrap_or_default()
+    /// **The movie parts an old rung stands for** (the migration): Year · Length, Genre, Video
+    /// quality, Age rating · Score, Nothing.
+    pub fn movie_parts(self) -> DetailParts {
+        match self {
+            UnderPostersLadder::YearLength => DetailParts::MOVIE_DEFAULT,
+            UnderPostersLadder::Genre => DetailParts::of(&[DetailPart::Genre]),
+            UnderPostersLadder::Video => DetailParts::of(&[DetailPart::VideoQuality]),
+            UnderPostersLadder::AgeRatingScore => DetailParts::of(&[DetailPart::AgeRating, DetailPart::Score]),
+            UnderPostersLadder::None => DetailParts::NONE,
+        }
     }
 
-    pub fn index(self) -> u8 {
-        Self::LADDER.iter().position(|&m| m == self).unwrap_or(0) as u8
+    /// **The TV show parts an old rung stands for**: the same, except that a show has no video
+    /// quality, so the rung that was never a show's own (a stored `video`, which the old picker
+    /// could not write for a show and a pre-split profile could hold for both) reads as the show's
+    /// default, Year · Seasons, exactly as the old `for_shows` did.
+    pub fn show_parts(self) -> DetailParts {
+        match self {
+            UnderPostersLadder::YearLength | UnderPostersLadder::Video => DetailParts::SHOW_DEFAULT,
+            other => other.movie_parts().for_shows(),
+        }
+    }
+
+    /// **The nearest rung to a set of parts**, written beside the parts for a build that predates
+    /// them: no parts is Nothing, otherwise the first rung (in the old ladder's order) that any
+    /// ticked part belongs to.
+    pub fn nearest(parts: DetailParts) -> UnderPostersLadder {
+        let has = |ps: &[DetailPart]| ps.iter().any(|p| parts.contains(*p));
+        if parts.is_empty() {
+            UnderPostersLadder::None
+        } else if has(&[DetailPart::Year, DetailPart::Length, DetailPart::Seasons]) {
+            UnderPostersLadder::YearLength
+        } else if has(&[DetailPart::Genre]) {
+            UnderPostersLadder::Genre
+        } else if has(&[DetailPart::VideoQuality]) {
+            UnderPostersLadder::Video
+        } else {
+            UnderPostersLadder::AgeRatingScore
+        }
     }
 }
 
 /// **What sits under the focused poster** — one setting for every poster grid and row (Library,
-/// Collections, Home, Search, Watchlist): whether the title shows, and which fact the details
-/// line carries. Per profile, like [`DeckPress`]. The default is no title and the year and length.
+/// Collections, Home, Search, Watchlist): whether the title shows, which facts the details line
+/// carries (a SET of parts per kind of title, [`DetailParts`]), and whether a library grid sorted by
+/// something other than Title or Random shows the value it is sorted by on one line under every
+/// poster (`sort_value`). Per profile, like [`DeckPress`]. The default is no title, the year and
+/// length of a movie and the year and seasons of a show, and the sort value On.
 ///
-/// Each field is soft-parsed on its own, so a spelling a later build wrote for `details` costs the
-/// details alone and never the title.
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(default)]
+/// **Stored** as `title`, the two part lists (`detail_parts` for movies, `show_detail_parts` for
+/// shows: arrays of [`DetailPart::name`]) and `sort_value_off`, plus the nearest old rung under the
+/// old keys `details` / `show_details` ([`UnderPostersLadder::nearest`]) so an older build still
+/// reads a choice. **Read**: a part list that is present wins (unknown names and parts a kind does
+/// not offer are dropped, more than [`DetailParts::MAX`] keep the first four); one that is absent is
+/// migrated from the old key ([`UnderPostersLadder::movie_parts`] / [`UnderPostersLadder::show_parts`]),
+/// and a show list absent beside the movie's old key is that key read for shows.
+///
+/// Each field is soft-parsed on its own, so a spelling a later build wrote for one costs that one
+/// alone and never the title. `sort_value` is stored as its OFF state only (the key is absent while
+/// it is On), so a profile that never chose it, and one that persisted the retired `show_sort_info`
+/// key of the earlier sort-information switch (ignored, never written), reads On.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(from = "UnderPostersWire", into = "UnderPostersWire")]
 pub struct UnderPosters {
-    #[serde(deserialize_with = "de_soft_under_posters_title")]
     pub title: bool,
-    #[serde(deserialize_with = "de_soft_under_posters_details")]
-    pub details: UnderPostersDetails,
+    /// The parts of the details line under a MOVIE (and under a season or an episode, which have
+    /// always followed it), held to what a movie offers ([`DetailPart::MOVIE`]).
+    pub details: DetailParts,
+    /// The parts of the details line under a TV SHOW, held to what a show offers ([`DetailPart::SHOW`]).
+    pub show_details: DetailParts,
+    /// A library grid sorted by something other than Title or Random shows the sort's value under
+    /// every card (the Movies, TV Shows, Seasons and Episodes grids; the Library's `registry::sort_info`). On by default.
+    pub sort_value: bool,
+}
+
+/// What [`UnderPosters`] is read from and written as: each field soft-parsed on its own, and the
+/// fields a record may lack kept optional so absence can be told from a choice.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct UnderPostersWire {
+    #[serde(deserialize_with = "de_soft_under_posters_title")]
+    title: bool,
+    /// The old single choice (movies): read when `detail_parts` is absent, written as the nearest rung.
+    #[serde(deserialize_with = "de_soft_under_posters_ladder")]
+    details: UnderPostersLadder,
+    #[serde(deserialize_with = "de_soft_show_ladder", skip_serializing_if = "Option::is_none")]
+    show_details: Option<UnderPostersLadder>,
+    #[serde(deserialize_with = "de_soft_parts", skip_serializing_if = "Option::is_none")]
+    detail_parts: Option<Vec<String>>,
+    #[serde(deserialize_with = "de_soft_parts", skip_serializing_if = "Option::is_none")]
+    show_detail_parts: Option<Vec<String>>,
+    #[serde(rename = "sort_value_off", with = "sort_value_off", skip_serializing_if = "sort_value_off::is_on")]
+    sort_value: bool,
+}
+
+impl Default for UnderPostersWire {
+    fn default() -> Self {
+        Self { title: false, details: UnderPostersLadder::default(), show_details: None, detail_parts: None, show_detail_parts: None, sort_value: true }
+    }
+}
+
+/// The parts a stored list names: unknown spellings are dropped.
+fn parts_named(names: &[String]) -> DetailParts {
+    DetailParts::of(&names.iter().filter_map(|n| DetailPart::from_name(n)).collect::<Vec<_>>())
+}
+
+fn names_of(parts: DetailParts) -> Vec<String> {
+    parts.iter().map(|p| p.name().to_owned()).collect()
+}
+
+impl From<UnderPostersWire> for UnderPosters {
+    fn from(w: UnderPostersWire) -> Self {
+        let details = match &w.detail_parts {
+            Some(names) => parts_named(names).for_movies(),
+            None => w.details.movie_parts(),
+        };
+        let show_details = match (&w.show_detail_parts, w.show_details) {
+            (Some(names), _) => parts_named(names).for_shows(),
+            (None, Some(rung)) => rung.show_parts(),
+            (None, None) => w.details.show_parts(),
+        };
+        UnderPosters { title: w.title, details, show_details, sort_value: w.sort_value }
+    }
+}
+
+impl From<UnderPosters> for UnderPostersWire {
+    fn from(v: UnderPosters) -> Self {
+        UnderPostersWire {
+            title: v.title,
+            details: UnderPostersLadder::nearest(v.details),
+            show_details: Some(UnderPostersLadder::nearest(v.show_details)),
+            detail_parts: Some(names_of(v.details)),
+            show_detail_parts: Some(names_of(v.show_details)),
+            sort_value: v.sort_value,
+        }
+    }
+}
+
+impl Default for UnderPosters {
+    fn default() -> Self { Self::DEFAULT }
+}
+
+/// `sort_value` on the wire: the key `sort_value_off` is written only while the value is Off, and
+/// any absent, malformed or non-boolean entry reads as On (the default), the way every other
+/// field of the setting is soft-parsed.
+mod sort_value_off {
+    use serde::{Deserializer, Serializer};
+
+    pub fn is_on(on: &bool) -> bool { *on }
+
+    pub fn serialize<S: Serializer>(on: &bool, s: S) -> Result<S::Ok, S::Error> { s.serialize_bool(!*on) }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        super::de_soft_bool(d).map(|off| !off)
+    }
 }
 
 fn de_soft_under_posters_title<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -1291,23 +1460,45 @@ fn de_soft_under_posters_title<'de, D: Deserializer<'de>>(d: D) -> Result<bool, 
     Ok(v.as_bool().unwrap_or(false))
 }
 
-fn de_soft_under_posters_details<'de, D: Deserializer<'de>>(d: D) -> Result<UnderPostersDetails, D::Error> {
-    let Ok(v) = Value::deserialize(d) else { return Ok(UnderPostersDetails::default()) };
-    Ok(serde_json::from_value::<UnderPostersDetails>(v).unwrap_or_default())
+fn de_soft_under_posters_ladder<'de, D: Deserializer<'de>>(d: D) -> Result<UnderPostersLadder, D::Error> {
+    let Ok(v) = Value::deserialize(d) else { return Ok(UnderPostersLadder::default()) };
+    Ok(serde_json::from_value::<UnderPostersLadder>(v).unwrap_or_default())
+}
+
+/// `show_details`: a spelling this build knows is a choice, anything else reads as absent, so the
+/// movie value seeds it.
+fn de_soft_show_ladder<'de, D: Deserializer<'de>>(d: D) -> Result<Option<UnderPostersLadder>, D::Error> {
+    let Ok(v) = Value::deserialize(d) else { return Ok(None) };
+    Ok(serde_json::from_value::<UnderPostersLadder>(v).ok())
+}
+
+/// A part list: an array reads as the names in it (a non-string entry is skipped), anything else
+/// as absent, so the old key stands in.
+fn de_soft_parts<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    let Ok(Value::Array(items)) = Value::deserialize(d) else { return Ok(None) };
+    Ok(Some(items.into_iter().filter_map(|i| i.as_str().map(str::to_owned)).collect()))
 }
 
 impl UnderPosters {
     /// The defaults, as a `const` for callers that compare against them.
-    pub const DEFAULT: UnderPosters = UnderPosters { title: false, details: UnderPostersDetails::YearLength };
+    pub const DEFAULT: UnderPosters =
+        UnderPosters { title: false, details: DetailParts::MOVIE_DEFAULT, show_details: DetailParts::SHOW_DEFAULT, sort_value: true };
 
-    /// One byte for the media layer's live cell: the title in bit 0, the details' index in bits 1-3.
-    pub fn pack(self) -> u8 {
-        u8::from(self.title) | (self.details.index() << 1)
+    /// Two bytes for the live cell: title in bit 0, "sort value Off" in bit 1, the movie parts in
+    /// bits 2-8 and the TV show parts in bits 9-15 (one bit per [`DetailPart`]).
+    pub const fn pack(self) -> u16 {
+        self.title as u16 | ((!self.sort_value as u16) << 1) | ((self.details.bits() as u16) << 2) | ((self.show_details.bits() as u16) << 9)
     }
 
-    /// The inverse of [`UnderPosters::pack`]; an out-of-range details index is the default.
-    pub fn unpack(b: u8) -> UnderPosters {
-        UnderPosters { title: b & 1 != 0, details: UnderPostersDetails::from_index((b >> 1) & 0b111) }
+    /// The inverse of [`UnderPosters::pack`]; each side is held to what its kind offers and to the
+    /// maximum ([`DetailParts::kept`]).
+    pub fn unpack(b: u16) -> UnderPosters {
+        UnderPosters {
+            title: b & 1 != 0,
+            sort_value: b & 2 == 0,
+            details: DetailParts::from_bits(((b >> 2) & 0x7F) as u8).for_movies(),
+            show_details: DetailParts::from_bits(((b >> 9) & 0x7F) as u8).for_shows(),
+        }
     }
 }
 
@@ -1888,6 +2079,78 @@ pub struct ServerKeyPin {
     pub extensions: OpaqueExtensions,
 }
 
+/// How many facet-clean proofs persist a refusal on its build (D6(c) of the playback-refusal plan):
+/// the first rescue of a play whose conversion changed only the refused facet is counted, the second
+/// applies. A transient `601` coinciding with one Load cannot teach alone.
+pub const LEARNED_REFUSAL_PROOFS: u32 = 2;
+
+/// One native audio combination the TV's pipeline was watched refusing on this install: the
+/// firmware family, the codec and the refused track's channel count. See
+/// [`Preferences::native_audio_refused`] and `devcaps::Refusal`. **Identity** is `(build, codec,
+/// channels)` with the raw channel count (`refusal_ceiling` is applied only when a play start
+/// derives its capability value, `devcaps::Caps::minus`); the firmware codename is a stamped field
+/// that only records which set taught it (a build implies its codename, so applying a row does not
+/// ask it).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NativeAudioRefusal {
+    pub firmware: String,
+    pub codec: String,
+    pub channels: u32,
+    /// The exact firmware build it was watched on; absent from a record written before builds were
+    /// recorded, which reads as empty and counts as stale (see [`Session::with_native_audio_refusal`]).
+    #[serde(default)]
+    pub build: String,
+    /// Facet-clean proofs seen on `build` (D6(c)). ABSENT = a refusal that named the codec
+    /// (`type=18 num=200` or the stall, and every row written before S2a): applied at once. Capped
+    /// at [`LEARNED_REFUSAL_PROOFS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proofs: Option<u32>,
+    #[serde(flatten, default, skip_serializing_if = "OpaqueExtensions::is_empty")]
+    pub extensions: OpaqueExtensions,
+}
+
+impl NativeAudioRefusal {
+    /// The row for `facet` on `firmware`'s `build`, or `None` when it cannot be stored. `proofs`
+    /// `None` names the codec; `Some(n)` counts proofs. A PROOF of unknown width (`channels == 0`)
+    /// is not stored: `refusal_ceiling(0)` would remove the whole codec, too broad for a counted
+    /// lesson; a named refusal keeps that behaviour. The `Facet::Video` arm returns `None`: video
+    /// rows never persist (D6(c): a video facet never proves), and this row has no video fields to
+    /// hold one.
+    pub fn of_facet(facet: &plx_platform::devcaps::Facet, firmware: &str, build: &str, proofs: Option<u32>) -> Option<Self> {
+        match facet {
+            plx_platform::devcaps::Facet::Audio { codec, channels } => {
+                if *channels == 0 && proofs.is_some() {
+                    return None;
+                }
+                Some(NativeAudioRefusal {
+                    firmware: firmware.to_owned(),
+                    codec: plx_platform::devcaps::audio_codec_id(codec).into_owned(),
+                    channels: *channels,
+                    build: build.to_owned(),
+                    proofs,
+                    extensions: Default::default(),
+                })
+            }
+            plx_platform::devcaps::Facet::Video { .. } => None,
+        }
+    }
+
+    /// Whether the row is in force: a named row (and every row written before S2a) at once, a
+    /// counted one from [`LEARNED_REFUSAL_PROOFS`] proofs.
+    pub fn applies(&self) -> bool {
+        self.proofs.is_none_or(|n| n >= LEARNED_REFUSAL_PROOFS)
+    }
+
+    /// Whether `other` is the same combination on the same build (the row's identity).
+    fn same_as(&self, other: &Self) -> bool {
+        self.build == other.build && self.codec == other.codec && self.channels == other.channels
+    }
+
+    fn to_devcaps(&self) -> plx_platform::devcaps::Refusal {
+        plx_platform::devcaps::Refusal { codec: self.codec.clone(), channels: self.channels, build: self.build.clone() }
+    }
+}
+
 /// Is `pin` shaped like `plx_base::spki::pin_from_pem`'s answer: `sha256//` and the 44 base64
 /// characters of a 32-byte digest. The file is hand-editable and the value goes to libcurl, so a
 /// string that is not one is treated as absent rather than handed on.
@@ -1971,8 +2234,22 @@ pub struct LibraryViews {
     pub extensions: OpaqueExtensions,
 }
 
-/// Everything one person chose in one library's view: the section, and what the Library screen's
-/// toolbar changed about it.
+/// A page left open above the library grid.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryPage {
+    Collections,
+    Recommended,
+    #[default]
+    #[serde(other)]
+    Grid,
+}
+
+impl LibraryPage {
+    fn is_grid(&self) -> bool { *self == Self::Grid }
+}
+
+/// Everything one person chose in one library's view: the section, its open page and toolbar choices.
 ///
 /// `machine_id`, `key`, `sort` and `desc` are the entry's ORIGINAL fields, always written, so an
 /// older build reads the sort back from a file this one wrote; every field added since is omitted
@@ -2012,6 +2289,8 @@ pub struct LibraryView {
     /// The direction of `listing_sort`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub listing_desc: bool,
+    #[serde(skip_serializing_if = "LibraryPage::is_grid")]
+    pub page: LibraryPage,
     #[serde(flatten, default, skip_serializing_if = "OpaqueExtensions::is_empty")]
     pub extensions: OpaqueExtensions,
 }
@@ -2036,6 +2315,7 @@ impl LibraryView {
     pub fn is_default(&self) -> bool {
         self.sort.is_empty() && !self.desc && !self.unwatched && self.genre.is_empty()
             && self.listing.is_empty() && self.listing_sort.is_empty() && !self.listing_desc
+            && self.page.is_grid()
             && self.extensions.is_empty()
     }
     /// This view with every field a record may not carry dropped back to its default: a sort
@@ -2432,6 +2712,40 @@ impl Session {
         Some(next)
     }
 
+    /// The native audio refusals this install has learned.
+    pub fn native_audio_refused(&self) -> &[NativeAudioRefusal] {
+        &self.prefs.native_audio_refused
+    }
+
+    /// This session with `refusal` remembered, or `None` when nothing would change (so the caller
+    /// skips the write). **The one way the list changes**: it takes the new entry and drops what
+    /// another firmware build learned (and what an older record never tagged), because an LG update
+    /// replaces the decoder a refusal was watched on, so the new firmware gets a fresh native try.
+    /// An entry without a build (the set did not name one) judges nothing and drops nothing. The
+    /// stale entries are inert until then: `devcaps` ignores a refusal watched on another build.
+    /// For the same identity the counts merge: a named row always wins (`proofs` `None`) and a
+    /// proof never downgrades it, two proofs add up to [`LEARNED_REFUSAL_PROOFS`] and no further.
+    pub fn with_native_audio_refusal(&self, refusal: &NativeAudioRefusal) -> Option<Self> {
+        if refusal.firmware.is_empty() || refusal.codec.is_empty() {
+            return None;
+        }
+        let mut next = self.clone();
+        let list = &mut next.prefs.native_audio_refused;
+        if !refusal.build.is_empty() {
+            list.retain(|r| r.build == refusal.build);
+        }
+        match list.iter_mut().find(|r| r.same_as(refusal)) {
+            Some(old) => {
+                old.proofs = match (old.proofs, refusal.proofs) {
+                    (None, _) | (_, None) => None,
+                    (Some(a), Some(b)) => Some(a.saturating_add(b).min(LEARNED_REFUSAL_PROOFS)),
+                };
+            }
+            None => list.push(refusal.clone()),
+        }
+        (*list != self.prefs.native_audio_refused).then_some(next)
+    }
+
     pub fn subtitle_tone(&self) -> SubtitleTone {
         self.prefs.subtitle_tone
     }
@@ -2823,16 +3137,17 @@ enum Cached {
     /// next write installs or drops it.
     Settled(std::sync::Arc<ReadState>),
     /// [`ReadState::Locked`], `Blocked`, or fallback `Ready`: a transient failure (a helper timeout, a keymanager
-    /// hiccup), not a fact about the file — served only until `retry_at`, never latched forever.
+    /// hiccup), not a fact about the file — served as the last known state, never latched forever:
+    /// [`refresh_need`] asks for another read and the session owner decides when (its backoff clock is
+    /// the frame tick, [`LOCKED_RETRY_MS`]).
     Transient {
         state: std::sync::Arc<ReadState>,
-        retry_at: std::time::Instant,
     },
 }
 
 /// **The live read cache** — what [`peek`] answers from memory instead of taking [`IO`]. A hit is
-/// one short `Mutex` lock and an `Arc` clone; a miss schedules a single worker refresh and serves
-/// the previous snapshot (or the empty session). See the module doc for the full invariant list;
+/// one short `Mutex` lock and an `Arc` clone; a miss serves the previous snapshot (or the empty
+/// session) and leaves the refill to the session owner's `RefreshCache` effect ([`refresh_need`]). See the module doc for the full invariant list;
 /// the two that matter for reasoning about a deadlock: nobody takes `IO` while holding this
 /// lock, and a writer always re-reads the authority under `IO` rather than trusting
 /// whatever is cached, so a miss can never overwrite a newer write. `player::preview`'s own
@@ -2841,12 +3156,13 @@ enum Cached {
 /// closure, unchanged by the cache.
 static CACHE: Mutex<Cached> = Mutex::new(Cached::Unloaded);
 
-/// How long a Locked/Blocked answer or fallback Ready is served from [`CACHE`] before
-/// the next reader tries canonical storage again, measured from the end of the read. These are
-/// transient by definition (see [`ReadState`]'s doc), so the interval only needs to be short enough
-/// that a real recovery is felt quickly, and long enough to limit background retries to about
-/// once a second. Per-frame callers never pay for these reads.
-const LOCKED_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long (in frame-tick milliseconds) the session owner holds back another refresh of the
+/// generation whose read came back Locked/Blocked or as a fallback Ready, and of every generation
+/// after a refused or unwound job. These are transient by definition (see [`ReadState`]'s doc), so
+/// the interval only needs to be short enough that a real recovery is felt quickly, and long
+/// enough to limit background retries to about once a second. Per-frame callers never pay for
+/// these reads, and nothing here reads a clock: the owner measures it on `cx.tick.ms`.
+pub const LOCKED_RETRY_MS: u32 = 1000;
 
 /// The `Session` every non-`Ready` read answers with, shared so a Locked/Blocked retry window does
 /// not allocate a fresh default every time.
@@ -2864,42 +3180,40 @@ fn session_of(state: &ReadState) -> std::sync::Arc<Session> {
     }
 }
 
-/// Which [`Cached`] arm a fresh [`ReadState`] belongs in — shared by [`refresh_locked`] (a read)
-/// and [`install_locked`] (a write's proven outcome). `now` anchors a `Transient` arm's
-/// `retry_at`; a read supplies the later of the caller's clock and its completion time. Using
-/// only the caller's clock would install an already-expired entry after a slow helper timeout.
-/// `peek_at` supplies a simulated completion clock too, so its exact retry boundaries remain
-/// deterministic and a miss in the simulated future cannot move the retry anchor backwards.
-fn cached_arm(state: std::sync::Arc<ReadState>, now: std::time::Instant) -> Cached {
-    match &*state {
-        ReadState::Locked { .. } | ReadState::Blocked | ReadState::Ready { retry_canonical: true, .. } => Cached::Transient {
-            state,
-            retry_at: now + LOCKED_RETRY,
-        },
-        ReadState::Ready { .. } | ReadState::Missing | ReadState::Cleared { .. } => Cached::Settled(state),
+/// Whether a [`ReadState`] is a transient failure to read rather than a fact about the file.
+fn is_transient(state: &ReadState) -> bool {
+    match state {
+        ReadState::Locked { .. } | ReadState::Blocked | ReadState::Ready { retry_canonical: true, .. } => true,
+        ReadState::Ready { .. } | ReadState::Missing | ReadState::Cleared { .. } => false,
     }
 }
 
-/// A cache hit as of `now`, if one exists. Never takes [`IO`].
-fn cached_at(now: std::time::Instant) -> Option<std::sync::Arc<ReadState>> {
+/// Which [`Cached`] arm a fresh [`ReadState`] belongs in — shared by [`refresh_locked`] (a read)
+/// and [`install_locked`] (a write's proven outcome).
+fn cached_arm(state: std::sync::Arc<ReadState>) -> Cached {
+    if is_transient(&state) { Cached::Transient { state } } else { Cached::Settled(state) }
+}
+
+/// A settled cache hit, if one exists. Never takes [`IO`]. A transient entry is a miss here: the
+/// boot and background callers that ask ([`load_with_id`]) want a fact about the file.
+fn cached_settled() -> Option<std::sync::Arc<ReadState>> {
     match &*CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
-        Cached::Unloaded | Cached::Revoked => None,
         Cached::Settled(state) => Some(state.clone()),
-        Cached::Transient { state, retry_at } if now < *retry_at => Some(state.clone()),
-        Cached::Transient { .. } => None,
+        Cached::Unloaded | Cached::Revoked | Cached::Transient { .. } => None,
     }
 }
 
 /// Read the authority (the caller must already hold [`IO`]), install the result into [`CACHE`],
 /// and return it. Publishes identities on a `Ready` read — the same hook [`load`] and every write
 /// already carry, so a cache-filling read is covered by the scrubber exactly as an uncached one
-/// always was. The retry anchor is at least `now` and at least the read's completion time, so a
-/// slow read cannot consume its own cache lifetime before the next frame gets to use it.
-fn refresh_locked(now: std::time::Instant) -> std::sync::Arc<ReadState> {
-    refresh_if_current_locked(now, None)
+/// always was.
+fn refresh_locked() -> std::sync::Arc<ReadState> {
+    read_into_cache_locked(None).0
 }
 
-fn refresh_if_current_locked(now: std::time::Instant, expected: Option<u64>) -> std::sync::Arc<ReadState> {
+/// [`refresh_locked`] that installs only while the cache generation is still `expected`, and says
+/// whether it did (`false`: a write, a drop or a revocation got in first, and the read was discarded).
+fn read_into_cache_locked(expected: Option<u64>) -> (std::sync::Arc<ReadState>, bool) {
     #[cfg(not(any(test, feature = "test-support")))]
     let state = std::sync::Arc::new(read_live_locked());
     #[cfg(any(test, feature = "test-support"))]
@@ -2908,23 +3222,16 @@ fn refresh_if_current_locked(now: std::time::Instant, expected: Option<u64>) -> 
     }));
     #[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
     plx_base::eventlog::log("session: authority read reason=miss");
-    #[cfg(not(any(test, feature = "test-support")))]
-    let finished = std::time::Instant::now();
-    #[cfg(any(test, feature = "test-support"))]
-    let finished = CACHE_NOW_FOR_TEST.with(|clock| clock.get().unwrap_or_else(std::time::Instant::now));
-    let now = now.max(finished);
-    if !replace_cache(cached_arm(state.clone(), now), expected, false) { return state; }
+    if !replace_cache(cached_arm(state.clone()), expected, false) { return (state, false); }
     if let ReadState::Ready { session, .. } = &*state { publish_identities(session); }
-    state
+    (state, true)
 }
 
 /// Install a proven [`ReadState`] — a completed read, or the outcome of a write that IS provably
 /// the record (`Durable`, or on the `TEST_FILE` path a legacy persist that returned `Some(_)`) —
 /// as the new cache content. The caller must already hold [`IO`]; see the module doc's invariants.
-/// Always anchored to real wall-clock time: none of this function's callers are exercised through
-/// `peek_at`'s simulated clock, only real reads and writes.
 fn install_locked(state: std::sync::Arc<ReadState>) {
-    set_cache_locked(cached_arm(state, std::time::Instant::now()));
+    set_cache_locked(cached_arm(state));
 }
 
 /// Drop whatever is cached: a write whose outcome is not provably the record (`Uncertain`,
@@ -2974,6 +3281,63 @@ pub fn learn_hold_hint_taught(taught: HoldHintTaught) -> bool {
         let next = cur.with_hold_hint_taught(taught);
         (next.prefs.hold_hint_taught != cur.prefs.hold_hint_taught).then_some(next)
     })
+}
+
+/// **The pipeline refused a native audio track and named it** (`type=18 num=200` with the audio fed
+/// natively, or the stall watchdog): record `(this build, codec, channels)` as refused, applied at
+/// once. See [`record_refusal_proof`] for the counted kind. Returns whether a write was queued (a set
+/// that cannot learn and an unstorable facet return false); what the write changes is decided when it
+/// lands, against the record then current.
+pub fn record_named_refusal(facet: &plx_platform::devcaps::Facet) -> bool {
+    record(facet, None)
+}
+
+/// **A conversion rescued a play and changed only the refused facet** (S2a's facet-clean proof):
+/// count one proof for `(this build, codec, channels)`; the row applies from
+/// [`LEARNED_REFUSAL_PROOFS`]. Returns whether a write was queued, as [`record_named_refusal`] does.
+pub fn record_refusal_proof(facet: &plx_platform::devcaps::Facet) -> bool {
+    record(facet, Some(1))
+}
+
+/// The one body of both writers: stamp the row with the learning firmware
+/// (`devcaps::learning_firmware`, a read) and queue the merge as an install preference off the
+/// caller's thread, best effort like [`learn_hold_hint_taught`]. The merge runs on the storage worker
+/// against the record it finds there (no read of the cached record here), and logs only when it
+/// changes something. Nothing here changes `devcaps::caps()`, which is write-once: a row reaches a
+/// play through the next play-start edge (`devcaps::start_caps` over [`Session::applied_refusals`])
+/// once the queued write has landed, and the request in flight already narrowed its own attempt. This
+/// is the store's property for every preference, not this one's: a write that does not land
+/// (unwritable storage) leaves the record as it was, and the next play loads the combination, is
+/// refused once more, and the ladder converts it, one refused Load slower.
+fn record(facet: &plx_platform::devcaps::Facet, proofs: Option<u32>) -> bool {
+    let Some((firmware, build)) = plx_platform::devcaps::learning_firmware() else {
+        return false;
+    };
+    let Some(row) = NativeAudioRefusal::of_facet(facet, &firmware, &build, proofs) else {
+        return false;
+    };
+    queue_update(move |cur| {
+        let merged = cur.with_native_audio_refusal(&row)?;
+        let applies = merged.native_audio_refused().iter().any(|r| r.same_as(&row) && r.applies());
+        plx_base::eventlog::log(&format!(
+            "native audio: the pipeline refused {} with {} channels on firmware {firmware:?} ({}); remembered{}",
+            row.codec,
+            row.channels,
+            if proofs.is_some() { "proved by its conversion" } else { "named by the pipeline" },
+            if applies { ", later plays convert it" } else { ", not yet applied" }
+        ));
+        Some(merged)
+    });
+    true
+}
+
+impl Session {
+    /// The stored native-audio rows in force, as `devcaps` takes them (a counted row below the
+    /// threshold is stored and not applied). PURE: the play-start edge reads it from `peek()` and
+    /// passes it to `devcaps::start_caps`, the one place a stored row narrows a capability value.
+    pub fn applied_refusals(&self) -> Vec<plx_platform::devcaps::Refusal> {
+        self.prefs.native_audio_refused.iter().filter(|r| r.applies()).map(NativeAudioRefusal::to_devcaps).collect()
+    }
 }
 
 /// The UI may retain the receipt while showing its pending preference locally.
@@ -3031,44 +3395,94 @@ pub fn queue_update_settled(
 /// [`load`].
 ///
 /// **Cached** — see [`CACHE`]. Returns the same `Arc<Session>` across repeated calls as long as
-/// nothing in this process has written since the last one. Neither hits nor misses take [`IO`].
-/// A miss schedules at most one background read and immediately returns the last known state,
-/// or an empty session before the first read. A visible change advances a generation that the
-/// frame thread observes before invalidating; unchanged retries leave a settled UI alone.
+/// nothing in this process has written since the last one. **A pure read of memory:** it takes no
+/// [`IO`], submits nothing and reads no clock, so it answers the last known state (or the empty
+/// session before the first read) on a miss. Refilling a missing or transient cache is the session
+/// owner's job: [`refresh_need`] says what is missing, the owner's `RefreshCache` effect runs
+/// [`refresh_cache_job`], and the frame thread observes the visible generation move before
+/// invalidating; unchanged retries leave a settled UI alone.
 pub fn peek() -> std::sync::Arc<Session> {
-    peek_impl(std::time::Instant::now())
+    match &*CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        Cached::Unloaded | Cached::Revoked => empty_session(),
+        Cached::Settled(state) | Cached::Transient { state } => session_of(state),
+    }
 }
 
-/// [`peek`], parameterized on "now" so a test can simulate [`LOCKED_RETRY`] elapsing without an
-/// actual one-second sleep. The supplied clock stays fixed through the read; call again with
-/// that same instant plus `LOCKED_RETRY` (or more) to observe the retry.
-#[cfg(any(test, feature = "test-support"))]
-pub fn peek_at(now: std::time::Instant) -> std::sync::Arc<Session> {
-    struct RestoreClock(Option<std::time::Instant>);
-    impl Drop for RestoreClock {
-        fn drop(&mut self) {
-            CACHE_NOW_FOR_TEST.with(|clock| clock.set(self.0));
+/// What the cache is missing, for the session owner's refresh decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RefreshNeed {
+    /// The cache generation the need was observed at; the refresh installs only while it still holds.
+    pub generation: u64,
+    /// The cache holds a transient failure to read (a retry), not an `Unloaded` cache.
+    pub transient: bool,
+}
+
+/// Whether the cache needs a read, and at which generation. Pure: it takes no [`IO`] and reads no
+/// clock. `Settled` and `Revoked` need nothing; `Unloaded` and `Transient` do. Only the app's
+/// frame step asks, and answers with a `RefreshCache` effect once the owner's backoff allows it.
+pub fn refresh_need() -> Option<RefreshNeed> {
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let transient = match &*cache {
+        Cached::Unloaded => false,
+        Cached::Transient { .. } => true,
+        Cached::Settled(_) | Cached::Revoked => return None,
+    };
+    Some(RefreshNeed { generation: CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed), transient })
+}
+
+/// How a refresh job ended. `Refused` is never produced by [`refresh_cache_job`]: it is reported
+/// when the job never ran to completion. The adapter reports it when the queue refused the job or
+/// the job panicked; the app's bridge reports it, from its frame-step reconcile, when the adapter
+/// that began the job was replaced or dropped and so lost it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheRefreshOutcome {
+    /// A write, a drop or a revocation moved the cache before the read could land; nothing installed.
+    Superseded,
+    /// The read installed a fact about the file.
+    Settled,
+    /// The read installed a transient failure (Locked, Blocked, fallback Ready). `generation` is
+    /// the cache generation that entry stands at: the install itself moved it, so the owner holds
+    /// back only observations of THIS generation, and a drop or a write (which move it again)
+    /// refresh at once.
+    Transient { generation: u64 },
+    /// The job did not complete.
+    Refused,
+}
+
+/// The body of one cache refresh, for the storage worker: take [`IO`], quit if the cache generation
+/// moved since `generation` was observed, otherwise read the authority and install it (still
+/// fenced by `generation`, so a sign-out or write that lands mid-read wins). The two sign-out
+/// fences, [`CACHE_GENERATION`] and [`replace_cache`]'s Revoked guard, are exactly the ones the old
+/// scheduled refresh used. The test read substitute is captured here, on the submitting thread.
+pub fn refresh_cache_job(generation: u64) -> impl FnOnce() -> CacheRefreshOutcome + Send + 'static {
+    #[cfg(any(test, feature = "test-support"))]
+    let read = CACHE_READ_FOR_TEST.with(|read| read.get());
+    move || {
+        let _io = io();
+        if CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) != generation {
+            return CacheRefreshOutcome::Superseded;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        CACHE_READ_FOR_TEST.with(|slot| slot.set(read));
+        let (state, installed) = read_into_cache_locked(Some(generation));
+        #[cfg(any(test, feature = "test-support"))]
+        CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
+        match (installed, is_transient(&state)) {
+            (false, _) => CacheRefreshOutcome::Superseded,
+            (true, true) => CacheRefreshOutcome::Transient {
+                generation: CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed),
+            },
+            (true, false) => CacheRefreshOutcome::Settled,
         }
     }
-    let _clock = RestoreClock(CACHE_NOW_FOR_TEST.with(|clock| clock.replace(Some(now))));
-    peek_blocking_at(now)
 }
 
+/// Fill the cache from the authority now, on the calling thread, and return what it says: for tests
+/// that need a filled cache without driving the owner's `RefreshCache` effect.
 #[cfg(any(test, feature = "test-support"))]
-fn peek_blocking_at(now: std::time::Instant) -> std::sync::Arc<Session> {
-    if let Some(state) = cached_at(now) {
-        return session_of(&state);
-    }
+pub fn refresh_blocking_for_test() -> std::sync::Arc<Session> {
     let _io = io();
-    // Two callers can both miss and then take turns on `IO`: by the time this one finally gets
-    // the lock, the caller ahead of it may have already installed the answer. Re-check before
-    // paying for another read of storage — the whole reason this cache exists is that a read is a
-    // `recv(2)` round trip to the storage helper (~27 ms/frame), so serving the second miss from
-    // the first one's fill rather than redoing it is not an optimization, it is the point.
-    if let Some(state) = cached_at(now) {
-        return session_of(&state);
-    }
-    session_of(&refresh_locked(now))
+    session_of(&refresh_locked())
 }
 
 /// A queued refresh is invalidated by any intervening write or cache drop. The worker checks
@@ -3081,14 +3495,14 @@ fn set_cache_locked(value: Cached) {
 
 /// Only an explicit, proven credential write may end local revocation.
 fn install_proven_locked(state: std::sync::Arc<ReadState>, generation: u64) {
-    replace_cache(cached_arm(state, std::time::Instant::now()), Some(generation), true);
+    replace_cache(cached_arm(state), Some(generation), true);
 }
 
 fn install_write_locked(state: std::sync::Arc<ReadState>, authority: SaveAuthority, generation: u64) {
     if authority == SaveAuthority::FreshReauthentication {
         install_proven_locked(state, generation);
     } else {
-        replace_cache(cached_arm(state, std::time::Instant::now()), Some(generation), false);
+        replace_cache(cached_arm(state), Some(generation), false);
     }
 }
 
@@ -3111,8 +3525,38 @@ pub fn visible_generation() -> u64 {
     VISIBLE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Host-only publication fence for retained screen inputs, including signed-out defaults.
+/// The cache revision is read under CACHE: replace_cache assigns its content, advances the
+/// counter, and projects keys before releasing that same lock. CURRENT is read separately
+/// to avoid lock-order coupling; a before/after pair fences both publications without allocation.
+pub fn screen_input_revision() -> (u64, u64) {
+    let cache_revision = {
+        let _cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let profile_revision = {
+        let _current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        CURRENT_PUBLICATION.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    (cache_revision, profile_revision)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_cleared_for_test(ui_resolution: UiResolution) {
+    plx_base::testlock::assert_held("cleared screen input fixture");
+    let kept = Retained { language: plx_platform::i18n::Preference::System, ui_resolution };
+    set_cache_locked(Cached::Settled(std::sync::Arc::new(ReadState::Cleared { kept })));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_locked_defaults_for_test(ui_resolution: UiResolution) {
+    plx_base::testlock::assert_held("locked screen input fixture");
+    let kept = Retained { language: plx_platform::i18n::Preference::System, ui_resolution };
+    set_cache_locked(Cached::Transient { state: std::sync::Arc::new(ReadState::Locked { kept }) });
+}
+
 /// Per-consumer cursor for cached session-derived views. Poll on Tick, including while storage
-/// is unavailable: peek schedules the bounded retry without blocking the frame.
+/// is unavailable: the owner's `RefreshCache` effect runs the bounded retry, so the frame never blocks.
 #[derive(Default)]
 pub struct VisibleSessionWatch(Option<(u64, bool)>);
 impl VisibleSessionWatch {
@@ -3128,7 +3572,6 @@ impl VisibleSessionWatch {
 /// A settled visible authority, or None while a read is unloaded/Locked/Blocked. Local revocation
 /// is settled for UI purposes: retaining a pre-sign-out account would be misleading.
 pub fn peek_settled() -> Option<std::sync::Arc<Session>> {
-    let _ = peek();
     match &*CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
         Cached::Settled(state) => Some(session_of(state)),
         Cached::Revoked => Some(empty_session()),
@@ -3138,7 +3581,7 @@ pub fn peek_settled() -> Option<std::sync::Arc<Session>> {
 
 fn same_visible_session(previous: &Cached, next: &Cached) -> bool {
     let ready = |cache: &Cached| match cache {
-        Cached::Settled(state) | Cached::Transient { state, .. } => match &**state {
+        Cached::Settled(state) | Cached::Transient { state } => match &**state {
             ReadState::Ready { session, .. } => Some(session.clone()),
             _ => None,
         },
@@ -3196,7 +3639,7 @@ fn key_projection(value: &Cached) -> Option<(std::sync::Arc<Session>, bool)> {
     match value {
         Cached::Revoked => Some((empty_session(), true)),
         Cached::Unloaded => None,
-        Cached::Settled(state) | Cached::Transient { state, .. } => match &**state {
+        Cached::Settled(state) | Cached::Transient { state } => match &**state {
             ReadState::Ready { session, .. } => Some((session.clone(), false)),
             ReadState::Missing | ReadState::Cleared { .. } => Some((empty_session(), true)),
             ReadState::Locked { .. } | ReadState::Blocked => None,
@@ -3223,7 +3666,9 @@ fn replace_cache(value: Cached, expected: Option<u64>, proven: bool) -> bool {
         CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Under the cache lock, so two replacements project in the order they landed.
         // `net::keypin` takes its own lock and never calls back into this module.
-        if let Some((session, signed_out)) = &projection { project_server_keys(session, *signed_out); }
+        if let Some((session, signed_out)) = &projection {
+            project_server_keys(session, *signed_out);
+        }
         if changed { VISIBLE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release); }
         return true;
     }
@@ -3238,82 +3683,8 @@ pub fn revoke_cached_session() {
     set_cache_locked(Cached::Revoked);
 }
 
-struct Refresh {
-    in_flight: bool,
-    retry_at: Option<std::time::Instant>,
-}
-static REFRESH: Mutex<Refresh> = Mutex::new(Refresh { in_flight: false, retry_at: None });
-
-struct RefreshFlight { completed: bool }
-impl Drop for RefreshFlight {
-    fn drop(&mut self) {
-        let mut refresh = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
-        refresh.in_flight = false;
-        // Back off only refused/unwinding jobs. A completed read has its own cache deadline;
-        // an intervening write that drops that cache must be able to refresh immediately.
-        refresh.retry_at = (!self.completed).then(|| std::time::Instant::now() + LOCKED_RETRY);
-    }
-}
-
-fn peek_impl(now: std::time::Instant) -> std::sync::Arc<Session> {
-    let (last, needs_refresh, generation) = {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let (last, needs_refresh) = match &*cache {
-            Cached::Unloaded => (empty_session(), true),
-            Cached::Revoked => (empty_session(), false),
-            Cached::Settled(state) => (session_of(state), false),
-            Cached::Transient { state, retry_at } => (session_of(state), now >= *retry_at),
-        };
-        (last, needs_refresh, CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed))
-    };
-    if needs_refresh { schedule_refresh(now, generation); }
-    last
-}
-
-fn schedule_refresh(now: std::time::Instant, generation: u64) {
-    // Shared asynchronous fixtures opt in by holding testlock::serial. Its teardown drains the
-    // FIFO before another test can own the cache; incidental readers cannot leak jobs into it.
-    #[cfg(any(test, feature = "test-support"))]
-    if !plx_base::testlock::held() { return; }
-    {
-        let mut refresh = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
-        if refresh.in_flight || refresh.retry_at.is_some_and(|retry| now < retry) { return; }
-        refresh.in_flight = true;
-    }
-    let flight = RefreshFlight { completed: false };
-    #[cfg(any(test, feature = "test-support"))]
-    let read = CACHE_READ_FOR_TEST.with(|read| read.get());
-    // The shared bounded FIFO uses task::spawn (Builder::spawn with an error return).
-    // A discarded ticket does not cancel the job; its result is the cache publication itself.
-    let _ = plx_base::storage_worker::submit(move || {
-        let mut flight = flight;
-        let _io = io();
-        if CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) != generation {
-            flight.completed = true;
-            return;
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        CACHE_READ_FOR_TEST.with(|slot| slot.set(read));
-        refresh_if_current_locked(std::time::Instant::now(), Some(generation));
-        flight.completed = true;
-        #[cfg(any(test, feature = "test-support"))]
-        CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
-    });
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn drain_refresh_for_test() {
-    if REFRESH.lock().unwrap_or_else(|e| e.into_inner()).in_flight {
-        plx_base::storage_worker::drain_for_test();
-    }
-}
-
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    /// `peek_at` advances this clock explicitly; ordinary `peek` still measures real read time.
-    static CACHE_NOW_FOR_TEST: std::cell::Cell<Option<std::time::Instant>> = const {
-        std::cell::Cell::new(None)
-    };
     /// Substitute a slow authority read without changing the storage or legacy-file paths.
     static CACHE_READ_FOR_TEST: std::cell::Cell<Option<fn() -> ReadState>> = const {
         std::cell::Cell::new(None)
@@ -3328,7 +3699,7 @@ mod cache_timing_tests {
     // serial fixture: a later test's time zero would otherwise wrap the keepalive arithmetic.
     struct ResetIdle;
     impl Drop for ResetIdle {
-        fn drop(&mut self) { plx_machine::idle::reset_for_test(); }
+        fn drop(&mut self) { plx_machine::motion::report::reset_for_test(); }
     }
 
     /// What a frame thread's landing step reads of the cache: whether the visible generation moved
@@ -3344,39 +3715,72 @@ mod cache_timing_tests {
         }
     }
 
+    /// `peek` is a read of memory and nothing else: it never submits a refresh, so an invalidated
+    /// cache stays invalidated until the session owner's `RefreshCache` effect runs
+    /// ([`refresh_need`]).
     #[test]
-    fn a_slow_production_peek_is_single_flight_and_lands_on_the_frame_step() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, mpsc::{self, Receiver, Sender}};
-        static CHANNELS: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+    fn peek_never_reads_storage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         static READS: AtomicUsize = AtomicUsize::new(0);
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("peek-never-reads");
+        { let _io = io(); install_locked(std::sync::Arc::new(ReadState::Blocked)); }
+        invalidate_for_test();
+        READS.store(0, Ordering::SeqCst);
+        CACHE_READ_FOR_TEST.with(|slot| slot.set(Some(|| {
+            READS.fetch_add(1, Ordering::SeqCst);
+            ReadState::Missing
+        })));
+        for _ in 0..30 { assert!(peek().client_id.is_empty()); }
+        plx_base::storage_worker::drain_for_test();
+        CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
+        assert_eq!(READS.load(Ordering::SeqCst), 0, "peek must not schedule a storage read");
+    }
+
+    #[test]
+    fn a_slow_refresh_job_never_blocks_peek_and_lands_on_the_frame_step() {
+        use std::sync::mpsc::{self, Receiver, Sender};
+        static CHANNELS: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+        // Set by the read once its release (or its 5 s fallback) came: the clockless witness that a
+        // peek taking the read's `IO` would have had to wait for it.
+        static READ_RETURNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        READ_RETURNED.store(false, std::sync::atomic::Ordering::SeqCst);
         let _serial = plx_base::testlock::serial();
         let _session = test_support::TempSession::new("slow-production-landing");
         let _idle = ResetIdle;
         { let _io = io(); install_locked(std::sync::Arc::new(ReadState::Blocked)); }
         let mut frame_step = FrameCursor::new();
         invalidate_for_test();
+        let need = refresh_need().expect("an invalidated cache needs a read");
+        assert!(!need.transient);
         let (started, entered) = mpsc::channel();
         let (release, held) = mpsc::channel();
         *CHANNELS.lock().unwrap() = Some((started, held));
-        READS.store(0, Ordering::SeqCst);
         CACHE_READ_FOR_TEST.with(|slot| slot.set(Some(|| {
-            READS.fetch_add(1, Ordering::SeqCst);
             let (started, held) = CHANNELS.lock().unwrap().take().unwrap();
             started.send(()).unwrap();
             let _ = held.recv_timeout(std::time::Duration::from_secs(5));
+            READ_RETURNED.store(true, std::sync::atomic::Ordering::SeqCst);
             ReadState::Ready { session: std::sync::Arc::new(test_support::signed_in()), plaintext: false, retry_canonical: false }
         })));
-        plx_machine::idle::reset_for_test();
-        let start = std::time::Instant::now();
-        for _ in 0..30 { assert!(peek().client_id.is_empty()); }
+        plx_machine::motion::report::reset_for_test();
+        let ticket = plx_base::storage_worker::submit_retained(refresh_cache_job(need.generation));
         CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
-        assert!(start.elapsed() < std::time::Duration::from_millis(200));
         entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(READS.load(Ordering::SeqCst), 1);
+        for _ in 0..30 { assert!(peek().client_id.is_empty()); }
+        assert!(
+            !READ_RETURNED.load(std::sync::atomic::Ordering::SeqCst),
+            "peek must not wait for the read: the peeks finished only after the parked read had returned"
+        );
         release.send(()).unwrap();
+        assert_eq!(ticket.wait_blocking().unwrap(), CacheRefreshOutcome::Settled);
         plx_base::storage_worker::drain_for_test();
-        assert!(!plx_machine::idle::should_present(0), "the worker only publishes data");
-        assert_eq!(plx_machine::idle::take_local_damage(), 0, "the peeks raise no frame damage of their own");
+        let mut present = plx_machine::present::Present::new();
+        present.take(0);
+        present.acknowledge(0);
+        plx_machine::motion::report::collect_into(&mut present, 0);
+        assert!(!present.take(0), "the worker only publishes data");
+        assert!(!present.take(1), "the peeks raise no owned frame damage of their own");
         let _frame = plx_base::task::FrameScope::enter();
         assert!(frame_step.lands(), "the frame step observes the published session");
         assert_eq!(peek().client_id, "cid-1");
@@ -3442,13 +3846,15 @@ mod cache_timing_tests {
     fn a_queued_refresh_cannot_overwrite_a_newer_write() {
         let _serial = plx_base::testlock::serial();
         let _session = test_support::TempSession::new("cache-queued-write");
+        let need = refresh_need().expect("an unloaded cache needs a read");
         let held = io();
-        assert!(peek().client_id.is_empty());
+        let ticket = plx_base::storage_worker::submit_retained(refresh_cache_job(need.generation));
         install_locked(std::sync::Arc::new(ReadState::Ready {
             session: std::sync::Arc::new(test_support::signed_in()), plaintext: false, retry_canonical: false,
         }));
         drop(held);
-        drain_refresh_for_test();
+        assert_eq!(ticket.wait_blocking().unwrap(), CacheRefreshOutcome::Superseded,
+            "a write that landed first fences the queued read out");
         assert_eq!(peek().client_id, "cid-1");
     }
 
@@ -3467,53 +3873,16 @@ mod cache_timing_tests {
             let _ = release.recv_timeout(std::time::Duration::from_secs(5));
             ReadState::Ready { session: std::sync::Arc::new(test_support::signed_in()), plaintext: false, retry_canonical: false }
         })));
-        let _ = peek();
+        let need = refresh_need().expect("an unloaded cache needs a read");
+        let ticket = plx_base::storage_worker::submit_retained(refresh_cache_job(need.generation));
         CACHE_READ_FOR_TEST.with(|read| read.set(None));
         entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         revoke_cached_session();
         assert!(peek().account_token.is_empty());
         release_tx.send(()).unwrap();
-        drain_refresh_for_test();
+        assert_eq!(ticket.wait_blocking().unwrap(), CacheRefreshOutcome::Superseded);
         assert!(peek().account_token.is_empty(), "an old read must not republish revoked credentials");
         assert!(matches!(*CACHE.lock().unwrap(), Cached::Revoked));
-    }
-
-    #[test]
-    fn peek_does_not_wait_for_a_slow_backend() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static READS: AtomicUsize = AtomicUsize::new(0);
-        static FINISHED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-        let _serial = plx_base::testlock::serial();
-        let _session = test_support::TempSession::new("cache-background-blocked");
-        let _idle = ResetIdle;
-        struct ResetRead;
-        impl Drop for ResetRead {
-            fn drop(&mut self) {
-                plx_base::storage_worker::drain_for_test();
-                CACHE_READ_FOR_TEST.with(|read| read.set(None));
-            }
-        }
-        let _reset = ResetRead;
-        READS.store(0, Ordering::SeqCst);
-        CACHE_READ_FOR_TEST.with(|read| read.set(Some(|| {
-            READS.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(LOCKED_RETRY + std::time::Duration::from_millis(50));
-            *FINISHED.lock().unwrap() = Some(std::time::Instant::now());
-            ReadState::Blocked
-        })));
-        plx_machine::idle::reset_for_test();
-        plx_machine::idle::note_present(10_000);
-        assert!(!plx_machine::idle::should_present(10_001));
-        let started = std::time::Instant::now();
-        for _ in 0..30 { assert!(peek().client_id.is_empty()); }
-        assert!(started.elapsed() < std::time::Duration::from_millis(200),
-            "per-frame peeks must return while the backend is still blocked");
-        plx_base::storage_worker::drain_for_test();
-        assert_eq!(READS.load(Ordering::SeqCst), 1, "one refresh for all thirty frames");
-        let finished = FINISHED.lock().unwrap().unwrap();
-        assert!(cached_at(finished + LOCKED_RETRY / 2).is_some(),
-            "a background timeout gets a full retry window after completion");
-        assert!(!plx_machine::idle::should_present(10_001), "an unchanged landing must leave the UI settled");
     }
 
     #[test]
@@ -3539,62 +3908,66 @@ mod cache_timing_tests {
                 session: std::sync::Arc::new(test_support::signed_in()), plaintext: true, retry_canonical: false,
             }) as fn() -> ReadState, false),
         ] {
-            plx_machine::idle::reset_for_test();
-            plx_machine::idle::note_present(10_000);
+            plx_machine::motion::report::reset_for_test();
+            let mut present = plx_machine::present::Present::new();
+            present.take(10_000);
+            present.acknowledge(10_000);
             CACHE_READ_FOR_TEST.with(|slot| slot.set(Some(read)));
-            schedule_refresh(std::time::Instant::now(),
-                CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed));
+            let job = refresh_cache_job(CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed));
             CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
+            drop(plx_base::storage_worker::submit_retained(job));
             plx_base::storage_worker::drain_for_test();
-            assert!(!plx_machine::idle::should_present(10_001), "workers cannot wake the UI");
-            assert_eq!(plx_machine::idle::take_local_damage(), 0);
+            plx_machine::motion::report::collect_into(&mut present, 10_001);
+            assert!(!present.take(10_001), "workers cannot wake the UI");
+            assert!(!present.take(10_001), "only the owned landing boundary can damage the gate");
             let _frame = plx_base::task::FrameScope::enter();
             assert_eq!(frame_step.lands(), landed);
             assert!(!frame_step.lands(), "one landing per change");
-            assert_eq!(plx_machine::idle::take_local_damage(), 0, "landing the cache raises no frame damage of its own");
-        }
-    }
-
-    #[test]
-    fn an_unserialized_peek_cannot_leak_a_refresh_into_another_test() {
-        let _serial = plx_base::testlock::serial();
-        let _session = test_support::TempSession::new("cache-unserialized-peek");
-        let held = io();
-        std::thread::Builder::new().spawn(|| {
-            assert!(!plx_base::testlock::held());
-            assert!(peek().client_id.is_empty());
-        }).unwrap().join().unwrap();
-        let in_flight = REFRESH.lock().unwrap().in_flight;
-        drop(held);
-        drain_refresh_for_test();
-        assert!(!in_flight, "a caller outside the serial fixture cannot admit shared work");
-    }
-
-    #[test]
-    fn a_slow_blocked_read_is_cached_from_its_completion() {
-        let _serial = plx_base::testlock::serial();
-        let _session = test_support::TempSession::new("cache-slow-blocked");
-        struct ResetRead;
-        impl Drop for ResetRead {
-            fn drop(&mut self) {
-                CACHE_READ_FOR_TEST.with(|read| read.set(None));
+            assert!(!present.take(10_001), "landing the cache raises no owned damage of its own");
+            if landed {
+                plx_machine::machine::PresentHandle::of(&mut present).note(
+                    plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Lifecycle));
             }
+            assert_eq!(present.take(10_001), landed, "the caller attributes the typed landing once");
         }
-        let _reset = ResetRead;
-        CACHE_READ_FOR_TEST.with(|read| read.set(Some(|| {
-            READS_FOR_TEST.with(|count| count.set(count.get() + 1));
-            std::thread::sleep(LOCKED_RETRY + std::time::Duration::from_millis(50));
-            ReadState::Blocked
-        })));
-        reset_reads_for_test();
+    }
 
-        let started = std::time::Instant::now();
-        assert!(peek_blocking_at(started).client_id.is_empty());
-        let finished = std::time::Instant::now();
-        assert!(finished.duration_since(started) > LOCKED_RETRY);
-        assert_eq!(reads_for_test(), 1);
-        assert!(peek_at(finished + LOCKED_RETRY / 2).client_id.is_empty());
-        assert_eq!(reads_for_test(), 1, "the retry window must start after the slow read ends");
+    #[test]
+    fn refresh_need_reports_what_the_cache_lacks() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refresh-need");
+        invalidate_for_test();
+        let unloaded = refresh_need().expect("Unloaded needs a read");
+        assert!(!unloaded.transient);
+        { let _io = io(); install_locked(std::sync::Arc::new(ReadState::Blocked)); }
+        let transient = refresh_need().expect("Transient needs a retry");
+        assert!(transient.transient);
+        assert_ne!(transient.generation, unloaded.generation, "the install moved the generation");
+        { let _io = io(); install_locked(std::sync::Arc::new(ReadState::Missing)); }
+        assert_eq!(refresh_need(), None, "Settled needs nothing");
+        revoke_cached_session();
+        assert_eq!(refresh_need(), None, "a local revocation is never refilled");
+    }
+
+    #[test]
+    fn a_refresh_job_reports_how_it_ended() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refresh-outcomes");
+        let run = |read: fn() -> ReadState, generation: u64| {
+            CACHE_READ_FOR_TEST.with(|slot| slot.set(Some(read)));
+            let job = refresh_cache_job(generation);
+            CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
+            plx_base::storage_worker::submit_retained(job).wait_blocking().unwrap()
+        };
+        invalidate_for_test();
+        let g = refresh_need().unwrap().generation;
+        assert_eq!(run(|| ReadState::Blocked, g), CacheRefreshOutcome::Transient { generation: g + 1 },
+            "the install moved the generation; the outcome names the one the entry stands at");
+        let g = refresh_need().unwrap().generation;
+        assert_eq!(run(|| ReadState::Missing, g), CacheRefreshOutcome::Settled);
+        assert_eq!(run(|| ReadState::Missing, g), CacheRefreshOutcome::Superseded,
+            "the generation the job was given has moved on");
+        assert_eq!(refresh_need(), None);
     }
 }
 
@@ -4002,7 +4375,8 @@ impl DeferredLoad {
         if read_identity(&read) != self.expected {
             // Refused, exactly like `update_with_outcome`'s own refusal path: install the record
             // this capture lost the race against, rather than leaving the cache empty for the
-            // next `peek()` to queue a duplicate of the read this call just took under `IO`.
+            // session owner to refill with a second read of what this call just established
+            // under `IO`.
             install_locked(read);
             return Err("session changed during capture");
         }
@@ -4012,8 +4386,8 @@ impl DeferredLoad {
             save_locked(&self.session);
         } else {
             // No write happens on this path, but the read above IS the verified record: install
-            // it so the boot path's first `peek()` does not queue a redundant read for a fact
-            // this call already established under `IO`.
+            // it so the cache is not left empty for the session owner to refill with a second
+            // read of what this call just established under `IO`.
             install_locked(read);
         }
         publish_identities(&self.session);
@@ -4052,8 +4426,7 @@ fn established(read: &ReadState) -> bool {
 
 fn load_with_id(mint: impl FnOnce() -> String) -> Session {
     if cache_revoked() { return Session::default(); }
-    let now = std::time::Instant::now();
-    if let Some(read) = cached_at(now) {
+    if let Some(read) = cached_settled() {
         if established(&read) {
             let (s, save) = prepare_load(&read, mint);
             debug_assert!(!save, "an established, protected record must never need a resave");
@@ -4065,7 +4438,7 @@ fn load_with_id(mint: impl FnOnce() -> String) -> Session {
     // The same race a synchronous cache fill guards against: another caller may have installed an established
     // record while this one waited for `IO`, in which case re-reading storage here would be a
     // second, needless read of a record already proved.
-    if let Some(read) = cached_at(now) {
+    if let Some(read) = cached_settled() {
         if established(&read) {
             let (s, save) = prepare_load(&read, mint);
             debug_assert!(!save, "an established, protected record must never need a resave");
@@ -4073,7 +4446,7 @@ fn load_with_id(mint: impl FnOnce() -> String) -> Session {
             return s;
         }
     }
-    let read = refresh_locked(now);
+    let read = refresh_locked();
     if cache_revoked() { return Session::default(); }
     let (s, save) = prepare_load(&read, mint);
     if save { save_locked(&s); }
@@ -4353,12 +4726,7 @@ fn save_locked_with_authority(
     plx_platform::storage::wire::failure::clear();
     CANDIDATE_ERRNOS.with(|slot| slot.set([None; 8]));
     let protected_before = has_protected_authority();
-    let write_started = std::time::Instant::now();
-    let commit = persistence::write_session(s, authority);
-    plx_base::eventlog::log(&format!(
-        "session: canonical write took {} ms",
-        write_started.elapsed().as_millis()
-    ));
+    let commit = persistence::write_session_timed(s, authority);
     // Uncertain helper replies already own their evidence in CanonicalCommit. Only the older
     // StoreError-only failure variants still need this immediate thread-local snapshot.
     let helper_failure = match &commit {
@@ -4395,7 +4763,7 @@ fn save_locked_with_authority(
         };
         // A `Durable` commit IS the record now — install it rather than drop it, so the very next
         // `peek()` (even the caller's own, right after this returns) is served from memory instead
-        // of forcing a re-read of what this call just proved.
+        // of finding the cache left `Unloaded` until the session owner refills it.
         install_write_locked(std::sync::Arc::new(ReadState::Ready {
             session: std::sync::Arc::new(s.clone()),
             plaintext: protection.is_none(),
@@ -6101,6 +6469,243 @@ mod server_key_pin_tests {
         assert!(peek().prefs.server_key_pins.is_empty(), "cleared with the credentials");
     }
 
+    /// The native audio refusals this install learned live in the PUBLIC install preferences, and
+    /// that list is the ONE place they are kept: a session that never learned one writes nothing, one
+    /// that did round-trips it, a malformed entry costs only itself, only a refusal watched on a newer
+    /// firmware build retires the older build's, and sign-out leaves them (a property of the
+    /// television's firmware, not of an account).
+    #[test]
+    fn native_audio_refusals_persist_as_an_install_fact_and_only_a_new_build_retires_them() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("native-audio-refusals");
+        let refusal = |codec: &str, channels: u32| NativeAudioRefusal {
+            firmware: "kisscurl-koli".into(),
+            codec: codec.into(),
+            channels,
+            build: "6.5.3-47".into(),
+            proofs: None,
+            extensions: Default::default(),
+        };
+        let session = test_support::signed_in();
+        assert!(!serde_json::to_string(&session).unwrap().contains("native_audio_refused"), "empty is not written");
+        let with = session.with_native_audio_refusal(&refusal("vorbis", 2)).expect("news");
+        assert!(with.with_native_audio_refusal(&refusal("vorbis", 2)).is_none(), "a known one is not");
+        assert!(with.with_native_audio_refusal(&refusal("vorbis", 6)).is_some(), "another channel count is");
+        assert!(session.with_native_audio_refusal(&NativeAudioRefusal { firmware: String::new(), ..refusal("x", 2) }).is_none());
+        let round: Session = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(round.native_audio_refused(), with.native_audio_refused());
+        // A firmware update drops what another build learned, and what an older record never tagged,
+        // with the next refusal it watches; a set that did not name its build judges nothing.
+        let untagged: Session = serde_json::from_value(serde_json::json!({
+            "native_audio_refused": [{"firmware": "kisscurl-koli", "codec": "opus", "channels": 6}]
+        }))
+        .unwrap();
+        assert_eq!(untagged.native_audio_refused()[0].build, "", "an old record reads as unrecorded");
+        let updated = with.with_native_audio_refusal(&NativeAudioRefusal { build: "6.5.3-48".into(), ..refusal("flac", 6) }).expect("news");
+        assert_eq!(updated.native_audio_refused().len(), 1, "the 6.5.3-47 lesson went with the old decoder");
+        assert_eq!(updated.native_audio_refused()[0].build, "6.5.3-48");
+        let relearned = untagged.with_native_audio_refusal(&refusal("vorbis", 2)).expect("news");
+        assert_eq!(relearned.native_audio_refused().len(), 1, "an unrecorded entry is stale");
+        assert_eq!(relearned.native_audio_refused()[0].codec, "vorbis");
+        let blind = with.with_native_audio_refusal(&NativeAudioRefusal { build: String::new(), ..refusal("flac", 6) }).expect("news");
+        assert_eq!(blind.native_audio_refused().len(), 2, "no build named: nothing is judged stale");
+        let mixed: Session = serde_json::from_value(serde_json::json!({
+            "native_audio_refused": [{"firmware": "f", "codec": "flac", "channels": 6}, "garbage", {"codec": 1}]
+        }))
+        .unwrap();
+        assert_eq!(mixed.native_audio_refused().len(), 1, "a malformed entry costs only itself");
+
+        save(&with);
+        assert_eq!(peek().native_audio_refused().len(), 1);
+        clear();
+        // The sign-out keeps install facts in the stored preferences, but the cleared session itself is empty.
+        assert!(peek().native_audio_refused().is_empty());
+    }
+
+    // ---- S2a: a refusal is learned from a facet-clean proof, counted, and applied at the threshold ----
+
+    fn dts6() -> plx_platform::devcaps::Facet {
+        plx_platform::devcaps::Facet::Audio { codec: "dca".into(), channels: 6 }
+    }
+
+    fn opus6() -> plx_platform::devcaps::Facet {
+        plx_platform::devcaps::Facet::Audio { codec: "opus".into(), channels: 6 }
+    }
+
+    /// This thread's set: names its firmware and build, so it can record a refusal.
+    fn firmware_build(build: &str) -> plx_platform::devcaps::CapsGuard {
+        plx_platform::devcaps::firmware_on_this_thread_for_test("fw", build, plx_platform::devcaps::Caps::assumed())
+    }
+
+    fn row(codec: &str, channels: u32, build: &str, proofs: Option<u32>) -> NativeAudioRefusal {
+        NativeAudioRefusal { firmware: "fw".into(), codec: codec.into(), channels, build: build.into(), proofs, extensions: Default::default() }
+    }
+
+    /// One proof is stored and counted, not applied: the record says so and `applied_refusals` (what
+    /// the play start hands `devcaps::start_caps`) holds nothing.
+    #[test]
+    fn a_first_proof_is_stored_counted_once_and_not_applied() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refusal-proof-one");
+        let _fw = firmware_build("B");
+        save(&test_support::signed_in());
+        assert!(record_refusal_proof(&dts6()), "the write is queued");
+        plx_base::storage_worker::drain_for_test();
+        let rows = peek().native_audio_refused().to_vec();
+        assert_eq!(rows, [row("dts", 6, "B", Some(1))], "dca is stored in the pipeline's spelling");
+        assert!(!rows[0].applies());
+        assert!(peek().applied_refusals().is_empty(), "a counted row is never handed to the play start");
+    }
+
+    /// The second proof persists the refusal (it applies and projects); a third has nothing to add
+    /// and writes nothing.
+    #[test]
+    fn a_second_proof_persists_and_a_third_writes_nothing() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refusal-proof-two");
+        let _fw = firmware_build("B");
+        save(&test_support::signed_in());
+        assert!(record_refusal_proof(&dts6()));
+        plx_base::storage_worker::drain_for_test();
+        assert!(!peek().applied_refusals().iter().any(|r| r.codec == "dts"), "one proof applies nothing");
+        assert!(record_refusal_proof(&dts6()));
+        plx_base::storage_worker::drain_for_test();
+        let rows = peek().native_audio_refused().to_vec();
+        assert_eq!(rows, [row("dts", 6, "B", Some(LEARNED_REFUSAL_PROOFS))]);
+        assert!(rows[0].applies());
+        assert_eq!(peek().applied_refusals().len(), 1);
+        assert!(record_refusal_proof(&dts6()), "queued again");
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(peek().native_audio_refused(), rows, "a third proof writes nothing");
+        assert!(peek().with_native_audio_refusal(&row("dts", 6, "B", Some(1))).is_none(), "a third proof changes nothing");
+    }
+
+    /// A refusal that names the codec applies at once; no proof downgrades it; a counted row that is
+    /// then named upgrades to a named one.
+    #[test]
+    fn a_named_refusal_applies_at_once_and_no_proof_downgrades_it() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refusal-named");
+        let _fw = firmware_build("B");
+        save(&test_support::signed_in());
+        assert!(record_named_refusal(&opus6()));
+        plx_base::storage_worker::drain_for_test();
+        let rows = peek().native_audio_refused().to_vec();
+        assert_eq!(rows, [row("opus", 6, "B", None)]);
+        assert!(rows[0].applies());
+        assert!(record_refusal_proof(&opus6()));
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(peek().native_audio_refused(), rows, "a proof on a named row writes nothing");
+        assert!(peek().with_native_audio_refusal(&row("opus", 6, "B", Some(1))).is_none(), "a proof never downgrades");
+        // Separately: a counted row followed by the same combination named.
+        assert!(record_refusal_proof(&dts6()));
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(peek().native_audio_refused()[1].proofs, Some(1));
+        assert!(record_named_refusal(&dts6()));
+        plx_base::storage_worker::drain_for_test();
+        let upgraded = peek().native_audio_refused().iter().find(|r| r.codec == "dts").cloned().expect("the dts row");
+        assert_eq!(upgraded.proofs, None, "the count-1 row upgrades to a named row");
+        assert!(upgraded.applies());
+    }
+
+    /// A set that announces Opus 5.1, so a recorded Opus refusal WOULD move `caps()` if anything wrote it.
+    fn opus_announcing_caps() -> plx_platform::devcaps::Caps {
+        plx_platform::devcaps::Caps { audio: "aac,ac3,eac3,opus".into(), ..plx_platform::devcaps::Caps::assumed() }
+    }
+
+    /// `devcaps` is write-once (#1047): a recorded refusal lands in the install's record and moves
+    /// nothing under a running play, however the record is installed. `caps()` answers the same `Arc`
+    /// before the write, after it, and after the record is installed again on this thread.
+    #[test]
+    fn caps_is_one_arc_across_a_recorded_refusal() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refusal-one-arc");
+        let _fw = plx_platform::devcaps::firmware_on_this_thread_for_test("fw", "B", opus_announcing_caps());
+        save(&test_support::signed_in());
+        let before = plx_platform::devcaps::caps();
+        assert!(before.audio_supports("opus", 6), "sanity: the set announces Opus 5.1");
+        assert!(record_named_refusal(&opus6()));
+        plx_base::storage_worker::drain_for_test();
+        save(&peek());
+        assert_eq!(peek().native_audio_refused().len(), 1, "the row is stored");
+        let after = plx_platform::devcaps::caps();
+        assert!(std::sync::Arc::ptr_eq(&before, &after), "the stored row moved caps(): opus ceiling {:?} -> {:?}", before.audio_channels.get("opus"), after.audio_channels.get("opus"));
+    }
+
+    /// A firmware update retires counted rows as it retires named ones: only the new build's remains.
+    #[test]
+    fn a_build_change_clears_counted_and_named_rows() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("refusal-build-change");
+        save(&test_support::signed_in());
+        {
+            let _b = firmware_build("B");
+            assert!(record_named_refusal(&opus6()));
+            assert!(record_refusal_proof(&dts6()));
+            plx_base::storage_worker::drain_for_test();
+            assert_eq!(peek().native_audio_refused().len(), 2);
+        }
+        let _c = firmware_build("C");
+        assert!(record_refusal_proof(&dts6()));
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(peek().native_audio_refused(), [row("dts", 6, "C", Some(1))], "B's named and counted rows went with the old decoder");
+    }
+
+    /// A record written before S2a (no `proofs` key) is a persisted refusal; a counted one is not
+    /// applied; a malformed count costs only its own entry.
+    #[test]
+    fn a_pre_s2a_row_reads_as_persisted() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "native_audio_refused": [
+                {"firmware": "f", "codec": "opus", "channels": 6, "build": "b"},
+                {"firmware": "f", "codec": "dts", "channels": 6, "build": "b", "proofs": 1},
+                {"firmware": "f", "codec": "flac", "channels": 6, "build": "b", "proofs": "x"}
+            ]
+        }))
+        .unwrap();
+        let rows = session.native_audio_refused();
+        assert_eq!(rows.len(), 2, "the malformed count dropped only itself");
+        assert!(rows[0].applies(), "an old row is applied, not one proof");
+        assert_eq!(rows[0].proofs, None);
+        assert!(!rows[1].applies(), "a counted row below the threshold is not");
+        assert_eq!(session.applied_refusals().len(), 1);
+        let json = serde_json::to_string(&session.native_audio_refused()[0]).unwrap();
+        assert!(!json.contains("proofs"), "a named row round-trips with no proofs key: {json}");
+    }
+
+    /// The play start is handed the rows in force and nothing else: a named row and a twice-proved
+    /// one, in the record's order, as `devcaps` rows; a once-proved row is stored and absent.
+    #[test]
+    fn applied_refusals_hands_over_named_and_twice_proved_rows_only() {
+        let mut session = Session::default();
+        session.prefs.native_audio_refused = vec![
+            row("opus", 6, "B", None),
+            row("dts", 6, "B", Some(LEARNED_REFUSAL_PROOFS)),
+            row("flac", 6, "B", Some(1)),
+        ];
+        let refusal = |codec: &str| plx_platform::devcaps::Refusal { codec: codec.into(), channels: 6, build: "B".into() };
+        assert_eq!(session.applied_refusals(), [refusal("opus"), refusal("dts")]);
+        assert!(Session::default().applied_refusals().is_empty());
+    }
+
+    /// A proof of unknown width (the pipeline was fed no channel count) is not stored: it would
+    /// remove the whole codec. A named refusal keeps the unguarded behaviour.
+    #[test]
+    fn a_proof_of_unknown_width_is_not_stored() {
+        let unknown = plx_platform::devcaps::Facet::Audio { codec: "dts".into(), channels: 0 };
+        assert_eq!(NativeAudioRefusal::of_facet(&unknown, "fw", "B", Some(1)), None);
+        assert!(NativeAudioRefusal::of_facet(&unknown, "fw", "B", None).is_some());
+    }
+
+    /// A video facet never proves (D6(c)) and has no field on this row to be stored in: it is the
+    /// attempt's alone, so the next play retries the raster once.
+    #[test]
+    fn a_video_facet_is_never_stored() {
+        let video = plx_platform::devcaps::Facet::Video { codec: "h264".into(), width: 3840, height: 2160 };
+        assert_eq!(NativeAudioRefusal::of_facet(&video, "fw", "b", Some(1)), None);
+        assert_eq!(NativeAudioRefusal::of_facet(&video, "fw", "b", None), None);
+    }
+
     /// `plx_ui::hold_hint` hands the application what an install was taught: the learn door queues a
     /// write only for news, never un-teaches, and writes through the same ticketed door every
     /// install-wide preference uses.
@@ -6225,5 +6830,40 @@ mod server_key_pin_tests {
         plx_base::storage_worker::drain_for_test();
         let _ = peek();
         assert_eq!(plx_net::net::keypin::pin_for_test(&key), None, "the late probe did not repopulate it");
+    }
+}
+
+#[cfg(test)]
+mod screen_input_revision_tests {
+    use super::*;
+    #[test]
+    fn screen_input_revision_observes_cleared_defaults_without_a_visible_generation_change() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("screen-revision-defaults");
+        install_cleared_for_test(UiResolution::Auto);
+        let before = screen_input_revision();
+        let visible = visible_generation();
+        install_cleared_for_test(UiResolution::Hd720);
+        assert_ne!(screen_input_revision().0, before.0);
+        assert_eq!(visible_generation(), visible);
+        assert_eq!(peek_settled().unwrap().ui_resolution(), UiResolution::Hd720);
+    }
+    #[test]
+    fn screen_input_revision_waits_for_the_cache_publication_lock() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("screen-revision-lock");
+        let expected = screen_input_revision();
+        let cache = CACHE.lock().unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (answer, result) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            answer.send(screen_input_revision()).unwrap();
+        });
+        start.recv().unwrap();
+        assert!(matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        drop(cache);
+        assert_eq!(result.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), expected);
+        reader.join().unwrap();
     }
 }

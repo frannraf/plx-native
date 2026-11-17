@@ -70,6 +70,16 @@ fn route(path: &str) -> String {
             )
             .to_string()
         }
+        "/library/metadata/s3e14" => {
+            return concat!(
+                r#"{"MediaContainer":{"size":1,"Metadata":[{"ratingKey":"s3e14","type":"episode","index":14,"parentIndex":3,"Media":["#,
+                r#"{"id":31,"videoResolution":"4k","width":3840,"height":2160,"videoCodec":"hevc","Part":[{"key":"/library/parts/31/1/p5.mkv","Stream":["#,
+                r#"{"id":311,"streamType":1,"codec":"hevc","DOVIPresent":true,"DOVIProfile":5,"DOVIBLCompatID":0}]}]},"#,
+                r#"{"id":32,"videoResolution":"4k","width":3840,"height":2160,"videoCodec":"hevc","Part":[{"key":"/library/parts/32/1/hdr10.mkv","Stream":["#,
+                r#"{"id":321,"streamType":1,"codec":"hevc","colorTrc":"smpte2084"}]}]}]}]}}"#
+            )
+            .to_string()
+        }
         "/library/metadata/show-1/children" => (1..=4)
             .map(|n| format!(r#"{{"ratingKey":"sk{n}","type":"season","index":{n},"title":"Season {n}"}}"#))
             .collect::<Vec<_>>(),
@@ -130,6 +140,11 @@ fn open(server: &Pms) -> plx_plex::plex::ServerId {
     sid
 }
 
+/// The client the runner would resolve for `sid` and hand the chain.
+fn client_of(sid: plx_plex::plex::ServerId) -> &'static plx_plex::plex::Client {
+    plx_plex::plex::client_for(sid).expect("the server is registered")
+}
+
 fn first_episode_rk(d: &Detail) -> Option<String> {
     d.episodes.get(0).map(|e| e.rk.clone())
 }
@@ -137,8 +152,25 @@ fn first_episode_rk(d: &Detail) -> Option<String> {
 /// Request `show-1` through the store's own command and land it, as a page open or a re-read does.
 fn read_show(sid: plx_plex::plex::ServerId) {
     run(test_state(), test_adapter(), MetadataCmd::RequestDetail { sid, rk: "show-1".into() });
-    assert_eq!(test_adapter().run_held_detail_fetches_for_test(), 1);
-    assert!(pump_detail(test_state(), test_adapter()), "the read landed");
+    let jobs = std::mem::take(&mut test_state().jobs);
+    assert_eq!(jobs.len(), 1, "one request, one job");
+    for job in jobs {
+        let crate::stores::StoreJob::Detail(job, port) = job else { panic!("a detail request emits a detail job") };
+        let DetailReq { sid, rk, prefer } = job.req;
+        // The runner's completion path, on this thread: the fetch, then its answer to the port.
+        finish_detail_fetch(&port, job.addr, (sid, rk.clone()), Some(client_of(sid)), |client| fetch_full(client, sid, &rk, prefer, None));
+    }
+    assert!(pump_detail(test_state(), test_adapter(), &plx_plex::plex::ClientKeys::default(), false), "the read landed");
+}
+
+#[test]
+fn the_on_deck_episodes_versions_come_from_its_own_full_read() {
+    let _serial = plx_base::testlock::serial();
+    let server = serve();
+    let sid = open(&server);
+    let d = fetch_full(client_of(sid), sid, "show-1", None, None).expect("the show page answers");
+    let versions = &d.on_deck.as_ref().expect("the show has an on-deck episode").versions;
+    assert_eq!(versions.iter().map(|v| (v.id.0, v.dovi.profile)).collect::<Vec<_>>(), [(31, 5), (32, 0)]);
 }
 
 #[test]
@@ -146,7 +178,7 @@ fn a_show_with_an_on_deck_episode_in_season_three_opens_on_season_three() {
     let _serial = plx_base::testlock::serial();
     let server = serve();
     let sid = open(&server);
-    let d = fetch_full(sid, "show-1", None).expect("the show page answers");
+    let d = fetch_full(client_of(sid), sid, "show-1", None, None).expect("the show page answers");
     assert_eq!(d.cur_season, 2, "season 3 is the third tab");
     assert_eq!(d.seasons[d.cur_season].index, 3);
     assert_eq!(first_episode_rk(&d).as_deref(), Some("s3e1"), "and its episodes are the ones loaded, not season 1's");

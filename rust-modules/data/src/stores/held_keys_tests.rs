@@ -39,7 +39,11 @@ fn person_holds_its_shelves_for_that_person_only() {
     let arg = ContentArg::Person {
         sid: ServerId::UNSET, key: "42".into(), guid: String::new(), name: "N".into(), thumb: String::new() };
     assert!(store.held_keys(&arg).is_empty(), "no person mounted");
-    store.run(PersonCmd::Open { sid: ServerId::UNSET, key: "42".into(), guid: String::new(), name: "N".into(), thumb: String::new() });
+    let keys = plx_plex::plex::ClientKeys::default();
+    let input = crate::person::PersonInput { keys: &keys, session: None, visible_generation: 0,
+                profile_scope: 0, owner_epoch: 0, profile_generation: 0, tenure: 0, profile_key: "",
+        controlled: false, profile_refused: false, credits_refused: false, dev_bio: None, dev_credits: None };
+    store.run_with_input(PersonCmd::Open { sid: ServerId::UNSET, key: "42".into(), guid: String::new(), name: "N".into(), thumb: String::new() }, &input);
     store.install_for_test(vec![movie("a"), movie("b")], vec![movie("c")]);
     assert_eq!(rks(&store.held_keys(&arg)), ["a", "b", "c"]);
     let other = ContentArg::Person {
@@ -56,9 +60,9 @@ fn collection_holds_its_wanted_window_for_that_collection_only() {
     let id = CollectionRef::by_rk(ServerId::UNSET, "col", 1, "C");
     let arg = ContentArg::Collection(id.clone());
     assert!(store.held_keys(&arg).is_empty());
-    store.run(CollectionCmd::Open { target: CollectionTarget { id, want: 4 } });
+    store.run(CollectionCmd::Open { target: CollectionTarget { id, want: 4 } }, &plx_plex::plex::ClientKeys::default());
     store.install_for_test((0..10).map(|i| movie(&format!("m{i}"))).collect(), CollectionStatus::Ready);
-    store.run(CollectionCmd::Window { wanted: 2..5, focus: None, restore: None });
+    store.run(CollectionCmd::Window { wanted: 2..5, focus: None, restore: None }, &plx_plex::plex::ClientKeys::default());
     assert_eq!(rks(&store.held_keys(&arg)), ["m2", "m3", "m4"]);
     let other = ContentArg::Collection(CollectionRef::by_rk(ServerId::UNSET, "other", 1, "O"));
     assert!(store.held_keys(&other).is_empty());

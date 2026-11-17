@@ -5,7 +5,7 @@
 //! transport in its place: the `Trailer` kicker over a title ([`transport_title`] — the item's
 //! own by default, the trailer extra's when THAT says something the kicker doesn't), the playbar,
 //! the clocks and the state read-out. Those are the player HUD's own pieces drawn through
-//! `appkit::player_hud::{draw_scrim, draw_title, draw_playbar}`, so the two transports cannot drift;
+//! `appkit::player_hud::{classic::draw_scrim, classic::draw_title, classic::draw_playbar}`, so the two transports cannot drift;
 //! what a trailer does NOT get is the rest of the HUD — no quality, subtitle, audio or Info
 //! control, no tabs and no track menus. A preview session has no PlayQueue, no timeline reporter
 //! and no watch state, and a control that writes one has no business on it.
@@ -16,7 +16,7 @@
 
 use plx_appkit::held_key::HeldKey;
 use plx_ui::icons::Icon;
-use plx_appkit::player_hud::{Knob, Playbar, TransportMark};
+use plx_appkit::player_hud::{classic::Knob, classic::Playbar, TransportMark};
 use plx_ui::widgets::KeyHint;
 use plx_ui::{consts, theme, Painter};
 use std::ffi::CString;
@@ -58,9 +58,8 @@ pub(super) enum TrailerKey {
     Pause,
     /// BACK and DOWN: back to background autoplay, page chrome and all.
     Collapse,
-    /// UP — the mode's own promotion key, pressed again: puts the controls back on screen and
-    /// does nothing more.
-    Reveal,
+    /// UP toggles the transport without leaving full-trailer mode.
+    ToggleHud,
     /// LEFT/RIGHT: hold-to-scrub, forward = `true` (RIGHT). Acted on every edge — `Down` for the
     /// fixed hop, `Repeat` to engage the continuous ramp, `Up` to commit — unlike every other
     /// variant here, which only the `Down` edge drives. See [`trailer_key`]'s own doc for why this
@@ -92,7 +91,7 @@ pub(super) fn trailer_key(
         consts::Key::Play => Some(TrailerKey::Play),
         consts::Key::Pause => Some(TrailerKey::Pause),
         consts::Key::PlayPause | consts::Key::Ok => Some(TrailerKey::Toggle),
-        consts::Key::Up => Some(TrailerKey::Reveal),
+        consts::Key::Up => Some(TrailerKey::ToggleHud),
         consts::Key::Left { .. } => Some(TrailerKey::Scrub(false)),
         consts::Key::Right { .. } => Some(TrailerKey::Scrub(true)),
         consts::Key::Down | consts::Key::Back => Some(TrailerKey::Collapse),
@@ -155,6 +154,8 @@ pub(super) struct Transport {
     /// (`PlayerScreen::hud.until`), and the one `ci/check-deps.sh`'s `dt` gate requires of an
     /// animator here: absolute clock readings, never a per-frame delta accumulated into state.
     until_ms: u32,
+    /// Explicit dismissal outranks the paused-picture visibility rule until another key reveals it.
+    dismissed: bool,
     /// the transport's eased alpha
     pub(super) alpha: f32,
     /// the UP hint's eased alpha — eases toward [`HINT_ALPHA_PEAK`] on appearing, then toward the
@@ -165,7 +166,7 @@ pub(super) struct Transport {
     /// long it has been continuously up. `None` while it is down.
     hint_since: Option<u32>,
     /// When the last paused→playing edge happened, so the read-out can wear
-    /// [`TransportMark::Play`] for [`PLAY_MARK_MS`], exactly as the HUD's `TransportRow::play_at`
+    /// [`TransportMark::Play`] for [`PLAY_MARK_MS`], exactly as the HUD's `HudMotion::play_at`
     /// makes it.
     play_at: Option<u32>,
     /// last tick's pause state, which is the only way to see that edge
@@ -194,6 +195,7 @@ pub(super) struct Transport {
 impl Transport {
     pub(super) const IDLE: Self = Self {
         until_ms: 0,
+        dismissed: false,
         alpha: 0.0,
         hint: 0.0,
         hint_since: None,
@@ -207,7 +209,17 @@ impl Transport {
 
     /// A key arrived: put the controls back on screen for a full linger.
     pub(super) fn reveal(&mut self) {
+        self.dismissed = false;
         self.until_ms = self.now_ms.wrapping_add(LINGER_MS);
+    }
+
+    pub(super) fn toggle_controls(&mut self, paused: bool) {
+        if !self.dismissed && controls_shown(true, self.now_ms, self.until_ms, paused) {
+            self.dismiss();
+            self.dismissed = true;
+        } else {
+            self.reveal();
+        }
     }
 
     /// Full-trailer mode is over: the transport goes with it, the resume mark it was carrying
@@ -216,6 +228,7 @@ impl Transport {
     /// firing in the background after the page nobody is looking at has already collapsed.
     pub(super) fn dismiss(&mut self) {
         self.until_ms = 0;
+        self.dismissed = false;
         self.play_at = None;
         self.cancel_scrub();
     }
@@ -239,7 +252,7 @@ impl Transport {
     /// There is no `Reveal`-only first press here (unlike the HUD, which a LEFT/RIGHT can arrive
     /// at hidden): full-trailer mode's transport is already up the instant it is entered
     /// ([`reveal`](Self::reveal) fires on promotion), so every press is a real gesture. `dur_ns`
-    /// is `player::duration_ns()`, `live_ns` is `player::playpos_ns()` — passed in rather than
+    /// is `player::duration_ns(ps)`, `live_ns` is `player::playpos_ns(ps)` — passed in rather than
     /// read here so this stays a pure function of state the caller already has, like the rest of
     /// this type.
     ///
@@ -252,6 +265,7 @@ impl Transport {
         now: u32,
         dur_ns: i64,
         live_ns: i64,
+        interval: plx_plex::plex::session::SkipInterval,
     ) -> Option<i64> {
         if dur_ns <= 0 {
             return None;
@@ -266,11 +280,7 @@ impl Transport {
         }
         self.scrub_commit_at = 0; // more input → cancel a pending tap commit
         if !self.scrub_key.engaged {
-            let step = if fwd {
-                plx_appkit::player_hud::scrub_step_ns()
-            } else {
-                -plx_appkit::player_hud::scrub_step_ns()
-            };
+            let step = plx_appkit::player_hud::scrub_step_ns(interval) * if fwd { 1 } else { -1 };
             self.scrub_ns =
                 plx_appkit::player_hud::scrub_clamp_target(self.scrub_ns.max(0) + step, dur_ns);
         }
@@ -356,7 +366,7 @@ impl Transport {
     /// says nothing without the clock reading it was taken from.
     #[cfg(test)]
     pub(super) fn revealed(&self) -> bool {
-        self.now_ms < self.until_ms
+        !self.dismissed && self.now_ms < self.until_ms
     }
 
     /// The in-flight scrub preview position, for `screens::detail`'s own tests — which live
@@ -382,7 +392,7 @@ impl Transport {
         // A pause holds the controls on screen by itself ([`controls_shown`]), so the deadline
         // travels with it — otherwise the resume would hide them on the very frame it set the
         // picture moving again, which is the one frame the viewer is looking at them.
-        if self.was_paused && paused {
+        if self.was_paused && paused && !self.dismissed {
             self.until_ms = self.until_ms.wrapping_add(now.wrapping_sub(self.now_ms));
         }
         self.now_ms = now;
@@ -393,7 +403,7 @@ impl Transport {
         if !full_trailer {
             self.dismiss();
         }
-        let shown = controls_shown(full_trailer, now, self.until_ms, paused);
+        let shown = !self.dismissed && controls_shown(full_trailer, now, self.until_ms, paused);
         if self
             .play_at
             .is_some_and(|at| now.wrapping_sub(at) >= PLAY_MARK_MS)
@@ -441,7 +451,7 @@ impl Transport {
     /// While a LEFT/RIGHT scrub is in flight the playbar and the elapsed/remaining read-out follow
     /// the PREVIEW position instead of the live one — same as the player HUD's scrubber — falling
     /// back to the live position the instant the gesture ends (commit or cancel alike): a commit's
-    /// own `engine::arm_seek` republishes the live position at the target immediately, so there is
+    /// own reload (`FeedCommand::ArmOpen`) republishes the live position at the target immediately, so there is
     /// no frame where the two disagree.
     pub(super) fn draw(
         &self,
@@ -449,35 +459,38 @@ impl Transport {
         film_title: &str,
         extra_title: &str,
         paused: bool,
+        live_ns: Option<i64>,
+        duration_ns: Option<i64>,
         measure: &dyn plx_machine::machine::Measure,
     ) {
         if self.alpha <= 0.01 {
             return;
         }
         let p = p.alpha(self.alpha);
-        plx_appkit::player_hud::draw_scrim(p);
+        plx_appkit::player_hud::classic::draw_scrim(p);
         // `if let Ok`, not `.unwrap_or_default()` — the player HUD's own rule (5a221a54): a title
         // with an interior NUL skips the title block rather than drawing an empty line under the
         // kicker. The transport below it still draws; only the unprintable text is dropped.
         if let Ok(title) = CString::new(transport_title(film_title, extra_title)) {
-            plx_appkit::player_hud::draw_title(
+            plx_appkit::player_hud::classic::draw_title(
                 p,
-                plx_appkit::player_hud::Kicker::Context(plx_platform::i18n::msg::browse_detail_trailer_c().as_ptr()),
+                plx_appkit::player_hud::classic::Kicker::Context(plx_platform::i18n::msg::browse_detail_trailer_c().as_ptr()),
                 title.as_ptr(),
             );
         }
-        let live_ns = plx_media::player::playpos_ns();
-        plx_appkit::player_hud::draw_playbar(
+        let live_ns = live_ns.unwrap_or(0);
+        plx_appkit::player_hud::classic::draw_playbar(
             p,
             Playbar {
                 pos_ns: if self.scrubbing() { self.scrub_ns } else { live_ns },
-                dur_ns: plx_media::player::duration_ns(),
+                dur_ns: duration_ns.unwrap_or(0),
                 // The trailer's playbar is not FOCUSABLE and a pointer cannot drag it — the tick
                 // knob everywhere else on this transport is a read-out — but LEFT/RIGHT do move
                 // it now, same as the player HUD's own scrubber.
                 knob: Knob::Tick,
                 mark: self.mark(paused, live_ns),
                 now: self.now_ms,
+                end_time: None,
                 clock_grow: 0.0,
                 live: false,
                 live_airing: None,
@@ -555,14 +568,14 @@ mod tests {
         }
     }
 
-    /// The key policy, key by key. `Reveal` is the default for a direction the mode owns; the two
-    /// collapse keys and the three transport keys are the exceptions, and EXIT/STOP are nobody's.
+    /// The key policy, key by key: transport, scrubbing, HUD visibility and collapse.
+    /// EXIT/STOP belong to the loop.
     #[test]
     fn the_mode_owns_the_transport_and_direction_keys_and_nothing_else() {
         assert_eq!(trailer_key(MKey::Ok, 0, 0), Some(TrailerKey::Toggle));
         assert_eq!(trailer_key(MKey::Back, 0, 0), Some(TrailerKey::Collapse));
         assert_eq!(trailer_key(MKey::Down, 0, 0), Some(TrailerKey::Collapse));
-        assert_eq!(trailer_key(MKey::Up, 0, 0), Some(TrailerKey::Reveal));
+        assert_eq!(trailer_key(MKey::Up, 0, 0), Some(TrailerKey::ToggleHud));
         assert_eq!(trailer_key(MKey::Left, 0, 0), Some(TrailerKey::Scrub(false)));
         assert_eq!(trailer_key(MKey::Right, 0, 0), Some(TrailerKey::Scrub(true)));
         assert_eq!(
@@ -606,7 +619,7 @@ mod tests {
         let dur = 120_000_000_000i64;
         let live = 30_000_000_000i64;
 
-        t.scrub_fresh(true, 0, dur, live);
+        t.scrub_fresh(true, 0, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         assert!(t.scrubbing(), "a fresh press starts a gesture");
         assert_eq!(
             t.scrub_ns,
@@ -636,12 +649,12 @@ mod tests {
         const S: i64 = 1_000_000_000;
         let (dur, live) = (200 * S, 100 * S);
         for interval in SkipInterval::LADDER {
-            let _i = plx_appkit::player_hud::SkipIntervalGuard::set(interval);
+            // Each press receives its own captured value, without changing a global.
             let mut t = Transport::IDLE;
-            t.scrub_fresh(true, 0, dur, live);
+            t.scrub_fresh(true, 0, dur, live, interval);
             assert_eq!(t.scrub_ns, live + interval.ns(), "{interval:?} forward");
             let mut t = Transport::IDLE;
-            t.scrub_fresh(false, 0, dur, live);
+            t.scrub_fresh(false, 0, dur, live, interval);
             assert_eq!(t.scrub_ns, live - interval.ns(), "{interval:?} back");
         }
     }
@@ -655,7 +668,7 @@ mod tests {
         let dur = 600_000_000_000i64;
         let live = 100_000_000_000i64;
 
-        t.scrub_fresh(true, 0, dur, live);
+        t.scrub_fresh(true, 0, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         let after_hop = t.scrub_ns;
         let mut now = 0u32;
         t.scrub_repeat(now);
@@ -695,7 +708,7 @@ mod tests {
         let mut t = Transport::IDLE;
         let dur = 600_000_000_000i64;
         let live = 100_000_000_000i64;
-        t.scrub_fresh(true, 0, dur, live);
+        t.scrub_fresh(true, 0, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         t.scrub_repeat(500);
         for (i, now) in (516..=1_500).step_by(16).enumerate() {
             t.step_scrub_hold(now, dur);
@@ -706,7 +719,7 @@ mod tests {
         let (before, since) = (t.scrub_ns, t.scrub_key.since);
 
         t.scrub_release(1_504);
-        assert_eq!(t.scrub_fresh(true, 1_505, dur, live), None, "the bounce commits nothing");
+        assert_eq!(t.scrub_fresh(true, 1_505, dur, live, plx_plex::plex::session::SkipInterval::Seconds10), None, "the bounce commits nothing");
         assert!(t.scrubbing() && t.scrub_key.engaged, "the hold goes on");
         assert_eq!(t.scrub_key.since, since, "…and the ramp keeps its speed");
         assert_eq!(t.scrub_ns, before, "…with no extra hop");
@@ -725,13 +738,13 @@ mod tests {
         let mut t = Transport::IDLE;
         let dur = 600_000_000_000i64;
         let live = 100_000_000_000i64;
-        t.scrub_fresh(true, 0, dur, live);
+        t.scrub_fresh(true, 0, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         t.scrub_repeat(500);
         t.step_scrub_hold(600, dur);
         let held = t.scrub_ns;
         t.scrub_release(610);
         assert_eq!(
-            t.scrub_fresh(false, 615, dur, live),
+            t.scrub_fresh(false, 615, dur, live, plx_plex::plex::session::SkipInterval::Seconds10),
             Some(held),
             "the held scrub commits where it was released"
         );
@@ -748,7 +761,7 @@ mod tests {
         let dur = 600_000_000_000i64;
         let live = 100_000_000_000i64;
 
-        t.scrub_fresh(false, 0, dur, live);
+        t.scrub_fresh(false, 0, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         t.scrub_repeat(0);
         assert_eq!(t.step_scrub_hold(100, dur), None, "well inside the alive window");
         let target = t.step_scrub_hold(100 + plx_appkit::player_hud::SCRUB_LOST_MS + 1, dur);
@@ -767,7 +780,7 @@ mod tests {
         let dur = 600_000_000_000i64;
         let live = 100_000_000_000i64;
         let mut now = 0u32;
-        t.scrub_fresh(true, now, dur, live);
+        t.scrub_fresh(true, now, dur, live, plx_plex::plex::session::SkipInterval::Seconds10);
         t.scrub_repeat(now);
         // 400 frames * 16ms ~= 6.4s, comfortably past LINGER_MS (4.5s) if nothing kept reviving it.
         // A repeat every ~96ms (well inside SCRUB_LOST_MS) keeps the hold alive throughout, same

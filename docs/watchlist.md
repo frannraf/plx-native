@@ -70,8 +70,10 @@ outside one add/check/remove/check pair on that profile.
 
 The Watchlist is written and read with **the active profile's own plex.tv token**, never the owner's
 `account_token` and never a per-server PMS access token (a PMS token is refused on plex.tv, 401). It
-comes from `session::plex_tv_credential(&UserRef)`, captured on the MAIN thread at spawn into a
-`WatchlistAuth { client_id, credential, user, generation }` that the worker owns. New sessions carry
+comes from `session::plex_tv_credential(&UserRef)`, read on the MAIN thread by the Bridge (`Bridge::watchlist_input`,
+from one snapshot of the published profile) and handed to the store's `Open`, which builds the
+`WatchlistAuth { client_id, credential, user, generation }` that the worker owns. The store reads no registry:
+the frame pass is handed the seated profile (`Bridge::seated_profile`) to notice a switch. New sessions carry
 the profile's token explicitly; the one fallback is a proven legacy owner session. A managed or
 unknown legacy profile therefore has **no credential**: the page shows the account read-out
 (`Status::NoAccount`), `CatalogStore` reports `Unreachable`, and nothing is fetched.
@@ -169,8 +171,9 @@ this id lives on another service with another token). `IntentLedger`:
 outline when off the list, filled when on; the fill rises from the bottom with a 3 px ribbon drop on a
 flip, not on the first answer). It exists only for an item whose guid is `plex://movie|show/<hex>`
 (`HeroSet::watchlist`).
-The **Home hero** carries the same disc, second after Play/Resume and before Info (Play, disc, Info, with
-`HERO_CTRL_GAP` = `CONTROL_GAP`, 20 px, between controls; the 12 px `HERO_ICON_GAP` is inside the Play pill). It is present when the hero row stands for a title
+The **Home hero** carries the same disc, second after Play/Resume and before Info (Play, disc, Info, laid out by
+`hero_layout::flat_row` with one `CONTROL_GAP`, 20 px, between controls (the billboard's pager follows Info in the same row, 40 px after it: the gap and the dots group's own 20 px margin);
+the 12 px `HERO_ICON_GAP` is inside the Play pill). It is present when the hero row stands for a title
 (`PmsMovie::watchlist_subject`: a movie or show itself, a season or episode its SHOW, "Add Show"
 semantics) with a known id. The application feeds it the membership of the title the hero shows
 (`HomeScreen::watchlist_hex` / `set_watchlist`, `app::watchlist::catalog_feed`); it flips only on a real
@@ -189,14 +192,21 @@ open. The plan's `{hex}` keying for all three is not implemented; the owner has 
 the difference. The Remove row's wording is `Remove Show...` for an episode (plan 1.8), not the
 brief's `Remove Show from Watchlist`.
 
-**plex.tv unreachable.** The page shows the full-screen read-out with Retry (a populated list is never
-blanked). Detail, Home hero and catalog controls draw the outline face when membership is unknown, the item-menu
+**plex.tv unreachable.** With no list landed, the page shows the full-screen read-out with Retry. A list that
+has landed, populated or empty, is never blanked: an empty Watchlist keeps its empty read-out and its item-menu
+rows. Detail, Home hero and catalog controls draw the outline face when membership is unknown, the item-menu
 row is omitted when there is no face to offer, and a press flips then reverts. Reproduce with
 `/tmp/plxnative-nowan` or the failing-closure tests.
 
 **The count (Q7, decided: option D; reshaped onto the Library's header row).** The page header is the
-Library's one row (`plx_ui::page_header::PageHeader`; `watchlist/header.rs`): the title "Watchlist" on
-the selected plate at the left, and at the right the control "Sort & Filter · <value> ▾". The list's
+Library's one row (`plx_ui::page_header::PageHeader`; `watchlist/header.rs`): the title "Watchlist" as
+plain text at the left, and at the right the Library's own sort control (`HeaderItem::sort_control`):
+the sort icon, the chosen sort ("Date added") and a quiet down chevron, with "Sort & Filter" as its
+name (the item carries it; it is never drawn). The criterion is the SORT alone, a Type or Show filter
+never changes it (the read-out below says "N of M"), and it has no reserved slot: the control ends on the
+row's right text edge, x 1771, and a changed sort swaps on the page's `HeaderSwap` (the old criterion
+fades out at its own place and the new one in at its own, in the page's pass and in the opener lift
+alike, begun from the row's rebuild with `SharedRow::get_replacing`) as the Library's does. The list's
 count is a filter read-out and nothing else: "{shown} of {total}" (the Library's sentence,
 `library.header.filtered_of`, numbers grouped as it groups them) stands ahead of the control while a
 Type or Show filter narrows the list (Sort alone does not), including "0 of N" beside the
@@ -209,20 +219,20 @@ tiles move on one frame. It stays under the Sort & Filter menu's scrim; only the
 The row's pills are the Library's, one component. With one focus stop the focus pill has nowhere to
 travel from: it lands on the control and fades in on the top bar's alpha spring, then pops on the
 page's `CtlPop`; the title is plain text, no plate (`HeaderItem::title`, design review S10; `plx_ui::page_header`; the page holds
-the row's `TabStrip` and `CtlPop`, which `WatchlistScreen::SHAPE` carries and its tick steps), and the Sort & Filter
+the row's `TabStrip` and `CtlPop`, which `WatchlistScreen::SHAPE` carries and its tick steps; the `HeaderSwap` is decoration beside them and is not in `SHAPE`), and the Sort & Filter
 panel is as wide as its longest label or as the control's focused pill, whichever is wider
 (`TableView::menu_panel_width_from`, the rule the Library's Sort & Filter hangs by too).
 
 **The grid and its captions follow the Library.** Six columns of 250 x 375 posters from x 96, 285
 apart (the last column ends on the row's right text edge, x 1771), the first row at y 244, a focused
 row below the first resting at y 244 too. The caption under a poster is the global Under posters setting (Settings >
-Libraries; `plx_ui::caption_policy`): the Title switch (default off) and the Details picker, and only
+Libraries; `plx_ui::caption_policy`): the Title switch (default off) and the Movie / TV show details pickers (each a set of up to four ticked parts, shown in a fixed order), and only
 the focused row opens its band (0 / 80 / 112 px). A Watchlist row itself carries a title, a year and a
 kind; the rest of what a caption words is the matched copy's, as the guid lookup's row said it
 (`ListingFacts`, `app/watchlist.rs`), so a playable title reads like any poster ("2001 · 1h 40m",
 "Drama", "4K · HDR", "PG-13 · 7.8", "2019 · 3 seasons") and a title with no copy falls to its year (or,
 under a picker the row has nothing for, to its kind). An unplayable title's state sentence ("Coming soon", "Not on your servers", "Server
-offline") takes the details line whatever the picker shows, except Nothing, which shows no line at all.
+offline") takes the details line whatever the pickers show, an empty set included (the status words are the tile's own; the band opens one line for them under an empty set, and an available title with no ticked part has an empty second line there).
 A focused row below the first rests with its posters at the first row's y, 244 (`GridSpec::resting`,
 `poster_grid::rest_scroll`: the Library's rule, one function for both pages), and the last rows of a
 long list rest lower because the document's end holds them. So the first scrolled rest is a whole row
@@ -266,7 +276,7 @@ card, the Sort & Filter pill) is not in the lens.
 `CatalogScreen` (`ContentArg::Catalog { hex }`) is the page for a Discover-only title. It is not a
 Detail mode: it never reads `metadata::current()`, so it has no Play, Restart, Also available, Mark
 watched, extras, seasons, cast or Related. `CatalogStore` owns the one `GET discover
-/library/metadata/<hex>`, captures the same `WatchlistAuth`, and reads membership from the
+/library/metadata/<hex>`, takes the same `WatchlistAuth` from the Bridge's input, and reads membership from the
 WatchlistStore, keeping no copy. It draws the art ground (proxied through a reachable server's photo
 transcoder, since `metadata-static.plex.tv` art needs a PMS; else the neutral ground), title, meta,
 a line-clamped summary, genres, a status line (clock for coming soon, circle-slash for not on your servers,

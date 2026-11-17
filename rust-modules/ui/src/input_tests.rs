@@ -9,6 +9,164 @@ use super::fixture::{booted, events_of, key, tick, FixtureArg, FixtureHost, Fixt
 use plx_machine::machine::{Edge, FocusKey, InputEvent, InputKind, Key, MachineId, NavOp, Source, StoreOrd, Tick};
 use super::Rect;
 
+#[test]
+fn press_read_is_taken_from_each_input_owner() {
+    use super::input::InputMachine;
+    use plx_machine::machine::{EntryId, PressArm, PressFrom};
+
+    let mut first = InputMachine::<u32>::new();
+    let mut second = InputMachine::<u32>::new();
+    let key = FocusKey { entry: EntryId(1), elem: 7 };
+    first.arm(PressArm { key, from: PressFrom::Key, holdable: true }, MachineId::Nav, 10);
+    first.tick(30, 0.02);
+    let before = first.press_read(30);
+    second.arm(PressArm { key: FocusKey { entry: EntryId(2), elem: 8 }, from: PressFrom::Pointer, holdable: false }, MachineId::Nav, 20);
+    second.tick(30, 0.01);
+    let after = first.press_read(30);
+    assert_eq!(after.owner, Some(key));
+    assert_eq!(after.held_ms, Some(20));
+    assert_eq!(after.scale, before.scale);
+    assert_eq!(after.identity, before.identity, "another input cannot change this arm identity");
+    assert!(after.live && after.active);
+    assert_ne!(after.owner, second.press_read(30).owner);
+    first.cancel_press();
+    let cancelled = first.press_read(30);
+    assert_eq!(cancelled.owner, Some(key), "the dip survives cancellation");
+    assert_eq!(cancelled.identity, before.identity);
+    assert!(!cancelled.live && cancelled.active, "cancellation leaves only the visible spring");
+    let next_key = FocusKey { entry: EntryId(1), elem: 9 };
+    first.arm(PressArm { key: next_key, from: PressFrom::Key, holdable: false }, MachineId::Nav, 40);
+    let rearmed = first.press_read(40);
+    assert_ne!(rearmed.identity, cancelled.identity, "rearming during spring-back is a new press");
+    assert_eq!(rearmed.owner, Some(next_key));
+    assert_eq!(rearmed.dip_of(&key), 1.0, "the previous owner must not take the new dip");
+}
+
+#[test]
+fn lift_receipts_are_canonical_and_retire_on_gesture_owner_or_target_change() {
+    use super::input::{InputMachine, LiftReceipt, PressEvent};
+    use plx_machine::machine::{Canon, EntryId, InstanceId, PressArm, PressFrom};
+    let key = FocusKey { entry: EntryId(1), elem: 7u32 };
+    let owner = InstanceId(4);
+    let mut input = InputMachine::new();
+    let id = input.arm(PressArm { key, from: PressFrom::Key, holdable: true }, MachineId::Instance(owner), 0);
+    input.tick(600, 0.016);
+    input.cancel_press();
+    let receipt = LiftReceipt { press: id, key, owner };
+    let hash = |input: &InputMachine<u32>| {
+        let mut c = Canon::new();
+        input.write_with(&mut c, &|k, c| { c.u32(*k); });
+        c.finish()
+    };
+    let before = hash(&input);
+    input.accept_lift(receipt);
+    assert_ne!(before, hash(&input), "retained policy is graded, not a hidden render cache");
+    input.validate_lift(Some((key, owner)));
+    assert_eq!(input.lift_receipt, Some(receipt), "cancelled spring retains matching gesture evidence");
+    assert!(!input.tick(616, 0.016).contains(&PressEvent::PageDamage));
+    input.validate_lift(Some((key, InstanceId(5))));
+    assert!(input.lift_receipt.is_none(), "a replaced instance cannot inherit a receipt");
+    assert!(input.tick(632, 0.016).contains(&PressEvent::PageDamage));
+    input.accept_lift(receipt);
+    input.validate_lift(Some((FocusKey { elem: 8, ..key }, owner)));
+    assert!(input.lift_receipt.is_none(), "a changed target retires evidence");
+    input.accept_lift(receipt);
+    input.validate_lift(None);
+    assert!(input.lift_receipt.is_none(), "a retired surface retires evidence before tick");
+    input.accept_lift(receipt);
+    input.arm(PressArm { key, from: PressFrom::Key, holdable: true }, MachineId::Instance(owner), 640);
+    assert!(input.lift_receipt.is_none(), "even rearming the same card is a new gesture");
+    input.accept_lift(receipt);
+    assert!(input.lift_receipt.is_none(), "late evidence from the abandoned press is refused");
+}
+
+#[test]
+fn recording_discovery_and_source_walks_never_publish_lift_policy() {
+    use crate::fixture::{FixtureView, FixtureViews, FixtureMeasure};
+    use plx_machine::machine::EntryId;
+    let _serial = plx_base::testlock::serial();
+    let (d, _, owner) = booted();
+    let parts = d.parts(tick(0));
+    let view = FixtureView::default();
+    let cx = parts.cx::<FixtureHost>(FixtureViews { store: &view }, &FixtureMeasure);
+    let key = FocusKey { entry: EntryId(1), elem: 7 };
+    let draw = |painter| {
+        let mut f = crate::screen::DrawFrame::new(&cx, painter);
+        f.lifted = Some(key);
+        f.lift_owner = Some(owner);
+        assert!(f.leaves_out(key.entry, key.elem));
+        f
+    };
+    let visible = draw(crate::Painter::root());
+    assert_eq!(visible.visible_lift_receipt().unwrap().owner, owner);
+    let recording = draw(crate::Painter::recording());
+    assert!(recording.lift_receipt().is_some(), "text may discover the omission locally");
+    assert!(recording.visible_lift_receipt().is_none(), "but recording is not publication");
+    let sources = std::rc::Rc::new(std::cell::RefCell::new(crate::frame::backdrop::Sources::default()));
+    {
+        let _walk = crate::frame::backdrop::enter(sources.clone(), crate::frame::backdrop::Z::OPENER);
+        assert!(draw(crate::Painter::root()).visible_lift_receipt().is_none());
+    }
+    {
+        let _walk = crate::frame::backdrop::discover(sources);
+        assert!(draw(crate::Painter::root()).visible_lift_receipt().is_none());
+    }
+    assert!(d.input.lift_receipt.is_none(), "all local draw receipts leave the owner untouched");
+    assert!(visible.visible_lift_receipt().is_some(), "source scopes restore the visible pass");
+}
+
+#[test]
+fn long_hold_page_damage_is_an_addressed_input_result() {
+    use super::input::{InputMachine, PressEvent};
+    use plx_machine::machine::{EntryId, PressArm, PressFrom};
+    use plx_machine::present::{Present, PresentEvent, Provenance, Scope};
+    let _serial = plx_base::testlock::serial();
+    // No lift receipt was admitted by this input owner.
+    let mut input = InputMachine::<u32>::new();
+    let key = FocusKey { entry: EntryId(1), elem: 7 };
+    input.arm(PressArm { key, from: PressFrom::Key, holdable: true }, MachineId::Nav, 10);
+    for frame in 1..45 { input.tick(10 + frame * 16, 0.016); }
+    input.cancel_press();
+    let mut a = Present::new();
+    let mut b = Present::new();
+    a.take(0); a.acknowledge(0);
+    b.take(0); b.acknowledge(0);
+    let mut effects = 0;
+    for frame in 45..90 {
+        for event in input.tick(10 + frame * 16, 0.016) {
+            if event == PressEvent::PageDamage {
+                a.note_in_scope(Scope::Page, PresentEvent::Damage(Provenance::Input));
+                effects += 1;
+            }
+        }
+    }
+    assert!(effects > 5, "the taken hold still moves a card painted into the page");
+    assert!(a.page_damaged());
+    assert_eq!(a.why(), Some(Provenance::Input));
+    assert!(!b.changed(), "another present owner cannot receive the hold's page effect");
+}
+
+#[test]
+fn presentation_input_scope_follows_the_owned_tree_not_a_closing_surface_image() {
+    use plx_machine::present::Scope;
+    let _serial = plx_base::testlock::serial();
+    let (mut d, mut rig, _) = booted();
+    assert_eq!(d.input_scope(), Scope::Page);
+    d.nav.next_style = Style::Compact;
+    d.request(MachineId::Nav, NavOp::Present(FixtureArg::Modal));
+    d.frame(&mut rig, tick(16), vec![], vec![], &mut NoTap);
+    assert_eq!(d.input_scope(), Scope::Surface);
+    let surface = d.nav.modals.surfaces.last().unwrap().entry.id;
+    for ms in (32..=1600).step_by(16) {
+        d.frame(&mut rig, tick(ms), vec![], vec![], &mut NoTap);
+    }
+    assert_eq!(d.input_scope(), Scope::Surface);
+    d.request(MachineId::Nav, NavOp::Dismiss(surface));
+    d.frame(&mut rig, tick(1616), vec![], vec![], &mut NoTap);
+    assert!(d.nav.modals.surfaces.iter().any(|s| s.entry.id == surface), "the fading image is still mounted");
+    assert_eq!(d.input_scope(), Scope::Page, "input is already back on the actual page owner");
+}
+
 fn interactive_event(kind: u8, at: Tick) -> super::screen::ScreenEvent<FixtureHost> {
     use plx_machine::machine::PressId;
     use super::screen::ScreenEvent;
@@ -930,8 +1088,8 @@ fn whole_text_commits_and_keyboard_edges_round_trip_in_order() {
     let mut d = Dispatcher::<FixtureHost>::new();
     let mut rig = FixtureRig::new();
     d.request(MachineId::Nav, NavOp::Root(FixtureArg::Page(801)));
-    d.frame(&mut rig, tick(0), vec![], vec![], &mut tap);
-    d.frame(&mut rig, tick(16), inputs, vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(0), vec![], vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(16), inputs, vec![], &mut tap);
     assert_eq!(events_of(&d, 0).matches("\"system_owner\"").count(), edits.len() + 1);
     tap.w.finish().unwrap();
     let manifest = json!({"schema": super::rec::SCHEMA, "state_fp": fixture_state_fp(),
@@ -1037,10 +1195,10 @@ fn resolve_mode_reports_every_mismatch_and_continues_from_the_recording() {
     let mut d: Dispatcher<FixtureHost> = Dispatcher::new();
     let mut rig = FixtureRig::new();
     d.request(MachineId::Nav, NavOp::Root(FixtureArg::Home));
-    d.frame(&mut rig, tick(0), vec![], vec![], &mut tap);
-    d.frame(&mut rig, tick(16), vec![key(Key::Right, tick(16))], vec![], &mut tap);
-    d.frame(&mut rig, tick(32), vec![key(Key::Right, tick(32))], vec![], &mut tap);
-    d.frame(&mut rig, tick(48), vec![], vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(0), vec![], vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(16), vec![key(Key::Right, tick(16))], vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(32), vec![key(Key::Right, tick(32))], vec![], &mut tap);
+    super::fixture::frame_and_swap(&mut d, &mut rig, tick(48), vec![], vec![], &mut tap);
     assert_eq!(elem(&d), Some(2));
     tap.w.finish().unwrap();
     let manifest = serde_json::to_string(&json!({

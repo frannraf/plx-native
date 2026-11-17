@@ -14,13 +14,15 @@ Media Server (PMS) entirely in-app.
 
 **Almost everything is Rust** in `rust-modules/` (UI, event loop, input, player orchestration,
 the streaming/demux pipeline, and the Plex data layer), compiled to a static lib and linked in
-(see the Makefile). Only two things stay C: `src/main.c` — a small **boot shim** (the event-log
+(see the Makefile). What stays C is `src/main.c` — a small **boot shim** (the event-log
 handle, stderr capture, process bring-up) that then calls the Rust `plex_run()` — and
-`src/starfish.c`, the **StarfishMediaAPIs C++/ACB seam**. Two more `.c` files sit beside them:
-`src/svg.c` (the nanosvg rasterizer) and, since 2026-08-29, `src/crashtrace.c` — the async-signal-
-safe **crash tracer**, lifted out of `main.c` into its own translation unit for one reason, that
-`ci/crashtrace-test.c` links it ALONE and can therefore fault a process on purpose and check how it
-died. Doing that immediately found a seven-week-old bug no log could have shown (below).
+`src/starfish.c`, the **buffer-feed StarfishMediaAPIs C++ seam**, and `src/video_plane.c`, the shared
+**ACB/exported-window display binding**, beside `src/svg.c` (the nanosvg rasterizer),
+`src/sentry_context.c`, `src/exit.c` (the key-files list below says what each does) and, since
+2026-08-29, `src/crashtrace.c` — the async-signal-safe **crash tracer**, lifted out of `main.c` into
+its own translation unit for one reason, that `ci/crashtrace-test.c` links it ALONE and can therefore
+fault a process on purpose and check how it died. Doing that immediately found a seven-week-old bug no
+log could have shown (below).
 
 Target device: LG 49SM9000PLA, webOS 4.5, rooted, reached as `root` over ssh. **Its address is NOT
 in the repo** — it comes from one line (an IP or hostname) in a gitignored file, found by ONE shared
@@ -89,7 +91,7 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   static libraries and out-of-process handler (`ci/build-sentry-native.sh`; CMake, patched for the
   webOS glibc-2.12/ARM32 ABI). Also compiles `ci/ffabi-assert.c` against
   `vendor/ffmpeg-prefix/include` — **the headers the shipped libraries were built from**, installed
-  by the same invocation that produced them — which is what proves `ff.rs`'s ABI table. **One**
+  by the same invocation that produced them — which is what proves `media-codecs/src/ffi.rs`'s ABI table. **One**
   header tree per target, **one** FFmpeg. This line long said BOTH vendored trees (n3.3 and n4.0)
   and *two* tables, which was true while the app read the television's FFmpeg and had to select a
   table per firmware; bundling collapsed that into a single equality (`ffabi-assert.c` opens by
@@ -219,15 +221,18 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   what the user can reach, which is the only class that is tracked rather than accepted; `--sites` lists every hit with its class.
   CI runs the three cargo targets plus those two as five parallel jobs
   (`host-lint`, `host-unit-default`, `host-unit-hostsim`, `host-python`, `host-python-harness`) behind an aggregator named
-  `host checks (NOT a device gate)`; `ci/test_ci_split.py` pins that no gate falls between them. The cargo half runs `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens`
-  **twice: once on the default feature set and once with `--features hostsim`**, which is not a
-  duplicate run. The host feed seam (`player/ffi_host.rs`) exists ONLY in the hostsim
+  `host checks (NOT a device gate)`; `ci/test_ci_split.py` pins that no gate falls between them. The cargo half runs `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens`
+  **on the default feature set, and again with `--features hostsim` for the crates that declare it
+  (`HOSTSIM_SUITE`: all of `UNIT_SUITE` except `plx_net`, `plx_ui`, `plx_appkit`, `plx_screens`,
+  `plx_media_codecs`, `plx_play_uri` and `plx_playback_contract`, which have no `hostsim` cfg and run the
+  same test names in both passes; `ci/test_test_crate.py` fails if one gains the feature or a cfg)**,
+  which is not a duplicate run. The host feed seam (`play-feed/src/ffi_host.rs`) exists ONLY in the hostsim
   configuration, so every test that drives an access unit through `sf_feed` is compiled out of the
   default pass and cannot fail it — which is how the prime-livelock regression
   (`player::engine::prime_livelock_tests`) sat outside the gate entirely while 1398 default-feature
   tests passed. Cargo keys fingerprints by feature set, so the two coexist in one `target/` and the
   second pass costs seconds warm. See the testing section for what it does and does not cover.
-  **The 14 test binaries run side by side, not one after another.** `cargo test` executes the
+  **The per-crate test binaries (`UNIT_SUITE`) run side by side, not one after another.** `cargo test` executes the
   binaries it builds serially, so after the workspace split the suite's wall time was the SUM of
   the per-crate times and one slow binary set it: measured 2026-10-05, 78.8 s sequential, of which
   `plx_media` alone was 28.7 s because `route::decision::plan_tests::unconfirmed_profile_5_forbids_copy_before_mde`
@@ -262,9 +267,9 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   SDL event loop where no host test can see it. Needs the **clippy component of the pinned toolchain** (`make setup-rust` installs it with
   `--profile minimal --component clippy`).
 - `make test-fast [T=filter]` — **opt-in** incremental inner loop: the same default-feature
-  `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens` as `check-cargo-unit-default` (throwaway runtime root, telemetry env), but
+  `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens` as `check-cargo-unit-default` (throwaway runtime root, telemetry env), but
   with `CARGO_INCREMENTAL=1` in its own `rust-modules/target-fast` (gitignored). `T=route::`
-  is the test-name filter, handed to every one of the 14 test binaries; each prints its own libtest
+  is the test-name filter, handed to every one of the per-crate test binaries; each prints its own libtest
   `test result:` line (the counts are per crate, never one total), followed by the wrapper's summary line. Use it for a long series of
   small edits in one lane: an edit-rebuild is ~10 s against 31-32 s non-incremental, flat across
   leaf/mid/hub edits (measured 2026-10-01, 5 interleaved rounds; cold is 51.7 s vs 46.2 s, so it
@@ -328,29 +333,60 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   `CARGO_TARGET_DIR` at a `/tmp` directory: those trees were not in any checkout, so no tool
   counted or reclaimed them (28 of them, 45.6 GiB, were found in `/tmp` on 2026-10-19). Refused
   under `RELEASE=1`; `ci/test_managed_targets.py` pins that the target dir is inside the checkout.
+- `make fuzz-hud [T=<target> ...] [SECS=60]` — the `cargo fuzz` package over every parser a HUD package or the
+  registry reaches (`docs/hud-plugins.md`, threat model): `admit` (the whole admission path),
+  `bundle_read`, `archive_read` (the 1.0 ZIP container), `svg_check` (the SVG gate in front of nanosvg),
+  `address_parse`, `catalog_parse` (the registry index), `catalog_verify` (the signed index: no input is accepted
+  under the shipped keys; the fuzzer's bytes are also signed with the data layer's TEST ONLY keys to reach what
+  follows the signature check), `catalog_cache` (its cache record, verified again) and `ws_frame` (the
+  WebSocket codec, `plx_net::ws`: the server's upgrade answer and frames, split at any byte). Each target
+  asserts only what its code promises (no panic, the documented bounds, round trips) and a crash fails the
+  run, with the input in `fuzz/artifacts/<target>/`. The package is a top-level `fuzz/` with its own
+  `[workspace]`, so no shipped `Cargo.toml` names it and no shipped build changes; it depends on the layer
+  crates by path, with `plx_media/hostsim` (the one configuration that links on a host), and `fuzz/build.rs`
+  reuses `rust-modules/build_support/host_link.rs`. `tools/fuzz-hud.py` is the whole workflow
+  (`list | seed | lock | build | run`): it copies `rust-modules/Cargo.lock` to the gitignored `fuzz/Cargo.lock`
+  (the shared crates are exactly the shipped versions), builds with the nightly named by `FUZZ_TOOLCHAIN`
+  (default `nightly`; CI names a dated one; `cargo install cargo-fuzz --locked` once) in
+  `rust-modules/target-fuzz` (3.1 GiB after a cold build of the first eight targets, plus 83 MiB for
+  `ws_frame`; `make disk` lists it), generates the seeds from
+  the fixtures, the examples and the icons the repository already has plus a dictionary from the published
+  schemas, and runs the targets one after another. A corpus is thousands of tiny files read and written all
+  run long: on a slow or shared disk (the external one a lane may sit on) set `FUZZ_WORK=<dir>` to move seeds,
+  corpora and artifacts to a fast one, or a 5 minute run spends its first two loading the corpus. Minimise a
+  crash with `cargo +nightly fuzz tmin --fuzz-dir fuzz --target-dir rust-modules/target-fuzz <target> <file>`,
+  add it as a red-first test in the owning crate, then fix the code. `.github/workflows/fuzz.yml` builds
+  every target and runs each for 10 s on a PR that touches the package or a parser, and runs each for 5
+  minutes weekly, resuming from a cached corpus when the cache still holds one. Not a gate: nothing in `make check` runs it.
 - `make check-nodef` — the shipping-feature-set type check, `cargo check --lib
-  --no-default-features`, which is the configuration `RELEASE=1` ships and which `make check` does
-  not cover. `CARGO_INCREMENTAL=0`, as every one-shot gate. It builds in the checkout's own
+  --no-default-features --features play-uri,play-feed`, which is the configuration `RELEASE=1`
+  ships and which `make check` does not cover. The backend features are part of the shipping set:
+  both are in the application crate's `default`, so the bare `--no-default-features` would check a
+  build with no playback backend (`PLAYBACK_BACKENDS=uri|feed` checks that one
+  backend's set; `none` checks the bare no-backend set, which is not a television package). `CARGO_INCREMENTAL=0`, as every one-shot gate. It
+  builds in the checkout's own
   `target/` (or the `CARGO_TARGET_DIR` a lane exports, as `make lint` does) rather than a tree of
   its own, and restores the cargo seed first like `lint`. Sharing is safe because cargo hashes a
-  unit by package, target, kind, mode, features and profile: of the 165 units this check needs, 139
+  unit by package, target, kind, mode, features and profile: of the 181 units this check needs, 151
   third-party units match `make lint`'s exactly (a `--unit-graph` comparison, nothing compiled) and
-  are reused, while all 26 workspace units differ in features (the application crate no longer
+  are reused, while the workspace units differ in features (the application crate no longer
   forwards `devtools`, `devtriggers` and `threadcheck`, so the layer crates get `default` only) and
   coexist beside lint's under their own hashes; `cargo check` writes no unhashed artifact that
-  could collide. The price is cargo's build-directory lock: a `make check-nodef` started while
+  could collide. The backend features add no third-party feature of their own: they reach only
+  workspace crates and activate `play-feed`'s `dolby_vision` subtree, which lint builds with the
+  same features. The price is cargo's build-directory lock: a `make check-nodef` started while
   another cargo runs in the same tree waits for it. The recipe carries neither `HOST_ENV` nor
   `TELEMETRY_ENV`: both change the third-party units it shares with lint. It never touches the
   release binaries (`SIDE_EFFECT_FREE`).
 - **CI build health** — four tools keep the build from growing unnoticed, and none of them is a
   device gate.
   - *Timings artifact.* `host-unit-default` compiles the test binary in its own step with
-    `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens --no-run --timings`, then `make check-cargo-unit-default` runs against what that
+    `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --no-run --timings`, then `make check-cargo-unit-default` runs against what that
     built (`--timings` is not part of cargo's fingerprint: checked 2026-10-02 by building with and
     without it and getting `Fresh` for `plxnative-modules` both ways, so the step moves the compile
     rather than adding one). Download `cargo-timings-host-unit-default` from the run page
     ("Artifacts", kept 14 days) and open `cargo-timing.html`: it names the crates on the critical
-    path. Locally: `cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens --no-run --timings` writes
+    path. Locally: `cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --no-run --timings` writes
     `target/cargo-timings/cargo-timing.html`.
   - *Trends.* `tools/ci-durations.py [--runs 30] [--recent 5] [--json]` reads the last 30 successful
     `main` runs of CI and Simulator CI through `gh api` and prints, per job, the median and p90 and
@@ -364,14 +400,14 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
     enforces them: the stripped ARM `plxnative` that `make ipk` stages (the cross-build job, dev
     flavour, `release` profile: CI selects it by itself, a local `make ipk` needs `ARM_PROFILE=release`), the number of third-party packages in the app crate's resolved graph for
     `armv7-unknown-linux-gnueabi` (normal + build edges, dev-dependencies excluded; asked for both with
-    default features and with `--no-default-features`, which is what ships), and the number of crate
+    default features and with the shipping set, `make RELEASE=1`'s `--no-default-features` plus the playback backends, read from the Makefile and not restated: that is what ships), and the number of crate
     names present in two versions on the normal-edge graph (what `cargo tree -d --edges normal`
     prints). The graph budgets run in `host-lint` from `cargo tree`, which compiles nothing and resolves
     features the way a build does: `cargo metadata` unifies them across dependency kinds, so it
     counted the layer crates' `test-support` optional dependencies (rcgen, rustls, ...) that only a
     `[dev-dependencies]` entry switches on. A fourth, the line count of `rust-modules/src` and every
     layer crate's `src`, only warns. Each entry records the value it was set
-    from and the date (10% headroom on sizes, +3 on counts). **To raise a budget deliberately, edit
+    from, the date and its declared headroom. **To raise a budget deliberately, edit
     the json in the same PR, update `measured`/`measured_on`, and justify the growth in the PR body**;
     the failing message says the same. Run it locally with
     `python3 ci/check-build-budgets.py --graph --src rust-modules/src` plus one `--src` per layer crate,
@@ -392,7 +428,7 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
     `.github/workflows/ci-metrics.yml` runs `tools/ci-history.py` and `tools/ci-summary.py` after
     every finished CI / Simulator CI / Nightly run that is a push to `main` or a pull request (one
     short ubuntu job, `concurrency`-collapsed, `actions: read` + `contents: write`; it checks out
-    only three tool files (the collector, the summary and the reader it imports) and never runs pull-request code, so a fork's pull request is recorded too,
+    only three tool files (the collector, the summary and the reader it imports) plus `ci/flaky.txt`, and never runs pull-request code, so a fork's pull request is recorded too,
     with `pr: null`). Rows carry `event` (absent = a push to main), the PR number, `conclusion`,
     `attempt`, `wall` (created to last update, for a re-run: what the developer waited) and the green
     jobs (`failed` names the others); the nightly is recorded for pull requests only; cancelled runs
@@ -406,12 +442,27 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
     nothing. `tools/test_ci_history.py` and `tools/test_ci_summary.py`, in `check-python`, use a fake
     `gh` and synthetic series. To look at local data files, serve `site/` with the files beside the
     page and open `/ci/?data=ci-history.json` (a same-origin relative path only).
+  - **Flaky tests.** The page's "Flaky tests" section lists tests that gave one job of one run both a
+    pass and a fail (the same commit and build, in practice a re-run attempt). Both host unit jobs of `ci.yml`
+    run `tools/ci-test-results.py` over the log of their `make check-cargo-unit-*` (stable libtest has no JSON
+    output, so it reads the `test <name> ... ok|FAILED` lines under each `Running unittests` header) and upload
+    `test-results-<job slug>-<run_attempt>` (14 days). For every new or re-run `ci` run that failed or has
+    attempt > 1, and whose head repository is this one (a fork's workflow file is its own, so its artifacts are
+    never read), `tools/ci-history.py` downloads those artifacts in memory and stores one event per flaky
+    (job, test) under `flaky` in `ci-history.json` (never the thousands of passes; 90-day retention, at most
+    100 events per run). Jobs are never compared with each other: the default-feature and `hostsim` jobs are
+    different builds. `tools/ci-summary.py` derives `flaky` in `ci-summary.json`: per (job, test) first and
+    last seen, number of runs, status Active, Quarantined (listed in `ci/flaky.txt`) or Fixed (no flake for
+    30 days), and `new` for a first flake within 24 hours. `ci/flaky.txt` is the quarantine list
+    (`test<TAB>reason`, a `# count:` header, it only shrinks like `ci/allow/layers.txt`); it is read from
+    `main` by both writers of the summary and today only changes a test's status on the page: nothing skips a
+    quarantined test and nothing blocks on a new flake. Not covered: the Python gates and the simulator jobs.
 - `make build-bench [ARGS='--runs 5 --json out.json']` / `make build-bench-quick` — the repeatable
   local **build benchmark** (`tools/build-bench.py`), so a build-affecting change pastes a
   before/after table instead of an ad-hoc scratch-script number. It prints a Markdown table (median /
   min / max over `--runs`, default 3, the scenarios interleaved round by round) and, with `--json`,
   a machine-readable document (git sha, `rustc -V` of the pinned toolchain, host, per-run load and swap). Rows:
-  a **no-op** host test build (`cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens --no-run`; it reports from cargo's JSON `fresh`
+  a **no-op** host test build (`cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --no-run`; it reports from cargo's JSON `fresh`
   flag whether the app crate was rebuilt and flags a recompile as UNEXPECTED, the
   `ci/test_build_not_always_dirty.py` hazard); an **edit-rebuild** after appending a comment to a
   leaf file of each crate (`plx_base`'s `cbuf.rs`, `plx_machine`'s `landgate.rs`, `plx_platform`'s `devcaps.rs`, `plx_gfx`'s `overdraw.rs`, `plx_net`'s `stream_redirect.rs`, `plx_ui`'s `dwell.rs`, `plx_plex`'s `retry.rs`, `plx_telemetry`'s `window.rs`, `plx_data`'s `tape.rs`, `plx_session`'s `scripted.rs`, `plx_media`'s `units.rs`, `plx_appkit`'s `skip_pill.rs`, `plx_screens`'s `clock_readout.rs`, the application's `coldstart.rs`) and to a hub (`plx_ui`'s `lib.rs`), non-incremental (`CARGO_INCREMENTAL=0`, the
@@ -599,6 +650,10 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   workflow above for the full sequence). A macOS render is a preview; only the Linux workflow's
   artifact is adoptable. The film is `tests/video/feel.json`: positions and durations, never titles
   (the demo catalog's order, `tests/demo_library/catalog.json`, decides what is under each position).
+  The demo mock's rows carry the `Image[]` a modern PMS sends (`CatalogLibrary._image_list`: a stamped
+  `clearLogo` only where the catalog has a logo, an episode's or a season's naming its show's). A row with no list
+  reads as an older server's and gets the legacy `/clearLogo` lookup, a 404 for each `logo_none_approved` title
+  (Metropolis, in the Continue Watching deck), and the frame dump ends the run on a failed art request.
   It is the Home hero held under a second, `right` to the hero's Info button, `right` again (the
   carousel turns forward to the second page), `left` to Continue and `left` again (back to the first
   page), `down` onto the Continue Watching row, `right` twice to its third card and `ok` for that
@@ -630,7 +685,7 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   popover or modal, any title flagged `not_in_video` opened (`gates` checks the mock's request log,
   and that no stream, transcode, timeline, scrobble or play-queue request was made), and the
   hold-hint capsule: the film is shot with the hint taught. The capsule is a one-time teaching
-  overlay (it stands after 1.5 s of rest on a card, once per install across every card screen, Home included, and once more on the Detail season pill after a shorter rest, and for the length of an `ok` held on a card), and a film has no
+  overlay (it stands after 1.5 s of rest on a card, once per install across every card screen, Home included, and once more on the Detail season pill after a shorter rest). A hidden hint also appears after 200 ms of an `ok` hold, with a fill in its cap; a short click leaves it hidden. A film has no
   viewer to teach, so `render --storyboard` writes the `plxnative-hintoff` trigger
   (`HINT_OFF` in `site_video.py`; the app reads it once at boot, in `devtriggers` builds only, and
   calls `hold_hint::teach_all_for_dev`, which marks the hint learned and both of its showings spent for the run) and `render.json` records `hold_hint: suppressed`. The hint's own timing is unchanged,
@@ -698,7 +753,10 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   `tools/build-gc.sh` now installs `.claude/worktrees/.cargo/config.toml` with
   `incremental = false`, which every cargo reads and which stops above the main checkout. Since
   2026-09-18 the same file also sets `[profile.dev] debug = "line-tables-only"` and `debug = false`
-  for third-party packages in lanes (main keeps full DWARF). A lane's target dirs are also no longer
+  for third-party packages in lanes (main keeps full DWARF for `dev`: the simulator, clippy and
+  `cargo check`). A host `cargo test` build is the `test` profile, whose line tables
+  `rust-modules/Cargo.toml` sets for every checkout, main included; a debugger on a host test needs
+  `CARGO_PROFILE_TEST_DEBUG=2`. A lane's target dirs are also no longer
   all built from scratch: in a linked worktree the Makefile seeds an ABSENT target dir with an APFS
   clone of the third-party output (registry crates, once also the build-std sysroot, about 40% of a lane's
   target bytes then) from `~/.cache/plxnative/cargo-seed/`, via `tools/cargo-seed.py`; the app crate is
@@ -740,9 +798,18 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   `make RELEASE=1 SYMBOLS=1 ipk symbols`. `make symbols` without the flag REFUSES rather than
   writing the empty shell `objcopy --only-keep-debug` produces from a binary with no DWARF.
   **`SYMBOLS=1` is sticky the way `RELEASE=1` is: pass it to EVERY invocation in the session.** It
-  is in the stamp, so a bare `make run` after `make SYMBOLS=1 deploy` deletes `pkg/plxnative` at
+  is in the stamp, so a bare `make deploy` after `make SYMBOLS=1 deploy` deletes `pkg/plxnative` at
   parse time and leaves you unable to symbolize the crash you just captured — the stamp working as
-  designed, but it costs a rebuild to notice. **Device-verified end to end 2026-08-29**: a
+  designed, but it costs a rebuild to notice. (Goals that build, read and ship none of the
+  stamp's artifacts are in `SIDE_EFFECT_FREE` and leave the stamp and the binary alone whatever the
+  last build was: the goals that only drive the TV — `kill`, `run`, `run-stream`, `verify-deploy`,
+  `uninstall`, `fetch-profile`, `softfloat-probe`, so `tv-session.sh` and `tests/run.py` can run
+  them — and the host-only ones — `test-fast`, `test-crate`, `test-hostsim`, `lint`, `check-nodef`,
+  the print queries and the set-up and fixture tooling, so a unit-test loop after a
+  `make ARM_PROFILE=release` build does not cost the binary. `make check` is NOT among them: its own
+  steps dry-run the ARM goals. The Makefile comment above `SIDE_EFFECT_FREE` has the rule and the
+  goals deliberately left out, and `ci/test_arm_profile.py` pins both.)
+  **Device-verified end to end 2026-08-29**: a
   deliberate SIGSEGV on the set resolved through `pkg/plxnative.debug` to
   `dev::crash_on_purpose at rust-modules/src/dev.rs:218` — file and line, from a binary the
   television runs, matched by build id alone.
@@ -866,13 +933,16 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   Each feature set also gets its own `--target-dir`, because cargo does not hash its output and
   would otherwise report the dev build fresh while the release `.a` sat at that path.
   **`make check` cannot see a break in this configuration** — it builds the default feature set —
-  **but the PR gate now can**: `.github/workflows/ci.yml` type-checks `--no-default-features` and
-  both `hostsim` configurations on every push. Until that landed, `--no-default-features` was first
-  compiled during a release cut, i.e. after the change had merged. The
+  **but the PR gate now can**: `.github/workflows/ci.yml` runs `make check-nodef` (the shipping set:
+  `--no-default-features` plus the playback backends) and type-checks both `hostsim` configurations
+  on every push. Until that landed, the shipping set was first compiled during a release cut, i.e.
+  after the change had merged. The
   **`PostToolUse` hook** (`.claude/hooks/release-config-check.py`) stays and is now the fast path
   rather than the only one — it catches the break before the push, and CI does not run in somebody
-  else's checkout. It type-checks after
-  every edit to a `rust-modules/src/**.rs` or a layer crate's `rust-modules/*/src/**.rs`; it costs well under a second warm, because cargo keys
+  else's checkout. It type-checks the bare `--no-default-features` set, which drops `play-uri` and `play-feed` too (a build with
+  no playback backend), so it does not replace `make check-nodef`, which passes the Makefile's `RUST_BACKEND_FEATURES`. It type-checks after
+  every edit to a `rust-modules/src/**.rs` or one of the thirteen layer crates it lists (it does not watch `playback-contract`, `media-codecs`,
+  `play-feed` or `play-uri`; `make check-nodef` is the only gate that compiles them in the shipping set); it costs well under a second warm, because cargo keys
   fingerprints by feature set and the two configurations coexist in one `target/`. The hazard it
   guards is hand-written `#[cfg(feature = "devtriggers")]` PAIRS, where a spliced-in function
   swallows a neighbour's attribute — `devtrig::latched_flag!` exists to avoid most of them.
@@ -928,6 +998,13 @@ bundled in the NDK), so the Starfish C++ calls get real link-time symbol checkin
 those has the **same SONAME on every webOS release from 2.2.3 to 11.2.0**, which is what makes
 linking them normally the right call — check any of it with `tools/fwcompat.py --inventory`.
 
+`PLAYBACK_BACKENDS=uri` omits the Feed Starfish objects and the `libplayerAPIs` / `libpf-1.0`
+imports. Grade that artifact with `PLAYBACK_BACKENDS=uri ./ci/check-elf.sh pkg/plxnative` (or pass
+`uri` as the script's second argument). The gate requires the Feed callback hook and the full
+`ci/expected-dt-needed.txt` set for the default `both` and explicit `feed` modes; URI mode
+requires the hook and both Feed imports to be absent and matches the exact
+`ci/expected-dt-needed-uri.txt` set. A bare `ci/check-elf.sh` grades the default `both` artifact.
+
 **Two families are deliberately NOT linked because their SONAME MOVES**: `libcurl`
 (`.so.5`→`.so.4`) and `libAcbAPI` (*deleted outright* at webOS 5.0). A `DT_NEEDED` entry is a hard
 requirement for one exact name, which cannot express "either of these", and a name the device lacks
@@ -940,7 +1017,7 @@ kills the process at `exec()` — before `main`, before the event log exists. So
   names go to the event log. Read that module's doc before adding a library to it; the rule is
   *only* when the version actually varies, because moving a library there trades link-time symbol
   checking for version tolerance.
-- **`src/starfish.c`** resolves ACB and the webOS 5+ SDL exported-window API the same way, and
+- **`src/video_plane.c`** resolves ACB and the webOS 5+ SDL exported-window API the same way, and
   picks between them (`vp_mode()`). The two are complementary across all 14 firmwares.
 - Adding a new FFmpeg/curl call means **adding it to the `dynlib!` block**. There is no link error
   to catch you any more — the failure is a logged `Incomplete` at boot and a refusal to demux.
@@ -959,7 +1036,7 @@ its own and PINS it.** This doc used to file FFmpeg beside curl and ACB as "SONA
 `ci/build-ffmpeg.sh` cross-compiles FFmpeg **9.0** with the NDK — shared, LGPL-clean (no
 `--enable-gpl`), under a `-plx` build suffix: `libavutil-plx.so.61`, `libavcodec-plx.so.63`,
 `libavformat-plx.so.63`, plus `libswscale-plx.so.10` in dev builds only. `make deploy`/`make ipk`
-ship those `.so` files **beside the binary**, and `ff.rs::load_libraries` opens them by **absolute
+ship those `.so` files **beside the binary**, and `media-codecs/src/ffi.rs::load_libraries` opens them by **absolute
 path out of `paths::app_dir()`**, in dependency order under `RTLD_GLOBAL` (they carry no rpath —
 FFmpeg's configure evals its flags and `$ORIGIN` does not survive), after which `boot()` refuses to
 demux unless the majors are exactly **63/63/61**. Both the suffix and the absolute path are
@@ -973,7 +1050,7 @@ both halves compile-time facts, and it is also webosbrew's published guidance.
 **One consequence settles a question that keeps getting re-opened: our FFmpeg has NO network.** It
 is configured `--disable-network` with `--enable-protocol=file` as the *only* protocol, so it
 cannot open a URL — http or https, on any firmware. Every byte reaches the demuxer through **the
-custom AVIO**, whichever transport happens to be under it (`stream.rs` for http, `curlio.rs` for
+custom AVIO**, whichever transport happens to be under it (`stream.rs` for http, `net::range_io` through media's credential facade for
 https), and that is not an accident of the current pipeline but a build-time fact you cannot route
 around. "Does the TV's FFmpeg have https?" is therefore not
 something to go and probe on a device; it is decided, and the answer is that no FFmpeg in this app
@@ -1061,39 +1138,45 @@ video shows through.
 
 **UI (the Rust app core — the frame loop in `app/run.rs::run`, entered via `plex_run()` in `port.rs`, which installs the port and runs `app::run_application`, after `app/boot.rs::boot()`):** SDL2 window + GLES2
 context. All UI is drawn with two tiny shaders — an SDF rounded-rect/triangle shader (cards, focus
-glow, HUD widgets, seven-segment FPS) and a text shader that samples SDL2_ttf-rendered glyph
-textures (cached by string+size). Critically-damped springs animate focus scale and shelf scroll.
-Fonts are `appfont.ttf` / `appfont-bold.ttf` deployed next to the binary; the subtitle renderer additionally loads the per-script Noto faces from `fonts/subs/` (`docs/ass-subtitles.md`, cut by `tools/cut-noto-subs.py`, staged by `SUBS_FONT_FILES` in the Makefile). (Wayland surface setup +
+glow, HUD widgets, seven-segment FPS) and a text shader that samples glyph
+textures (cached by string+size): SDL2_ttf renders every run except Arabic and Hebrew, which libass-plx
+shapes and rasterizes into the same texture (`gfx/src/rtl.rs`).
+Critically-damped springs animate focus scale and shelf scroll.
+Fonts are the `appfont*.ttf` faces deployed next to the binary, in the fallback chain `gfx/src/text.rs` opens (Inter, CJK, emoji, Arabic, Hebrew; Inter, Arabic and Hebrew with bold cuts; `ci/test_shipped_faces.py` holds every staging list to it), so a missing libass-plx costs Arabic and Hebrew UI text as well as text subtitles; the subtitle renderer additionally loads the per-script Noto faces from `fonts/subs/` (`docs/ass-subtitles.md`, cut by `tools/cut-noto-subs.py`, staged by `SUBS_FONT_FILES` in the Makefile). (Wayland surface setup +
 input decoding live in `system.rs` / `app/events.rs` + `app/input.rs`, not the C shim — see the gotchas below.)
 
 **Video playback (summary — `rust-modules/media/src/player/CLAUDE.md` is the deep-dive: pipeline,
 threading model, the Starfish/ACB ABI + bind-order gotchas, seek/PTS rebase. Read it before
 touching playback):** LG's in-process **StarfishMediaAPIs** (`libplayerAPIs.so`) in
 `BUFFERSTREAM` **buffer-feed** mode, the decoded sink bound to the hardware video plane via
-**`libAcbAPI` (ACB)** — in-process is what lets ACB bind the app-owned sink. The media pipeline
+**`libAcbAPI` (ACB)**. Normal playback uses this in-process buffer-feed path; the controlled
+[URI experiment](measurements/uri-acb-dass-2026-11-02.md) also displayed its SDR720p24 fixture
+through ACB on the webOS 4.5 dev set, with and without `connectDass`. The normal media pipeline
 is all Rust: `PMS HTTP GET` → demux (**`ff.rs`, over a custom AVIO on the
 FFmpeg the app BUNDLES** — not the television's; see the linking section, and note ours is built
 `--disable-network`, so the AVIO is the *only* way bytes reach it) → AU queues with backpressure
-(`aq.rs`) → the pump `Feed()`s the Starfish
+(`play-feed/src/aq.rs`) → the pump `Feed()`s the Starfish
 pipeline. Worker threads (demux, media/load, and `sf-unload` for a real stop's `Unload`) sit
 beside the main loop, which owns every other ACB/Starfish control call
 (`rust-modules/media/src/player/CLAUDE.md`, threading model). **That GET has TWO transports and the part URL's SCHEME picks one**,
 once, in `ff::demux`: `http` reads through `stream.rs`'s raw socket, `https` through
-**`curlio.rs`** — libcurl's *multi* interface behind a `read`/`seek`/`size`/`status`/`abort` pull
+**`net::range_io`** (through media's credential facade) — libcurl's *multi* interface behind a `read`/`seek`/`size`/`status`/`abort` pull
 source, so `ff.rs` never learns curl-multi mechanics. It exists because LG's reviewers have no PMS
 on their LAN and stream from the public internet, which `stream.rs` cannot reach: it speaks
-cleartext. So **libcurl is used by two modules for two jobs** — `net.rs` for plex.tv plus HTTPS PMS
-control calls, `curlio.rs` for the media bytes — and each binds its own `dynlib!` table,
+cleartext. So **libcurl is used by three modules for three jobs** — `net.rs` for plex.tv plus HTTPS PMS
+control calls, `net::range_io` for the media bytes, `net::connect_only` for the WebSocket's socket —
+and each binds its own `dynlib!` table,
 which the linking section explains is load-bearing rather than tidy.
 
 **Subtitles (summary — `docs/ass-subtitles.md` is the deep-dive; `rust-modules/media/src/player/CLAUDE.md`
 has the producers).** The client draws subtitles itself; the TV's subtitle engine is unreachable in
-buffer-feed. Every TEXT subtitle renders through the one bundled libass worker (`player::ass`),
+buffer-feed. Every TEXT subtitle renders through the one bundled libass renderer (`player::ass`: a
+primary worker, plus up to two helpers while a moving cue is pipelined, each with its own libass instance),
 whether it is authored ASS/SSA, an embedded SubRip/WebVTT/mov_text/SAMI track or a sidecar `.srt`/`.vtt`:
-a text track gets a header `text_ass::header` synthesizes from the viewer's size and position picks, and
+a text track gets a header `text_ass::header` synthesizes from the viewer's size, position and colour picks, and
 its cues become ASS events (`text_ass::convert`, `ass_source::push_text`). Such a source has
 `Origin::Text`: it renders into the full logical screen, the screen lifts its bottom-anchored regions
-clear of the transport, and a change of the size or position pick restyles it. An authored ASS source is
+clear of the transport, and a change of the size, position or colour pick restyles it (a change among white and the grays does not: a gray is a draw-time tint). An authored ASS source is
 never moved. The old caption path is gone (`CaptionPlan`, `draw_subtitles`, the `SHARED.sub_cues`
 store, `active_subtitle*`): do not look for a second text renderer. Image subtitles
 (PGS/VobSub) keep their bitmap path. The one text the sidecar still draws itself is its failure notice
@@ -1135,22 +1218,52 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   `plex_run()` (`rust-modules/src/port.rs`, which runs `app::run_application`). `src/crashtrace.c`
   (+ `crashtrace.h`) — the **fatal-signal tracer**, its own TU so the signal path can be tested; `src/crashfmt.h` is its pure half. **Both halves are host-tested in
   `make check`** — `ci/crashfmt-test.c` grades the parsing, `ci/crashtrace-test.c` crashes seven
-  processes on purpose and checks the record AND the exit status. `src/starfish.c` — the
-  StarfishMediaAPIs C++/ACB seam. `src/svg.c` — nanosvg rasterizer. `src/sentry_context.c` — the
-  narrow C wrapper that keeps Sentry's opaque by-value object ABI out of Rust. These five are the
+  processes on purpose and checks the record AND the exit status, and probes another with the freeze
+  signal (`SIGUSR2`) to check it records and survives. `src/starfish.c` — the
+  buffer-feed StarfishMediaAPIs C++ seam. `src/video_plane.c` — shared ACB/exported-window binding. `src/svg.c` — nanosvg rasterizer. `src/sentry_context.c` — the
+  narrow C wrapper that keeps Sentry's opaque by-value object ABI out of Rust. `src/exit.c` — libc
+  `exit` defined in the executable (and exported by the link), so a shared library's `exit()` ends the
+  process through `plx_exit_record` in `src/crashtrace.c` (an async-signal-safe record, in the event
+  log and the crash log, naming the thread and the calling library, then the `exit_group` syscall,
+  or a park while a fatal signal's handler is running, which lets that crash end the process; not
+  through Rust's `exit_now`, which flushes under locks); `ci/exit-interpose-test.c` grades it on Linux. These seven are the
   entire normal C side (`gpdebug.c` is an opt-in allocator instrument). Reach for
   `/tmp/plxnative-crashtest=<segv|abrt|bus|ill|trap|panic|unwind>` to fault the app deliberately
   ON the television — `segv` is a real null write, `abrt`/`bus`/`ill`/`trap` are `raise`, `panic`
   panics inside an `extern "C"` callback, and `unwind` panics straight in `crash_on_purpose` so the
   unwind crosses `plex_run`'s own frame (`rust-modules/src/dev.rs`'s `crash_on_purpose` doc comment
   has the detail).
+  `/tmp/plxnative-freeze=<seconds>` (1 to 120) stalls the MAIN thread on purpose, once, on the
+  eighth heartbeat, to exercise the freeze probe (`dev::freeze_on_purpose`; the trigger file is
+  removed when it fires). A real freeze is a 5 s stall of the loop in the foreground: the watchdog
+  (`plx_base::task::watchdog`) sends `SIGUSR2` to the main thread, `freeze_handler` in
+  `src/crashtrace.c` writes a `*** FREEZE` record, the observer thread appends
+  `freeze-at: seq=<n> leg=<word>` to the crash log (the loop leg the main thread was in, one of
+  `LoopPhase::word`'s eleven words; `LoopPhases::enter` stores seven of them and `span_leg`, called
+  by `diag::spans::span`, the other four for the span's duration (`scen`, `pump`, `land`,
+  `dframe`; restored on return or unwind), in every build, `threadcheck` or not and the frame
+  instrument armed or not, so a release report says where the loop stood, a freeze inside the
+  playback pump included; the importer joins the two lines by probe
+  number whichever came first), and the next launch reports it
+  (`telemetry::crashreport`). The app is never stopped. A default (`threadcheck`) build aborts the
+  stalled main thread at 2 s, before the 5 s probe, unless `/tmp/plxnative-guard` contains `log`:
+  write `log` there before launching, or no freeze report is produced.
+  An `exit()` made by a firmware library (`src/exit.c`) writes a `*** EXIT status=<n> caller=0x…`
+  record to the event log and the crash log, and the next launch reports it as an `error` event
+  that is not a crash (`telemetry::crashreport`). An exit made in the foreground leaves its session
+  `abnormal`, like a freeze's; one made after backgrounding (the PLX-NATIVE-1P shape) finds no open
+  session, because backgrounding already ended it `exited` (`telemetry::session`), so only the
+  `error` event exists.
 - `rust-modules/src/` — the app core (Rust): `app/` (`mod.rs` the `run_application` shim + `struct App`, `boot.rs` the bring-up, `run.rs` the frame loop and its phase functions, `events.rs`/`input.rs` the input decode and key ladders, `lifecycle.rs`, `playback.rs`, `content.rs`, `bridge.rs` the seam onto the container and the ONE navigation vocabulary, `words.rs` the heartbeat's `route=`/`overlay=` alphabet — `nav.rs` is gone with `enum Route` since restructure phase 12), `system.rs` (wayland),
   and, in the media layer (`rust-modules/media/`, crate `plx_media`, which the application links),
   `player/` (buffer-feed engine + worker threads — **`rust-modules/media/src/player/CLAUDE.md` is the
-  playback deep-dive; read it before touching playback**), `ff.rs` (THE demuxer — the **bundled,
-  pinned** libavformat shipped beside the binary, *not* the TV's), `aq.rs` (the AU pipeline behind
-  `plx_net`'s HTTP socket, `rust-modules/net/src/stream.rs`; libcurl/TLS is `rust-modules/net/src/net.rs`),
-  `curlio.rs`, `hls.rs`, `abr/` and `route/`; and the Plex layer (`rust-modules/plex/`, crate `plx_plex`: `plex/` and `http.rs` — **its own
+  playback deep-dive; read it before touching playback**), `abr/` and `route/`, and `ff.rs`, which
+  re-exports `plx_media_codecs`' FFmpeg bindings and holds the integration fixtures.
+  `play-feed` owns the feed demuxer (`play-feed/src/ff.rs`, `plx_play_feed::demux`, over the **bundled,
+  pinned** libavformat shipped beside the binary, *not* the TV's), the AU queues and the HLS parser;
+  `media-codecs` owns the FFmpeg ABI and encoder;
+  `net::range_io` owns interruptible HTTPS byte ranges while media supplies credential authorization.
+  The Plex layer (`rust-modules/plex/`, crate `plx_plex`: `plex/` and `http.rs` — **its own
   `rust-modules/plex/src/plex/CLAUDE.md`**, which the rest of this file never pointed at: read it before
   adding a PMS query, and before assuming there is one server. There is a REGISTRY behind
   `client()` now — the app can hold a friend's shared server beside your own, each with its own
@@ -1158,7 +1271,7 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
 - `rust-modules/ui/src/` (workspace crate `plx_ui`) — **the UI, as a shared design system**: `theme.rs` tokens, the retui core
   (`lib.rs` `Painter`/`View`), reusable components (`widgets.rs`/`table.rs`/`label.rs`/`icons.rs`),
   and, since phase 9 (Player was the last), no legacy screens at all — every route mounts an owned
-  screen under `screens/` (`rust-modules/screens/src/`, workspace crate `plx_screens`). The player's drawing/state modules (`appkit/player_hud.rs`,
+  screen under `screens/` (`rust-modules/screens/src/`, workspace crate `plx_screens`). The player's drawing/state modules (`appkit/player_hud/`,
   `track_menu.rs`, `info_panel.rs`, `chapters_panel.rs`, `up_next.rs`, `more_menu.rs`,
   `timing_capsule.rs`, `skip_pill.rs`) and the Sources row model (`appkit/source_list.rs`) live in
   `rust-modules/appkit/src/` (workspace crate `plx_appkit`), the layer between `ui/` and `screens/` for
@@ -1193,10 +1306,11 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   the tree — see `no_log_call_site_interpolates_viewing_content`. Adding a `log(&format!(…))` that
   interpolates an item title, a search query or subtitle text will fail `make check`.
   Identities come from `plex::session::publish_identities`, PUSHED on load/save; the scrubber must
-  never call `session::peek()` from the log path — it is now cache-served, with a refresh queued to
-  `storage_worker` and no direct file I/O, but worker startup holds `storage_worker::SHARED` across
-  `task::spawn`, whose refusal logs. A `peek()` that schedules a refresh from that log tries to take
-  `SHARED` again and deadlocks; `CACHE` and `REFRESH` are released before queue admission.
+  never call `session::peek()` from the log path. `peek()` is a pure read of the cache (it submits
+  nothing, so it can no longer reach `storage_worker` from a log line), and the refill that once hid
+  behind it is the session owner's `RefreshCache` effect; but worker startup holds
+  `storage_worker::SHARED` across `task::spawn`, whose refusal logs, so a log line must not grow
+  a path back into the queue, and the scrubber stays fed by the pushed identities.
 - `rust-modules/base/src/task/blocking.rs` / `watchdog.rs` — frame scopes reject synchronous work.
   Tests keep catchable panics. Release guards log elapsed time once per label; the watchdog logs
   once above 250 ms and once on recovery, polling every 100 ms after the first present.
@@ -1241,20 +1355,25 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   pages; `metadata` reads go through `MetadataView`, which borrows from the owner (`&'a`), not
   a compatibility global or mailbox.
 - `rust-modules/base/src/dynlib.rs` — the runtime library binder (`dlopen`, by SONAME candidate list or
-  by absolute path). **Four** callers in a lab build and three in every other, each for its own
+  by absolute path). Its callers (`git grep -l 'dynlib! {' -- rust-modules` lists them), each for its own
   reason: `net.rs` binds **curl** by candidate list because its SONAME moves between releases;
-  `ff.rs` binds the **bundled FFmpeg** by absolute path because ours ships beside the binary, on
+  `media-codecs/src/ffi.rs` binds the **bundled FFmpeg** by absolute path because ours ships beside the binary, on
   no library search path — not because any
-  version varies; and `curlio.rs` binds **`curl_multi_*` in a SECOND table of its own**, from the
+  version varies; `player/ass.rs` and `gfx/src/rtl.rs` bind the **bundled libass-plx** the same way,
+  the subtitle surface and the UI text surface in two tables, each checking the facade ABI against
+  its own `NATIVE_ABI`, so a facade bump edits both;
+  and `net::range_io` binds **`curl_multi_*` in a SECOND table of its own**, from the
   same candidate list, because `load_into` is all-or-nothing and a set missing one multi symbol
   must still be able to SIGN IN. That table is frozen to the oldest supported set:
   `curl_multi_poll`/`curl_multi_wakeup` resolve on the dev Mac, are absent on the dev television,
   and first appear at webOS 7.4.0 — so binding them would have emptied this table on four of the
-  nine gated releases. The fourth is `plx_base::diag::zlib` (`rust-modules/base/src/diag/zlib.rs`), which binds **one** symbol — `compress2` — in
+  nine gated releases. `net::connect_only` binds `curl_easy_send`/`curl_easy_recv`/`curl_easy_getinfo` in a
+  THIRD libcurl table, from the same candidate list, so a libcurl without them loses only the WebSocket.
+  Another is `plx_base::diag::zlib` (`rust-modules/base/src/diag/zlib.rs`), which binds **one** symbol — `compress2` — in
   a table of its own so that a television without libz degrades to an uncompressed upload rather
   than emptying anybody else's table; it exists only in a `lab-diagnostics` build, which is not the
-  default set, so an ordinary binary really does have three. (**ACB** is the same idea but not this
-  module: `src/starfish.c` is C and does its own `dlopen`.) Replaced `stub/`, which is deleted.
+  default set. (**ACB** is the same idea but not this
+  module: `src/video_plane.c` is C and does its own `dlopen`.) Replaced `stub/`, which is deleted.
   `tools/fwcompat.py` grades the result;
   `docs/webos5-port.md` is the full account.
 - `docs/release-notes/` + `docs/release-audits/` — **the two halves of a release, split
@@ -1294,6 +1413,16 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   and queue is capped, and there is no filesystem serving or subprocess. `tools/plxnative-lab
   selftest` proves upload, ordered redelivery/ack and refusal paths on loopback with no television,
   and runs inside `make check`.
+- `tools/hud-dev` — **Player HUD authoring server** (host-side, python3 stdlib only; on a Mac run it with
+  `/usr/bin/python3`, the interpreter the application firewall allows by default; any other python is dropped
+  silently until its "allow incoming connections?" prompt is clicked, as for `tools/netcond.py` below):
+  `tools/hud-dev SOURCE --sim PATH [--port N]` packs a HUD source folder or `.plxhud` with `tools/hud_package.py` (the simulator's `--hud-pack`),
+  lints it with `--hud-lint` on every mtime change, serves the last CLEAN bundle on `0.0.0.0` at a
+  `http://<RFC 1918 address>:<port>/<name>.plxhud` it prints (and refuses to start without such an address), and
+  raises the served patch version on every clean change (numeric `MAJOR.MINOR.PATCH` is all the store compares). It
+  touches no TV: the TV side is Settings > Player HUD > Install from address, then Play on the HUD's row to fetch the
+  next build. `tests/test_hud_dev.py` (a stub simulator, loopback port 0) is in `ci/check-python-steps.txt`; the
+  recipe is `site/hud/AUTHORING.md`, "Developing a HUD on the TV".
 - `tools/netcond.py` — **network-conditioning TCP proxy** (host-side), for the failures a healthy LAN
   cannot produce. Sits between the TV and the PMS (`--listen 32499 --target 127.0.0.1:32400
   --allow-client <TV_IP>`; the PMS runs on the dev Mac) and makes the server misbehave on demand
@@ -1340,7 +1469,7 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   for a reason worth writing down rather than re-deriving.** The finding was recorded as
   `THREADJOIN timeline 6974ms` (`task::join` emits one NAMED line per join), so the attribution
   came from the instrument and not from inferring a total; and `timeline` is the only join that
-  COULD have parked whatever else was stalled, because `engine::teardown`'s step 1 deliberately
+  COULD have parked whatever else was stalled, because `route_start::teardown`'s step 1 deliberately
   wakes the other two before joining them — `http_shutdown` on the demux socket, `aq_abort` on
   both AU lanes — while the reporter's POST had no such wake, `stream`'s one-shot wrappers boxing
   their socket privately. The before and after were taken the same way, so the 14x is
@@ -1494,7 +1623,8 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   inside `is_back`, in `consts.rs` itself, beside the constant and the comment explaining it).
   Preserve this raw-offset reading if you touch input.
 - **Starfish/ACB ABI + bind-order rules** (the C++-from-C mangled-symbol seam, `Load` with
-  `uid=NULL`, the exact ACB bind sequence, sourceInfo-verbatim (one exception: PQ VP9 is rewritten to HDR10), never feed audio to ACB, the
+  `uid=NULL`, the exact ACB bind sequence, buffer-feed sourceInfo-verbatim (PQ VP9 is rewritten to HDR10;
+  the developer URI ACB fixture uses a separate experimental descriptor), never feed audio to ACB, the
   3-arg taskId ABI) — moved to **`rust-modules/media/src/player/CLAUDE.md`**; read it before touching
   playback or `src/starfish.c`.
 - **Wayland transparency** (`system.rs`)**:** the UI surface is forced to a 32-bit RGBA config and
@@ -1505,6 +1635,20 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   Background notifications revoke the borrowed Wayland handles and block presentation, including
   idle keepalives and queued uploads. DID foreground reacquires the handles and invalidates the
   UI before rendering resumes. A failed or non-Wayland query leaves both handles null.
+- **The compositor multiplies our surface by its alpha, so the frame over the bound video plane is
+  straightened** (`rust-modules/gfx/src/gfx/straighten.rs`, the module doc has the measurement, the
+  buffer-age argument and the cost). The framebuffer holds PREMULTIPLIED colour over the player's
+  transparent clear; the platform composites it as `ui.rgb * ui.a + video * (1 - ui.a)`. So the
+  frame's last draw on a frame that drew anything while `Player::video_plane_bound` is `rgb / a`
+  (alpha unchanged, blending off) over the boxes of the surface the frame drew into and nowhere else
+  (every draw call in gfx declares its extent, `Extent`; a draw with none is the whole surface; at
+  most 16 disjoint boxes, because a pixel two quads cover would be divided twice), in place through `GL_ARM_shader_framebuffer_fetch` /
+  `GL_EXT_shader_framebuffer_fetch` and through a copy of the frame when the driver has neither (the
+  simulator): `present_and_swap` calls it after the dev capture's read and before the swap. A bound
+  frame must therefore stay a COMPLETE redraw from a clear: nothing may blend premultiplied colour
+  over pixels a buffer kept. The simulator stands in for the compositor (`draw_under`, straight
+  alpha, over the decoded picture or black) on those frames. The boot log's `straighten:` line says
+  which program the device took.
 - **Deploy uses a tmp+mv dance** (`plxnative.new` → `mv`) so scp succeeds while the old binary is
   still executing (avoids `ETXTBSY`). The TV drops to standby after a few idle minutes, so a deploy
   can die mid-scp — when scripting around `make deploy`, md5-compare local vs on-TV binary after
@@ -1748,17 +1892,20 @@ behaviour; real GL copies, glyphs and presentation still need a device capture w
 > **Since 2026-08-22 there IS a lock, and it is enforced.** `tools/tv-lock.sh` holds a lease in a
 > directory ON THE TELEVISION (`/tmp/plx-tv.lock`, so it spans worktrees and machines, and outside
 > the `plxnative-*` prefix so it neither trips `dev::any_trigger_present` nor gets swept by a
-> teardown). **The `tv-lock` skill is the workflow** — acquiring and queueing, the two things the
-> lock CANNOT see (a human watching television, and a job started from a checkout without these
-> tools) together with the `fuser`-per-install and ssh-count pre-flight that is the only thing that
-> catches them, and when a lease is safe to break.
+> teardown). **The `tv-lock` skill is the workflow** — acquiring and queueing, what the lock
+> CANNOT see (a job started from a checkout without these tools, and a human watching television)
+> and the pre-flight that partly makes up for it: `fuser` per install, an ssh count, and an
+> IDLE / IN USE / UNKNOWN verdict from the foreground app, and when a lease is safe to break.
+> An `IN USE:` line from `acquire` or `status` is a warning to stop and tell the owner; `tv-lock.sh
+> with` and `tests/run.py` refuse to start on it unless `PLX_TV_IN_USE_OK=1` (only after the owner
+> said go).
 >
 > **You cannot skip it.** `tv-session.sh` (`up`/`key`/`click`/`shot`/`down`), `make deploy`/`run`/
 > `run-stream`/`kill`/`install`/`uninstall`, `tests/run.py` and `tools/capture-screen.sh` all take
 > it, and a **`PreToolUse` hook** (`.claude/hooks/tv-lock-guard.py`) refuses any Bash command that
 > reaches the set without a lease — including a raw `ssh root@…`, an `scp` into the app directory
 > and a `sshpass` one-liner. Read-only diagnostics are deliberately not blocked:
-> `tv-session.sh log|status`, `tools/crash-report.sh`, `make -s print-*`, and `tests/run.py --list`
+> `tv-session.sh log|status|fg`, `tools/crash-report.sh`, `make -s print-*`, and `tests/run.py --list`
 > (it returns before the lock, before any trigger is armed and before anything is deployed, so
 > the guard treats it as a status read — since UI-restructure phase 11). With nobody holding the
 > set a single command takes a short implicit lease rather than failing; **a SESSION should take a
@@ -1772,13 +1919,18 @@ behaviour; real GL copies, glyphs and presentation still need a device capture w
 > access to at most one and send every other lane to `make sim-macos` or `tools/sim.ps1`. Telling two prompts "you own the
 > television exclusively" is *not* a mutex — each is true when written and false the moment the
 > second one starts, which is the 2026-08-21 collision that was caught by luck rather than by
-> anything failing loudly. **A subagent proves which lane it is by prefixing
-> `PLX_TV_LOCK_LANE=<its worktree path>` on every device command it runs**, not by exporting the
-> variable once — the harness reports the SESSION's own checkout as that command's `cwd`
-> regardless of which worktree the agent is actually in, so `tools/tv-lock.sh` (which already
-> reads `PLX_TV_LOCK_LANE`) and the `PreToolUse` guard's `lane_from_command()` (which resolves the
-> prefix, then the hook's own environment, then `cwd`, in that order) have to agree on the same
-> per-command spelling for several subagents to multiplex the one set through the lock, one
+> anything failing loudly. **A subagent names which lane it is by prefixing
+> `PLX_TV_LOCK_LANE=<its worktree path>` on the device commands it runs**, not by exporting the
+> variable once — the harness reports the SESSION's own checkout as a plain subagent's `cwd`
+> regardless of which worktree the agent is actually in (only an `isolation: worktree` subagent
+> reports its own), so `tools/tv-lock.sh` (which already reads `PLX_TV_LOCK_LANE`) and the
+> `PreToolUse` guard have to agree on the lane. The guard's `decide()` gives each device segment the
+> first of: that prefix, the variable in the hook's own environment, the segment's absolute
+> `tools/` or `tests/` script path (or `make -C <dir>`), an absolute `cd <dir>` the shell certainly
+> kept, then `cwd`'s checkout; a lane read from a path or a `cd` that is not the `cwd`'s own also
+> needs the caller's session in the lease's `SESSIONS`. The prefix is always correct and the one
+> source for a relative script path or a `cd "$W"`; a lane of its own per subagent is what lets
+> several of them multiplex the one set through the lock, one
 > `tools/tv-lock.sh with --ttl N --wait S -- <one test>` lease per test run.
 >
 > The skill carries the rest: the shared stash stack that hands one lane
@@ -1790,16 +1942,17 @@ behaviour; real GL copies, glyphs and presentation still need a device capture w
 There **is** a host unit suite, and it is not the real gate — both halves matter, and conflating
 them is how this section used to be wrong in three files at once.
 
-**Tier 1 — `make check` (host).** `cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens` (a bare `cargo test --lib` runs the application crate only and skips every layer crate: `plx_base`, `plx_machine`, `plx_platform`, `plx_gfx`, `plx_net`, `plx_ui`, `plx_plex`, `plx_telemetry`, `plx_data`, `plx_session`, `plx_media`, `plx_appkit`, `plx_screens`) runs the whole
-host suite on the dev Mac, no TV involved — and `make check` runs it a SECOND time under
-`--features hostsim`, because the host feed seam only exists there and the tests that need it are
-compiled out of the first pass (see the build section). **Treat every test COUNT in this section as
+**Tier 1 — `make check` (host).** `cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens` (a bare `cargo test --lib` runs the application crate only and skips every layer crate: `plx_base`, `plx_machine`, `plx_platform`, `plx_gfx`, `plx_net`, `plx_ui`, `plx_plex`, `plx_telemetry`, `plx_data`, `plx_session`, `plx_media`, `plx_appkit`, `plx_screens`) runs the whole
+host suite on the dev Mac, no TV involved — and `make check` runs the crates that declare `hostsim`
+(`HOSTSIM_SUITE`, a subset of that list) a SECOND time under `--features hostsim`, because the host
+feed seam only exists there and the tests that need it are compiled out of the first pass (the build
+section's paragraph on the two passes says which crates are left out and why). **Treat every test COUNT in this section as
 already wrong, including the one in this sentence.** 386 measured 2026-08-13; 284 on 2026-08-02; a
 documented 59 before that, which was five times stale before anyone noticed — and the first version
 of this paragraph was stale within one *commit*, because two agents were adding tests to the same
 batch that documented it. Three numbers have now rotted here, so do not add a fourth: the only
 count worth having is the one you take yourself, with
-`cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens -- --list | grep -c ': test'`. **The per-module counts
+`cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -- --list | grep -c ': test'`. **The per-module counts
 below have the same disease and are worse**, because a stale one reads as precise rather than round
 — several were written when the module was a third its present size, and two bullets have now
 outlived the file they named: `ui/home.rs` (retired to `screens/home/`) and `route.rs` (split in
@@ -1862,7 +2015,7 @@ you get without waking a television. What it covers today, by module:
   `plx_base::testlock::serial()` (one lock per test binary: `plx_data`'s tests and the application's each have their own) — not because its own state is global any more (`MetadataState` and
   `MetadataAdapter`, detail and season mailboxes included, are per-owner fields now, like the other
   five stores), but because `set_current_for_test`'s `assert_held` enforces the SAME
-  lock the genuinely-still-global seams (route's play mailbox, the player's SHARED block) also
+  lock the genuinely-still-global seams (route's play mailbox, the Feed backend's `FEED_SHARED` block) also
   take, and the convention is one lock, not one per module. Browse, Hubs, Metadata, Person, Search
   and ViewState are all owned now: a production `Bridge` owns each store's state, adapters and
   notices, so separate owners share neither state nor landings; their fixtures use explicit
@@ -1897,9 +2050,9 @@ navigation, every screen, and the whole Plex data layer.
 **On macOS, since 2026-08-28 it STREAMS — real HTTP, real demux, real HLS, the real adaptive
 controller.** `make sim-macos` builds a HOST copy of the same bundled FFmpeg 9.0 from the same
 `ci/build-ffmpeg.sh` component list (`HOST=1`, into `vendor/ffmpeg-prefix-host`, staged into
-`pkg/` as `libavformat-plx.63.dylib` beside the ARM `.so.63`), and `ff.rs` carries a second ABI
+`pkg/` as `libavformat-plx.63.dylib` beside the ARM `.so.63`), and `media-codecs/src/ffi.rs` carries a second ABI
 table selected on `target_pointer_width` with `ci/ffabi-assert.c` holding both. Arm
-`plxnative-clocksink` (`player/ffi_host.rs` — AUs accepted and discarded, a presentation clock
+`plxnative-clocksink` (`play-feed/src/ffi_host.rs` — AUs accepted and discarded, a presentation clock
 clamped to the last fed PTS, position reported at the television's measured 5 Hz) and the whole
 pipeline between the socket and the decoder runs on the Mac: both AVIO transports, `ff.rs`'s
 demux, the AU queues and their byte-cap backpressure, the feed-ahead throttle, rung transactions,
@@ -1936,14 +2089,28 @@ gone. The remote FIFO's key and `ck:` tokens are safe because every field they s
 to Starfish/ACB, so playback correctness — and every pixel-level and perf question — is only
 observable as behavior on the TV. **Wake the TV first** (`wake-tv` skill) — asleep, every assertion
 fails as "no line found", which reads exactly like a total regression. **The panel rule (the
-owner's standing directive, restated 2026-09-07):** the television's PANEL is **OFF and the sound
-is OFF for EVERY device run** — the playback tiers, the fps scenes, `shot` and capture alike; the
-set is in a living room. The owner's statement is that rendering continues with the LCD off, so an
-fps scene graded under `screen off` is a real measurement; the 2026-09-06 form of this rule (panel
-ON for fps, on the reasoning that `plx_machine::idle` gates presents on what the panel shows) is SUPERSEDED,
-and the one number still owed is a same-session `fps=` comparison of one scene screen-on vs
-screen-off, to be taken at the next device session and written here. `tests/run.py --fps` says so
-in its banner; the command is `tools/tv-session.sh screen off` (a PANEL state, not an app state —
+owner's standing directive, amended 2026-10-24):** the sound is **OFF (muted) for EVERY device run**,
+and the panel is **OFF by default for every device run, `--fps*` and `profile-tv` included** (the set
+is in a living room). The panel is only the backlight: `turnOffScreen` darkens the picture and the
+app keeps presenting at full rate. Nothing in the app reads the panel state (a search of
+`rust-modules/` and `src/` for `tvpower`, `turnOffScreen`, `screenOn` and `getPowerState` finds no app
+code), and `plx_machine::idle` gates presents on the UI's own changes ("nothing on screen changed, so
+don't repaint it"), not on the physical panel. The owner on 2026-10-24: "This is just a backlight …
+keep the screen off". Measured that day on the dev TV (Home `grid-pong` fps scene, release build):
+panel OFF gave 73 presented frames per cycle at 59.9 fps and 9 missed refreshes in cycles 2-60;
+panel ON controls gave 73 frames per cycle at 59.6-59.9 fps and 8, 13 and 14 misses, so the panel
+state changes neither pacing nor misses. `tests/run.py --fps --mock` therefore asserts `screen off`
+before every scene (`--panel on` lights it for a run someone wants to watch). This replaces the
+2026-10 form ("ON for every smoothness / fps run, because a dark panel lets `plx_machine::idle` hold
+presents back"), which that measurement contradicts, and the 2026-09-07 form before it ("panel OFF for fps
+too, rendering continues with the LCD off"), which named the same-session screen-on vs screen-off
+`fps=` comparison as owed — the 2026-10-24 measurement is that comparison. **Capture with the panel
+off:** `shot` (the DISPLAY compositor read) is on record as working: `docs/measurements/
+tv-session-7-2026-09-10.md` ran `screen off` first and got a 1920x1080 DISPLAY capture with real
+pixel values (opener p95 246.9 against a row-mate's 167.0), and `docs/measurements/
+library-all-types-and-fps-2026-09-26.md` checked native captures with the panel off. **Not on
+record:** the live capture stream (`/tmp/plxnative-capture`, the app's own GLES frames) with the
+panel off; check its first frame instead of assuming either way. The command is `tools/tv-session.sh screen off|on` (a PANEL state, not an app state —
 the app keeps running and playback keeps decoding). The sound half is now the same shape of
 command: `tools/tv-session.sh sound off|on|status` calls `com.webos.service.audio/setMuted` and
 reads `getVolume` back to confirm — this is the sanctioned path, so no lane needs
@@ -1992,14 +2159,20 @@ resume, the `/:/timeline` reporter — which is also why it needs somebody's lib
 It needs a TV address and nothing else — no token, no ratingKey, no `manifest.local.json`, no
 sharing — so it is the only tier a stranger can run, and it is what separates "the player is
 broken" from "the library layer is broken" when a server case fails. **What it covers, precisely:**
-the player feeds `{h264,hevc}` (plus `av1` / `vp9` on a set whose codec table lists that decoder's row) × `{aac,ac3,eac3,dts}` in mkv/mp4/m4v. Auto intersects this
-software set with the device table and per-codec channel ceilings; DTS requires a measured
+the player feeds `{h264,hevc}` (plus `av1` / `vp9` on a set whose codec table lists that decoder's row) × `{aac,ac3,eac3,dts}` (plus `flac`, `alac` and `pcm`, decoded in the app and fed as PCM) in mkv/mp4/m4v. Auto intersects this
+software set with the device table, per-codec channel ceilings and a 48 kHz sample-rate ceiling on the
+codecs `devcaps::audio_rate_bounded` names (`devcaps::AUDIO_RATE_CEILING`, #951; not DTS, TrueHD, nor FLAC, ALAC and LPCM,
+which the app resamples to 48 or 44.1 kHz itself, `devcaps::pcm_load_rate`; a 5.1 hi-res track still converts on the server); DTS requires a measured
 DTS row and feeds only the DTS core when an HD extension is present. PMS names DTS `dca`:
 `devcaps::audio_codec_id` folds it (and `ec-3`) onto the pipeline's `dts` at membership and at
 the Load payload, and the profile sends `dca` (`transcoder.rs::profile_codec_name`). Force
-Direct Play admits DTS only when the table has a DTS row with channels (`Caps::forced_admits_dts`)
-but skips the channel ceiling. The implemented Load
-strings are `H264`/`H265`/`AV1`/`VP9` (AV1 and VP9 only on a set whose table lists that decoder; elsewhere the Load is refused) and `AC3`/`AC3 PLUS`/`AAC`/`DTS`; these are not the firmware's whole
+Direct Play admits DTS natively only when the table has a DTS row with channels (`Caps::forced_admits_dts`)
+but skips the channel ceiling; where the set has no native path for a lossy track whose row has TV evidence
+(`devcaps::AppDecoded::measured`: DTS), Force Direct Play decodes it in the app instead, as stereo, for a track
+of at most two channels only: the app never mixes a source of more than two channels down to stereo by default, so a
+surround track there is refused like any unplayable one (`Caps::app_decodes_lossy_track`, `Caps::app_may_mix_down`,
+`devcaps::app_decode_mixes_down`). The implemented Load
+strings are `H264`/`H265`/`AV1`/`VP9` (AV1 and VP9 only on a set whose table lists that decoder; elsewhere the Load is refused) and `AC3`/`AC3 PLUS`/`AAC`/`DTS`, plus `PCM` for FLAC, ALAC and LPCM decoded in the app (and for the lossy rows the attempt decodes in the app: DTS where Force Direct Play has no native path (a stereo track only) or the failed-open ladder's last rung asks for it (a surround track only after the server conversions, the manual encode included, were refused), and every lossy row, MP3, Vorbis and TrueHD included, on a debug build with `/tmp/plxnative-appdecodelossy`; those three have no TV measurement, so a release build does not offer them); these are not the firmware's whole
 vocabulary. The six AC3/EAC3/AAC combinations and H264/DTS are covered
 here, plus DV 8.1, both containers, in-place seek in each, and the FRAME-RATE axis added the same
 day (`pipe_h264_1080p5994` is the only fixture that reaches `fps_rational`'s 1001-denominator
@@ -2011,12 +2184,14 @@ raster alone, each grading `expect.video_size` EXACTLY out of the `ff:` line rat
 floor — which is what stopped the item being answerable only as "pieces are covered", and which
 closed the `4k-h264` library gap on this tier (`8-bit-hevc` was already closed by
 `pipe_hevc_aac_mp4` and the gap list had not caught up; a generated clip closes neither gap's real
-half, which is a PMS DECISION on such an item). The same day added the one clip in
+half, which is a PMS DECISION on such an item). The same day added the first clip in
 either pack that is MEANT to run out (`pipe_finish_eos` and `pipe_replay_after_eos`, 20 s), which
 is #46 END TO END — the second of those restarts the finished stream through
 `/tmp/plxnative-replay[=N]`, a bounded counter re-arming `app.rs`'s one-shot autoplay latch, and
 grades the re-entry COUNT, a second `load:` line, a second fetch off the fixture server and a
-media position that falls and then climbs. Still
+media position that falls and then climbs. A second such clip followed for #865,
+`pipe_h264_ac3_audio_tail` (a film whose audio outlasts its picture, ended by the pipeline's own
+end-of-stream; `pipe_finish_audio_tail`). Still
 uncovered: HLG, HDR10+, DV P5/P7, Atmos, the
 4096-wide edge and any refusal above it, a USER-driven replay (a Play control on a detail page is
 server-tier by construction), and the transcode INPUT space
@@ -2025,12 +2200,13 @@ gap — `devcaps` reads the table's `maxFrameRate` only into the per-codec rows 
 envelope clamps against (since 2026-09-03), so the profile sent to PMS still bounds no frame rate
 at all. Three things about it
 are worth knowing before reading a result. **(1)** The declaration is the interesting half and the
-main false-PASS risk: `engine`'s `_ =>` arm maps an unrecognised AUDIO codec to `"AC3"`, but the video side no longer
-defaults: `LoadVideo::of_stream` is case-insensitive, `""` and `h264` are the only H264, `hevc`/`h265`, `av1` and `vp9` get their own
+main false-PASS risk: an unrecognised AUDIO codec (`""` included) no longer defaults to `"AC3"`
+(`plx_play_feed::audio_payload_codec`'s `_ => None` arm gives it no payload name, and the Load is refused with an
+`unsupported audio codec` log line), and the video side no longer defaults either: `LoadVideo::of_stream` is case-insensitive, `""` and `h264` are the only H264, `hevc`/`h265`, `av1` and `vp9` get their own
 payloads (`av1` and `vp9` only where the device's codec table lists the row, otherwise the Load is refused), and any other `vcodec` in a
-`playurl` declaration refuses the Load with a log line naming it. So a trigger that was never read (`""`) still produces exactly the right
-payload for the AC-3 baseline case — which is why the matrix carries cases expecting
-`"AC3 PLUS"` and `"AAC"`, and why the engine now logs one `load: v=… a=… fps=… dv=… atmos=…` line
+`playurl` declaration refuses the Load with a log line naming it. So a trigger that was never read (`""`) declares H264 and is refused
+at the audio step, and the matrix carries cases expecting
+`"AC3 PLUS"` and `"AAC"` because the declaration decides those names; the engine now logs one `load: v=… a=… fps=… dv=… atmos=…` line
 per streamed playback (the only place an event log says what the app told the television the stream
 WAS, as opposed to what the demuxer found in it). **(2)** `python3 -m http.server` is DISQUALIFIED
 and the failure is silent: the AVIO seeks by reopening with `Range: bytes=N-`, `stream.rs` accepts
@@ -2119,11 +2295,15 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   through it once the route no longer gets a free pass.
 - **The heartbeat's WIRE ORDER, since phase 11** (`rust-modules/base/src/diag/heartbeat.rs::heartbeat_tail` is the one
   definition; anything here that disagrees with it is this file being stale):
-  `loop= route= [overlay=] [pos= play=] [vtick= vgap=] fps= [load= snap= period=] [worstframe=
+  `loop= route= [overlay=] [section=] [pos= play=] [vtick= vgap=] fps= [load= snap= period=] [worstframe=
   worstprep=] carried= dropped= budget=<admitted>/<refused>[/solo:<class>] evicted_hot= [rec=]
   [sim=1]`. **Nothing may be inserted ahead of `fps=` or `worstframe=`** — `tests/run.py`'s
   `FPS_RE` and `WORST_RE` anchor on `loop=`/`route=`/`overlay=` and then reach forward with a lazy
-  `.*?`, so appending is free and inserting is not. The bracketed pairs are conditional;
+  `.*?`, so appending is free and inserting is not. `section=<chapters|info|chapters_info>` is the player page's
+  open HUD section (`app/words.rs::section_word`), printed right after `overlay=` only while one is open; a
+  section is the page's state and not a surface, so `overlay=` stays the topmost modal surface's name (`none` over
+  a bare player) and a scene that needs a section carries its own `"section"` key (`tests/run.py::select_section`).
+  The bracketed pairs are conditional;
   `worstframe=`/`worstprep=` need `plxnative-framedrop`, and the four frame-plan fields do NOT —
   they print in every build, because each is a counter its owner already keeps rather than a
   measurement anybody pays for. `budget=`'s `/solo:<class>` third field appears only when a solo
@@ -2154,11 +2334,13 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   a loop rate as a frame rate. Analysis docs under `docs/` still quote the old names against the
   line numbers of their day and carry a mapping banner instead of being rewritten.
 - **The once/sec `loop=` heartbeat carries `pos=<s>` while frames are presenting** — the same
-  `SHARED.playpos_ns` the 10s `/:/timeline` reporter posts, sampled at 1 Hz. The harness grades
+  `FEED_SHARED.playpos_ns` the 10s `/:/timeline` reporter posts, sampled at 1 Hz. The harness grades
   playback progress from it (`progress_secs`), because observing a 15s climb through 10s samples
-  costs ~30s of playback. It is gated on `player::is_playing()`, not `is_started()`: a direct-play
-  resume does not seed `playpos_ns` (only the transcode branch does), so the pre-roll would log a
-  0 and a 0→600 step reads as 600s of "climb" in one second — a false PASS.
+  costs ~30s of playback. It is gated on `player::is_playing()`, not `is_started()`: both resume
+  paths seed the playhead with their target before the first frame (`arm_open` for direct play,
+  `Rebase` for a transcode), so the pre-roll reads the target, and only a presented frame vouches
+  that playback got there; ungated, a resume or seek that never lands would read as playback that
+  climbed — a false PASS.
   **Beside it since 2026-08-27 is `play=<pm>`: media time advanced per WALL millisecond, in per
   mille — 1000 is the film running at speed and 670 is it crawling — and it is the ONLY field on
   that line that can see a slow film.** `fps=` counts our GL swaps and sits at 60 through a stream
@@ -2206,7 +2388,9 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   prove.
 - **Screen capture:** `tools/capture-screen.sh [out.png] [DISPLAY|VIDEO|GRAPHIC]` grabs the panel
   output. `DISPLAY` = video plane + UI composited (use this); `VIDEO`-only failing with "no
-  signal state" is itself a diagnostic that nothing is decoded on the video plane.
+  signal state" is itself a diagnostic that nothing is decoded on the video plane. `GRAPHIC` of a
+  frame over the bound video plane holds STRAIGHT colour (the straighten pass divided it by its alpha,
+  so a translucent pixel reads brighter than what the app drew); only `DISPLAY` is the picture.
 - **Perf gates:** `./tests/run.py --fps` runs the UI-tier FPS regression scenes (gates per scene in
   `tests/manifest.json`; `--fps-player` adds the player tier), asserting the app's once/sec
   heartbeat. **Six assertions in three families. Three RATE gates — and picking the wrong one is how a frozen
@@ -2231,10 +2415,8 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   oscillator added or taken away. A scene with no motion and only a `loop_floor`
   gates nothing — **`home-hero` carries an `_idle_gate_note` saying exactly that, and it is the only
   one left**; this line said "three" long after the other two (`home-grid`, `library-scroll`) were
-  given oscillators and real `fps_floor`s, which is the fix that note asks for. The other three
-  `loop_floor`-only scenes are the player-tier overlays (`info-panel`, `track-menu`, `chapters-panel` — take the list from `./tests/run.py --list --server`, not from here) and need no note, because
-  the video plane stays bound for the whole scene, so `fps=` grades neither an animator nor an
-  idle screen. Every run also reports
+  given oscillators and real `fps_floor`s, which is the fix that note asks for. The other `loop_floor`-only scenes need no note: the video plane stays bound for the whole scene, so `fps=` grades neither an animator nor an
+  idle screen. Take the list from `./tests/run.py --list --server`, not from here. Among them, `info-panel` and `chapters-panel` are HUD sections of the player page (they pin `overlay=none` and a `section` word), and `track-menu` is still an overlay. Every run also reports
   **`drift`** (last-third minus first-third mean): sorting used to destroy sample ORDER, so a
   monotone 60→53 decay and a flat 53 were byte-identical output. It is reported, never asserted —
   18–36 s is far too short to gate a thermal ramp on, and **the "the panel thermally throttles"
@@ -2289,7 +2471,7 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   tool here reports as "no line found", i.e. exactly like a total regression. Why any of it:
   **`docs/two-installs.md`**.
   **The catalog is the source, not this list** — get the real one with
-  `{ grep -rhoE '/tmp/plxnative-[a-z0-9]+' rust-modules/src rust-modules/media/src rust-modules/appkit/src rust-modules/screens/src src | sed 's|.*/||'; grep -rhoE 'devtrig::(flag|read)\("[a-z0-9]+"' rust-modules/src rust-modules/media/src rust-modules/appkit/src rust-modules/screens/src src | sed 's/.*("/plxnative-/;s/"$//'; } | sort -u`.
+  `{ grep -rhoE '/tmp/plxnative-[a-z0-9]+' rust-modules/src rust-modules/*/src src | sed 's|.*/||'; grep -rhoE 'devtrig::(flag|read)\("[a-z0-9]+"' rust-modules/src rust-modules/*/src src | sed 's/.*("/plxnative-/;s/"$//'; } | sort -u`.
   **Both halves are needed**: a path literal only ever appears in a COMMENT now, and four triggers
   (`grid`, `h265`, `playidx`, `ptype`) are named nowhere but their `devtrig::flag`/`devtrig::read` call, so
   the path grep alone silently under-reports. This line carried that grep alone and called it
@@ -2368,7 +2550,22 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   at each playback start, no relaunch: while a plain remux plays with no subtitle selected, a side
   reader demuxes the Part's subtitle packets over a fresh-session range read and the client
   renderer draws that track; logs `subside: open|anchor|reopen|failed|stop …`, never a URL, token
-  or session; `media::player::subside`, `ff_subside.rs`),
+  or session; `plx_play_feed::side_reader`, `media::player::subside`, `ff_subside.rs`),
+  `/tmp/plxnative-uriprobe[=load|late|none|drive]` (the webOS 5+ URI-mode probe, issue #1064: the
+  next Play hands its stream URL to `com.webos.media` over the platform bus instead of building an
+  Engine, to learn whether the exported window id is honoured and where it may go. The content
+  picks the variant: empty or `load` puts `windowId` in the `load` payload, `late` sends it with
+  `setWindowId` after `loadCompleted`, `none` sends no window at all, and `drive` binds like `load`
+  and then exercises the transport — pause, resume, a seek 20 s ahead, a text and an audio
+  `selectTrack`, `setSubtitleEnable` — logging the position before and after each, so the summary
+  says whether the pipeline accepts them; text naming no variant leaves the probe unarmed and the
+  play normal. After the variant, `bpsstart=N`, `bpsmax=N` and `bpsmin=N` (bit/s, each 1 to
+  1000000000, at most once, space separated, e.g. `load bpsmax=720000`) put the native
+  adaptive-streaming seed and limits into the `load` option as `adaptiveStreaming.bps.{start,maximum,minimum}`
+  and onto the `armed` line; any other token leaves the probe unarmed. Read at each playback start, no relaunch; skipped for a hero preview. No Engine
+  runs, so nothing is reported to Plex (no timeline, scrobble or unscrobble). The event log gets `uriprobe: …` lines ending in one `summary` line, never the URL,
+  token, host or a service payload; a tester sends those lines and removes the file.
+  `dev::DIAG`, so it does not move the boot screen; the play-uri crate's `uriprobe` (the machine), `dev::uriprobe` (the application's driver over it), `media::player::uriprobe_drive` (its route half and port)),
   `/tmp/plxnative-url` (override the streamed part
   URL) and **`/tmp/plxnative-playurl`** (the same, plus the LOAD DECLARATION — one JSON object,
   `{"url":…,"vcodec":…,"acodec":…,"fps":…,"dovi":{…},"atmos":…}`, which is what the pipeline test
@@ -2386,8 +2583,8 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   `/tmp/plxnative-autoplay` (auto-press OK for headless capture), `/tmp/plxnative-autoseek` (empty =
   one seek to 140s; else a seek script: optional `gap=<ms>` + comma steps, absolute `120` or
   tap-relative `+10`/`-10` — rapid-burst seek testing), `/tmp/plxnative-ptype` (ACB playerType
-  bisect knob), `/tmp/plxnative-holdload[=ms]` (sleep `ms` — default 30000 for a bare/empty
-  trigger — on `threads::load_thread` right after the real `sf_load` call returns and BEFORE the
+  bisect knob for Feed's handle; the URI engine's handle is always player type 0), `/tmp/plxnative-holdload[=ms]` (sleep `ms` — default 30000 for a bare/empty
+  trigger — on `native_load::load_thread` right after the real `sf_load` call returns and BEFORE the
   Load-returned flag publishes, making issue #74 D.1's budget observable on demand: the pump's
   `deferring` line, then, past `NATIVE_LOAD_BUDGET`, the failure read-out; NOT `DIAG`, since it
   changes playback behaviour), `/tmp/plxnative-marker[=intro|credits]` (once playing, seek to 5s before that
@@ -2425,8 +2622,7 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   within seconds — and two comparisons were silently mis-paired that way before it did.
   And the Library browse set: `/tmp/plxnative-library[=N]` (boot straight into the
   library on section N), **`/tmp/plxnative-libosc`** (a perpetual focus sweep of that library's
-  whole DOCUMENT — the library pill strip at the head where there is one (two or more eligible
-  libraries; a lone favourite draws no selector at all), each published shelf, the grid's control
+  whole DOCUMENT — the favorite library strip and persistent Library options at the head, each published shelf, the grid's control
   row, then the poster grid — reversing at the document's own ENDS rather than on a clock, which is
   the one
   oscillator here that does. The owned Library handles `LibraryCmd::Sweep`; the rule dates to
@@ -2521,7 +2717,7 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   modes, **MPEG1-in-TS** (default) and **JPEG/PXFR** (fallback); `stream-screen.py --source
   app|auto` consumes either and its page switches itself. Both encoders and the measured numbers
   are documented where they live — `capture.rs`'s module doc (slots, wire formats, fd ownership)
-  and `ff.rs`'s `venc` section (the device-verified FFmpeg ABI offsets + the RGBA→NV12-NEON
+  and `media-codecs/src/venc.rs` (using `media-codecs/src/ffi.rs`'s verified FFmpeg ABI offsets and the RGBA→NV12-NEON
   colorspace path). `make deploy` also ships the NDK's NEON libjpeg-turbo next to the binary
   best-effort, which JPEG mode dlopen's).
   **Any `plxnative-*` file in the install's runtime root marks the boot as automated and suppresses

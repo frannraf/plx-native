@@ -4,13 +4,15 @@
 //! The setting is published the way the write door ends (`restore_under_posters`, the cell's own
 //! door: the storage worker's publish is refused a process global by the test lock), and the grade
 //! is what the product DRAWS for the focused poster (`World::drawn`, text read off the recording
-//! painter): the title line follows the Title switch, the second line the Details picker, and a
-//! Continue Watching tile keeps its time-left line under every details kind but Nothing.
+//! painter): the title line follows the Title switch, the second line the Details picker. The
+//! Continue Watching deck is the exception, in two shapes: Recommended's poster deck keeps its
+//! time-left line under every details kind, Nothing included, and Home's deck is a row of stills
+//! (`captions::NOTHING_UNDER_STILLS`) that carries no caption block under any setting.
 
 use super::*;
 use super::home_chrome_route_tests::{home_shelves_of, TITLES};
 use super::test_support::World;
-use plx_plex::plex::session::{UnderPosters, UnderPostersDetails as Details};
+use plx_plex::plex::session::{UnderPosters, UnderPostersLadder as Details};
 
 /// Holds the live setting on its default for the test and puts it back after it.
 pub(super) struct Cell;
@@ -46,7 +48,7 @@ const VIDEO: &str = "1080p \u{b7} HDR";
 fn left() -> String { plx_ui::fmt::time_left(80 * 60 * 1000) }
 
 pub(super) fn set(w: &mut World, title: bool, details: Details) {
-    plx_media::route::restore_under_posters(UnderPosters { title, details });
+    plx_media::route::restore_under_posters(UnderPosters { title, details: details.movie_parts(), show_details: details.show_parts(), sort_value: false });
     w.frames(60);
 }
 
@@ -65,8 +67,24 @@ const TABLE: [(bool, Details, Option<&str>); 8] = [
 
 fn home(resume: bool, name: &str) -> World {
     let mut w = World::home_with_disc(name, [7; 12]);
-    plx_data::pms::edit_test_item(w.bridge.stores.hubs.state_mut(), "1", &|m| { facts(resume)(m); m.title = "Heat".into(); });
+    plx_data::pms::edit_test_item(w.bridge.bridge().stores.hubs.state_mut(), "1", &|m| { facts(resume)(m); m.title = "Heat".into(); });
     w.frames(30);
+    w.press(Key::Down);
+    w.frames(60);
+    w
+}
+
+/// Home as a library has it: the Continue Watching deck (row 0, a row of stills) above a Recently
+/// Added poster shelf (row 1, `r1`..`r3`), focus on the shelf's first poster, which is "Heat" and
+/// carries the facts of [`facts`]. The captions the Under posters setting words are the POSTER
+/// shelf's: the deck above it draws none of its own (its footer stands on the still).
+fn home_poster(name: &str) -> World {
+    let mut w = World::home_with_disc(name, [7; 12]);
+    w.bridge.bridge().stores.hubs.seed_deck_home_for_test(1);
+    w.frames(30);
+    plx_data::pms::edit_test_item(w.bridge.bridge().stores.hubs.state_mut(), "r1", &|m| { facts(false)(m); m.title = "Heat".into(); });
+    w.frames(30);
+    w.press(Key::Down);
     w.press(Key::Down);
     w.frames(60);
     w
@@ -74,7 +92,7 @@ fn home(resume: bool, name: &str) -> World {
 
 #[test]
 fn home_shelves_caption_the_focused_poster_per_the_stored_setting() {
-    let mut w = home(false, "cap-home");
+    let mut w = home_poster("cap-home");
     let _cell = Cell::default();
     for (title, details, line) in TABLE {
         set(&mut w, title, details);
@@ -84,51 +102,14 @@ fn home_shelves_caption_the_focused_poster_per_the_stored_setting() {
 }
 
 #[test]
-fn a_continue_watching_tile_on_home_keeps_its_time_left_line() {
+fn a_continue_watching_still_on_home_carries_no_caption_block() {
     let mut w = home(true, "cap-home-deck");
     let _cell = Cell::default();
     for (title, details, _) in TABLE {
         set(&mut w, title, details);
-        // The deck's details line is the time left, not the picked fact, and is always shown: Details
-        // Nothing included (the owner's 2026-10-22 call).
-        let left = left();
-        let want: Vec<&str> = title.then_some("Heat").into_iter().chain([left.as_str()]).collect();
-        assert_eq!(w.drawn().caption_lines(), want, "title {title}, details {details:?}");
-    }
-}
-
-/// **The amber play mark leads the FIRST line drawn whenever OK plays the deck card**, read off the
-/// frame the page draws (`Drawn::marks`, since a host paints no icon): the title when the Title switch
-/// is on, else the time-left line; Title Off with Details Nothing draws no line and so no mark; and a
-/// deck whose OK opens the page (the default) draws none under any setting.
-#[test]
-fn the_play_mark_leads_the_first_line_drawn_whenever_ok_plays_the_deck_card() {
-    use plx_media::route::{deck_press, restore_deck_press, DeckPress};
-    struct Back(DeckPress);
-    impl Drop for Back {
-        fn drop(&mut self) { restore_deck_press(self.0); }
-    }
-    let mut w = home(true, "cap-home-mark");
-    let _cell = Cell::default();
-    let _back = Back(deck_press());
-    for press in [DeckPress::Play, DeckPress::Details] {
-        restore_deck_press(press);
-        for (title, details, _) in TABLE {
-            set(&mut w, title, details);
-            let drawn = w.drawn();
-            let lines = drawn.caption_lines();
-            let setting = format!("{press:?}, title {title}, details {details:?}");
-            let marked = press == DeckPress::Play && !lines.is_empty();
-            assert_eq!(drawn.marks.len(), usize::from(marked), "{setting}: the mark is drawn exactly when OK plays and a line is: {lines:?}");
-            let Some(mark) = drawn.marks.first() else { continue };
-            // the first line drawn is the block's topmost run; the mark hangs left of it, on its line
-            let first = drawn.runs.iter().filter(|run| run.label)
-                .min_by(|a, b| a.at.y.total_cmp(&b.at.y)).expect("a block with a mark has a line");
-            assert_eq!(first.text, lines[0], "{setting}");
-            assert!(mark.x + mark.w <= first.at.x + 1.0, "{setting}: the mark {mark:?} hangs left of {:?} {:?}", first.text, first.at);
-            let line_mid = first.at.y + first.at.h.max(first.size as f32) * 0.5;
-            assert!((mark.cy() - line_mid).abs() < first.size as f32, "{setting}: the mark {mark:?} stands on its line (y {line_mid})");
-        }
+        // The deck is a row of landscape stills (2026-11 handoff): its footer stands ON the tile,
+        // so no caption line hangs under it whatever the Under posters setting says.
+        assert!(w.drawn().caption_lines().is_empty(), "title {title}, details {details:?}: {:?}", w.drawn().caption_lines());
     }
 }
 
@@ -149,7 +130,7 @@ fn the_focused_title_is_one_ink_on_every_poster_surface() {
         (first, ink)
     };
     // each world holds the process-global lock the setting needs, so the setting is restored before it drops
-    let on_home = { let mut w = home(false, "ink-home"); let _cell = Cell::default(); title_ink(&mut w, "Home").1 };
+    let on_home = { let mut w = home_poster("ink-home"); let _cell = Cell::default(); title_ink(&mut w, "Home").1 };
     let on_collections = { let mut w = World::collections("ink-collections", false); let _cell = Cell::default(); title_ink(&mut w, "Collections").1 };
     let on_watchlist = { let mut w = World::watchlist("ink-watchlist"); let _cell = Cell::default(); title_ink(&mut w, "Watchlist").1 };
     // (the cascade folds alpha in float: one 8-bit step is 0.004)
@@ -163,7 +144,7 @@ fn the_focused_title_is_one_ink_on_every_poster_surface() {
 fn recommended(resume_on_deck: bool, name: &str, deck_first: bool) -> World {
     let mut w = World::recommended_pending(name);
     {
-        let mut browse = w.bridge.stores.browse.borrow_mut();
+        let mut browse = w.bridge.stores().browse.borrow_mut();
         let deck = ("hub.movie.inprogress.1", "", "Continue Watching");
         let recent = ("hub.movie.recent", "", "Recently Added");
         browse.seed_named_shelves_for_test(0, &if deck_first { [deck, recent] } else { [recent, deck] }, 3);
@@ -265,9 +246,9 @@ fn caption(w: &mut World) -> Vec<String> { w.drawn().caption_lines() }
 /// carries no state, as the deck's episodes do.
 fn home_tile(name: &str, edit: fn(&mut plx_data::pms::PmsMovie)) -> World {
     let mut w = World::home_with_disc(name, [7; 12]);
-    w.bridge.stores.hubs.seed_deck_home_for_test(1);
+    w.bridge.bridge().stores.hubs.seed_deck_home_for_test(1);
     w.frames(30);
-    plx_data::pms::edit_test_item(w.bridge.stores.hubs.state_mut(), "r1", &edit);
+    plx_data::pms::edit_test_item(w.bridge.bridge().stores.hubs.state_mut(), "r1", &edit);
     w.frames(30);
     w.press(Key::Down);
     w.press(Key::Down);
@@ -306,7 +287,7 @@ fn home_from_hubs(name: &str, hubs: &str) -> World {
     let mut w = World::home_with_disc(name, [7; 12]);
     let body = format!(r#"{{"MediaContainer":{{"Hub":{hubs}}}}}"#);
     let mc = serde_json::from_str::<plx_plex::plex::Envelope>(&body).expect("a /hubs answer").media_container;
-    w.bridge.stores.hubs.seed_hubs_response_for_test(&mc);
+    w.bridge.bridge().stores.hubs.seed_hubs_response_for_test(&mc);
     w.frames(60);
     w
 }
@@ -342,7 +323,7 @@ fn an_untitled_season_is_drawn_in_homes_recently_added_seasons() {
 /// with `edit(card, rating key)`, and let the page take the publication in.
 pub(super) fn describe_cards(w: &mut World, cols: usize, edit: &dyn Fn(&mut plx_data::pms::PmsMovie, usize)) {
     for rk in 1..=cols {
-        plx_data::pms::edit_test_item(w.bridge.stores.hubs.state_mut(), &rk.to_string(), &|m| edit(m, rk));
+        plx_data::pms::edit_test_item(w.bridge.bridge().stores.hubs.state_mut(), &rk.to_string(), &|m| edit(m, rk));
     }
     w.frames(30);
 }
@@ -358,9 +339,9 @@ pub(super) fn describe_cards(w: &mut World, cols: usize, edit: &dyn Fn(&mut plx_
 /// setting. (The number of rows a sync projects has no app-tier reader: the FIX test counts them.)
 #[test]
 fn a_setting_changed_under_a_kept_home_reaches_the_card_after_back() {
-    let mut w = home(false, "cap-home-kept");
+    let mut w = home_poster("cap-home-kept");
     let _cell = Cell::default();
-    let published = |w: &World| plx_data::pms::hubs_snapshot(w.bridge.stores.hubs.state()).view().generation;
+    let published = |w: &World| plx_data::pms::hubs_snapshot(w.bridge.stores().hubs.state()).view().generation;
     let (focus, generation, entry) = (w.focus(), published(&w), w.d.nav.top_page().map(|page| page.id));
     assert!(focus.is_some() && entry.is_some(), "premise: Home holds focus on a poster");
     assert_eq!(w.drawn().caption_lines(), [YEAR_LENGTH], "premise: the default draws the year and length");
@@ -370,7 +351,7 @@ fn a_setting_changed_under_a_kept_home_reaches_the_card_after_back() {
         open_settings_at(&mut w.d, plx_screens::family::SettingsPage::UnderPosters);
         w.frames(40);
         assert_ne!(w.focus(), focus, "premise ({setting}): the Settings page holds focus over the kept Home");
-        plx_media::route::restore_under_posters(UnderPosters { title, details });
+        plx_media::route::restore_under_posters(UnderPosters { title, details: details.movie_parts(), show_details: details.show_parts(), sort_value: false });
         w.frames(30);
         w.press(Key::Back);
         w.frames(60);

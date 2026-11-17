@@ -3,6 +3,9 @@
 //! page teardown is as against the FADE a BACK is).
 
 use super::*;
+use plx_ui::consts::{SCR_H, SCR_W};
+use plx_ui::table::{MENU_MAX_W, MENU_MIN_W};
+use plx_ui::popover::{under_or_above, PANEL_EDGE, PANEL_EDGE_X, PANEL_GAP};
 use plx_data::metadata::{alt_source_count, alt_stand_in};
 use plx_data::stores::metadata::MetadataCmd;
 
@@ -18,14 +21,40 @@ fn test_store() -> &'static mut plx_data::stores::metadata::MetadataStore {
     TEST_METADATA.with(|cell| unsafe { &mut *cell.get() })
 }
 
-/// D3 test helper: `metadata::alt_install`/`alt_restamp_owners` are private now, reached only
-/// through `MetadataStore::run` — these wrap that so the call sites below read exactly as they
-/// did before the visibility change.
+/// TEST ONLY: capture the registry facts at each fixture command, as the host does before a step.
 fn alt_install(sid: ServerId, rk: &str, copies: Vec<AltCopy>) -> bool {
-    test_store().run(MetadataCmd::AltInstall { sid, rk: rk.to_string(), copies })
+    test_store().run_with_keys(MetadataCmd::AltInstall { sid, rk: rk.to_string(), copies },
+        &plx_data::pms::registry_keys_for_test())
 }
 fn alt_restamp_owners() -> bool {
-    test_store().run(MetadataCmd::AltRestampOwners)
+    test_store().run_with_keys(MetadataCmd::AltRestampOwners, &plx_data::pms::registry_keys_for_test())
+}
+
+#[test]
+fn alt_fixture_uses_captured_server_facts() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            test_store().run(MetadataCmd::Clear);
+            plx_plex::plex::reset_servers_for_test();
+        }
+    }
+    let _guard = plx_base::testlock::serial();
+    let _cleanup = Cleanup;
+    plx_plex::plex::reset_servers_for_test();
+    let server = plx_plex::plex::register_for_test("alt-capture", "127.0.0.1", 1, "t", "cid");
+    plx_plex::plex::describe_server(server, "Server", "captured", plx_plex::plex::GrantEvidence::outside());
+    let keys = plx_data::pms::registry_keys_for_test();
+    plx_plex::plex::describe_server(server, "Server", "current", plx_plex::plex::GrantEvidence::outside());
+    assert!(test_store().run_with_keys(MetadataCmd::AltInstall {
+        sid: server, rk: "4".into(), copies: vec![copy(server.raw(), "Movies", "stale", "4", "1080")],
+    }, &keys));
+    assert_eq!(test_store().view().alt_copies(server, "4")[0].owner.as_deref(), Some("captured"));
+    assert!(alt_restamp_owners());
+    assert_eq!(test_store().view().alt_copies(server, "4")[0].owner.as_deref(), Some("current"));
+    plx_plex::plex::describe_server(server, "Server", "latest", plx_plex::plex::GrantEvidence::outside());
+    assert!(alt_install(server, "4", vec![copy(server.raw(), "Movies", "stale", "4", "1080")]));
+    assert_eq!(test_store().view().alt_copies(server, "4")[0].owner.as_deref(), Some("latest"));
 }
 
 fn sid(n: u16) -> ServerId {
@@ -668,34 +697,34 @@ fn a_landing_for_another_servers_copy_with_the_same_key_is_refused() {
 #[test]
 fn the_panel_hangs_off_its_button_and_stays_on_screen() {
     let btn = Rect::new(plx_ui::consts::MARGIN_X, 300.0, 300.0, 60.0);
-    let r = panel_at(btn, 500.0, 224.0);
+    let r = under_or_above(btn, 500.0, 224.0);
     assert_eq!(r.w, MENU_MAX_W.min(500.0).max(MENU_MIN_W), "the panel hugs its content width");
     assert_eq!(
         r.y,
-        btn.y + btn.h + BTN_GAP,
+        btn.y + btn.h + PANEL_GAP,
         "under the button when there is room"
     );
     assert_eq!(r.x, btn.x, "and aligned to its left edge");
 
     // a button low on the page flips the panel ABOVE it rather than off the bottom
     let low = Rect::new(plx_ui::consts::MARGIN_X, 900.0, 300.0, 60.0);
-    let r = panel_at(low, 500.0, 224.0);
+    let r = under_or_above(low, 500.0, 224.0);
     assert!(
-        r.y + r.h <= low.y - BTN_GAP + 0.01,
+        r.y + r.h <= low.y - PANEL_GAP + 0.01,
         "flipped above the button"
     );
-    assert!(r.y >= EDGE);
+    assert!(r.y >= PANEL_EDGE);
 
     // a button near the right edge pulls the panel back inside the keep-out
     let right = Rect::new(SCR_W - 200.0, 300.0, 180.0, 60.0);
-    let r = panel_at(right, 500.0, 224.0);
+    let r = under_or_above(right, 500.0, 224.0);
     assert!(
-        r.x + r.w <= SCR_W - EDGE_X + 0.01,
+        r.x + r.w <= SCR_W - PANEL_EDGE_X + 0.01,
         "a panel must not run off the panel"
     );
     // …and a list taller than the screen is clamped rather than drawn past both edges
-    let tall = panel_at(btn, 500.0, 4000.0);
-    assert!(tall.y >= EDGE && tall.y + tall.h <= SCR_H - EDGE + 0.01);
+    let tall = under_or_above(btn, 500.0, 4000.0);
+    assert!(tall.y >= PANEL_EDGE && tall.y + tall.h <= SCR_H - PANEL_EDGE + 0.01);
 
     // Every one of those worst cases is inside the overscan frame — the keep-out is per AXIS
     // precisely so that the horizontal clamp is `MARGIN_X` and not the `space::XL` the vertical
@@ -704,7 +733,7 @@ fn the_panel_hangs_off_its_button_and_stays_on_screen() {
     for (what, p) in [
         ("under", r),
         ("tall", tall),
-        ("right-edge", panel_at(right, 500.0, 224.0)),
+        ("right-edge", under_or_above(right, 500.0, 224.0)),
     ] {
         assert!(
             plx_ui::consts::inside_safe(p),
@@ -730,7 +759,7 @@ fn the_panel_hangs_off_its_button_and_stays_on_screen() {
         plx_data::stores::metadata::MetadataStore::default().view(),
     );
     let measure = plx_ui::fixture::FixtureMeasure;
-    let want = panel_at(low, p.form.table.measured_width(&measure), p.form.table.measured_height());
+    let want = under_or_above(low, p.form.table.measured_width(&measure), p.form.table.measured_height());
     let got = p.frame(&measure);
     assert_eq!((got.x, got.y, got.w, got.h), (want.x, want.y, want.w, want.h));
 }
@@ -859,6 +888,7 @@ mod focus_and_hit {
             measure: &plx_ui::fixture::FixtureMeasure,
             focus: FocusRead { current: focus, ..Default::default() },
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             owner: InputOwner::Entry(EntryId(5)),
         }
     }

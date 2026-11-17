@@ -1,5 +1,28 @@
 # `tests/fixtures` — synthesizing the media the suite needs
 
+## Dolby Vision random-access comparison (issue #1166)
+
+The pipeline tier has an original DV Profile 8.1 A/B pair:
+
+```sh
+python3 tests/fixtures/make_fixtures.py --tier pipeline \
+  --only pipe_hevc_eac3_4k_dovi_p8,pipe_hevc_eac3_4k_dovi_idr --out /path/out
+```
+
+Both clips use synthetic 4K HDR10-compatible video, authored Dolby Vision RPU metadata,
+E-AC-3 audio, and a 60-second duration. The `p8` clip begins with an IDR and has CRA seek
+points; the `idr` control uses closed GOPs and later IDRs. Each banner identifies its clip.
+Verification reads the first five seconds' actual key-packet NAL types and requires an RPU
+at each inspected key, rather than trusting the container's keyframe flag. The results are
+in `video.random_access` in `fixtures.json`. Builds shorter than three seconds verify only
+the initial key; use the full clips for the comparison.
+
+Compare playback from the start, seeking to 4.2 seconds, and a cold resume at 4.2 seconds
+with Dolby Vision enabled. The reported webOS 5.5 failure skips CRA at the DV splitter's
+initial random-access gate. Matching that packet structure is a candidate reproducer;
+it is not proof that a generated clip reproduces the fault on that TV. See
+[the trace analysis](../../docs/measurements/issue1166-cra.md).
+
 `tests/run.py` grades the player against nine symbolic **item shapes**
 (`movie_h264_ac3_1080p`, `episode_hevc_4k_hdr10_eac3`, …), and
 `tests/manifest.local.json` maps each shape to a ratingKey on whatever PMS you own. That
@@ -257,7 +280,7 @@ the real one.)
 |---|---|---|
 | `movie_h264_ac3_1080p` | 1080 s | H.264 High + AC-3 5.1 + **four** SRT tracks ordered `[rus-forced, rus, eng, eng-SDH]`. 1080 s because `subtitle_text_srt` seeds 843 s (843/0.9 = 937 floor). CRF 20, not the 25 the rest of the H.264 set uses, and it declares a **`min_mbit` floor `verify()` asserts**: both rapid-seek cases' H.264 half lives here and seek *coalescing* is what they grade. |
 | `episode_hevc_4k_hdr10_eac3` (+`_next`) | 300 s ×2 | HEVC Main10 4K HDR10 (real mastering-display + CLL in-band) with a **German default** E-AC-3 at index 0 and English at index 1 — with no Plex language preference the file's default (row 0, German) is what plays at start (#210), so `audio_switch_native` picks row 1 to switch to the English track and expects a native switch. Built as a pair for `marker_credits_up_next`, with a shared 130 s intro and a 40 s black credits tail (see *markers*, below). Also carries a `min_mbit` floor. |
-| `movie_hevc_4k_hdr10_truehd` | 90 s | TrueHD 5.1 default + AC-3 5.1 sibling: the smart-direct-play shape. Also the item every player-tier fps scene decodes under its overlay. |
+| `movie_hevc_4k_hdr10_truehd` | 90 s | TrueHD 5.1 default + AC-3 5.1 sibling: the smart-direct-play shape. Also the item every player-tier fps scene decodes under. `info-panel` and `chapters-panel` have no overlay; they select a HUD section word. |
 | `movie_hevc_4k_dovi_p8` | 90 s | Dolby Vision **8.1**, RPU authored from scratch by `dovi_tool generate` and injected into a synthetic HDR10 base layer, muxed by `mkvmerge`. ffprobe reads back `dv_profile=8, bl_compat=1, el_present=0, rpu_present=1`, plus in-band `Dolby Vision RPU Data`. Carries the **four-track SRT stack** as well — its case covers `embedded-srt-many`. |
 | `movie_hevc_aac_mp4` | 90 s | HEVC/AAC in mp4 (`hvc1`, faststart) with a **sidecar** `.en.srt`. AAC **stereo**: this case is the mov-demuxer/ADTS path, real-world mp4s are usually 2.0, and Auto checks the device table’s per-codec channel limit. |
 | `episode_h264_aac` | 90 s | H.264/AAC episode with no subtitle tracks at all. |

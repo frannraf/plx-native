@@ -9,13 +9,14 @@
 //! because that is what the certificate is issued for — so the whole PMS control plane comes
 //! through here too whenever the origin is TLS. `crate::http` is the door that decides which of
 //! the two transports a request takes; this module is only ever the https half of it. Direct
-//! callers are `plex::account`, auth's public headerless QR-image fetch, and — since the telemetry
+//! callers include `plex::account`, auth's public headerless QR-image fetch, the HUD-package adapter's
+//! bounded public fetch, and — since the telemetry
 //! work — `plx_telemetry::telemetry::sender`, which is the first traffic in this app's history to a host
 //! that is neither Plex nor the user's own server. It goes through [`post_ca`]: CA-verified,
 //! unpinned, bounded sink. **This list has stood here while becoming untrue before**, which is why
 //! it is worth checking rather than trusting; that is twice.
 //!
-//! Only the curl *easy* API is used here; [`crate::curlio`] binds the multi API separately for the
+//! Only the curl *easy* API is used here; [`crate::range_io`] binds the multi API separately for the
 //! media plane. This module owns their shared process init, including the mutex callbacks required
 //! when the TV's libcurl uses OpenSSL 1.0. The option/info integer constants are curl's stable
 //! public ABI values (kept here so we do not need the header). TLS peer+host verification is ON
@@ -44,6 +45,8 @@ pub mod origin;
 
 /// What a caller may add to a request's headers, for both transports (module doc).
 pub mod headers;
+
+pub mod connect_only;
 
 type CURL = c_void;
 pub type curl_slist = c_void;
@@ -182,9 +185,19 @@ const CURLOPT_SSL_VERIFYHOST: c_int = 81;
 const CURLOPT_NOSIGNAL: c_int = 99;
 /// `CURLOPT_FRESH_CONNECT` (LONG + 74) and `CURLOPT_FORBID_REUSE` (LONG + 75): never take a cached
 /// connection for this handle, and never leave this handle's connection in the cache. Read off
-/// `curl/curl.h`; both have existed since libcurl 7.7. Set only by [`keypin::apply`].
-const CURLOPT_FRESH_CONNECT: c_int = 74;
+/// `curl/curl.h`; both have existed since libcurl 7.7. Set by [`keypin::apply`] on every key-mode
+/// handle; `CURLOPT_FRESH_CONNECT` alone also by `curlio` for a request to an origin whose cached
+/// HTTP/2 connection still carries a cancelled stream (`curlio::ConnLedger`). A libcurl that refuses
+/// it there reuses the connection, so that refusal is logged and never fatal.
+pub(crate) const CURLOPT_FRESH_CONNECT: c_int = 74;
 const CURLOPT_FORBID_REUSE: c_int = 75;
+/// `CURLOPT_SSL_SESSIONID_CACHE` (LONG + 150): `0` stops libcurl from looking up a cached TLS
+/// session for this handle AND from storing the one it negotiates, so the handshake is a full one.
+/// Read off `curl/curl.h`; the option has existed since libcurl 7.16.0, long before the television's
+/// 7.53.1. Set only by [`keypin::apply`], on key-mode handles: since libcurl 8.12 the session cache
+/// belongs to the multi handle (`Curl_ssl_scache`), so every easy handle one multi runs shares it, and
+/// a handle that resumed a session gets no certificate chain from the TLS stack (see `apply`).
+const CURLOPT_SSL_SESSIONID_CACHE: c_int = 150;
 const CURLOPT_CONNECTTIMEOUT: c_int = 78;
 const CURLOPT_TIMEOUT: c_int = 13;
 const CURLOPT_TIMEOUT_MS: c_int = 155;
@@ -641,6 +654,41 @@ struct BodySink {
     overflowed: bool,
     /// The `ETag` of the response being read (see [`header_cb`]); the last hop's, never a redirect's.
     etag: Option<String>,
+    /// A public transfer's protocol floor survives response/status resets across redirect hops.
+    redirect: Option<RedirectFloor>,
+}
+
+/// libcurl's redirect mask is fixed at the request's start. A plaintext entry may upgrade, so its
+/// mask allows both protocols; this per-transfer latch then rejects any downgrade after that upgrade.
+/// Relative and protocol-relative locations inherit the current scheme and do not change the floor.
+struct RedirectFloor {
+    tls: bool,
+    response_redirects: bool,
+}
+
+impl RedirectFloor {
+    fn new(url: &[u8]) -> Self {
+        Self { tls: allowed_redirect_protocols(url) == CURLPROTO_HTTPS, response_redirects: false }
+    }
+
+    fn accepts(&mut self, line: &[u8]) -> bool {
+        if line.starts_with(b"HTTP/") {
+            self.response_redirects = line.split(|b| b.is_ascii_whitespace()).nth(1)
+                .is_some_and(|code| code.len() == 3 && code[0] == b'3');
+        } else if self.response_redirects {
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                if line[..colon].eq_ignore_ascii_case(b"location") {
+                    let target = line[colon + 1..].trim_ascii();
+                    if target.get(..6).is_some_and(|s| s.eq_ignore_ascii_case(b"https:")) {
+                        self.tls = true;
+                    } else if self.tls && target.get(..5).is_some_and(|s| s.eq_ignore_ascii_case(b"http:")) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 impl BodySink {
@@ -650,6 +698,7 @@ impl BodySink {
             max,
             overflowed: false,
             etag: None,
+            redirect: None,
         }
     }
 
@@ -694,10 +743,10 @@ extern "C" fn write_cb(
     }
 }
 
-/// libcurl `CURLOPT_HEADERFUNCTION`: keep the one response header this client reads, `ETag`.
+/// libcurl `CURLOPT_HEADERFUNCTION`: keep the final `ETag` and enforce the public redirect floor.
 /// libcurl hands over each header line whole (CRLF included) and each hop's status line, so a
-/// status line forgets the previous hop's validator and the final response's wins. Always takes the
-/// line (returning anything else aborts the transfer); a line that is not UTF-8 text is ignored.
+/// status line forgets the previous hop's validator and the final response's wins. A forbidden
+/// downgrade returns zero to abort before libcurl follows it; non-UTF-8 validators are ignored.
 /// Infallible code, so nothing can unwind across the C frame. The line is not capped here: libcurl
 /// bounds a header line itself, and a validator is kept verbatim (weak `W/` prefix and quotes too).
 extern "C" fn header_cb(
@@ -712,20 +761,22 @@ extern "C" fn header_cb(
     }
     let sink = unsafe { &mut *(userdata as *mut BodySink) };
     let line = unsafe { std::slice::from_raw_parts(ptr as *const u8, n) };
-    sink.note_header(line);
-    n
+    if sink.note_header(line) { n } else { 0 }
 }
 
 impl BodySink {
-    /// One raw header line: a status line clears the validator, an `ETag:` line sets it.
-    fn note_header(&mut self, line: &[u8]) {
+    /// One raw header line: enforce the redirect floor, then retain the final validator.
+    fn note_header(&mut self, line: &[u8]) -> bool {
+        if self.redirect.as_mut().is_some_and(|floor| !floor.accepts(line)) {
+            return false;
+        }
         if line.starts_with(b"HTTP/") {
             self.etag = None;
-            return;
+            return true;
         }
-        let Some(colon) = line.iter().position(|&b| b == b':') else { return };
+        let Some(colon) = line.iter().position(|&b| b == b':') else { return true };
         if !line[..colon].eq_ignore_ascii_case(b"etag") {
-            return;
+            return true;
         }
         if let Ok(value) = std::str::from_utf8(&line[colon + 1..]) {
             let value = value.trim();
@@ -733,6 +784,7 @@ impl BodySink {
                 self.etag = Some(value.to_owned());
             }
         }
+        true
     }
 }
 
@@ -813,6 +865,17 @@ impl From<RequestError> for RequestFailure {
 }
 
 impl RequestFailure {
+    /// `true` when the transfer was aborted because the body ran past the `max_body` bound: the
+    /// bound a caller passed is echoed in [`Self::body_limit`] only for that failure, and no partial
+    /// body ever comes back with it.
+    pub fn too_large(&self) -> bool { self.body_limit.is_some() }
+
+    /// `true` when libcurl refused the server's certificate: `60` (the chain did not verify: an issuer
+    /// this trust store lacks, a self-signed certificate, a wrong clock) or `51` (the name check, on the
+    /// television's 7.53.1). [`Self::untrusted_chain`] and [`Self::verify`] say which; this says only
+    /// that the television's certificate check, and not the network, is what failed.
+    pub fn certificate_refused(&self) -> bool { matches!(self.curl_rc, Some(keypin::TLS_VERIFY_FAILED | 51)) }
+
     /// The verify result when this failure is a certificate chain the television's trust store could
     /// not verify — see [`keypin::untrusted_chain_verify`] for the closed set — and `None` for
     /// everything else, the clock cases (9, 10) and a name mismatch included.
@@ -909,8 +972,8 @@ pub const BULK: Timeouts = Timeouts {
     low_speed_s: 30,
 };
 
-/// Protocol floor for a public redirect. A TLS request may remain TLS only; a plaintext request
-/// may stay plaintext or upgrade. Pure so the no-downgrade rule is host-testable.
+/// Initial protocol mask for a public redirect. A TLS start may remain TLS only; a plaintext
+/// start may upgrade. [`RedirectFloor`] retains that upgrade for the remainder of the transfer.
 fn allowed_redirect_protocols(url: &[u8]) -> c_long {
     if url
         .get(..8)
@@ -1278,11 +1341,12 @@ mod loopback_pms {
     }
 
     /// What [`spawn_observed`] saw: the connections it accepted (every TCP accept, including one
-    /// whose TLS handshake the client then abandoned) and every complete request it read, headers
-    /// and body, verbatim.
+    /// whose TLS handshake the client then abandoned), the handshakes among them that RESUMED a TLS
+    /// session, and every complete request it read, headers and body, verbatim.
     pub struct Observed {
         pub port: u16,
         pub accepted: Arc<std::sync::atomic::AtomicUsize>,
+        pub resumed: Arc<std::sync::atomic::AtomicUsize>,
         pub requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     }
 
@@ -1290,6 +1354,21 @@ mod loopback_pms {
         /// TCP connections accepted so far.
         pub fn accepted(&self) -> usize {
             self.accepted.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Connections whose TLS handshake resumed a session instead of presenting the certificate,
+        /// counted once the connection's first request is in. The doubles keep rustls's default session
+        /// store, so a client that offers a cached session is resumed.
+        pub fn resumed(&self) -> usize {
+            self.resumed.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// Count `conn` in `resumed` when its handshake resumed a session. Called once per connection,
+    /// after the first request has been read, which is when rustls knows what kind of handshake it was.
+    fn note_resumption(conn: &rustls::ServerConnection, resumed: &std::sync::atomic::AtomicUsize) {
+        if conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+            resumed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -1326,7 +1405,7 @@ mod loopback_pms {
     /// A TLS-only loopback double that COUNTS and RECORDS: the latch tests count the handshakes a
     /// request cost, the body test reads what arrived. Answers `body` with `200`, or the tail of it
     /// with `206` and a `Content-Range` when the request carries `Range: bytes=N-`, so a
-    /// [`crate::curlio::CurlSource`] can open, seek and reopen against it. One request per
+    /// [`crate::range_io::CurlSource`] can open, seek and reopen against it. One request per
     /// connection (`Connection: close`); [`spawn_observed_keepalive`] is the persistent twin.
     pub fn spawn_observed(cert: Arc<TestCert>, body: Vec<u8>) -> Observed {
         spawn_observed_conn(cert, body, false)
@@ -1491,32 +1570,40 @@ mod loopback_pms {
         let port = listener.local_addr().unwrap().port();
         let tls_cfg = tls_config(&cert);
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (count, log) = (Arc::clone(&accepted), Arc::clone(&requests));
+        let (count, resumptions, log) = (Arc::clone(&accepted), Arc::clone(&resumed), Arc::clone(&requests));
         let answer = Arc::new(answer);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut sock) = stream else { continue };
                 count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let (tls_cfg, log, answer) = (Arc::clone(&tls_cfg), Arc::clone(&log), Arc::clone(&answer));
+                let (tls_cfg, resumptions, log, answer) =
+                    (Arc::clone(&tls_cfg), Arc::clone(&resumptions), Arc::clone(&log), Arc::clone(&answer));
                 std::thread::spawn(move || {
                     let Ok(mut conn) = rustls::ServerConnection::new(tls_cfg) else { return };
                     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+                    let mut first = true;
                     loop {
                         let request = read_whole_request(&mut tls);
                         if request.is_empty() {
                             return;
                         }
+                        if std::mem::take(&mut first) {
+                            note_resumption(tls.conn, &resumptions);
+                        }
                         let reply = answer(&request);
                         log.lock().unwrap_or_else(|e| e.into_inner()).push(request);
-                        if tls.write_all(&reply).is_err() || tls.flush().is_err() || !keep_alive {
-                            return;
-                        }
+                        if tls.write_all(&reply).is_err() { return; }
+                        // OpenSSL must see an orderly TLS close to keep the TLS 1.3 session
+                        // resumable after this response, not just a bare TCP EOF.
+                        if !keep_alive { tls.conn.send_close_notify(); }
+                        if tls.flush().is_err() || !keep_alive { return; }
                     }
                 });
             }
         });
-        Observed { port, accepted, requests }
+        Observed { port, accepted, resumed, requests }
     }
 
     /// One step of a [`spawn_streaming`] script.
@@ -1544,14 +1631,16 @@ mod loopback_pms {
         let port = listener.local_addr().unwrap().port();
         let tls_cfg = tls_config(&cert);
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (count, log) = (Arc::clone(&accepted), Arc::clone(&requests));
+        let (count, resumptions, log) = (Arc::clone(&accepted), Arc::clone(&resumed), Arc::clone(&requests));
         let steps = Arc::new(steps);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut sock) = stream else { continue };
                 count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let (tls_cfg, log, steps) = (Arc::clone(&tls_cfg), Arc::clone(&log), Arc::clone(&steps));
+                let (tls_cfg, resumptions, log, steps) =
+                    (Arc::clone(&tls_cfg), Arc::clone(&resumptions), Arc::clone(&log), Arc::clone(&steps));
                 std::thread::spawn(move || {
                     let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                     let Ok(mut conn) = rustls::ServerConnection::new(tls_cfg) else { return };
@@ -1560,6 +1649,7 @@ mod loopback_pms {
                     if request.is_empty() {
                         return;
                     }
+                    note_resumption(tls.conn, &resumptions);
                     log.lock().unwrap_or_else(|e| e.into_inner()).push(request);
                     if !matches!(steps.first(), Some(StreamStep::Status(_))) {
                         let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -1602,7 +1692,7 @@ mod loopback_pms {
                 });
             }
         });
-        Observed { port, accepted, requests }
+        Observed { port, accepted, resumed, requests }
     }
 
     /// A loopback double that only ever speaks plaintext HTTP — for the "HTTPS fails" E2E
@@ -2149,8 +2239,8 @@ fn request_tls_sink(
     // re-sends custom headers to a redirect's target (it strips only `Authorization` and `Cookie`
     // when the host changes, and the television's 7.53.1 predates even that), so a `X-Plex-Token:`
     // line on a request that follows `Location:` would reach whatever host the answer names. The
-    // one caller that follows redirects (`https_get_public`, the QR fetch) sends none; this is what
-    // keeps it so for the next one.
+    // callers that follow redirects (`https_get_public`, the QR fetch, and `https_get_public_bounded`,
+    // the HUD install-from-address fetch) send none; this is what keeps it so for the next one.
     if follow_redirects && !headers.is_empty() {
         plx_base::eventlog::log("net: request refused: a request that follows redirects carries no caller headers");
         return Err(RequestError::Transport.into());
@@ -2212,13 +2302,8 @@ fn request_tls_sink(
         unsafe {
             macro_rules! require_setopt {
                 ($call:expr, $name:literal) => {{
-                    let rc = $call;
-                    if rc != 0 {
-                        plx_base::eventlog::log(&format!(
-                            "net: libcurl refused security option {} (rc={rc}); request cancelled",
-                            $name
-                        ));
-                        return Err(RequestError::Transport.into());
+                    if let Err(error) = require_option($call, $name) {
+                        return Err(error.into());
                     }
                 }};
             }
@@ -2230,6 +2315,7 @@ fn request_tls_sink(
             curl_easy_setopt_ptr(easy.0, CURLOPT_URL, url_c.as_ptr() as *const c_void);
             // In stream mode `sink` stays empty: the body goes through `stream`'s callbacks instead.
             let mut sink = BodySink::new(max_body);
+            sink.redirect = follow_redirects.then(|| RedirectFloor::new(url.as_bytes()));
             match stream {
                 None => {
                     curl_easy_setopt_ptr(easy.0, CURLOPT_WRITEFUNCTION, write_cb as *const c_void);
@@ -2240,7 +2326,11 @@ fn request_tls_sink(
                     );
                     // HEADERDATA without a HEADERFUNCTION would send header bytes to the write
                     // callback (into the body), so the data is set only once the function took.
-                    if curl_easy_setopt_ptr(easy.0, CURLOPT_HEADERFUNCTION, header_cb as *const c_void) == 0 {
+                    let header_rc = curl_easy_setopt_ptr(easy.0, CURLOPT_HEADERFUNCTION, header_cb as *const c_void);
+                    if follow_redirects {
+                        require_setopt!(header_rc, "CURLOPT_HEADERFUNCTION");
+                        require_setopt!(curl_easy_setopt_ptr(easy.0, CURLOPT_HEADERDATA, (&mut sink as *mut BodySink).cast()), "CURLOPT_HEADERDATA");
+                    } else if header_rc == 0 {
                         curl_easy_setopt_ptr(
                             easy.0,
                             CURLOPT_HEADERDATA,
@@ -2267,8 +2357,9 @@ fn request_tls_sink(
                     }
                 }
             }
-            // No curl call in this module may escape HTTP(S). The public QR fetch is the only one that
-            // follows redirects; it is capped, and an HTTPS start may never downgrade to plaintext.
+            // No curl call in this module may escape HTTP(S). The public fetches (the QR image and the HUD-package
+            // install-from-address) are the only ones that follow redirects; they are capped. The mask
+            // forbids a downgrade from an HTTPS start, and the header callback latches any later upgrade.
             require_setopt!(
                 curl_easy_setopt_long(easy.0, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS),
                 "CURLOPT_PROTOCOLS"
@@ -2324,10 +2415,8 @@ fn request_tls_sink(
                 // Refusing here is a deliberate over-reaction — if we could not select the roots we
                 // meant to, the honest report is that the send did not happen.
                 TlsCfg::CaBundle(p) => {
-                    let rc = curl_easy_setopt_ptr(easy.0, CURLOPT_CAINFO, p.as_ptr() as *const c_void);
-                    if rc != 0 {
-                        plx_base::eventlog::log(&format!("net: this libcurl refuses CURLOPT_CAINFO (rc={rc}) — refusing to send against an unknown trust store"));
-                        return Err(RequestError::Transport.into());
+                    if let Err(error) = require_trust_store(curl_easy_setopt_ptr(easy.0, CURLOPT_CAINFO, p.as_ptr() as *const c_void)) {
+                        return Err(error.into());
                     }
                 }
                 TlsCfg::Pinned(p) => {
@@ -2885,15 +2974,50 @@ fn shipped_ca_bundle(dir: &std::path::Path) -> Option<String> {
 /// debugging a 400 and guessing at one.
 const TELEMETRY_MAX_REPLY: usize = 4096;
 
-/// Redirect-following HTTPS GET for a PUBLIC, credential-free resource. The QR image fetch is the
-/// only caller: at most five HTTP(S)-only redirects are followed, and an HTTPS request may never
-/// downgrade. Account/PMS requests keep redirects off because replayed headers/URLs carry tokens.
+/// Redirect-following HTTPS GET for a PUBLIC, credential-free resource. The QR image fetch
+/// (`session::auth`) calls it, and [`https_get_public_bounded`] is its body-bounded twin for the
+/// HUD-package install-from-address fetch: at most five HTTP(S)-only redirects are followed, and an
+/// HTTPS request may never downgrade. Account/PMS requests keep redirects off because replayed
+/// headers/URLs carry tokens.
 pub fn https_get_public(url: &str) -> Option<Resp> {
     request(url, &[], "GET", None, API, true, None, None)
 }
 
-/// The `nowan` gate shared by the three resolver doors ([`request_tls_result`],
-/// [`crate::curlio`] and [`crate::stream`]): `true` when `/tmp/plxnative-nowan` is armed and
+/// [`https_get_public`] with a body bound, answering the whole [`RequestFailure`] instead of folding
+/// it to `None`: the address a viewer typed (`hudpacks::address`) can be a 404, a host that does not
+/// answer, a certificate this television's trust store cannot verify
+/// ([`RequestFailure::untrusted_chain`]) or a body past `max_body`, and each is told apart on the
+/// page. The same headerless, redirect-following request as [`https_get_public`] through the same
+/// entry: [`allowed_redirect_protocols`] restricts the initial scheme and [`RedirectFloor`] retains
+/// any later HTTPS upgrade. No curl option is added.
+///
+/// A body over `max_body` is never returned truncated: the transfer is aborted and the failure
+/// carries `body_limit` ([`RequestFailure::too_large`]). A reply that completed within the bound is
+/// `Ok` whatever its status, so a `404` is a value here, not an error.
+pub fn https_get_public_bounded(url: &str, max_body: usize) -> Result<Resp, RequestFailure> {
+    request_result_evidence(url, &[], "GET", None, API, true, Some(max_body), None, false)
+}
+
+fn require_option(rc: c_int, option: &str) -> Result<(), RequestError> {
+    if rc == 0 {
+        return Ok(());
+    }
+    plx_base::eventlog::log(&format!("net: libcurl refused security option {option} (rc={rc}); request cancelled"));
+    Err(RequestError::Transport)
+}
+
+fn require_trust_store(rc: c_int) -> Result<(), RequestError> {
+    if rc == 0 {
+        return Ok(());
+    }
+    plx_base::eventlog::log(&format!(
+        "net: this libcurl refuses CURLOPT_CAINFO (rc={rc}) — refusing to send against an unknown trust store"
+    ));
+    Err(RequestError::Transport)
+}
+
+/// The `nowan` gate shared by the four resolver doors ([`request_tls_result`],
+/// [`crate::range_io`], [`crate::stream`] and [`connect_only`]): `true` when `/tmp/plxnative-nowan` is armed and
 /// `host` is a NAME rather than a literal, i.e. when a dead resolver would have refused it. The
 /// `slow` variant first spends `connect_s`, the budget a worker would have lost waiting on that
 /// resolver. `false` without the trigger, and at compile time without `devtriggers`.
@@ -2924,7 +3048,7 @@ pub fn refuse_name(host: &str, connect_s: c_long) -> bool {
 /// [`ResolvePin::for_origin`] so that it is a pure function of the hostname (its doc has the
 /// rule). The control plane carries the pin on each `Client` and passes it into
 /// [`request_result`] explicitly. The media plane cannot: `ff::demux` receives a URL string and
-/// `curlio::CurlSource` builds a fresh easy handle on every open and seek, so it asks THIS table
+/// `range_io::CurlSource` builds a fresh easy handle on every open and seek, so it asks THIS table
 /// by the URL's host and port instead.
 ///
 /// **Append-only, process-lifetime, never replaced** (the remembered KEYS, [`keypin`], beside it
@@ -3075,7 +3199,8 @@ pub mod resolve {
 /// doomed strict handshake, and a refusal by the bundle ([`roots_failed`]) ends it.
 ///
 /// **Redirects.** No mode crosses a redirect. The control plane never enters either mode for a request
-/// that follows one (the public QR fetch is the only such request), and the media plane follows
+/// that follows one (the public fetches, [`https_get_public`] and its bounded twin, are the only such
+/// requests), and the media plane follows
 /// redirects itself, one easy handle per hop, so each hop enters this module under its own `host:port`
 /// and begins where `begin` puts that host. Nothing a hop's handshake says is recorded against the
 /// host that redirected to it.
@@ -3092,8 +3217,8 @@ pub mod keypin {
     use super::{
         c_int, c_long, curl_easy_setopt_long, curl_easy_setopt_ptr, peer_leaf_pin, tls_verify_why,
         wall_clock_year, CURL, CURLOPT_CAINFO, CURLOPT_CERTINFO, CURLOPT_FORBID_REUSE,
-        CURLOPT_FRESH_CONNECT, CURLOPT_PINNEDPUBLICKEY, CURLOPT_SSL_VERIFYHOST,
-        CURLOPT_SSL_VERIFYPEER,
+        CURLOPT_FRESH_CONNECT, CURLOPT_PINNEDPUBLICKEY, CURLOPT_SSL_SESSIONID_CACHE,
+        CURLOPT_SSL_VERIFYHOST, CURLOPT_SSL_VERIFYPEER,
     };
     use std::collections::HashMap;
     use std::ffi::{c_void, CStr};
@@ -3807,15 +3932,28 @@ pub mod keypin {
     /// asked for so [`confirm`] can check the key itself too, in case a backend accepts the pin
     /// option and never enforces it.
     ///
-    /// **Every key-mode handle does its own handshake.** `CURLOPT_FRESH_CONNECT` and
+    /// **Every key-mode handle does its own FULL handshake.** `CURLOPT_FRESH_CONNECT` and
     /// `CURLOPT_FORBID_REUSE` are set before `VERIFYPEER` goes to 0, so the handle never takes a
-    /// cached connection and leaves none behind. A reused connection performs no handshake: there
+    /// cached connection and leaves none behind, and `CURLOPT_SSL_SESSIONID_CACHE` is 0, so it
+    /// neither resumes a cached TLS session nor stores one. A reused connection performs no
+    /// handshake, and a resumed session performs one that carries no certificate: either way there
     /// would be no certificate for [`confirm`] to read (the open would be refused as a pin
-    /// mismatch), and the pin and the name would not have been checked for this request at all. It
-    /// also covers libcurl 7.53.1, where the pinned key is not part of the connection-reuse match,
-    /// so a key-mode handle could otherwise ride a connection set up under different rules. The cost
-    /// is one TLS handshake per key-mode request, accepted because key mode is a degraded state
-    /// (a wrong clock) that the first strict success ends.
+    /// mismatch, rc 90), and the pin and the name would not have been checked for this request at
+    /// all. libcurl says so itself for the second case (`Curl_ossl_check_peer_cert` skips `CERTINFO`
+    /// for a reused session: "Reused sessions do not have cert chains"). The session cache is the
+    /// one that moved: before libcurl 8.12 it belonged to each easy handle, so the fresh handle every
+    /// attempt gets never found a session; from 8.12 it belongs to the multi handle
+    /// (`Curl_ssl_scache`), and a [`crate::range_io::CurlSource`], which keeps one multi across its
+    /// attempts, resumed the session its previous key-mode attempt left there — Ubuntu 26.04's
+    /// libcurl 8.18 over OpenSSL 3.5 failed every key-mode seek that way. It also covers libcurl
+    /// 7.53.1, where the pinned key is not part of the connection-reuse match, so a key-mode handle
+    /// could otherwise ride a connection set up under different rules. The cost is one full TLS
+    /// handshake per key-mode request, accepted because key mode is a degraded state (a wrong
+    /// clock) that the first strict success ends. Strict and roots-mode handles keep their session
+    /// cache: a `CurlSource`'s read no certificate chain back, and the control plane's one that does
+    /// (to learn a key) is a fresh easy handle per request, which shares no cache. Key mode stores no
+    /// session at all, so none can be offered to a handle that verifies (libcurl 7.53.1 matches a
+    /// session on `verifypeer`, `verifyhost` and the CA settings, not on the pin; 8.12+ adds the pin).
     ///
     /// # Safety
     /// `easy` is a live curl easy handle; `pin` outlives the transfer (libcurl 7.17+ copies it,
@@ -3830,6 +3968,7 @@ pub mod keypin {
             (CURLOPT_CERTINFO, 1),
             (CURLOPT_FRESH_CONNECT, 1),
             (CURLOPT_FORBID_REUSE, 1),
+            (CURLOPT_SSL_SESSIONID_CACHE, 0),
             (CURLOPT_SSL_VERIFYHOST, 2),
             (CURLOPT_SSL_VERIFYPEER, 0),
         ] {
@@ -4178,6 +4317,58 @@ mod request_tests {
                 });
             }
         }
+    }
+
+    /// The install-from-address door: a body over the bound is a typed "too large" and never a
+    /// truncated `Ok`, a body within it (the bound itself included) is delivered, and a `404` is
+    /// a value the caller maps, not a transport failure.
+    #[test]
+    fn bounded_public_get_refuses_over_the_bound_and_delivers_under_it() {
+        let _serial = plx_base::testlock::serial();
+        assert!(global_init() && available());
+        for len in [31usize, 32, 33, 65536] {
+            let mut reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n").into_bytes();
+            reply.extend(vec![b'x'; len]);
+            with_response(reply, false, |url| {
+                let got = https_get_public_bounded(url, 32);
+                if len <= 32 {
+                    let resp = got.ok().expect("a body within the bound is delivered");
+                    assert_eq!((resp.status, resp.body.len()), (200, len));
+                } else {
+                    let failure = got.err().expect("a body over the bound is refused, never truncated");
+                    assert!(failure.too_large(), "{failure:?}");
+                    assert_eq!(failure.body_limit, Some(32));
+                }
+            });
+        }
+        // The same over-bound answer without a Content-Length: the bound is enforced on the bytes
+        // that arrive, not on a header a server may omit or understate.
+        let mut chunked = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        chunked.extend(vec![b'x'; 64]);
+        with_response(chunked, false, |url| {
+            let failure = https_get_public_bounded(url, 32).err().expect("unframed over-bound body");
+            assert!(failure.too_large(), "{failure:?}");
+        });
+        with_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(), false, |url| {
+            let resp = https_get_public_bounded(url, 32).ok().expect("a 404 completes");
+            assert_eq!((resp.status, resp.body.len()), (404, 0));
+        });
+    }
+
+    /// A host that answers nothing is a failure without a status or a bound, so the page says "could
+    /// not connect" and not "not found" or "too large".
+    #[test]
+    fn bounded_public_get_names_a_refused_connection() {
+        let _serial = plx_base::testlock::serial();
+        assert!(global_init() && available());
+        let failure = https_get_public_bounded(&format!("http://127.0.0.1:{}/", dead_port()), 32)
+            .err()
+            .expect("nothing listens");
+        assert!(!failure.too_large());
+        assert!(!failure.certificate_refused());
+        assert_eq!(failure.status, None);
+        assert_eq!(failure.untrusted_chain(), None);
+        assert_eq!(failure.curl_rc, Some(7), "CURLE_COULDNT_CONNECT");
     }
 
     #[test]
@@ -4962,6 +5153,20 @@ mod tls_mode_tests {
 
 #[cfg(test)]
 mod blocking_guard_tests {
+    #[test]
+    fn a_logic_step_cannot_dial_even_under_allow_blocking() {
+        let allowed = plx_base::task::allow_blocking(const { &plx_base::task::BlockingLabel::new("fixture") });
+        let step = plx_base::step::StepScope::enter();
+        let refused = std::panic::catch_unwind(|| {
+            super::request_evidence("https://plex.tv.invalid/ping", &[], "GET", None, super::API, false, None, None)
+        });
+        assert!(refused.is_err());
+        drop(step);
+        // A malformed URL returns before curl or DNS, proving the guard unwound and did not leak.
+        assert!(super::request_result("bad\0url", &[], "GET", None, super::API, false, None, None).is_err());
+        drop(allowed);
+    }
+
     use super::*;
 
     /// plex.tv calls (`AccountClient`) never pass `http::request_with`, so its `assert_may_block`
@@ -5100,5 +5305,138 @@ mod peer_pin_tests {
         assert!(!peer_pin_wanted("https://lab.local/x", &Tls::Pinned("sha256//x"), false), "verification off");
         assert!(!peer_pin_wanted("https://pms.plex.direct/identity", &ca, true), "a redirect can change the peer");
         assert!(!peer_pin_wanted("", &ca, false));
+    }
+}
+
+/// **A key-mode handle does its own FULL handshake, however many transfers it runs.**
+/// `keypin::apply` sets `CURLOPT_SSL_SESSIONID_CACHE` to 0 for the reason its doc gives: a handle
+/// that resumed a TLS session gets no certificate chain from libcurl, so [`keypin::confirm`] has
+/// nothing to read and refuses a server whose key is exactly the remembered one (rc 90). From libcurl
+/// 8.12 the session cache belongs to the multi handle, so what a handle resumes is what an earlier
+/// handle of the same multi left behind — Ubuntu 26.04's libcurl 8.18 over OpenSSL 3.5 broke every
+/// key-mode seek of a `range_io::CurlSource` that way.
+///
+/// These tests put that cache in front of every libcurl, whatever version it is, through a SHARE
+/// handle (`CURL_LOCK_DATA_SSL_SESSION`, libcurl 7.23+): each transfer is a fresh easy handle, as
+/// each attempt of a `CurlSource` is, and the handles share one session cache, as the multi's
+/// handles do from 8.12. The double counts the handshakes it was asked to resume.
+#[cfg(test)]
+mod key_mode_session_tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::sync::Arc;
+
+    /// `CURLOPT_SHARE` (OBJECTPOINT + 100), `CURLSHOPT_SHARE` and `CURL_LOCK_DATA_SSL_SESSION`, off
+    /// `curl/curl.h`. The share API is bound here, in the test, and nowhere in the product: nothing
+    /// of the application shares a handle.
+    const CURLOPT_SHARE: c_int = 10100;
+    const CURLSHOPT_SHARE: c_int = 1;
+    const CURL_LOCK_DATA_SSL_SESSION: c_long = 4;
+
+    /// One TLS session cache that every transfer made through it shares.
+    struct SharedSessions {
+        share: *mut c_void,
+        cleanup: unsafe extern "C" fn(*mut c_void) -> c_int,
+    }
+
+    impl SharedSessions {
+        fn new() -> SharedSessions {
+            type Init = unsafe extern "C" fn() -> *mut c_void;
+            type Setopt = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
+            type Cleanup = unsafe extern "C" fn(*mut c_void) -> c_int;
+            let (lib, _) = plx_base::dynlib::Handle::open(curl::CANDIDATES).expect("libcurl is bound");
+            let sym = |name| lib.sym(name).unwrap_or_else(|| panic!("this libcurl has no {name}"));
+            unsafe {
+                let init: Init = std::mem::transmute(sym("curl_share_init"));
+                let setopt: Setopt = std::mem::transmute(sym("curl_share_setopt"));
+                let cleanup: Cleanup = std::mem::transmute(sym("curl_share_cleanup"));
+                let share = init();
+                assert!(!share.is_null());
+                assert_eq!(setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION), 0);
+                SharedSessions { share, cleanup }
+            }
+        }
+    }
+
+    impl Drop for SharedSessions {
+        fn drop(&mut self) {
+            unsafe { (self.cleanup)(self.share) };
+        }
+    }
+
+    extern "C" fn discard(_ptr: *mut c_char, size: usize, nmemb: usize, _user: *mut c_void) -> usize {
+        size * nmemb
+    }
+
+    /// One transfer of `url` on a fresh easy handle that uses `sessions`: libcurl's result, and, when
+    /// `pin` is given (key mode), whether [`keypin::confirm`] found the pinned key in what the peer
+    /// presented. Without a pin the handle verifies nothing, which is all the control needs.
+    fn transfer(sessions: &SharedSessions, url: &CStr, pin: Option<&str>) -> (c_int, bool) {
+        unsafe {
+            let easy = curl_easy_init();
+            assert!(!easy.is_null());
+            curl_easy_setopt_ptr(easy, CURLOPT_URL, url.as_ptr() as *const c_void);
+            curl_easy_setopt_ptr(easy, CURLOPT_WRITEFUNCTION, discard as *const c_void);
+            curl_easy_setopt_ptr(easy, CURLOPT_SHARE, sessions.share as *const c_void);
+            curl_easy_setopt_long(easy, CURLOPT_NOSIGNAL, 1);
+            match pin {
+                Some(pin) => {
+                    let pin = CString::new(pin).unwrap();
+                    keypin::apply(easy, &pin).expect("this libcurl takes the key-mode options");
+                }
+                None => {
+                    curl_easy_setopt_long(easy, CURLOPT_SSL_VERIFYPEER, 0);
+                    curl_easy_setopt_long(easy, CURLOPT_SSL_VERIFYHOST, 0);
+                }
+            }
+            let rc = curl_easy_perform(easy);
+            let confirmed = pin.is_none_or(|p| keypin::confirm(easy, p));
+            curl_easy_cleanup(easy);
+            (rc, confirmed)
+        }
+    }
+
+    fn loopback(port: u16) -> CString {
+        CString::new(format!("https://127.0.0.1:{port}/video.mkv")).unwrap()
+    }
+
+    /// The control: an ordinary handle, run twice over the shared cache, DOES resume, so the test
+    /// below is not vacuous. It is asked of an OpenSSL-backed libcurl, which is every libcurl the
+    /// television and the Linux CI runners have; the desktop simulator's SecureTransport does not
+    /// resume against the double here (measured, libcurl 8.7.1), and says so instead of failing.
+    #[test]
+    fn the_shared_cache_resumes_an_ordinary_handle() {
+        let _serial = plx_base::testlock::serial();
+        if !curl_ready() { return; }
+        let version = unsafe { CStr::from_ptr(curl_version()) }.to_string_lossy().into_owned();
+        if !version.contains("OpenSSL") {
+            eprintln!("{version} does not resume across a shared session cache here; skipping");
+            return;
+        }
+        let served = spawn_observed(Arc::new(mint_cert(&["127.0.0.1"])), b"control".to_vec());
+        let sessions = SharedSessions::new();
+        for round in 0..2 {
+            assert_eq!(transfer(&sessions, &loopback(served.port), None).0, 0, "round {round}");
+        }
+        assert_eq!(served.accepted(), 2);
+        assert_eq!(served.resumed(), 1, "the second handle resumed the session the first one left");
+    }
+
+    #[test]
+    fn a_key_mode_handle_never_resumes_a_session_and_confirms_the_key_every_time() {
+        let _serial = plx_base::testlock::serial();
+        if !curl_ready() { return; }
+        let cert = Arc::new(mint_cert(&["127.0.0.1"]));
+        let served = spawn_observed(Arc::clone(&cert), b"key mode".to_vec());
+        let pin = leaf_pin(&cert);
+        let sessions = SharedSessions::new();
+        const ROUNDS: usize = 3;
+        for round in 0..ROUNDS {
+            let (rc, confirmed) = transfer(&sessions, &loopback(served.port), Some(&pin));
+            assert_eq!(rc, 0, "round {round}: the transfer");
+            assert!(confirmed, "round {round}: a key-mode handshake presents the certificate chain");
+        }
+        assert_eq!(served.accepted(), ROUNDS, "every round is a connection of its own");
+        assert_eq!(served.resumed(), 0, "and none of them resumed a TLS session");
     }
 }

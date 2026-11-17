@@ -33,6 +33,9 @@ impl Host for SearchHost {
     type Init = Arg;
     type Memory = PageMemory;
 }
+impl crate::registry::ScreenInputsLike for SearchHost {
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+}
 impl SearchLike for SearchHost {
     fn search<'a>(cx: &Cx<'a, Self>) -> SearchView<'a> { cx.views }
 }
@@ -73,6 +76,7 @@ impl Harness {
 
     fn cx(&self) -> Cx<'_, SearchHost> {
         Cx { views: self.snap.view(), tick: Tick { ms: self.ms, dt_us: 16_667 }, measure: &FixtureMeasure,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             press: PressRead { scale: self.press, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() }, owner: InputOwner::Entry(ENTRY) }
     }
@@ -80,8 +84,9 @@ impl Harness {
     fn step(&mut self, ev: ScreenEvent<SearchHost>) -> bool {
         let mut present = Present::new();
         let mut out = Vec::new();
-        let (_, moving) = plx_machine::idle::scoped_motion(|| {
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
             let cx: Cx<'_, SearchHost> = Cx { views: self.snap.view(), tick: Tick { ms: self.ms, dt_us: 16_667 },
+                modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
                 measure: &FixtureMeasure, press: PressRead { scale: self.press, ..Default::default() },
                 focus: FocusRead { current: self.focus, ..Default::default() }, owner: InputOwner::Entry(ENTRY) };
             let mut fx = Effects::new(&mut out, MachineId::Instance(INSTANCE), &mut present);
@@ -137,14 +142,14 @@ impl CardHarness for Harness {
         let (row, _) = self.at(elem)?;
         let cx = self.cx();
         let mut frame = DrawFrame::new(&cx, plx_ui::Painter::root());
-        let src = self.screen.row_cards(self.snap.view(), row)?;
+        let src = self.screen.row_cards(self.snap.view(), row, crate::registry::captions::policy())?;
         let root = frame.painter;
         if let Some((at, shelf)) = self.screen.row_frame(&self.cx(), row) { shelf.record_stops(&mut frame, root, &src, at); }
         frame.stops().iter().find(|s| s.key.elem == elem).map(|s| s.rect)
     }
     fn scale(&self, elem: u32) -> Option<f32> {
         let (row, _) = self.at(elem)?;
-        let src = self.screen.row_cards(self.snap.view(), row)?;
+        let src = self.screen.row_cards(self.snap.view(), row, crate::registry::captions::policy())?;
         self.screen.row_frame(&self.cx(), row)?.1.scale_of(&self.cx(), &src, &elem)
     }
     fn focus_scale(&self) -> f32 { layout::style(Kind::Movie).focus_scale }

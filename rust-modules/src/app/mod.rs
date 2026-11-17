@@ -3,9 +3,14 @@
 //! the buffer-feed pump orchestration, and the dev triggers. The C boot shim
 //! (main.c) sets up the log and fallback crash tracer, calls the Rust image-marker and native-spool
 //! entries when required, then calls `plex_run` (port.rs), which hands over to `run_application`.
-//! The only application subsystem left in C is the starfish.c C++/ACB seam (the engine itself is
-//! Rust: plx_media::player).
+//! The only application subsystems left in C are the starfish.c C++ Feed seam and the video_plane.c
+//! ACB / exported-window display binding (the engine itself is Rust: plx_media::player).
 #![allow(non_upper_case_globals)]
+pub(crate) mod hud_source;
+#[cfg(feature = "devtriggers")]
+mod anim_diagnostics;
+mod card_motion_policy;
+mod player_presentation;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -30,13 +35,14 @@ const SIM_TAG: &str = if cfg!(feature = "hostsim") {
 /// **not RESIZABLE**: `surface::probe` reads the drawable once, at boot, so a dragged edge would
 /// leave the viewport describing a window that no longer exists, and the interface would sit in a
 /// 1920x1080-shaped corner of the new one with every pointer hit landing somewhere else. The window
-/// opens at an exact divisor of the canvas instead — see `desktop_window_size`.
+/// opens at an exact divisor of the canvas instead — see `boot::plan_desktop_window`.
 ///
 /// ALLOW_HIGHDPI is what makes that divisor land on a **1:1 surface** on the Mac people actually
 /// have: without it a Retina display gives a drawable equal to the window in POINTS, which the
 /// compositor then doubles, so the whole interface is an upscale of a half-size render. With it,
-/// the 960x540-point window `desktop_window_size` picks on a laptop has a 1920x1080 drawable —
-/// `surface::scale() == 1.0`, the same 1:1 texel contract the television gets.
+/// `boot::fit_window_to_density` measures the pixels per point once the window exists and sizes
+/// it in points for the drawable it should give: 960x540 points for a 1920x1080 drawable on a 2x
+/// display, so `surface::scale() == 1.0`, the same 1:1 texel contract the television gets.
 const SDL_WINDOW_FLAGS: u32 = if cfg!(feature = "hostsim") {
     0x2 | 0x2000
 } else {
@@ -98,6 +104,10 @@ extern "C" {
     /// `SDL_GetDisplayUsableBounds` — the display minus the menu bar and the Dock, which is what
     /// a window may actually occupy. The out parameter is an `SDL_Rect`: exactly four `c_int`.
     fn SDL_GetDisplayUsableBounds(display: c_int, rect: *mut c_int) -> c_int;
+    /// `SDL_SetWindowSize` / `SDL_SetWindowPosition` — `app::boot::fit_window_to_density` re-sizes
+    /// and re-centres the window once the display's pixel density has been measured from it.
+    fn SDL_SetWindowSize(win: *mut c_void, w: c_int, h: c_int);
+    fn SDL_SetWindowPosition(win: *mut c_void, x: c_int, y: c_int);
 }
 
 // Phase 1a of the UI restructure split this file: everything above `run_application` moved into
@@ -125,9 +135,11 @@ pub(crate) mod playback;
 mod preferences;
 pub(crate) mod input;
 pub(crate) mod bridge;
+mod runtime_owners;
 pub(crate) mod chrome;
 mod collections_probe;
 pub(crate) mod content;
+pub(crate) mod deeplink;
 pub(crate) mod reread;
 pub(crate) mod run;
 use self::boot::*;
@@ -193,7 +205,6 @@ extern "C" {
     pub(crate) fn SDL_LogSetPriority(category: c_int, priority: c_int);
     fn glGetString(name: c_uint) -> *const c_char;
     fn glViewport(x: c_int, y: c_int, w: c_int, h: c_int);
-    fn glClearColor(r: f32, g: f32, b: f32, a: f32);
     fn glClear(mask: c_uint);
 }
 
@@ -234,6 +245,20 @@ pub(crate) struct App {
     #[cfg(feature = "devtools")]
     fps_shown: i32,
     play_prev: Option<(i64, u32)>,
+    /// The pipeline's `FRAMEREADY` counters at the last heartbeat line (`vtick=` and `vgap=` are
+    /// differences of them).
+    #[cfg(feature = "play-feed")]
+    vpres_prev: plx_media::player::VplaneMark,
+    /// The compiled HUD the player page draws from (`player_hud::loaded`), in the language the process
+    /// started in (a label's width sets a pill's width; the language cannot change while it runs). Compiled at boot (`boot::enter_application`), outside any frame, and handed to
+    /// the mount through the mounter's seed (`Bridge::seed_player_compiled`); `None` only in a controlled
+    /// replay or record run, which measures nothing outside a frame and compiles on its first player frame
+    /// (`run::refresh_hud`, inside the frame iteration). It is replaced by the package the seated profile chose when
+    /// that one fits the language and the cost ceilings (`Bridge::huds_tick`, in the frame's prepare window, never in the draw), and a
+    /// `plxnative-hud=<path>` package replaces whatever is chosen.
+    hud: Option<plx_appkit::player_hud::loaded::LoadedHud>,
+    /// the `plxnative-hud=<path>` package, read once on the first player frame (`run::refresh_hud`)
+    dev_hud: plx_appkit::player_hud::loaded::DevHud,
     running: bool,
     window_activity: window_activity::WindowActivity,
     #[cfg(feature = "devtools")]
@@ -265,6 +290,7 @@ pub(crate) struct App {
     /// nine `static mut`s in `ui/stats.rs`. Not a `ModalStack` surface, and `diagnostics.rs`'s
     /// `Diagnostics` doc says why — the panel takes no keys and draws at two different z-positions.
     pub(crate) diagnostics: diagnostics::Diagnostics,
+    pub(crate) lab_toast: crate::lab::ToastObserver,
     /// **The Player machine** (restructure spec §2.2, phase 9): the playback session that was
     /// `route::decision::SESSION`, the app-switch lifecycle that was `App.foreground`, and this
     /// frame's tick. Reached as a parameter from here down — `plx_media::player::machine`'s doc says
@@ -278,7 +304,11 @@ pub(crate) struct App {
     /// The playing session is parked because the pipeline took its video decoder back, not
     /// because the app left the screen; the next press restores it (`run::park_on_decoder_release`).
     decoder_parked: bool,
-    pub(crate) ok_armed: bool,
+    /// The foreground Load was refused while the plaintext grants were still being re-proven (the
+    /// DID edge withdraws them), as `(grant revision at the refusal, retries left)`; the frame
+    /// step claims again once the revision moves (`run::retry_refused_foreground`).
+    foreground_retry: Option<(u64, u8)>,
+
     last_route_reported: &'static str,
     pub(crate) ptr: Pointer,
     // (`route`, `play_from`, `trail` and `nav_pending` stood here — four fields that between them
@@ -293,6 +323,9 @@ pub(crate) struct App {
     /// already finished by then). See `input::menu_play_tick`, driven every frame beside
     /// `pump_detail()` (`app/run.rs`).
     pub(crate) menu_play_await: Option<MenuPlayAwait>,
+    /// A title another app asked to open (`deeplink`), until Home is up to hand it to
+    /// `menu_play_await`.
+    pub(crate) deeplink: deeplink::DeepLink,
     pub(crate) prev: u32,
     /// A playback exit is owed a re-read of Home's hubs and every library's shelves. Armed by
     /// `exit_player`; spent by `playback_tick` once the stop's `stopped` POST has landed
@@ -326,17 +359,14 @@ pub(crate) struct App {
     /// Every dev-trigger arm's own state — oscillator phases, retry latches, boot-time flags
     /// (formerly `DevFlags`) — gathered on ONE struct (spec: `dev/scenarios.rs`'s module doc).
     pub(crate) scenarios: crate::dev::scenarios::Scenarios,
-    /// The Input machine: owner of the press (restructure spec §2.2); the ladders borrow it.
-    pub(crate) input: plx_ui::input::Input,
+
     /// `text::take_measure_fault` has been reported once (the report is once per process).
     measure_fault_logged: bool,
     /// The recorder / replay driver (`plxnative-rec` / `plxnative-recplay`, spec §5.3/§5.5).
     pub(crate) rec: recorder::Recplay,
     pub(crate) boot_initial: Option<bootstrap::Initial>,
     pub(crate) telemetry_guard: Option<plx_telemetry::telemetry::native::Guard>,
-    /// The present gate as a machine (spec §4.4). `plx_machine::idle` is still the product's verdict on
-    /// this loop; this one receives the render cache's notes and is what `dispatch` takes over.
-    present: plx_machine::present::Present,
+
     /// The frame plan's GLASS half (spec §8.3): the layer/region source registry, shared chrome
     /// material and dev load dial. The budget half lives on the `Dispatcher` (§2.2).
     pub(crate) glass: plx_ui::frame::glass::GlassPlan,
@@ -355,15 +385,30 @@ pub(crate) struct App {
     pub(crate) pages: plx_ui::dispatch::Dispatcher<bridge::AppHost>,
     /// Inputs collected for the dispatcher this iteration (`bridge` module doc).
     pub(crate) inputs: Vec<plx_machine::machine::InputEvent<u32>>,
-    /// What that dispatcher borrows: the mounter, the real `TtfMeasure`, the store deliveries,
-    /// the consent machine and the queue of requests an owned screen makes of this loop.
-    pub(crate) bridge: bridge::Bridge,
+    /// Physical logical children. Native playback resources remain in `adapters` above.
+    pub(crate) runtime: runtime_owners::RuntimeOwners,
+    /// Retained publications and IO bookkeeping; each turn borrows these alongside `runtime`.
+    pub(crate) bridge: bridge::BridgeRetained,
+}
+
+impl App {
+    /// Application/runner mutations belong to the page, never an ambient damage queue.
+    pub(crate) fn note_presentation_damage(&mut self, why: plx_machine::present::Provenance) {
+        self.pages.present.note_in_scope(plx_machine::present::Scope::Page,
+            plx_machine::present::PresentEvent::Damage(why));
+    }
+
+    pub(crate) fn note_input_damage(&mut self) {
+        let scope = self.pages.input_scope();
+        self.pages.present.note_in_scope(scope,
+            plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
+    }
 }
 
 impl App {
     pub(crate) fn snapshot_init(&self) -> Option<bootstrap::Initial> {
         let mut initial = self.boot_initial.clone()?;
-        initial.session = self.bridge.snapshot_session_init();
+        initial.session = self.runtime.session.machine.snapshot_init();
         Some(initial)
     }
     /// `instr`'s own narrow read — see [`plx_base::diag::heartbeat::Instruments::last_frame_ms`]. A
@@ -424,7 +469,7 @@ fn pre_boot_diagnostics() -> plx_telemetry::telemetry::native::Guard {
     //
     // `APPID_env` is here for a second reason, and it is evidence rather than configuration.
     // Nothing this project can read off a desk says whether SAM exports `APPID` to a native app on
-    // this firmware, or what it sets it to — and `engine::acb_init_acb` used to depend on it. It
+    // this firmware, or what it sets it to — and the ACB boot (`adapters::backends::acb_init`) used to depend on it. It
     // does not any more (the install directory is the authority), so this line turns an unanswered
     // device question into something every single run answers for free.
     log(&format!(
@@ -506,15 +551,24 @@ fn pre_boot_diagnostics() -> plx_telemetry::telemetry::native::Guard {
 /// The run+teardown sequence `run_application` hands the mounted `App` to, split out for the same
 /// reason as [`pre_boot_diagnostics`] (D4): `run_application` stays a ten-line skeleton naming only
 /// the THREE real phases (pre-boot diagnostics, `boot`, this), never the steps inside any one of them.
-unsafe fn run_and_shutdown(app: &mut App) -> c_int {
+unsafe fn run_and_shutdown(app: &mut App) -> ! {
     run::run(app);
-    let failed = finish_recording(&mut app.rec, app.bridge.landgate())
-        || app.bridge.controlled_failure().is_some();
+    // The crash record's phase (`src/crashtrace.c`): from here a fault is in the teardown.
+    plx_base::task::watchdog::set_crash_phase(plx_base::task::watchdog::CrashPhase::Shutdown);
+    // Quit: the last screen's visit has not been reported, and no route change will.
+    run::end_route_visit(app, false);
+    let bridge = app.runtime.bridge(&mut app.bridge);
+    let failed = finish_recording(&mut app.rec, bridge.landgate())
+        || bridge.controlled_failure().is_some();
     app.glass.sources.borrow_mut().clear();
     // A tune the Live TV store still owns (landed, not played; owed a release) is freed first.
-    app.bridge.live_tv_release_for_exit();
+    app.runtime.bridge(&mut app.bridge).live_tv_release_for_exit();
+    let code = i32::from(failed);
     run::shutdown(&mut app.player.session, &mut app.adapters.player);
-    i32::from(failed)
+    // The crash-channel guard is the one `Drop` that persists something (it closes the capture
+    // backend and removes its database), so it runs here explicitly: nothing drops the `App`.
+    drop(app.telemetry_guard.take());
+    plx_base::process::exit_now(code)
 }
 
 fn finish_recording(rec: &mut recorder::Recplay, gate: &plx_machine::landgate::Gate) -> bool {
@@ -522,7 +576,7 @@ fn finish_recording(rec: &mut recorder::Recplay, gate: &plx_machine::landgate::G
 }
 
 /// Simulator tooling emits the entire typed contract, never a patched household auth file.
-#[cfg(feature = "hostsim")]
+#[cfg(any(test, feature = "hostsim"))]
 pub fn synthetic_home_initial(seed: u32, port: u16, settings: Option<String>)
     -> Result<String, &'static str> {
     let content = settings.as_deref() == Some("flow12");
@@ -580,8 +634,10 @@ fn enter_application(pms_host: *const c_char, pms_port: c_int) -> Result<App,c_i
 }
 
 /// The ten-line public skeleton: preflight/construction, then the ordinary loop and teardown.
-pub(crate) fn run_application(pms_host: *const c_char, pms_port: c_int) -> c_int {
-    let mut app = match enter_application(pms_host,pms_port) { Ok(app) => app, Err(code) => return code };
+pub(crate) fn run_application(pms_host: *const c_char, pms_port: c_int) -> ! {
+    // An early-boot refusal ends the same way: the workers it has already started (diagnostics,
+    // capability probe, telemetry) are as live as after a played session.
+    let mut app = match enter_application(pms_host,pms_port) { Ok(app) => app, Err(code) => plx_base::process::exit_now(code) };
     unsafe { run_and_shutdown(&mut app) }
 }
 

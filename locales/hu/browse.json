@@ -42,6 +42,7 @@
   "browse.detail.mark_show_unwatched": "Sorozat megjelölése nem látottként",
   "browse.detail.play_start": "Lejátszás az elejéről",
   "browse.detail.trailer": "Előzetes",
+  "browse.detail.play_version": "Verzió lejátszása",
   "browse.detail.resume": "Folytatás",
   "browse.detail.play": "Lejátszás",
   "browse.detail.created_by": "Alkotó",
@@ -76,6 +77,8 @@
   "browse.menu.go_season": "Ugrás az évadhoz",
   "browse.menu.go_movie": "Ugrás a filmhez",
   "browse.menu.remove_deck": "Eltávolítás a listából",
+  "browse.menu.play_version": "Verzió lejátszása…",
+  "browse.menu.play_version_title": "Verzió lejátszása",
   "browse.login.deleted": "Helyi adatok törölve",
   "browse.login.deleted_detail": "A hitelesítő adatok, a beállítások, a telemetria és a helyi diagnosztika törölve.",
   "browse.login.partial": "Kijelentkezve, a legtöbb helyi adat törölve",
@@ -266,5 +269,8 @@
   "browse.clock.notice_year": "A TV órája hibásnak tűnik ({year}). A kapcsolat a mentett kulccsal létrejött.",
   "browse.clock.notice": "A TV órája hibásnak tűnik. A kapcsolat a mentett kulccsal létrejött.",
   "browse.clock.no_key": "A TV órája hibásnak tűnik. Csatlakoztassa egyszer a TV-t az internethez, majd próbálja újra.",
-  "browse.clock.key_changed": "A szerver kulcsa megváltozott. Csatlakoztassa egyszer a TV-t az internethez, hogy az alkalmazás újra ellenőrizhesse."
+  "browse.clock.key_changed": "A szerver kulcsa megváltozott. Csatlakoztassa egyszer a TV-t az internethez, hogy az alkalmazás újra ellenőrizhesse.",
+  "browse.detail.mark_episode_watched": "Epizód megjelölése megnézettként",
+  "browse.detail.mark_episode_unwatched": "Epizód megjelölése nem megnézettként",
+  "browse.detail.minutes_left": "{minutes} perc van hátra"
 }

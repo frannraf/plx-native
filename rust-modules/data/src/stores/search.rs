@@ -1,5 +1,11 @@
 //! The physically owned Search model and fetch transport (`docs/stores-as-machines.md`). Each
 //! production `Bridge` owns one [`SearchStore`]; no free selector can connect two Bridges.
+//!
+//! The store starts no worker. Its pump emits each source's fetch as a
+//! [`StoreJob::Search`](super::StoreJob::Search) and a recents edit emits its write as a
+//! [`StoreJob::SaveRecents`](super::StoreJob::SaveRecents), both on [`SearchStore::take_jobs`]; the
+//! `Bridge` takes them in the same call and the application's runner starts them
+//! (`docs/sans-io.md`, "The Search lane").
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -79,11 +85,15 @@ impl SearchStore {
         self.state.snapshot()
     }
 
-    pub fn snapshot_with_directory(
+    /// `household`: the signed-in profile's household member ids, read by the application's
+    /// `Bridge` and handed in (`SearchState::snapshot_with_directory`).
+    pub fn snapshot_with_directory_and_input(
         &self,
         directory: crate::stores::browse::DirectoryView<'_>,
+        household: &[i64],
+        input: &crate::search::SearchInput<'_>,
     ) -> SearchSnapshot {
-        self.state.snapshot_with_directory(directory)
+        self.state.snapshot_with_directory_and_input(directory, input, household)
     }
 
     /// The ITEMS the result shelves hold, in shelf order. A tag or collection hit has no rating
@@ -131,37 +141,80 @@ impl SearchStore {
 
     /// Synchronous command path with the Browse owner publication captured by the application.
     /// Query admission snapshots its favourite-library ranking from this directory.
-    pub fn run_with_directory(
+    pub fn run_with_directory_and_input(
         &mut self,
         cmd: SearchCmd,
         directory: crate::stores::browse::DirectoryView<'_>,
+        input: &crate::search::SearchInput<'_>,
     ) -> bool {
         if matches!(&cmd, SearchCmd::Reset) {
             self.adapter = Arc::new(Default::default());
         }
         let view_edit = matches!(&cmd, SearchCmd::ApplyView { .. });
-        let answer = self.state.run_with_directory(&self.adapter, cmd, directory);
+        let answer = self.state.run_with_directory_and_input(&self.adapter, cmd, directory, input);
         if answer || !view_edit {
             self.bump();
         }
         answer
     }
 
-    /// Route-unconditional landing/spawn pass for this owner's adapter.
-    pub fn pump_with_directory_and_gate(
+    /// Route-unconditional landing/request pass for this owner's adapter. `keys` is the registry's
+    /// answer as of this call. It does NOT start the requests it emitted: the caller takes them with
+    /// [`SearchStore::take_jobs`] and hands them to a runner in the same turn (the one production
+    /// caller is `Bridge::search_pump`; the application's test rigs fail a frame that ends with a
+    /// job still here, `Bridge::assert_no_store_jobs_left_for_test`).
+    pub fn pump_with_directory_and_input_and_gate(
         &mut self,
         dt: f32,
         directory: crate::stores::browse::DirectoryView<'_>,
         gate: &plx_machine::landgate::Gate,
+        input: &crate::search::SearchInput<'_>,
     ) -> bool {
-        let changed = self.state.pump_with_directory_and_gate(&self.adapter, dt, directory, gate);
+        let changed = self.state.pump_with_directory_and_input_and_gate(&self.adapter, dt, directory, gate, input);
         if changed {
             self.bump();
         }
         changed
     }
 
-    /// Test-only compatibility pump for fixtures without a retained directory.
+    pub(crate) fn run_local(&mut self, cmd: SearchCmd) -> bool {
+        if matches!(&cmd, SearchCmd::Reset) { self.adapter = Arc::new(Default::default()); }
+        let view_edit = matches!(&cmd, SearchCmd::ApplyView { .. });
+        let changed = self.state.run_local(&self.adapter, cmd);
+        if changed || !view_edit { self.bump(); }
+        changed
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn snapshot_with_directory(&self, directory: crate::stores::browse::DirectoryView<'_>, household: &[i64]) -> SearchSnapshot {
+        self.snapshot_with_directory_and_input(directory, household, &crate::search::fixture_input().input())
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn run_with_directory(&mut self, cmd: SearchCmd, directory: crate::stores::browse::DirectoryView<'_>) -> bool {
+        self.run_with_directory_and_input(cmd, directory, &crate::search::fixture_input().input())
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pump_with_directory_and_gate(&mut self, dt: f32, directory: crate::stores::browse::DirectoryView<'_>,
+        gate: &plx_machine::landgate::Gate, keys: &plx_plex::plex::ClientKeys) -> bool {
+        let captured = crate::search::fixture_input();
+        let input = crate::search::SearchInput { keys, ..captured.input() };
+        self.pump_with_directory_and_input_and_gate(dt, directory, gate, &input)
+    }
+
+    /// Take the jobs the last step has emitted since the last take, in order. The caller OWES each
+    /// one to a runner: a job dropped here is a fetch whose claim is never released.
+    #[must_use]
+    pub fn take_jobs(&mut self) -> Vec<super::StoreJob> {
+        std::mem::take(&mut self.state.jobs)
+    }
+
+    /// Does the outbox hold a job nobody has taken yet?
+    pub fn has_jobs(&self) -> bool {
+        !self.state.jobs.is_empty()
+    }
+
+    /// Test-only compatibility pump for fixtures without a retained directory. The requests it
+    /// emits wait on the outbox for the caller to take.
     #[cfg(any(test, feature = "test-support"))]
     pub fn pump(&mut self, dt: f32) -> bool {
         let changed = self.state.pump(&self.adapter, dt);
@@ -221,7 +274,7 @@ mod view_edit_notice_tests {
             })],
         }]);
         let _ = store.take_notice();
-        let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0 };
+        let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0, sort: None };
         let apply = |store: &mut SearchStore, rk: &str| {
             store.run(SearchCmd::ApplyView { at: ViewAt::leaf(sid, rk), edit: facts })
         };

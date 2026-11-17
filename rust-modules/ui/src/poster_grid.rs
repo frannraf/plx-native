@@ -109,6 +109,15 @@ impl GridBands {
         self.slots[at] = Slot { row: Some(row), card: None, spring: Spring::at(0.0) };
     }
 
+    /// Close every band at once and name no focused row: what was opening and what was closing
+    /// behind a move are gone, with no spring left to step. [`focus`](Self::focus)`(None, false)`
+    /// cannot say it when the focus has already left (`None`): it returns early, and the band a
+    /// move off the grid left closing goes on closing.
+    pub fn shut(&mut self) {
+        self.focus = None;
+        self.slots = [Slot::EMPTY; MAX_GRID_BANDS];
+    }
+
     /// Note which card of the focused row `row` the focus is on, so the band, once it closes behind
     /// a move, still knows whose caption it carries ([`closing`](Self::closing)). A card outside the
     /// focused row is not noted.
@@ -239,6 +248,13 @@ impl GridPop {
             self.take(card.key);
             self.let_gos.push(LetGo { card, spring: self.pop.spring });
         }
+    }
+
+    /// The focused card is let go without another taking its place: it eases back to rest from
+    /// where its spring is, and the pop belongs to no card until one is armed or adopted.
+    pub fn let_go(&mut self) {
+        self.release();
+        self.vacate();
     }
 
     /// Take the let-go of the element `key` out of the running, if it has one: its spring.
@@ -395,18 +411,30 @@ pub struct Geom {
     pub w: f32,
     pub h: f32,
     pub gap: f32,
+    /// The grid shows a sort value under every poster ([`card_row::SortValue`]): a collapsed row
+    /// keeps [`card_row::SORT_VALUE_ROW_GAP`] under its posters instead of 40 px.
+    pub value_line: bool,
 }
 
 impl Geom {
     #[cfg(test)]
-    pub const DEFAULT: Self = Self { cols: COLS, left: MARGIN_X, w: CARD_W, h: CARD_H, gap: GAP };
+    pub const DEFAULT: Self = Self { cols: COLS, left: MARGIN_X, w: CARD_W, h: CARD_H, gap: GAP, value_line: false };
 
     pub const fn of(cols: usize, left: f32, style: &RowStyle) -> Self {
-        Self { cols, left, w: style.w, h: style.h, gap: style.gap }
+        Self { cols, left, w: style.w, h: style.h, gap: style.gap, value_line: false }
     }
 
     /// A COLLAPSED row's pitch.
-    pub fn pitch(&self) -> f32 { self.h + LABEL_BAND_COLLAPSED + UNDER_LABEL_AIR }
+    pub fn pitch(&self) -> f32 {
+        self.h + if self.value_line { card_row::SORT_VALUE_ROW_GAP }
+            else { LABEL_BAND_COLLAPSED + UNDER_LABEL_AIR }
+    }
+
+    /// How far under a card's unscaled bottom the focused row's caption reaches for a band of
+    /// `band_h`: what the page must keep on screen, and what paging counts back from.
+    fn under_reach(&self, band_h: f32) -> f32 {
+        if self.value_line { card_row::SORT_VALUE_REACH } else { shown_band(band_h) }
+    }
 }
 
 #[cfg(test)]
@@ -495,7 +523,7 @@ pub fn snap_row_in_for(band_h: f32, g: &Geom, current: f32, row: usize, len: usi
     if row == 0 || len == 0 { return 0.0; }
     let bands = settled(Some(row));
     let focused_top = row_top_in_for(band_h, g, row, top, &bands);
-    let min = card_row::reveal(current, focused_top + g.h + shown_band(band_h) - (SCR_H - MARGIN_Y),
+    let min = card_row::reveal(current, focused_top + g.h + g.under_reach(band_h) - (SCR_H - MARGIN_Y),
         focused_top - edge, f32::INFINITY);
     if min <= 0.0 { return 0.0; }
     (0..=row).map(|k| row_top_in_for(band_h, g, k, top, &bands) - edge).find(|&at| at >= min - 0.5)
@@ -512,8 +540,16 @@ pub fn snap_row_in_for(band_h: f32, g: &Geom, current: f32, row: usize, len: usi
 /// and a [`Grid`](crate::cards::Grid) built with `GridSpec::resting` (the Watchlist) both land here,
 /// so the line (244 on those pages) is one rule, not two.
 pub fn rest_scroll(row: usize, pitch: f32, growth_before: f32, max: f32) -> f32 {
+    rest_scroll_at(row, row as f32 * pitch + growth_before, max)
+}
+
+/// [`rest_scroll`] for a column whose rows do not share one pitch (Home's stills row on top of its
+/// poster shelves): `top` is row `row`'s settled top in document space, however it was summed
+/// (`card_row::settled_top_by`). Row 0 rests at the head, the end holds the last rows at `max`, and
+/// no row rests above the line.
+pub fn rest_scroll_at(row: usize, top: f32, max: f32) -> f32 {
     if row == 0 { return 0.0; }
-    (row as f32 * pitch + growth_before).min(max).max(0.0)
+    top.min(max).max(0.0)
 }
 
 /// The label block a focused row shows under its posters for a band of `band_h`: the band less the
@@ -551,7 +587,7 @@ pub fn visible_in(g: &Geom, len: usize, top: f32, scroll: f32) -> std::ops::Rang
 pub fn visible_in_for(band_h: f32, g: &Geom, len: usize, top: f32, scroll: f32) -> std::ops::Range<usize> {
     if len == 0 { return 0..0; }
     let pitch = g.pitch();
-    let first = ((scroll - top - g.h - shown_band(band_h)) / pitch).floor().max(0.0) as usize;
+    let first = ((scroll - top - g.h - g.under_reach(band_h)) / pitch).floor().max(0.0) as usize;
     let last = ((scroll + SCR_H - top) / pitch).ceil().max(0.0) as usize + 1;
     first.saturating_mul(g.cols)..last.saturating_mul(g.cols).min(len)
 }
@@ -559,6 +595,16 @@ pub fn visible_in_for(band_h: f32, g: &Geom, len: usize, top: f32, scroll: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rest_at_a_settled_top_is_the_uniform_rest_and_is_held_by_the_end() {
+        for row in 0..8 {
+            assert_eq!(rest_scroll_at(row, row as f32 * 300.0 + 40.0, 1000.0), rest_scroll(row, 300.0, 40.0, 1000.0));
+        }
+        assert_eq!(rest_scroll_at(0, 500.0, 1000.0), 0.0, "row 0 rests at the head");
+        assert_eq!(rest_scroll_at(5, 5000.0, 1000.0), 1000.0, "the end holds the last rows");
+        assert_eq!(rest_scroll_at(2, -4.0, 1000.0), 0.0, "never above the line");
+    }
 
     #[test]
     fn six_portraits_keep_existing_card_size_and_share_one_pitch() {
@@ -609,7 +655,7 @@ mod tests {
         bands.focus(Some(0), false);
         bands.focus(Some(1), true);
         let k = RowStyle::HOME.k_scroll;
-        let (_, moving) = plx_machine::idle::scoped_motion(|| bands.tick(k, 1.0 / 60.0));
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| bands.tick(k, 1.0 / 60.0));
         assert!(moving, "caption motion keeps the presenter awake");
         let geometry = bands.geometry();
         let opened = geometry.iter().find(|b| b.row == 1).unwrap().expansion;
@@ -617,7 +663,7 @@ mod tests {
         assert!(opened > 0.0 && opened < 1.0 && closing > 0.0 && closing < 1.0);
         assert!((opened + closing - 1.0).abs() < 0.0001);
         for _ in 0..120 { bands.tick(k, 1.0 / 60.0); }
-        let (_, moving) = plx_machine::idle::scoped_motion(|| bands.tick(k, 1.0 / 60.0));
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| bands.tick(k, 1.0 / 60.0));
         assert!(!moving, "a settled grid lets idle suppression sleep");
         assert_eq!(bands.slots.iter().filter(|s| s.row.is_some()).count(), 1);
         let settled = bands.geometry().iter().find(|b| b.row == 1).unwrap().expansion;
@@ -712,7 +758,7 @@ mod tests {
         for _ in 0..120 { pop.tick(Some(at(4)), &style, dt); }
         assert!((pop.scale(4, true, &style) - style.focus_scale).abs() < 0.001);
         assert_eq!(pop.scale(3, false, &style), 1.0);
-        let (_, moving) = plx_machine::idle::scoped_motion(|| pop.tick(Some(at(4)), &style, dt));
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| pop.tick(Some(at(4)), &style, dt));
         assert!(!moving, "a settled grid lets idle suppression sleep");
     }
 

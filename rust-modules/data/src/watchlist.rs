@@ -16,14 +16,15 @@ pub mod order;
 
 use ledger::{Intent, PendingWrite, WriteOutcome};
 use model::{Asked, Kind, Reach, ServerMatch, WatchRow};
-use plx_plex::plex::account::AccountClient;
-use plx_plex::plex::session::UserRef;
+
+use plx_plex::plex::session::{CurrentProfile, UserRef};
 use plx_plex::plex::watchlist::{WatchItem, WatchKind, WatchPage, WatchlistError, MAX_PAGE};
 use plx_plex::plex::{GuidKind, GuidLookupError, GuidMatch, ServerId, GUIDS_PER_REQUEST};
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Who a worker acts for, captured on the MAIN thread at spawn (`session::plex_tv_credential`) and
-/// owned by the worker: it never reads the session itself. `generation` is the profile generation
+/// Who a worker acts for, built from the [`WatchlistInput`] the app read on the MAIN thread
+/// (`session::plex_tv_credential`) and owned by the worker: it never reads the session itself. `generation` is the profile generation
 /// at capture; a landing tagged with an older one is dropped.
 #[derive(Clone)]
 pub struct WatchlistAuth {
@@ -40,38 +41,76 @@ impl std::fmt::Debug for WatchlistAuth {
 }
 
 impl WatchlistAuth {
-    /// MAIN THREAD. The active profile's account-service credential, or `None` when there is none
-    /// (signed out, or a managed profile with no plex.tv token): the page then has no list to read.
-    pub fn capture() -> Option<WatchlistAuth> {
-        let current = plx_plex::plex::session::current_snapshot();
-        let user = current.user.clone()?;
-        let credential = plx_plex::plex::session::plex_tv_credential(&user)?;
-        let client_id = plx_plex::plex::session::peek().client_id.clone();
-        if client_id.is_empty() {
-            return None;
-        }
-        Some(WatchlistAuth { client_id, credential, user, generation: current.generation })
-    }
-
-    /// Is this still the seated profile? Compared by id and uuid and the profile generation.
-    pub fn is_current(&self) -> bool {
-        let now = plx_plex::plex::session::current_snapshot();
+    /// Is this still the seated profile? Compared by id and uuid and the profile generation, against
+    /// the profile the app read for this pass ([`WatchlistInput`]).
+    pub fn is_current(&self, now: &CurrentProfile) -> bool {
         now.generation == self.generation
             && now.user.as_ref().is_some_and(|u| u.id == self.user.id && u.uuid == self.user.uuid)
     }
 
-    fn client(&self) -> AccountClient {
-        AccountClient::new(&self.client_id, Some(&self.credential))
+    pub fn matches_lease(&self, profile: &CurrentProfile, credential: Option<&str>) -> bool {
+        self.is_current(profile) && credential == Some(self.credential.as_str())
+    }
+
+
+}
+
+/// **What the app reads from the session for the two plex.tv stores (docs/sans-io.md S5):** the
+/// seated profile and, when a capture can happen, the identity to act as. The Bridge reads the
+/// registry (`Bridge::watchlist_input`) and hands this to a step; nothing here reads it. Built per
+/// call, never kept: a capture reads the credential at the moment it is made.
+pub struct WatchlistInput {
+    profile: Arc<CurrentProfile>,
+    auth: Option<WatchlistAuth>,
+}
+
+impl WatchlistInput {
+    /// The input for `profile`, whose plex.tv `credential` and the install's `client_id` the caller
+    /// read. `auth` is `None` when there is no profile, no credential or no client id: the page then
+    /// has no list to read.
+    pub fn new(profile: Arc<CurrentProfile>, credential: Option<String>, client_id: &str) -> Self {
+        let auth = match (profile.user.clone(), credential) {
+            (Some(user), Some(credential)) if !client_id.is_empty() => Some(WatchlistAuth {
+                client_id: client_id.to_owned(),
+                credential,
+                user,
+                generation: profile.generation,
+            }),
+            _ => None,
+        };
+        Self { profile, auth }
+    }
+
+    pub fn profile(&self) -> &CurrentProfile {
+        &self.profile
+    }
+
+    pub fn auth(&self) -> Option<&WatchlistAuth> {
+        self.auth.as_ref()
+    }
+
+    /// A seated profile of `generation` with a credential: what a signed-in test hands a step.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(generation: u32) -> Self {
+        Self::new(Self::profile_for_test(generation), Some("test-credential".into()), "test-client")
+    }
+
+    /// The same seat with no plex.tv credential: the page has no account to read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn signed_out_for_test(generation: u32) -> Self {
+        Self::new(Self::profile_for_test(generation), None, "test-client")
+    }
+
+    /// The profile a frame pass is handed: the default user seated at `generation`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn profile_for_test(generation: u32) -> Arc<CurrentProfile> {
+        Arc::new(CurrentProfile { user: Some(UserRef::default()), generation, stamp: String::new() })
     }
 }
 
-/// Everything a worker (and the store's frame pass) asks of the outside world. Production is
-/// [`LiveIo`]; tests script it. `Reach` carries the roster and the reachability facts.
+/// Worker transport plus captured facts. The job wrapper supplies `Reach`, generations and
+/// today from its request; the narrow live port or a script supplies transport responses.
 pub trait WatchlistIo: Reach + Send + Sync {
-    /// MAIN THREAD: capture the identity for a new epoch.
-    fn capture_auth(&self) -> Option<WatchlistAuth>;
-    /// MAIN THREAD: is `auth` still the seated profile?
-    fn is_current(&self, auth: &WatchlistAuth) -> bool;
     /// One page of the list. `if_none_match` is the `ETag` of the last COMPLETE read, handed over
     /// for page 0 only; an answer of `Err(WatchlistError::NotModified)` is the service saying the
     /// list is unchanged.
@@ -86,88 +125,13 @@ pub trait WatchlistIo: Reach + Send + Sync {
     fn facts_gen(&self) -> u32;
     /// Today as `YYYY-MM-DD` (UTC), the fallback "coming soon" test when the released list failed.
     fn today(&self) -> Option<String>;
-    /// WORKER THREAD. The `guid` of the item `rk` on `server`'s own record
-    /// (`client.metadata(rk).guid`): what a card row that carried no catalog id is resolved by
-    /// (`plex::resolve_catalog_hex`). `None` when the server did not answer (the caller then forgets the
-    /// attempt and asks again at the next menu; a guid that is not portable answers `Some`). The default answers
-    /// nothing, so a script that never resolves needs no line for it.
-    fn guid_of(&self, _server: ServerId, _rk: &str) -> Option<String> {
-        None
-    }
+
 }
 
-/// The production seam: libcurl through `plex::watchlist`, matching through the registered
-/// servers' clients, reachability from the probe results.
-pub struct LiveIo;
 
-impl Reach for LiveIo {
-    fn reachable(&self, server: ServerId) -> bool {
-        matches!(plx_plex::plex::server_probe_result(server), Some(plx_plex::plex::probe::Outcome::Reachable))
-    }
-    fn roster(&self) -> Vec<ServerId> {
-        plx_plex::plex::server_ids().collect()
-    }
-    fn copy_rank(&self, server: ServerId) -> u8 {
-        if plx_plex::plex::current_server() == server {
-            0
-        } else if plx_plex::plex::server_facts(server).is_some_and(|f| f.owned) {
-            1
-        } else {
-            2
-        }
-    }
-}
-
-impl WatchlistIo for LiveIo {
-    fn capture_auth(&self) -> Option<WatchlistAuth> {
-        WatchlistAuth::capture()
-    }
-    fn is_current(&self, auth: &WatchlistAuth) -> bool {
-        auth.is_current()
-    }
-    fn page(&self, auth: &WatchlistAuth, start: u32, size: u32, if_none_match: Option<&str>)
-        -> Result<WatchPage, WatchlistError>
-    {
-        let client = auth.client();
-        let mut transport = client.watchlist_transport();
-        let answer = client.watchlist_page(start, size, if_none_match, &mut transport);
-        answer
-    }
-    fn released(&self, auth: &WatchlistAuth) -> Result<Vec<WatchItem>, WatchlistError> {
-        let client = auth.client();
-        let mut transport = client.watchlist_transport();
-        let answer = client.watchlist_released(&mut transport);
-        answer
-    }
-    fn write(&self, auth: &WatchlistAuth, hex: &str, intent: Intent) -> Result<(), WatchlistError> {
-        let client = auth.client();
-        let mut transport = client.watchlist_transport();
-        let answer = match intent {
-            Intent::Add => client.watchlist_add(hex, &mut transport),
-            Intent::Remove => client.watchlist_remove(hex, &mut transport),
-        };
-        answer
-    }
-    fn find(&self, server: ServerId, kind: GuidKind, guids: &[String]) -> Result<Vec<GuidMatch>, GuidLookupError> {
-        plx_plex::plex::client_for(server).ok_or(GuidLookupError::Unanswered)?.find_by_guids(kind, guids)
-    }
-    fn roster_gen(&self) -> u32 {
-        plx_plex::plex::server_roster_gen()
-    }
-    fn facts_gen(&self) -> u32 {
-        plx_plex::plex::server_facts_gen()
-    }
-    fn guid_of(&self, server: ServerId, rk: &str) -> Option<String> {
-        plx_plex::plex::client_for(server)?.metadata(rk).map(|m| m.guid)
-    }
-    fn today(&self) -> Option<String> {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        Some(ymd_of_unix_days((secs / 86_400) as i64))
-    }
-}
 
 /// Civil date of a day count since 1970-01-01 (Howard Hinnant's algorithm).
-fn ymd_of_unix_days(days: i64) -> String {
+pub fn ymd_of_unix_days(days: i64) -> String {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -364,7 +328,8 @@ pub fn match_on(io: &dyn WatchlistIo, sid: ServerId, rows: &[(String, Kind)]) ->
 
 /// WORKER THREAD: read the list. Page 0, then the released set, then the remaining pages until
 /// the server's own end (`start` reaches `totalSize`, a short page, or an empty one); each page is
-/// matched against the servers before it is posted so a tile arrives with its state. Stops at the first page that fails. Always ends with [`What::ListDone`].
+/// matched against the servers before it is posted so a tile arrives with its state. Stops at
+/// the first page that fails; the owned stream worker owes the terminal completion.
 /// `known` is the guids already matched against every reachable server under roster generation
 /// `known.1`; they are skipped while the roster has not moved (a new roster is a full re-match).
 /// `etag` is the validator of the last complete read (`If-None-Match` on page 0 only): when the
@@ -426,7 +391,7 @@ pub fn run_list(
         }
         page_no += 1;
     }
-    post(Landed { tag, what: What::ListDone });
+
 }
 
 /// WORKER THREAD: the full re-match of `rows` after the roster moved.
@@ -468,6 +433,21 @@ mod tests {
         assert_eq!(ymd_of_unix_days(0), "1970-01-01");
         assert_eq!(ymd_of_unix_days(19_782), "2024-02-29");
         assert_eq!(ymd_of_unix_days(20_001), "2024-10-05");
+    }
+
+    #[test]
+    fn auth_lease_requires_the_same_profile_and_current_credential() {
+        let input = WatchlistInput::for_test(9);
+        let auth = input.auth().unwrap();
+        assert!(auth.matches_lease(input.profile(), Some("test-credential")));
+        assert!(!auth.matches_lease(input.profile(), Some("rotated-credential")));
+        assert!(!auth.matches_lease(input.profile(), None));
+        let other = WatchlistInput::profile_for_test(10);
+        assert!(!auth.matches_lease(&other, Some("test-credential")));
+        let mut user = input.profile().user.clone().unwrap();
+        user.uuid = "different".into();
+        let other = CurrentProfile { user: Some(user), generation: 9, stamp: String::new() };
+        assert!(!auth.matches_lease(&other, Some("test-credential")));
     }
 
     #[test]

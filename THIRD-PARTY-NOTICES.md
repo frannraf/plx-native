@@ -53,10 +53,13 @@ has always done).
 
 **Configuration.** Built with `--disable-everything` plus an explicit component list, **without**
 `--enable-gpl`, `--enable-version3` or `--enable-nonfree`, so no GPL-licensed or non-free FFmpeg
-component is present. Only demuxers, parsers, bitstream filters and *subtitle* decoders are
-enabled — video and audio are decoded by the television's hardware, not by FFmpeg. The one
-external library enabled is **zlib**, the television's own `libz.so.1` (not redistributed — see
-section 3), which the Matroska demuxer needs to inflate compressed subtitle tracks.
+component is present. Only demuxers, parsers, bitstream filters, *subtitle* decoders and the
+LGPL audio decoders the app runs itself are enabled — video and, in the ordinary case, audio are
+decoded by the television's hardware, not by FFmpeg. FLAC, ALAC and LPCM are decoded by the app
+because the television's player has no input for them; the result is fed to it as PCM. The DTS core is decoded
+by the app (`dca`) where Force Direct Play has no native path for it or a refused open falls back to it. The one external library enabled is **zlib**,
+the television's own `libz.so.1` (not redistributed — see section 3), which the Matroska demuxer
+needs to inflate compressed subtitle tracks.
 
 **You may modify and replace them.** They are ordinary shared libraries, loaded at run time by
 `dlopen` from the application's own directory; no FFmpeg code is linked into the `plxnative`
@@ -80,9 +83,9 @@ uses `libass-plx-host.so.0`.
 |---|---|---|
 | libass | 0.17.5 | ISC (`licenses/libass-ISC.txt`) |
 | FreeType | 2.15.0 | Elected FreeType License; contributed MIT and Zlib code (`licenses/FreeType.txt`, `licenses/Zlib.txt`) |
-| FriBidi | 1.0.17 | LGPL-2.1-or-later (`licenses/LGPL-2.1.txt`) |
-| HarfBuzz | 14.6.0 | Old MIT (`licenses/HarfBuzz-Old-MIT.txt`) |
-| libunibreak | 8.0 | zlib (`licenses/libunibreak-Zlib.txt`) |
+| FriBidi | 1.0.18 | LGPL-2.1-or-later (`licenses/LGPL-2.1.txt`) |
+| HarfBuzz | 15.1.0 | Old MIT (`licenses/HarfBuzz-Old-MIT.txt`) |
+| libunibreak | 8.0.1 | zlib (`licenses/libunibreak-Zlib.txt`) |
 
 Portions of this software are copyright © 2026 The FreeType Project
 (https://freetype.org). All rights reserved. Its built-in gzip reader contains
@@ -96,7 +99,7 @@ libass and HarfBuzz copyright notices are retained in their licence files above.
 
 The exact upstream archives, checksums and licences are recorded in
 `ci/dependencies.json`. Each versioned PlxNative source release contains all
-five archives, the facade (`src/ass.c`, `src/ass_fonts.c`, `src/ass_internal.h`,
+five archives, the facade (`src/ass.c`, `src/ass_fonts.c`, `src/ass_text.c`, `src/ass_internal.h`,
 `include/ass.h`), its complete build recipe (`ci/build-libass.sh`, `ci/build-libass.py`) and the
 one local patch to libass. **libass carries that local patch; every other archive is unmodified.**
 `ci/patches/libass-0001-grow-font-faces.patch` replaces the fixed table of ten font faces that
@@ -265,6 +268,29 @@ which pins the input by sha256.
 *Why it ships:* it is the emoji link of the application's font fallback chain, so an emoji in a
 library or title name draws instead of an empty box.
 
+**Noto Kufi Arabic** — `appfont-arabic.ttf`, `appfont-arabic-bold.ttf`
+Copyright 2019-2022 Google LLC, per the fonts' own name table. Version 2.110 (the
+`notofonts/arabic` release `NotoKufiArabic-v2.110`), the unhinted static Regular and Bold TTFs
+`fonts/NotoKufiArabic/unhinted/ttf/NotoKufiArabic-{Regular,Bold}.ttf` of
+`github.com/notofonts/notofonts.github.io` at commit `5c3913063bb189df4edc94b766584dfb4c04a187`.
+**Noto Sans Hebrew** — `appfont-hebrew.ttf`, `appfont-hebrew-bold.ttf`
+Copyright 2024 The Noto Project Authors (https://github.com/notofonts/hebrew), per the fonts' own
+name table. Version 3.001 (the `notofonts/hebrew` release `NotoSansHebrew-v3.001`), the unhinted
+static Regular and Bold TTFs `fonts/NotoSansHebrew/unhinted/ttf/NotoSansHebrew-{Regular,Bold}.ttf`
+of the same repository at the same commit.
+Licence (all four): **SIL Open Font License 1.1**, the same text that ships in this package as
+`OFL.txt`. Neither copyright statement declares a **Reserved Font Name**, so the family names
+"Noto Kufi Arabic" and "Noto Sans Hebrew" are retained. The fonts carry the upstream trademark
+statement "Noto is a trademark of Google LLC" (the Hebrew cut: "Google Inc.").
+*Unmodified*: shipped byte for byte as published, every layout table kept (Arabic needs `GSUB`
+joining and `GPOS` mark placement). The recipe is `tools/fetch-noto-rtl.py`, which pins each input
+by URL, size and sha256.
+
+*Why they ship:* they are the Arabic and Hebrew links of the application's font fallback chain.
+Their runs are shaped by the bundled ASS renderer's UI text surface (HarfBuzz, FriBidi and
+FreeType, section 1.2), so Arabic, Persian, Urdu and Hebrew titles draw joined and in reading
+order instead of as empty boxes.
+
 ### 2.4 Rust code statically linked into `plxnative`
 
 The application core is Rust. The Rust standard library (the pinned stable toolchain's
@@ -278,7 +304,7 @@ stated; election does not alter your rights under the other arms.
 
 | Package | Version(s) | Declared licence | Copyright |
 |---|---|---|---|
-| The Rust standard library (`core`, `alloc`, `std`, `panic_unwind`, `unwind`, and the `rustc-std-workspace-*` shims) | rustc 1.99.1 (58cf8f9c3 2026-10-13) | MIT OR Apache-2.0 | The Rust Project Developers |
+| The Rust standard library (`core`, `alloc`, `std`, `panic_unwind`, `unwind`, and the `rustc-std-workspace-*` shims) | rustc 1.100.0 (0ef1bc386 2026-11-09) | MIT OR Apache-2.0 | The Rust Project Developers |
 | — its in-tree backtrace support (`library/backtrace`) | 0.3.76 | MIT OR Apache-2.0 | 2014 Alex Crichton |
 | — its in-tree mpmc channels (`library/std/src/sync/mpmc`) | in-tree | MIT OR Apache-2.0 | 2019 The Crossbeam Project Developers |
 | addr2line | 0.27.1 | Apache-2.0 OR MIT | The `addr2line` authors |
@@ -293,15 +319,19 @@ stated; election does not alter your rights under the other arms.
 | crc | 3.4.0 | MIT OR Apache-2.0 | 2017 crc-rs Developers |
 | crc-catalog | 2.5.0 | MIT OR Apache-2.0 | Akhil Velagapudi |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 | 2018 Sam Rijs, Alex Crichton and contributors |
+| ed25519-compact | 2.6.1 | MIT | 2020-2026 Frank Denis |
 | either | 1.18.0 | MIT OR Apache-2.0 | Copyright (c) 2015 (the upstream notice names no holder) |
-| encoding_rs | 0.8.42 | (Apache-2.0 OR MIT) AND BSD-3-Clause | Mozilla Foundation. Its encoding tables derive from the WHATWG Encoding Standard, whose data files are BSD-3-Clause (`licenses/WHATWG-BSD-3-Clause.txt`) |
+| encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause | Mozilla Foundation. Its encoding tables derive from the WHATWG Encoding Standard, whose data files are BSD-3-Clause (`licenses/WHATWG-BSD-3-Clause.txt`) |
+| equivalent | 1.0.3 | Apache-2.0 OR MIT | 2016–2023 The equivalent authors |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | The image-rs Developers |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 | 2014-2026 Alex Crichton |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 | 2018–2026 The rust-random Project Developers; 2014 The Rust Project Developers |
 | gimli | 0.34.0 | MIT OR Apache-2.0 | The `gimli` authors |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | Amanieu d'Antras |
 | image | 0.25.10 | MIT OR Apache-2.0 | The image-rs Developers |
+| indexmap | 2.14.2 | Apache-2.0 OR MIT | 2016–2017 The indexmap authors |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | David Tolnay |
-| libc | 0.2.190 and 0.2.189 | MIT OR Apache-2.0 | The Rust Project Developers |
+| libc | 0.2.191 and 0.2.189 | MIT OR Apache-2.0 | The Rust Project Developers |
 | memchr | 2.8.3 and 2.8.2 | Unlicense OR MIT | 2015 Andrew Gallant |
 | miniz_oxide | 0.9.1 and 0.8.9 | MIT OR Zlib OR Apache-2.0 | 2013-2014 RAD Game Tools and Valve Software; 2010-2014 Rich Geldreich and Tenacious Software LLC; (c) 2017 Frommi; (c) 2017-2024 oyvindln |
 | no_std_io2 | 0.9.4 | Apache-2.0 OR MIT | 2020-2021 Brendan Molloy |
@@ -316,6 +346,8 @@ stated; election does not alter your rights under the other arms.
 | smallvec | 1.16.2 | MIT OR Apache-2.0 | Copyright (c) 2018 The Servo Project Developers |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | Copyright (c) 2017 Robert Grosse |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT | 2019 Daniel "Lokathor" Gee |
+| typed-path | 0.13.0 | MIT OR Apache-2.0 | The typed-path authors |
+| zip | 9.2.2 | MIT | 2014 Mathijs van de Nes |
 | zune-core | 0.5.1 | MIT OR Apache-2.0 OR Zlib | The zune-image developers |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | The zune-image developers |
 
@@ -330,7 +362,7 @@ stated; election does not alter your rights under the other arms.
 | bitvec | 1.1.1 | Copyright (c) 2018 myrrlyn (Alexander Payne) |
 | bitvec_helpers | 4.0.2 | Copyright (c) 2026 quietvoid |
 | core_maths | 0.1.1 | Copyright (c) 2024 Robert Bastian |
-| dolby_vision | 3.4.0 | Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_media`'s `ff.rs`); used unmodified, with no optional features |
+| dolby_vision | 3.4.0 | Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_play_feed`'s `ff.rs`); used unmodified, with no optional features |
 | funty | 2.0.0 | Copyright (c) 2020 myrrlyn (Alexander Payne) |
 | libm | 0.2.16 | Copyright (c) 2018 Jorge Aparicio and the third-party copyright notices preserved verbatim in `licenses/libm.txt` |
 | qrcodegen | 1.8.0 | Copyright (c) Project Nayuki. The complete upstream MIT notice is preserved in `licenses/qrcodegen.txt` |
@@ -339,7 +371,7 @@ stated; election does not alter your rights under the other arms.
 | tap | 1.0.1 | Copyright (c) 2017 Elliot Linder |
 | wyz | 0.5.1 | Copyright (c) 2018 myrrlyn (Alexander Payne) |
 | zmij | 1.0.21 | David Tolnay (a Rust port of Victor Zverovich's C++ `zmij`) |
-| rust-lang/libm — compiled *inside* `compiler_builtins` and exposed as intrinsics on this target | as vendored in rustc 1.99.1 | (c) 2018 Jorge Aparicio; musl libc (c) 2005-2020 Rich Felker, et al.; CORE-MATH; and the fdlibm-derived notice: (c) 1993, 2004 Sun Microsystems; (c) 2003-2011 David Schultz; (c) 2003-2009 Steven G. Kargl; (c) 2003-2009 Bruce D. Evans; (c) 2008 Stephen L. Moshier; (c) 2017-2018 Arm Limited |
+| rust-lang/libm — compiled *inside* `compiler_builtins` and exposed as intrinsics on this target | as vendored in rustc 1.100.0 | (c) 2018 Jorge Aparicio; musl libc (c) 2005-2020 Rich Felker, et al.; CORE-MATH; and the fdlibm-derived notice: (c) 1993, 2004 Sun Microsystems; (c) 2003-2011 David Schultz; (c) 2003-2009 Steven G. Kargl; (c) 2003-2009 Bruce D. Evans; (c) 2008 Stephen L. Moshier; (c) 2017-2018 Arm Limited |
 
 <!-- END GENERATED notices:mit-only -->
 
@@ -378,23 +410,23 @@ verbatim in `licenses/ICU4X.txt`, including both notices:
 | icu_decimal | 2.1.1 |
 | icu_decimal_data | 2.1.1 |
 | icu_locale | 2.1.1 |
-| icu_locale_core | 2.3.0 |
+| icu_locale_core | 2.4.0 |
 | icu_locale_data | 2.1.2 |
 | icu_pattern | 0.4.2 |
 | icu_plurals | 2.1.1 |
 | icu_plurals_data | 2.1.1 |
-| icu_provider | 2.3.1 |
+| icu_provider | 2.4.0 |
 | icu_time | 2.1.1 |
 | icu_time_data | 2.1.1 |
 | ixdtf | 0.6.6 |
 | litemap | 0.8.3 |
 | potential_utf | 0.1.6 |
-| tinystr | 0.8.4 |
+| tinystr | 0.8.5 |
 | writeable | 0.6.4 |
-| yoke | 0.8.3 |
+| yoke | 0.8.4 |
 | zerofrom | 0.1.8 |
 | zerotrie | 0.2.5 |
-| zerovec | 0.11.8 |
+| zerovec | 0.11.9 |
 
 <!-- END GENERATED notices:icu -->
 
@@ -473,7 +505,7 @@ enable it) — verified absent from the binary. `rustc-literal-escaper`, `proc_m
 
 ### 2.6 Native crash capture
 
-**Sentry Native 0.17.4** — Copyright (c) 2019 Sentry and individual contributors. Licence:
+**Sentry Native 0.17.6** — Copyright (c) 2019 Sentry and individual contributors. Licence:
 **MIT** (`licenses/MIT.txt`). Its client library is statically linked into `plxnative`; the
 out-of-process `sentry-crash` handler is shipped beside it. The handler is built with its HTTP
 transport disabled: it writes a crash envelope for PlxNative's consent-aware sender to deliver on

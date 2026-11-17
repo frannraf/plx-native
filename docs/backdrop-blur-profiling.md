@@ -190,6 +190,10 @@ Four things to hold onto when reading counter output:
 - **Report cycles.** There is no GPU clock node anywhere in this TV's sysfs — no
   `/sys/class/devfreq` entry, no frequency file under `/sys/devices/platform/mali.0`. Cycles cannot
   be converted to milliseconds here, so compare cycles between legs and do not invent a clock.
+  (2026-10-24: wrong. The clock is in fact fixed at 672 MHz, so one 60 Hz refresh is about 11.2M
+  `GPU_ACTIVE` cycles. The TV's `mali_kbase.ko` declares it and has no clock-setting path, and
+  debugfs `mali0/gpu_utilization` agrees; see `.agents/skills/profile-tv/SKILL.md`, "Mali T820
+  facts".)
 - **Words 0..3 of every block are the block header, not counters.** Word 2 is `PRFCNT_EN`, and each
   of its bits enables a group of four counters. The profiler logs all five masks once per run.
   On this television they are jm `0xff`, tiler `0x1f`, l2 `0xffff`, sc0/sc1 `0xffff` — so **tiler
@@ -388,9 +392,10 @@ rougher, because the Kawase tap offsets scale with the source while the bilinear
 
 ## Part 5 — the other 88.6%: what the MAIN UI submits, and why removing 37% of it bought 0.8%
 
-> **The instruments this part describes ARE in the tree now** — `plx_gfx::overdraw`,
-> `/tmp/plxnative-overdraw`, `/tmp/plxnative-drawmask` and `/tmp/plxnative-heroground`. They were
-> hand-transplanted from `blur/e4-overdraw` rather than merged: that branch's history was rewritten
+> **The instruments this part describes are in the tree** — `plx_gfx::overdraw`,
+> `/tmp/plxnative-overdraw` and `/tmp/plxnative-drawmask` — except the third, `/tmp/plxnative-heroground`,
+> which was deleted with the one-pass ground it armed (2026-11; see the RETIRED note under "The
+> experiment" below). They were hand-transplanted from `blur/e4-overdraw` rather than merged: that branch's history was rewritten
 > with `filter-branch`, so it shares no ancestry with the baseline commits here, and a direct merge
 > conflicts in fifteen files while sitting ~24,000 lines behind — resolving it in the branch's
 > favour would delete the deliberately-kept nav-glass code among much else. Only the ledger, the
@@ -428,7 +433,10 @@ answer that without guessing.
 screen-VISIBLE area of every quad the app submits, clipped to the panel and to `Painter::clip`'s
 live box. It is not `glFinish`-serialised and it cannot be billed for another process's work. It
 runs in the desktop simulator too, and gives the same authored-pixel answer there, because it works
-in authored coordinates.
+in authored coordinates. (One exception, added after these measurements: `draw_ambient` books its
+quad before it decides to draw a flat ground, four equal corners and no ink, as a clear, so on
+those frames the ledger counts `ambient` fragments that were never shaded. It over-reports that
+class there; HWCNT is unaffected, and `drawmask=ambient` refuses the clear with the quad.)
 
 **`/tmp/plxnative-drawmask=<classes>`** — refuse every draw of the named classes, so a whole-frame
 `frame.ui` HWCNT A/B against the unmasked control prices that class **as the frame sees it**,
@@ -447,8 +455,8 @@ OVERDRAW frames=60 panel=... | card=... image=... | cardpath split=P/D focus=P/D
 ```
 
 `split` is a resting card cut into pieces; `focus` a card with `f > 0` or `dy > 0` (the focus
-program, whole); `clip` a resting, rounded card on a reduced-resolution blur source pass with the
-split on (whole); `nointerior` a card with no certainly-plain interior (a circle, a sliver);
+program, whole); `clip` a resting, rounded card on a reduced-resolution blur source pass, or inside a
+full-resolution `FrameCache::render_region` fill (scale 1), with the split on (whole); `nointerior` a card with no certainly-plain interior (a circle, a sliver);
 `plain` a corner radius under half a pixel (the shader's own whole-quad plain branch); `off` a card
 that would have been split with the split switched off. A card is sorted focus, then plain, then
 off, and only a card that is still to be split has its target checked, so a popped, square-cornered
@@ -598,7 +606,15 @@ submits**. The card composites everyone assumes are the expensive part are 5%.
 
 ### The experiment: fold the hero's whole ground into one pass
 
-`/tmp/plxnative-heroground` (`ui::widgets::hero_ground` + `shaders/fs_hero.frag`) draws the
+> **RETIRED (2026-11).** Neither hero draws the wedge and ramp this experiment folded any more: both
+> use a continuous edge shade, which the heroes' one-pass ground
+> (`AmbientWash::draw_ground`) carries per vertex. The experiment's code is deleted
+> (`ui::widgets::hero_ground`, `Painter::hero_ground`, `gfx::draw_hero_ground`, `shaders/fs_hero.frag`
+> and the `/tmp/plxnative-heroground` trigger), and so is the wedge it folded (`hero_scrim_a`); the
+> four-quad A/B no longer exists. The account below is the 2026-10 measurement of the old pair of
+> fields, kept as the record of it, and its names are the names of what ran then.
+
+`/tmp/plxnative-heroground` (`ui::widgets::hero_ground` + `shaders/fs_hero.frag`) drew the
 photograph and BOTH scrim fields in **one** quad instead of the art plus four blended gradient
 quads over it. Both fields are closed forms of the authored pixel position — `home::base_scrim_a`
 and `hero_scrim_a` feathered over `[HERO_SCRIM_TOP, HERO_SCRIM_KNEE]` — and both are
@@ -677,7 +693,7 @@ remove ARITHMETIC, not fragments.
 4. **`plx_gfx::overdraw` is worth keeping** whichever way the fold goes. It is compiled out of a release
    build entirely, it runs in the simulator, and it is the only instrument here that can attribute a
    fragment to a draw class — the counters cannot, because they are GPU-global.
-5. The fold itself is **worth having in the tree behind its flag and not worth switching on**: 0.81%
+5. The fold itself (retired since, see the note on the experiment) was **worth having in the tree behind its flag and not worth switching on**: 0.81%
    does not pay for a GLSL copy of two design curves that `theme.rs` and two screens own, and every
    future retune of either curve would have to be made in both places. It becomes interesting the
    day the surface is not 1080p — at 4K the fragment and load/store work scale by four while the
@@ -747,6 +763,10 @@ framebuffer 0. Whether that is Mali kbase DVFS reacting to a gap-free submission
 starting the frame's fragment work earlier is NOT settled — but the consequence is: **lowering
 the glass cadence or removing the source pass to "save work" costs 20% of the frame rate, and any
 change to that path has to be re-measured on the set.**
+(2026-10-24: the DVFS half is ruled out. The GPU clock is in fact fixed at 672 MHz — the TV's
+`mali_kbase.ko` declares it and has no clock-setting path, and debugfs `mali0/gpu_utilization`
+agrees; see `.agents/skills/profile-tv/SKILL.md`, "Mali T820 facts". Only the driver-scheduling
+explanation is left open.)
 
 **3. The census: `plxnative-hwcnt` (`frame.ui`) + `plxnative-drawmask=<class>`, hero paging,
 flat tabs.** Control 13.81M GPU_ACTIVE per frame — against 8.76M for a hero frame on 2026-08-22,
@@ -1401,9 +1421,12 @@ synchronous `glReadPixels` once every thirty frames. That frame cost 27–29 ms:
 **Fix: a ground reading never waits on the frame** (`gfx::GroundProbe`, cadence in the pure
 `gfx::ProbeCadence`). A due call copies the tap boxes GPU-side into a small probe target and
 inserts a fence. `gfx::ground_probes_frame_end` reads the target right after the swap, once the
-fence has signalled. The sampler's next call reduces it. Both samplers take this path: the tab
-track's `sample_ground` and the Hero row's `sample_control_ground`. Two intermediate steps were
-measured and rejected:
+fence has signalled. The sampler's next call reduces it. Both samplers took this path: the tab
+track's `sample_ground` and the Hero row's `sample_control_ground`. (The track's copy has since
+moved off framebuffer 0: it copies the band's retained backdrop image at the frame boundary, and
+only the Hero row still copies framebuffer 0 on its call; see `gfx::sample_ground`, and
+`docs/glass-hardware-budget.md`, "What to index on instead", for what the move took out of the
+frame.) Two intermediate steps were measured and rejected:
 
 - **Reading the probe mid-page, at the sampler's next call.** `gndread` fell to 0.2 ms, but the
   frame still ran ~12 ms over its neighbours.
@@ -1427,9 +1450,11 @@ changed here.
   frames: `clear` 26–28 ms, `page` 31–32 ms, the page's own CPU 4.5 ms. Nothing in the app changes
   on those frames. The settled Detail frame sits within about a millisecond of the vsync on the
   GPU, so any disturbance tips it into two-vsync frames until the backlog drains. That disturbance
-  can be a probe kick's render-pass split, a texture arriving, or GPU clock scaling. This is now the
-  main warm-cycle failure (22 of 34 Detail cycles). Only fill-rate work on the settled Detail
-  frame can fix it. Price it class by class with production `drawmask` A/B runs.
+  can be a probe kick's render-pass split, a texture arriving, or GPU clock scaling. (2026-10-24:
+  not clock scaling. The GPU clock is in fact fixed at 672 MHz — the TV's `mali_kbase.ko` declares
+  it and has no clock-setting path; see `.agents/skills/profile-tv/SKILL.md`, "Mali T820 facts".)
+  This is now the main warm-cycle failure (22 of 34 Detail cycles). Only fill-rate work on the
+  settled Detail frame can fix it. Price it class by class with production `drawmask` A/B runs.
 - **The cold first cycle of each page (cycle 1 Detail ~100 ms, the first Person 30–45 ms, the
   first Library 38–41 ms).** On the cold Detail frame (106.8 ms in total), 47 new strings each paid
   a `TTF_RenderUTF8_Blended` (24.7 ms together) and a texture upload (`upload_rgba`, 26.2 ms
@@ -1498,7 +1523,9 @@ This is not a promise to skip the first pop-back frame or a still-changing page 
 
 **Elimination versus cadence.** The earlier experiment in this document measured 46 fps with
 source work every present, 35 without glass, and 36 at one-in-eight. The source pass paces the
-GPU; its exact driver/DVFS explanation remains unproven. We have not changed the cadence for
+GPU; its exact driver/DVFS explanation remains unproven. (2026-10-24: DVFS is ruled out — the GPU
+clock is in fact fixed at 672 MHz, see `.agents/skills/profile-tv/SKILL.md`, "Mali T820 facts"; the
+driver-side explanation remains unproven.) We have not changed the cadence for
 changing pages (`DEFAULT_DYNAMIC_PERIOD` remains 1), nor disabled glass globally. We eliminate
 an invisible source under a modal, and reuse a valid source when only its foreground chrome
 moves. This avoids redundant work without temporally undersampling changing artwork. It still
@@ -1615,12 +1642,14 @@ same logical surfaces participate in declaration and visible walks. Existing ren
 
 The earlier result remains a constraint: 46 fps refreshing every changing present versus 35
 without glass and 36 at one-in-eight. The source pass **paces** this Mali GPU; the driver/DVFS
-explanation remains unproven. This mechanism skips only occluded or unchanged sources. It does
-not undersample changing underlays. The extra declaration traversal, retained-output copy and
-per-band storage are deliberate costs for structural correctness; the prefix-copy path for
-stacked glass also needs a device comparison before any performance claim. Host-only tests cover
-the layer walk, geometry, validity, union scheduling, upload identity and frozen-host bookkeeping.
-No television was contacted and no new GPU measurements or visual verification are claimed here.
+explanation remains unproven (2026-10-24: DVFS is ruled out, the GPU clock is in fact fixed at
+672 MHz; see `.agents/skills/profile-tv/SKILL.md`, "Mali T820 facts"). This mechanism skips only
+occluded or unchanged sources. It does not undersample changing underlays. The extra declaration
+traversal, retained-output copy and per-band storage are deliberate costs for structural
+correctness; the prefix-copy path for stacked glass also needs a device comparison before any
+performance claim. Host-only tests cover the layer walk, geometry, validity, union scheduling,
+upload identity and frozen-host bookkeeping. No television was contacted and no new GPU
+measurements or visual verification are claimed here.
 
 ## 2026-09-19: two declaration-traversal costs, `modal-100`/`push-100` still regressed after the fix
 
@@ -1771,7 +1800,8 @@ from the television, with the panel off and the sound muted.
   one full-screen quad and the chrome. The frames before them were normal. The backlog they wait
   on is not this frame's work, and no span attributes it. Whether it is the Home capture's GPU
   cost, the compositor holding a buffer, or GPU DVFS is still open; `gpu_timer` saw the UI pass
-  average ~16 ms during transitions.
+  average ~16 ms during transitions. (2026-10-24: not GPU DVFS. The GPU clock is in fact fixed at
+  672 MHz; see `.agents/skills/profile-tv/SKILL.md`, "Mali T820 facts".)
 - **modal-100.** Its steady misses are close frames whose `draw` is 25–31 ms with under 2 ms in
   named spans, so the wait sits in an unspanned GL call.
 - **Cycle 1.** A 1080p backdrop upload (2 073 600 px) spent 22.5 ms in `upload_rgba` in one held
@@ -1815,3 +1845,15 @@ whose FRAMEDROP line carries `inl` in its `spans=` took the inline path (it coun
 that line is logged for, not on every frame). Two caveats: the
 per-pass split of the inline increment (copy, render-pass split, chain) is not measured, and the
 ~6050 class is not unique to inline captures (frames with no glass job at all land there too).
+
+
+## 2026-11-05: live glass within a modal surface
+
+The full-image HUD preview uses the shared standing tab-track glass inside Settings. The old
+blanket exclusion of surface primitives could not describe the preview's changing texture or
+dissolve mix, so a retained glass image could stay stale. `discover_with` now first discovers the
+current consumers with the ordinary cheap traversal, then repeats argument recording only when
+a visible live-glass consumer requires a surface prefix. The repeat stops at the highest required
+consumer, uses a fresh walk ID and snapshot ledger, and does not advance the frame or reapply
+damage. Frozen menus and Settings pages without live glass keep one traversal and skip their
+primitive argument construction. Source resolution and capture policy remain shared.

@@ -550,8 +550,7 @@ fn the_lift_never_spends_the_labels_contrast() {
 /// away, and the unfurled capsule's whole content is a name in [`theme::TEXT_PRIMARY`]. Where
 /// the two grounds agree the shared face is exactly right, which is the arrangement's whole
 /// argument; where they do not, the chip carries a promise nobody made about it. Nothing
-/// darkens the top band before this — [`HERO_BASE_SCRIM_Y0`] is 367 and [`HERO_SCRIM_TOP`]
-/// 162 — so both grounds are raw backdrop, and `gfx::sample_ground`'s census puts the MEDIAN
+/// darkens the top band before this on Detail at rest — the hero shade starts below the copy — so both grounds are raw backdrop, and `gfx::sample_ground`'s census puts the MEDIAN
 /// span at 26.8 L* across the track alone.
 ///
 /// Written as a test so the number cannot drift silently in EITHER direction: tightening the
@@ -605,49 +604,16 @@ fn the_bands_face_carries_no_promise_about_the_chips_own_ground() {
     );
 }
 
-/// **The play indicator is a biconditional, and this grades every cell of it.**
-///
-/// The owner's rule, 2026-09-05: *"visual play indicators mean immediate playback, progress
-/// bars mean viewing progress, and cards without a play indicator navigate to details."* Two of
-/// those three clauses are about what is ABSENT, which is why an exhaustive table is the only
-/// honest test — the defect this was written for was a cell nobody looked at (in-progress on a
-/// shelf that plays), and it was invisible to every screen test because it is a missing draw
-/// call rather than a wrong one.
+/// **No still draws the amber triangle any more** (owner, 2026-11: nobody read it as "playback
+/// starts"). What is left of the leading slot of a two-line still is the watched TICK, a state in the
+/// secondary ink; every other mark leaves it empty. The cue that OK plays is the Continue Watching
+/// footer's white play glyph (`still_footer`), drawn only on the focused card.
 #[test]
-fn the_play_glyph_appears_exactly_where_the_press_plays() {
+fn a_still_line_has_no_play_glyph_and_the_watched_tick_is_secondary_ink() {
     use crate::icons::Icon;
-    let g = |m, plays| still_glyph(m, plays).map(|(i, _)| i);
-
-    // navigating shelves: never a play indicator, whatever the watch state
-    assert_eq!(g(PosterMark::None, false), None);
-    assert_eq!(g(PosterMark::InProgress, false), None);
-    assert_eq!(
-        g(PosterMark::Watched, false),
-        Some(Icon::Check),
-        "a tick is a statement about the past, not a promise about the press",
-    );
-
-    // shelves that play: the action takes the slot, IN PROGRESS INCLUDED
-    assert_eq!(g(PosterMark::None, true), Some(Icon::Play));
-    assert_eq!(
-        g(PosterMark::InProgress, true),
-        Some(Icon::Play),
-        "the Continue Watching deck is almost entirely in-progress tiles — this is the cell \
-         that made the whole deck announce nothing and then play",
-    );
-    assert_eq!(
-        g(PosterMark::Watched, true),
-        Some(Icon::Check),
-        "the bounded exception: the tick is the only carrier of watched-ness, and the one \
-         surface it is reachable on draws no navigating card beside it",
-    );
-
-    // the amber is the action's and nothing else's
-    assert_eq!(still_glyph(PosterMark::None, true).map(|(_, c)| c), Some(theme::RESUME_FILL));
-    assert_eq!(
-        still_glyph(PosterMark::Watched, false).map(|(_, c)| c),
-        Some(theme::TEXT_SECONDARY),
-    );
+    assert_eq!(still_glyph(PosterMark::None), None);
+    assert_eq!(still_glyph(PosterMark::InProgress), None);
+    assert_eq!(still_glyph(PosterMark::Watched), Some((Icon::Check, theme::TEXT_SECONDARY)));
 }
 
 // ---- ink by the capsule's drawn edge ---------------------------------------------------------
@@ -706,16 +672,29 @@ fn backing_at_xy(strip: &TabStrip, ground: TabGround, x: f32, y: f32) -> [f32; 4
 /// the 2-D grade the column-only ones could not give.
 fn worst_contrast_2d(strip: &TabStrip, ground: TabGround, pill: (f32, f32), ink_of: fn(f32, f32) -> [f32; 4]) -> (f32, f32, f32) {
     let rect = Rect::new(pill.0, 0.0, pill.1, INK_H);
+    // The ink regions are a fact about the strip, the ground and the pill, so they are decided once
+    // and asked per pixel (`ink_at` is `pill_ink(..).at(..)`: it re-derived them for every one of
+    // the ~5 000 pixels). A pixel's ratio is a function of its backing and its ink alone, and
+    // neighbouring pixels nearly always share both, so the last one is kept.
+    let regions = strip.pill_ink(rect, ground);
+    let mut last: Option<([f32; 4], [f32; 4], f32)> = None;
     let mut worst = (f32::MAX, pill.0, 0.0);
     for column in (pill.0.floor() as i32)..((pill.0 + pill.1).ceil() as i32) {
         let x = column as f32 + 0.5;
         if x < pill.0 + 12.0 || x >= pill.0 + pill.1 - 12.0 { continue; }
         for k in -17..17 {
             let y = INK_H * 0.5 + k as f32 + 0.5;
-            let (focus, selected) = strip.ink_at(rect, ground, x, y);
+            let (focus, selected) = regions.at(x, y);
             let backing = backing_at_xy(strip, ground, x, y);
             let ink = ink_of(focus, selected);
-            let ratio = contrast(theme::cross(backing, [ink[0], ink[1], ink[2], 1.0], ink[3]), backing);
+            let ratio = match last {
+                Some((b, i, r)) if b == backing && i == ink => r,
+                _ => {
+                    let r = contrast(theme::cross(backing, [ink[0], ink[1], ink[2], 1.0], ink[3]), backing);
+                    last = Some((backing, ink, r));
+                    r
+                }
+            };
             if ratio < worst.0 { worst = (ratio, x, y - INK_H * 0.5); }
         }
     }
@@ -894,16 +873,9 @@ fn the_top_bar_keeps_three_to_one_on_every_glyph_pixel_of_every_hop() {
 #[test]
 fn the_top_bar_draws_every_label_at_full_ink_in_one_weight_per_frame() {
     let _g = serial_for_motion();
-    // A recording painter paints no pixels, but the bar's draw also queues a framebuffer read of the
-    // ground under its track (`gfx::sample_ground`), which needs GL. A frozen page answers from the
-    // last reading and reads nothing (`gfx`'s `a_frozen_page_answers_its_ground_from_the_last_reading`).
-    struct Frozen(bool);
-    impl Drop for Frozen {
-        fn drop(&mut self) {
-            plx_gfx::gfx::set_page_frozen(self.0);
-        }
-    }
-    let _frozen = Frozen(plx_gfx::gfx::set_page_frozen(true));
+    // A recording painter paints no pixels, and the bar's draw calls `gfx::sample_ground`, which
+    // reads a band image and so needs a walk; with none it answers the last reading and copies
+    // nothing (`gfx`'s `a_bar_with_no_band_image_keeps_its_last_reading_and_copies_nothing`).
     let faces = [
         TabFace::Label("Home".into()),
         TabFace::Label("Movies".into()),
@@ -926,8 +898,9 @@ fn the_top_bar_draws_every_label_at_full_ink_in_one_weight_per_frame() {
         let mut flips = [0usize; 3];
         for frame in 0..80 {
             strip.update(labels, sel, TopFocus::Pill(to), DT);
-            let runs = crate::draw_census::capture_runs(|| strip.draw(labels, Painter::recording(), &mut band));
-            let (widths, glass_on) = with_tab_metrics_for(labels, |_, _, w| (w.to_vec(), tab_glass_on(tab_geometry(w, 0.0).track.w)));
+            let runs = crate::draw_census::capture_runs(|| strip.draw(labels, Painter::recording(), &mut band, Default::default()));
+            let widths = with_tab_metrics_for(labels, |_, _, w| w.to_vec());
+            let glass_on = tab_glass_on();
             for (i, word) in words.iter().enumerate() {
                 let mine: Vec<_> = runs.iter().filter(|r| r.text == *word).collect();
                 assert!(!mine.is_empty(), "{from} -> {to} frame {frame}: \"{word}\" is not drawn");
@@ -972,13 +945,6 @@ fn the_top_bar_draws_every_label_at_full_ink_in_one_weight_per_frame() {
 #[test]
 fn painted_pill_frames_stand_one_gap_apart_in_the_top_bar_and_in_a_strip() {
     let _g = serial_for_motion();
-    struct Frozen(bool);
-    impl Drop for Frozen {
-        fn drop(&mut self) {
-            plx_gfx::gfx::set_page_frozen(self.0);
-        }
-    }
-    let _frozen = Frozen(plx_gfx::gfx::set_page_frozen(true));
     // a label's frame (x, w) from the first run that says it
     fn frame(runs: &[crate::draw_census::Run], word: &str, pad: f32) -> (f32, f32) {
         let run = runs.iter().find(|r| r.text == word).unwrap_or_else(|| panic!("\"{word}\" is not drawn"));
@@ -999,7 +965,7 @@ fn painted_pill_frames_stand_one_gap_apart_in_the_top_bar_and_in_a_strip() {
     for _ in 0..90 {
         strip.update(labels, 0, TopFocus::Pill(0), DT);
     }
-    let runs = crate::draw_census::capture_runs(|| strip.draw(labels, Painter::recording(), &mut band));
+    let runs = crate::draw_census::capture_runs(|| strip.draw(labels, Painter::recording(), &mut band, Default::default()));
     let bar: Vec<(f32, f32)> = ["Home", "Movies", "TV Shows"].iter().map(|w| frame(&runs, w, TAB_PILL_PAD)).collect();
     for pair in bar.windows(2) {
         let air = pair[1].0 - (pair[0].0 + pair[0].1);
@@ -1027,5 +993,63 @@ fn painted_pill_frames_stand_one_gap_apart_in_the_top_bar_and_in_a_strip() {
     for pair in frames.windows(2) {
         let air = pair[1].0 - (pair[0].0 + pair[0].1);
         assert!((air - gap).abs() <= 0.5, "strip pill frames stand {air} apart, not {gap}");
+    }
+}
+
+/// The focus cast rides the capsule's own fade (`control_cast_at`'s doc): on a plated strip the
+/// shadow used to be drawn at full strength while the fill faded out and then vanish in the one
+/// frame the fill dropped under the draw cutoff — and appear whole on the way back.
+#[test]
+fn a_plated_focus_capsules_cast_fades_with_it_both_ways() {
+    let _g = serial_for_motion();
+    let measure = crate::fixture::FixtureMeasure;
+    let lays = strip_layout_measured(
+        ["Alpha".into(), "Beta".into(), "Gamma".into()].into_iter(),
+        96.0, theme::size::BODY, 37.0, &measure,
+    );
+    let (top, h) = (10.0, 60.0);
+    let span = |i: usize| lays.iter().find(|l| l.i == i).map(|l| {
+        let r = strip_pill_rect(l, top, h);
+        (r.x, r.w)
+    });
+    let full: f32 = theme::CONTROL_CAST_FOCUS.iter().map(|(_, _, a)| a).sum();
+    let mut strip = TabStrip::new();
+    // (cast strength as a share of the full lift, the focus fill's effective alpha, plates drawn)
+    let frame = |strip: &mut TabStrip, focused: c_int| {
+        strip.update(0, focused, span, SelMark::Lands, DT);
+        let inks = crate::draw_census::capture_inks(|| {
+            draw_strip(Painter::recording(), strip, &lays, top, h, 0.0, TabGround::Plated { pop: 1.0 });
+        });
+        // The cast must be the OUTSIDE-only shadow (tag 5): the interior-painting one (tag 4) shows
+        // through a translucent capsule as it fades.
+        assert!(inks.iter().all(|(t, _, _)| *t != 4), "a capsule's cast is drawn outside its outline only");
+        let sum = |tag: u64| inks.iter().filter(|(t, _, _)| *t == tag).map(|(_, _, a)| *a).sum::<f32>();
+        let fill = inks.iter().filter(|(t, _, _)| *t == 8).map(|(_, _, a)| *a).fold(0.0, f32::max);
+        (sum(5) / full, fill, inks.iter().any(|(t, _, _)| *t == 2))
+    };
+    let mut trace = Vec::new();
+    for _ in 0..60 { trace.push(frame(&mut strip, 0)); }
+    let held = *trace.last().unwrap();
+    assert!((held.0 - 1.0).abs() < 1e-3, "a focused plated pill wears the full cast ({})", held.0);
+    for _ in 0..60 { trace.push(frame(&mut strip, -1)); }
+    let out = *trace.last().unwrap();
+    for _ in 0..60 { trace.push(frame(&mut strip, 0)); }
+    let back = *trace.last().unwrap();
+
+    assert_eq!(out.0, 0.0, "after focus leaves the strip there is no cast");
+    assert_eq!(out.1, 0.0, "…and no focus capsule");
+    assert!(out.2, "…only the selection plate remains");
+    assert!((back.0 - 1.0).abs() < 1e-3, "after focus returns the cast is whole again ({})", back.0);
+    assert!(back.1 > 0.99, "…and so is the fill ({})", back.1);
+    // the cast leads the fill out: <=10% of full once the capsule is at half alpha, whole at rest
+    for (n, t) in trace.iter().enumerate() {
+        if t.1 <= 0.5 { assert!(t.0 <= 0.1, "frame {n}: the cast ({}) outlives the fill ({})", t.0, t.1); }
+        if t.1 > 0.999 { assert!((t.0 - 1.0).abs() < 1e-3, "frame {n}: a settled capsule wears the whole cast ({})", t.0); }
+    }
+    // the cast is a smoothstep of the fill (slope up to 3x over [0.5, 1]): it may move 3x as fast per frame, never a step
+    for (n, pair) in trace.windows(2).enumerate() {
+        let (dc, df) = ((pair[1].0 - pair[0].0).abs(), (pair[1].1 - pair[0].1).abs());
+        assert!(dc <= 0.35, "frame {}: the cast jumped {dc} in one frame ({} -> {})", n + 1, pair[0].0, pair[1].0);
+        assert!(df <= 0.12, "frame {}: the fill jumped {df} in one frame ({} -> {})", n + 1, pair[0].1, pair[1].1);
     }
 }

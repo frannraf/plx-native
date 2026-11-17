@@ -847,11 +847,6 @@ impl Client {
         self.body_2xx(path_no_token, Method::Post, &[]).is_some()
     }
 
-    /// A POST whose 2xx body the caller reads (a live timeline report's capture window).
-    pub(super) fn body_2xx_post(&self, path_no_token: &str) -> Option<Vec<u8>> {
-        self.body_2xx(path_no_token, Method::Post, &["Accept: application/json"])
-    }
-
     /// DELETE (no body) whose HTTP status is the protocol result: removing a DVR subscription,
     /// cancelling one recording, releasing a live tune (`docs/pms-api.md` §10). `None` when the
     /// request never completed, so a caller that must retry a release can tell "the server said
@@ -904,6 +899,10 @@ impl Client {
         // answer's shape. Nothing but Live TV calls this door.
         super::live_tv::debug::exchange(method, path_no_token, &outcome, started.elapsed().as_millis());
         outcome
+    }
+
+    pub(super) fn post_accepting_json(&self, path_no_token: &str) -> Option<Vec<u8>> {
+        self.body_2xx(path_no_token, Method::Post, &[ACCEPT_JSON])
     }
 
     /// POST → parse the `{ "MediaContainer": … }` envelope — /playQueues (the returned ids).
@@ -973,6 +972,15 @@ impl QueryBuilder {
     }
     pub(super) fn int(mut self, k: &str, v: i64) -> Self {
         self.parts.push(format!("{k}={v}"));
+        self
+    }
+    /// A term whose KEY carries the filter operator: `rating>>` with `9.49` is `rating>>=9.49` on the
+    /// wire (PMS reads the operator out of the key, `docs/pms-api.md` "Count probes at band edges").
+    /// `.str` encodes only the value, so a key with an operator in it would go out raw; here BOTH
+    /// are encoded (`rating%3E%3E=9.49`). A plain key such as `type` or `genre` comes out unchanged,
+    /// so this is also the spelling of a listing's own filter terms.
+    pub(super) fn range(mut self, field_op: &str, v: &str) -> Self {
+        self.parts.push(format!("{}={}", urlenc_str(field_op), urlenc_str(v)));
         self
     }
     pub(super) fn opt_int(self, k: &str, v: i64) -> Self {
@@ -1135,10 +1143,10 @@ mod tests {
     #[test]
     fn malformed_2xx_remains_a_response_after_its_deadline_passes() {
         use std::io::{Read, Write};
+        use plx_base::testnet::{self, CLIENT_WAIT, LOOPBACK_DEADLINE};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
+        let server = testnet::serve_once(listener, CLIENT_WAIT, move |mut socket| {
             let mut request = [0u8; 4096];
             let _ = socket.read(&mut request).expect("request");
             socket
@@ -1154,14 +1162,11 @@ mod tests {
             "tok",
             "cid",
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + LOOPBACK_DEADLINE;
 
         let outcome = client.get_json_with_headers_until("/decision", &[], deadline);
         server.join().unwrap();
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if !left.is_zero() {
-            std::thread::sleep(left + std::time::Duration::from_millis(10));
-        }
+        testnet::cross(deadline);
 
         assert!(matches!(
             outcome,

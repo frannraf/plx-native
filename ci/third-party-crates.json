@@ -1,8 +1,8 @@
 {
  "_comment": "Inputs of ci/gen-third-party-notices.py (THIRD-PARTY-NOTICES.md section 2.4). Versions are NOT here: they come from rust-modules/Cargo.lock and the std snapshot below.",
  "toolchain": {
-  "pin": "1.99.1",
-  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "pin": "1.100.0",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
   "backtrace": "0.3.76"
  },
  "std_lock": {
@@ -21,6 +21,7 @@
  "std_not_shipped": [
   "cc",
   "dlmalloc",
+  "find-msvc-tools",
   "foldhash",
   "fortanix-sgx-abi",
   "getopts",
@@ -47,17 +48,20 @@
   "autocfg",
   "base64",
   "bit-vec",
+  "bumpalo",
   "cc",
+  "cfg_aliases",
   "core_detect",
   "data-encoding",
   "der-parser",
   "deranged",
   "displaydoc",
   "find-msvc-tools",
-  "getrandom",
+  "js-sys",
   "lazy_static",
   "minimal-lexical",
   "multiversion_no_op",
+  "nix",
   "nom",
   "num-bigint",
   "num-conv",
@@ -68,6 +72,7 @@
   "powerfmt",
   "proc-macro2",
   "quote",
+  "r-efi",
   "rcgen",
   "ring",
   "rusticata-macros",
@@ -89,6 +94,11 @@
   "unicode-ident",
   "untrusted",
   "wasi",
+  "wasm-bindgen",
+  "wasm-bindgen-macro",
+  "wasm-bindgen-macro-support",
+  "wasm-bindgen-shared",
+  "windows-link",
   "windows-sys",
   "windows-targets",
   "windows_aarch64_gnullvm",
@@ -178,6 +188,11 @@
      "copyright": "2018 Sam Rijs, Alex Crichton and contributors"
     },
     {
+     "name": "ed25519-compact",
+     "licence": "MIT",
+     "copyright": "2020-2026 Frank Denis"
+    },
+    {
      "name": "either",
      "licence": "MIT OR Apache-2.0",
      "copyright": "Copyright (c) 2015 (the upstream notice names no holder)"
@@ -188,6 +203,11 @@
      "copyright": "Mozilla Foundation. Its encoding tables derive from the WHATWG Encoding Standard, whose data files are BSD-3-Clause (`licenses/WHATWG-BSD-3-Clause.txt`)"
     },
     {
+     "name": "equivalent",
+     "licence": "Apache-2.0 OR MIT",
+     "copyright": "2016–2023 The equivalent authors"
+    },
+    {
      "name": "fdeflate",
      "licence": "MIT OR Apache-2.0",
      "copyright": "The image-rs Developers"
@@ -196,6 +216,11 @@
      "name": "flate2",
      "licence": "MIT OR Apache-2.0",
      "copyright": "2014-2026 Alex Crichton"
+    },
+    {
+     "name": "getrandom",
+     "licence": "MIT OR Apache-2.0",
+     "copyright": "2018–2026 The rust-random Project Developers; 2014 The Rust Project Developers"
     },
     {
      "name": "gimli",
@@ -211,6 +236,11 @@
      "name": "image",
      "licence": "MIT OR Apache-2.0",
      "copyright": "The image-rs Developers"
+    },
+    {
+     "name": "indexmap",
+     "licence": "Apache-2.0 OR MIT",
+     "copyright": "2016–2017 The indexmap authors"
     },
     {
      "name": "itoa",
@@ -293,6 +323,16 @@
      "copyright": "2019 Daniel \"Lokathor\" Gee"
     },
     {
+     "name": "typed-path",
+     "licence": "MIT OR Apache-2.0",
+     "copyright": "The typed-path authors"
+    },
+    {
+     "name": "zip",
+     "licence": "MIT",
+     "copyright": "2014 Mathijs van de Nes"
+    },
+    {
      "name": "zune-core",
      "licence": "MIT OR Apache-2.0 OR Zlib",
      "copyright": "The zune-image developers"
@@ -346,7 +386,7 @@
     },
     {
      "name": "dolby_vision",
-     "copyright": "Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_media`'s `ff.rs`); used unmodified, with no optional features"
+     "copyright": "Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_play_feed`'s `ff.rs`); used unmodified, with no optional features"
     },
     {
      "name": "funty",
@@ -502,5 +542,10 @@
     }
    ]
   }
- ]
+ ],
+ "not_shipped_versions": {
+  "getrandom": [
+   "0.2.17"
+  ]
+ }
 }

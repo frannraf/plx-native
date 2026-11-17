@@ -9,7 +9,13 @@
 //! `Instant::now`/`SystemTime::now`/`.elapsed()`; `decision.rs` is not scanned by that gate (a
 //! network/adapter effect is allowed to read wall time) but as of this split carries none either.
 
+pub mod backend_policy;
+pub mod uri_preflight;
+mod uri_offer;
+pub use uri_offer::{QualifiedUriOffer, UriRecoveryNotice, UriSourceRecipe};
 mod decision;
+mod queue_navigation;
+pub use queue_navigation::{QueueContinuation, QueueStep, queue_neighbor, queue_neighbors};
 mod flight;
 mod live;
 mod plan;

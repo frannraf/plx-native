@@ -27,6 +27,17 @@ impl ScreenArg for TestArg {
 
 struct TestHost;
 
+impl crate::registry::ScreenInputsLike for TestHost {
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::empty_fixture() }
+}
+
+impl crate::registry::PlayerLike for TestHost {
+    fn session<'a>(_cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession {
+        plx_media::route::idle_session_for_test()
+    }
+    fn transport_paused(_cx: &Cx<'_, Self>) -> bool { false }
+}
+
 impl Host for TestHost {
     type Arg = TestArg;
     type Fx = AppFx;
@@ -64,6 +75,7 @@ fn cx<'a>(measure: &'a dyn plx_machine::machine::Measure, elem: Option<u32>) -> 
         tick: Default::default(),
         measure,
         press: PressRead::default(),
+        modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         focus: plx_machine::machine::FocusRead {
             current: elem.map(|elem| FocusKey { entry: EntryId(8), elem }),
         ..Default::default() },
@@ -73,6 +85,7 @@ fn cx<'a>(measure: &'a dyn plx_machine::machine::Measure, elem: Option<u32>) -> 
 
 fn bare(sid: ServerId, rk: &str) -> DetailScreen {
     let mut screen = DetailScreen {
+        caption_policy: crate::registry::captions::policy(),
         entry: EntryId(8),
         sid,
         rk: rk.into(),
@@ -104,6 +117,8 @@ fn bare(sid: ServerId, rk: &str) -> DetailScreen {
         refresh_gen: 0,
         scroll: Spring::at(0.0),
         scroll_target: 0.0,
+        free: false,
+        episode_free: false,
         episode_scroll: Spring::at(0.0),
         tab_scroll: Spring::at(0.0),
         episode_cells: episodes::Cells::new(),
@@ -111,14 +126,14 @@ fn bare(sid: ServerId, rk: &str) -> DetailScreen {
             strip_seat: Default::default(),
         about_card_lift: plx_ui::text_lift::TextLift::new(),
         about_lang_lift: plx_ui::text_lift::TextLift::new(),
-        related: plx_ui::cards::Shelf::new(EntryId(8), &plx_ui::cards::RowStyle::HOME),
-        collection: plx_ui::cards::Shelf::new(EntryId(8), &plx_ui::cards::RowStyle::HOME),
-        extras: plx_ui::cards::Shelf::new(EntryId(8), &plx_ui::cards::RowStyle::EPISODE),
-        cast: plx_ui::cards::Shelf::new(EntryId(8), &plx_ui::cards::RowStyle::CAST),
+        related: plx_ui::cards::Shelf::new(EntryId(8), plx_ui::cards::RowStyle::HOME),
+        collection: plx_ui::cards::Shelf::new(EntryId(8), plx_ui::cards::RowStyle::HOME),
+        extras: plx_ui::cards::Shelf::new(EntryId(8), plx_ui::cards::RowStyle::EPISODE),
+        cast: plx_ui::cards::Shelf::new(EntryId(8), plx_ui::cards::RowStyle::CAST),
         tabs: TabStrip::new(),
         season_pop: CtlPop::new(),
         ctl_pop: CtlPop::new(),
-        disc_unfurl: [Spring::at(0.0); 3],
+        disc_unfurl: [Spring::at(0.0); hero::DISCS],
         watchlist: plx_appkit::watchlist_disc::Disc::new(plx_data::catalog::Membership::Unknown), watchlist_hex: None,
         season_metrics: season::Metrics::new(),
         about_rows: about::Rows::new(),

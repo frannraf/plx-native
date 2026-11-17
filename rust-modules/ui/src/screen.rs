@@ -138,6 +138,14 @@ pub trait Screen<H: Host>: Machine<H, Ev = ScreenEvent<H>> + Focusable<H> {
     fn strip_reachable(&self) -> bool {
         true
     }
+    /// **Does the page scroll itself by a wheel?** A page that answers `true` moves its own
+    /// scroll on `InputKind::Wheel` (fractional `dy` included, focus staying where it is), so the
+    /// application's pointer EDGE GLIDE (`app::input::EdgeScroll`) is offered to it. A page that
+    /// answers `false` (Home, whose scroll follows its focus) is never glided and keeps the
+    /// pointer's hover at its edges.
+    fn glides(&self) -> bool {
+        false
+    }
     /// The page's declared `Link`s (§7.3 step 3) — the strip→hero door among them.
     fn links(&self, _out: &mut Vec<Link>) {}
     /// **Does the page hold this arrow key instead of letting it move focus?** Asked only while
@@ -185,6 +193,13 @@ pub trait Screen<H: Host>: Machine<H, Ev = ScreenEvent<H>> + Focusable<H> {
     /// only surfaces, and only ones whose host is cached rather than replaced.
     fn scrim(&self) -> Scrim {
         Scrim::NONE
+    }
+    /// **How this SURFACE arrives** ([`crate::containers::modal::EntryMotion`]): the shared appear
+    /// spring by default, or the route dip (70 ms out, 140 ms in) for a surface with an opaque
+    /// ground of its own that does not translate. Asked of the mounted body while the surface is
+    /// opening; a page never answers.
+    fn entry_motion(&self) -> crate::containers::modal::EntryMotion {
+        crate::containers::modal::EntryMotion::Spring
     }
     /// An `Opaque` surface's ground has drawn at full strength: the fold may REPLACE the host
     /// from here (§6.2 `Surface::ground_ready`). The dispatcher copies it onto the surface after
@@ -270,6 +285,19 @@ pub trait Screen<H: Host>: Machine<H, Ev = ScreenEvent<H>> + Focusable<H> {
     /// as it stands at the start of its motion, through a live painter. The text it draws is the
     /// page's own and was resident a frame ago. The default draws nothing.
     fn draw_held(&mut self, _f: &mut DrawFrame<'_, '_, H>) {}
+    /// **A VISIBLE surface is holding content back until its text is resident.** A Settings push
+    /// commits at once and the page it brings in would be rasterised, cold, in the push's first
+    /// drawn frame; the surface waits at the push's start instead ([`crate::route_screen::RoutePush::begin_warm`])
+    /// and answers `true` while it does. The dispatcher's surface pass then walks
+    /// [`draw_warm`](Self::draw_warm) through the text recorder after the surface's own `draw` and
+    /// drains the queue under the frame's shared prewarm budget. The default is `false`.
+    fn warms_text(&self) -> bool {
+        false
+    }
+    /// **Walk the content that is about to be shown through the text recorder** (the frame's painter
+    /// records; nothing is drawn). Called only while [`warms_text`](Self::warms_text) is true, and
+    /// not in a blur source pass. The default walks nothing.
+    fn draw_warm(&mut self, _f: &mut DrawFrame<'_, '_, H>) {}
     /// **The card the page has focused, and where it sits** — the host's question for an item menu
     /// and for the focus probe, asked of whichever card page is on screen so the host names no
     /// screen type. `focus` is the engine key to answer for (a page answers only its own entry's
@@ -687,17 +715,17 @@ macro_rules! focusable_via_composed {
 /// generic too (`fn view<H: Bounds>(&self) -> impl Focusable<H> + '_`) — a `cards::Stack` page.
 #[macro_export]
 macro_rules! focusable_via_view {
-    (@impl [$($gen:tt)*] $t:ty, $h:ty, $view:ident, [$($turbofish:tt)*]) => {
+    (@impl [$($gen:tt)*] $t:ty, $h:ty, $view:ident, [$($turbofish:tt)*] $(, $press:ident)?) => {
         impl $($gen)* $crate::screen::Focusable<$h> for $t {
             fn groups(&self, cx: &plx_machine::machine::Cx<'_, $h>, out: &mut Vec<$crate::screen::GroupSpec>) {
-                $crate::screen::Focusable::<$h>::groups(&self.$view $($turbofish)* (), cx, out)
+                $crate::screen::Focusable::<$h>::groups(&self.$view $($turbofish)* ($(cx.$press)?), cx, out)
             }
             fn group_of(
                 &self,
                 key: &<$h as plx_machine::machine::Host>::Elem,
                 cx: &plx_machine::machine::Cx<'_, $h>,
             ) -> Option<plx_machine::machine::GroupId> {
-                $crate::screen::Focusable::<$h>::group_of(&self.$view $($turbofish)* (), key, cx)
+                $crate::screen::Focusable::<$h>::group_of(&self.$view $($turbofish)* ($(cx.$press)?), key, cx)
             }
             fn neighbour(
                 &self,
@@ -705,7 +733,7 @@ macro_rules! focusable_via_view {
                 dir: $crate::screen::Dir,
                 cx: &plx_machine::machine::Cx<'_, $h>,
             ) -> $crate::screen::Step<<$h as plx_machine::machine::Host>::Elem> {
-                $crate::screen::Focusable::<$h>::neighbour(&self.$view $($turbofish)* (), key, dir, cx)
+                $crate::screen::Focusable::<$h>::neighbour(&self.$view $($turbofish)* ($(cx.$press)?), key, dir, cx)
             }
             fn place(
                 &self,
@@ -713,14 +741,14 @@ macro_rules! focusable_via_view {
                 cx: &plx_machine::machine::Cx<'_, $h>,
                 at: $crate::screen::At,
             ) -> Option<$crate::screen::Placed> {
-                $crate::screen::Focusable::<$h>::place(&self.$view $($turbofish)* (), key, cx, at)
+                $crate::screen::Focusable::<$h>::place(&self.$view $($turbofish)* ($(cx.$press)?), key, cx, at)
             }
             fn reconcile(
                 &self,
                 want: plx_machine::machine::FocusKey<<$h as plx_machine::machine::Host>::Elem>,
                 cx: &plx_machine::machine::Cx<'_, $h>,
             ) -> plx_machine::machine::FocusKey<<$h as plx_machine::machine::Host>::Elem> {
-                $crate::screen::Focusable::<$h>::reconcile(&self.$view $($turbofish)* (), want, cx)
+                $crate::screen::Focusable::<$h>::reconcile(&self.$view $($turbofish)* ($(cx.$press)?), want, cx)
             }
             fn seat(
                 &self,
@@ -728,7 +756,7 @@ macro_rules! focusable_via_view {
                 from: $crate::screen::Placed,
                 cx: &plx_machine::machine::Cx<'_, $h>,
             ) -> plx_machine::machine::FocusKey<<$h as plx_machine::machine::Host>::Elem> {
-                $crate::screen::Focusable::<$h>::seat(&self.$view $($turbofish)* (), g, from, cx)
+                $crate::screen::Focusable::<$h>::seat(&self.$view $($turbofish)* ($(cx.$press)?), g, from, cx)
             }
         }
     };
@@ -737,6 +765,9 @@ macro_rules! focusable_via_view {
     };
     ($t:ty, $h:ty, $view:ident) => {
         $crate::focusable_via_view!(@impl [] $t, $h, $view, []);
+    };
+    ($t:ty, $h:ty, $view:ident, press) => {
+        $crate::focusable_via_view!(@impl [] $t, $h, $view, [], press);
     };
 }
 
@@ -808,6 +839,17 @@ pub fn chrome_lift(tuck: f32) -> f32 {
 }
 
 impl NavPresentation {
+    /// Build a snapshot from the owning stack and the application's tab and blur configuration.
+    pub fn from_transition(page: f32, chrome: f32, view_tab: Option<u32>, blur_dissolve: bool) -> Self {
+        Self {
+            page_alpha: if blur_dissolve { 1.0 } else { page },
+            chrome_alpha: chrome,
+            view_tab,
+            blur_amount: if blur_dissolve { 1.0 - page } else { 0.0 },
+            chrome_lift: 0.0,
+        }
+    }
+
     /// This presentation with the top chrome tucked away by `tuck` ([`Screen::chrome_tuck`]):
     /// the chrome's alpha falls to 0 and it lifts by [`chrome_lift`] as the tuck reaches 1. The dispatcher hands the chrome pass
     /// this value for the page that answers a tuck; every other page answers 0 and is unchanged.
@@ -862,18 +904,34 @@ pub struct DrawFrame<'a, 'views, H: Host> {
     /// sheet". Set by the dispatcher's surface pass, never by a screen.
     pub underlay: Option<&'a crate::underlay::UnderlayField>,
     /// **The page element a surface lifts back out of the dim this frame** (item menu opener,
-    /// [`Screen::opener`]). A card section leaves that card OUT of the page pass
+    /// [`Screen::opener`]). A page leaves that element OUT of the page pass ([`Self::leaves_out`]: a card section, the Detail episode strip)
     /// (`cards::Shelf` / `Grid::draw_card`): the lift ([`Screen::redraw_focused`], drawn live above
     /// the host snapshot at the press's own scale) is its only copy, so the frozen page never holds
     /// a stale (dipped) copy under the growing one and the release spring of a taken hold is not
     /// page damage. `None` on every frame the lift does not run, and on the lift's own frame.
     pub lifted: Option<FocusKey<H::Elem>>,
+    /// Page instance addressed by this walk; assigned only by its dispatcher.
+    pub lift_owner: Option<InstanceId>,
+    lift_receipt: std::cell::Cell<Option<crate::input::LiftReceipt<H::Elem>>>,
+    // Render evidence only; the dispatcher owns final-swap admission and logical delivery.
+    presentation: std::cell::RefCell<Option<H::Msg>>,
     /// **The lift's own frame for an opener that left the page** ([`Screen::opener_departing`]):
     /// the element whose landing ghost the lift carries above the dim. A grid's
     /// `paint_ghosts` paints that ghost alone on such a frame (and the page pass, whose `lifted`
     /// names it, leaves it out). `None` on every other frame.
     pub lifting: Option<FocusKey<H::Elem>>,
+    /// **The push this frame is drawn under, for a page that holds its narrative column**
+    /// ([`crate::route_screen::PushFrame`]). `None` everywhere else: a page the surface draws whole
+    /// carries its push in `painter` already, and a page drawn at rest has none. Set by the
+    /// Settings surface, read through [`Self::narrative_painter`] / [`Self::list_painter`] by the
+    /// parts that draw a route's two columns (`table_screen`).
+    pub push: Option<crate::route_screen::PushFrame>,
+    /// **How far a surface's entry dip has taken the page beneath it to the app ground**, `0..=1`
+    /// (`containers::modal::PopoverMotion::floor`). `0` on every frame but the opening of a surface
+    /// that opts into the dip ([`Screen::entry_motion`]). Set by the dispatcher's surface pass.
+    pub entry_floor: f32,
     stops: Vec<Stop<H::Elem>>,
+    wants_frame: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -908,6 +966,17 @@ pub fn record_stops_while_recording<R>(f: impl FnOnce() -> R) -> R {
 }
 
 impl<'a, 'views, H: Host> DrawFrame<'a, 'views, H> {
+    /// Route presentation retained independently of a container's local page alpha.
+    pub fn route_navigation(&self) -> NavPresentation {
+        NavPresentation {
+            page_alpha: self.nav_page_alpha,
+            chrome_alpha: self.chrome_alpha,
+            view_tab: self.view_tab,
+            blur_amount: self.blur_amount,
+            chrome_lift: 0.0,
+        }
+    }
+
     pub fn new(cx: &'a Cx<'views, H>, painter: Painter) -> Self {
         Self::with_navigation(cx, painter, NavPresentation::default())
     }
@@ -924,9 +993,81 @@ impl<'a, 'views, H: Host> DrawFrame<'a, 'views, H> {
             press: cx.press,
             underlay: None,
             lifted: None,
+            lift_owner: None,
+            lift_receipt: std::cell::Cell::new(None),
+            presentation: std::cell::RefCell::new(None),
             lifting: None,
+            push: None,
+            entry_floor: 0.0,
             stops: Vec::new(),
+            wants_frame: false,
         }
+    }
+
+    /// The painter for a route's NARRATIVE column: the frame's own at rest, and under a push that
+    /// holds the column ([`Self::push`]) the same position with the push's cross-fade alpha.
+    pub fn narrative_painter(&self) -> Painter {
+        self.push.map_or(self.painter, |push| push.narrative(self.painter))
+    }
+
+    /// The painter for a route's CONTENT column (its table): the frame's own at rest, and under a
+    /// push that holds the narrative column ([`Self::push`]) the list's lead-in or exit.
+    pub fn list_painter(&self) -> Painter {
+        self.push.map_or(self.painter, |push| push.list(self.painter))
+    }
+
+    /// **Does the page pass leave `elem` of `entry` out, because a surface lifts it?** The ONE
+    /// question every page asks of [`Self::lifted`] before it draws an element a surface can open
+    /// from (a card section's tile, a Detail episode's cell). `true` means the opener lift
+    /// ([`Screen::redraw_focused`]) draws the only copy above the host snapshot, so the page draws
+    /// NOTHING of it - not its art and not its label plate - and the snapshot never holds a stale
+    /// (dipped) copy under the lift's. It also says so to the press machine
+    /// through a local receipt, whose spring then is no page damage. The lift's own
+    /// frame carries no `lifted`, so it draws.
+    pub fn leaves_out(&self, entry: EntryId, elem: H::Elem) -> bool {
+        let out = self.lifted.is_some_and(|k| k.entry == entry && k.elem == elem);
+        if out {
+            if let Some(owner) = self.lift_owner {
+                self.lift_receipt.set(Some(crate::input::LiftReceipt {
+                    press: plx_machine::machine::PressId(self.press.identity),
+                    key: FocusKey { entry, elem }, owner,
+                }));
+            }
+        }
+        out
+    }
+
+    /// Local draw evidence. Only Dispatcher may admit it as logical input policy.
+    pub fn lift_receipt(&self) -> Option<crate::input::LiftReceipt<H::Elem>> {
+        self.lift_receipt.get()
+    }
+
+    /// Speculative, blur, discovery and text-recording walks cannot publish logical policy.
+    pub fn visible_lift_receipt(&self) -> Option<crate::input::LiftReceipt<H::Elem>> {
+        if self.painter.is_recording() || crate::frame::backdrop::source_walk()
+            || plx_gfx::gfx::blur_source_pass() {
+            None
+        } else {
+            self.lift_receipt()
+        }
+    }
+
+    /// Report one typed paint observation, never a logical mutation. Offscreen walks cannot
+    /// manufacture evidence, even when their geometry describes an otherwise visible control.
+    pub fn report_presentation(&self, message: H::Msg) {
+        if !self.painter.is_recording() && !crate::rec::speculating()
+            && !crate::frame::backdrop::source_walk() && !plx_gfx::gfx::blur_source_pass() {
+            *self.presentation.borrow_mut() = Some(message);
+        }
+    }
+
+    pub(crate) fn take_presentation(&self) -> Option<H::Msg> {
+        self.presentation.borrow_mut().take()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_presentation_for_test(&self) -> Option<H::Msg> {
+        self.take_presentation()
     }
 
     /// Carry this frame's presentation into a nested frame, including any container alpha.
@@ -988,6 +1129,23 @@ impl<'a, 'views, H: Host> DrawFrame<'a, 'views, H> {
         &self.stops
     }
 
+    /// Deferred renderer work is an effect of this visible frame, never a process wake.
+    pub fn is_visible_pass(&self) -> bool {
+        !self.painter.is_recording() && !plx_gfx::gfx::blur_source_pass()
+            && !crate::frame::backdrop::source_walk()
+    }
+
+    pub fn request_frame(&mut self) {
+        if self.is_visible_pass() { self.wants_frame = true; }
+    }
+
+    pub fn take_frame_request(&mut self) -> bool {
+        std::mem::take(&mut self.wants_frame)
+    }
+
+    pub fn apply_frame_requests(&mut self, present: &mut plx_machine::present::Present) {
+        if self.take_frame_request() { present.note(plx_machine::present::PresentEvent::Wake); }
+    }
     pub fn into_stops(self) -> Vec<Stop<H::Elem>> {
         self.stops
     }
@@ -1094,6 +1252,7 @@ mod draw_frame_tests {
             press: PressRead::default(),
             focus: FocusRead::default(),
             owner: InputOwner::Entry(EntryId(0)),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         }
     }
 
@@ -1161,6 +1320,50 @@ mod draw_frame_tests {
             let _walk = backdrop::enter(sources, Z::ALL);
             assert_eq!(record(Painter::root()), (true, 1), "the visible walk records");
         }
+    }
+
+    #[test]
+    fn frame_demand_is_owned_and_survives_the_current_admission() {
+        use plx_machine::present::Present;
+        let _serial = plx_base::testlock::serial();
+        let measure = crate::fixture::FixtureMeasure;
+        let view = crate::fixture::FixtureView::default();
+        let context = cx(&measure, &view);
+        let mut owner = Present::new();
+        let mut other = Present::new();
+        let mut worker = Present::global();
+        for p in [&mut other, &mut worker] { p.take(0); p.acknowledge(0); }
+        assert!(owner.take(0));
+        let mut frame = DrawFrame::new(&context, Painter::root());
+        frame.request_frame();
+        frame.request_frame();
+        frame.apply_frame_requests(&mut owner);
+        assert!(!frame.take_frame_request(), "the frame effect is consumed exactly once");
+        owner.acknowledge(0);
+        assert!(owner.peek(1));
+        assert!(!other.peek(1));
+        assert!(!worker.peek(1));
+        assert!(!owner.page_damaged());
+        assert!(!owner.page_moving());
+        assert!(owner.why().is_none());
+    }
+
+    #[test]
+    fn source_and_recording_frames_do_not_request_presents() {
+        use crate::frame::backdrop::{self, Z};
+        let _serial = plx_base::testlock::serial();
+        let measure = crate::fixture::FixtureMeasure;
+        let view = crate::fixture::FixtureView::default();
+        let context = cx(&measure, &view);
+        let sources = std::rc::Rc::new(std::cell::RefCell::new(backdrop::Sources::default()));
+        let request = |painter| {
+            let mut frame = DrawFrame::new(&context, painter);
+            frame.request_frame(); frame.take_frame_request()
+        };
+        assert!(!request(Painter::recording()));
+        { let _walk = backdrop::discover(sources.clone()); assert!(!request(Painter::root())); }
+        { let _walk = backdrop::enter(sources, Z::OPENER); assert!(!request(Painter::root())); }
+        assert!(request(Painter::root()));
     }
 
     /// A stop under a clipped painter is clipped to the cascade's clip ∩ its own.
@@ -1257,6 +1460,21 @@ mod draw_frame_tests {
         assert_eq!(f.nav_page_alpha, 0.42, "the outer route fade must survive the overwrite");
     }
 
+    #[test]
+    fn transition_presentations_are_independent_and_keep_blur_and_chrome_separate() {
+        let first = NavPresentation::from_transition(0.25, 1.0, Some(2), true);
+        let second = NavPresentation::from_transition(0.6, 0.4, None, false);
+        assert_eq!(first.page_alpha, 1.0);
+        assert_eq!(first.blur_amount, 0.75);
+        assert_eq!(first.chrome_alpha, 1.0);
+        assert_eq!(first.view_tab, Some(2));
+        assert_eq!(second.page_alpha, 0.6);
+        assert_eq!(second.blur_amount, 0.0);
+        assert_eq!(second.chrome_alpha, 0.4);
+        assert_eq!(second.view_tab, None);
+        assert_eq!(NavPresentation::from_transition(1.0, 1.0, None, false), NavPresentation::default());
+    }
+
     /// `DrawFrame::new` (no explicit navigation) is `NavPresentation::default()`, whose
     /// `page_alpha` is 1.0 — the same rest value `ui::nav::page_alpha()` answers when no route
     /// transition is in flight, so a screen built through the plain constructor sees the same
@@ -1307,7 +1525,8 @@ mod composed_owner_tests {
     fn repaired(pair: &Pair, elem: u32) -> u32 {
         let (measure, store) = (FixtureMeasure, FixtureView::default());
         let cx = Cx { views: FixtureViews { store: &store }, tick: Tick::default(), measure: &measure,
-            press: PressRead::default(), focus: FocusRead::default(), owner: InputOwner::Entry(EntryId(1)) };
+            press: PressRead::default(), focus: FocusRead::default(), owner: InputOwner::Entry(EntryId(1)),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default() };
         composed_reconcile(pair, FocusKey { entry: EntryId(1), elem }, &cx).elem
     }
     fn pair(owned: Vec<u32>, placed: Vec<u32>, repair: u32) -> Pair {

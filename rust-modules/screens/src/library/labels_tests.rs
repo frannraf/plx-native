@@ -1,6 +1,5 @@
 //! Meaningful legacy caption and landscape assertions, on the owned production helpers.
 use plx_data::pms::PmsMovie;
-use plx_media::route::DeckPress;
 use plx_ui::cards::{self as ui_cards, RowStyle};
 use plx_ui::consts::{self, CARD_H, CARD_W, MARGIN_X};
 use plx_ui::fixture::FixtureMeasure;
@@ -13,10 +12,7 @@ use super::layout::{self, Layout, COLS, CONTENT_TOP, GRID_RIGHT,
     RAIL_TRACK_W};
 
 /// Title over the default year line: the shape the legacy grid caption had.
-const POLICY: plx_ui::caption_policy::CaptionPolicy = plx_ui::caption_policy::CaptionPolicy {
-    title: true,
-    details: plx_ui::caption_policy::DetailsKind::YearLength,
-};
+const POLICY: plx_ui::caption_policy::CaptionPolicy = plx_ui::caption_policy::CaptionPolicy { title: true, ..plx_ui::caption_policy::CaptionPolicy::DEFAULT };
 
 #[test]
 fn grid_labels_identify_episodes_and_seasons() {
@@ -157,32 +153,6 @@ fn owned_library_overscan_probe_covers_every_legacy_edge() {
     }
 }
 
-/// The deck's focused title carries the amber ▶ only while OK on the deck plays.
-#[test]
-fn the_deck_title_carries_the_play_glyph_only_while_the_press_plays() {
-    let _guard = plx_base::testlock::serial();
-    let prior = plx_media::route::deck_press();
-    // The play mark leads the title line, so the Title switch is on for this test's thread.
-    crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(
-        plx_plex::plex::session::UnderPosters { title: true, details: plx_plex::plex::session::UnderPostersDetails::YearLength })));
-    let glyph = |mode, is_continue| {
-        plx_media::route::restore_deck_press(mode);
-        let shelf = plx_data::browse::section_hubs::Shelf {
-            id: "x".into(), key: String::new(), link: None, total: 0, title: "On Deck".into(), is_continue,
-            landscape: false, items: vec![PmsMovie { kind: 0, title: "Stardust".into(), ..Default::default() }],
-            ..Default::default()
-        };
-        shelf_label(&shelf, 0).glyph
-    };
-    let seen = (
-        glyph(DeckPress::Play, true), glyph(DeckPress::Details, true),
-        glyph(DeckPress::Play, false), glyph(DeckPress::Details, false),
-    );
-    plx_media::route::restore_deck_press(prior);
-    crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(None));
-    assert_eq!(seen, (true, false, false, false));
-}
-
 #[test]
 fn a_focused_poster_tile_always_fills_the_caption_rung_it_reserves() {
     // Port the original Library assertion against the owned screen's production helper.
@@ -279,20 +249,18 @@ fn a_focused_poster_tile_always_fills_the_caption_rung_it_reserves() {
              of one show differ only by number, so the number cannot be the thing behind focus"
         );
 
-        // **Continue Watching trails time left instead**, because for a part-watched episode that
-        // is the fact you came for. The shelf decides and not the item.
+        // **The Continue Watching deck hangs no block under its stills** (it is Home's deck: the
+        // time left is its footer line, on the tile), however far an episode has been watched.
         let mut deck = shelf(vec![PmsMovie {
             dur_ns: 30 * 60 * 1_000_000_000,
             resume_ms: 6 * 60 * 1000,
             ..dated(ep(3, 4, "Violet", "The Bear"))
         }]);
         deck.is_continue = true;
-        assert_eq!(caption(&shelf_label(&deck, 0)), "24m left");
-        // …and a deck tile never started has no time to report, so it falls back to the date
-        // rather than to an empty rung.
+        assert_eq!((title(&shelf_label(&deck, 0)).as_str(), caption(&shelf_label(&deck, 0)).as_str()), ("", ""));
         let mut next_up = shelf(vec![dated(ep(3, 5, "Ice Chips", "The Bear"))]);
         next_up.is_continue = true;
-        assert_eq!(caption(&shelf_label(&next_up, 0)), "9/11/2026");
+        assert_eq!((title(&shelf_label(&next_up, 0)).as_str(), caption(&shelf_label(&next_up, 0)).as_str()), ("", ""));
 
         // …an episode the server dated to nothing at all draws ONE rung, not an empty second one
         let sh = shelf(vec![ep(3, 4, "Violet", "The Bear")]);
@@ -312,7 +280,7 @@ fn a_focused_poster_tile_always_fills_the_caption_rung_it_reserves() {
         poster.landscape = false;
         assert_eq!(title(&shelf_label(&poster, 0)), "", "the default setting wears no title");
         crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(
-            plx_plex::plex::session::UnderPosters { title: true, details: plx_plex::plex::session::UnderPostersDetails::YearLength })));
+            plx_plex::plex::session::UnderPosters { title: true, details: plx_plex::plex::session::UnderPostersLadder::YearLength.movie_parts(), show_details: plx_plex::plex::session::UnderPostersLadder::YearLength.show_parts(), sort_value: false })));
         let l = shelf_label(&poster, 0);
         crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(None));
         assert_eq!((title(&l).as_str(), caption(&l).as_str()), ("Violet", "S3 \u{b7} E4"));

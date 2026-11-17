@@ -4,7 +4,8 @@
 
 PlxNative is a production-quality native Plex client for rooted LG webOS 4.5 TVs. Most of the
 application is Rust under `rust-modules/` (the application in `src/`, the layers in their own crates); `src/main.c` is the boot/crash shim,
-`src/starfish.c` is the StarfishMediaAPIs/ACB seam, and `src/svg.c` rasterizes SVGs. Keep changes
+`src/starfish.c` is the Feed-only StarfishMediaAPIs seam (compiled only with `PLAYBACK_HAS_FEED`),
+`src/video_plane.c` is the ACB / exported-window display binding both backends share, and `src/svg.c` rasterizes SVGs. Keep changes
 properly factored and finished; "only a demo" is never a reason to leave a shortcut behind.
 
 The target is a cross-compiled 32-bit ARM application with a hardware video plane. Host tests and
@@ -17,6 +18,8 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   when a narrower section is enough.
 - Before playback work, read `rust-modules/media/src/player/CLAUDE.md`.
 - Before Plex data-layer work, read `rust-modules/plex/src/plex/CLAUDE.md` and `docs/pms-api.md`.
+- Before adding or changing a `data/` store, read `rust-modules/data/src/AGENTS.md` (the store, runner and
+  Bridge split, and the Sans-IO recipe for it).
 - Before UI work, read `rust-modules/ui/src/CLAUDE.md` and use the shared theme, layout, and widget
   systems instead of adding screen-local visual primitives. Before touching a screen, also read
   `rust-modules/screens/src/CLAUDE.md`; the restructure's design record is
@@ -46,6 +49,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   whole. The reason is the history itself: `main` is read by `git log`, by the release audit and by
   `git bisect`, and a trunk of "fix typo" / "wip" / merge commits pollutes all three. Push `main`
   only when the user asked for it.
+- **Releases are cut from release lines, and fixes reach a line from `main`.** `main` never holds
+  a PR back for a release: `cut-line.yml` branches `release/vX.Y` off `main` and moves `main` on,
+  and the release and its candidates ship from that line (the `cut-release` skill). A fix the line
+  needs lands on `main` first with the `backport release/vX.Y` label, and `backport.yml`
+  cherry-picks it into a PR against the line; a line takes squash merges only, like `main`. Never
+  fix only on the line: that is how `release/v0.6` once carried 37 fixes `main` never had.
 - **A diff stat is not a measure of change.** `dec32f2e` ran rustfmt over all of `ui/`, so
   `detail.rs` read +2416 lines for +113 characters of content. `git diff -w` does not rescue it —
   that ignores whitespace *within* a line, not one line split into three. Size a change by content
@@ -55,14 +64,26 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   `ci/module-layers.ini` declares the crates `rust-modules/src` is being split into, and
   `ci/check-module-layers.py` (in `make check`) fails on a reference that names a layer its own
   layer may not use, on a module placed in no layer, and on a reference from outside
-  `[port webos]` to `webos`, `keymanager`, `system`, `player::ffi` or `port`. Fix the reference
+  `[port webos]` to `webos`, `keymanager`, `system` or `port`. Fix the reference
   (`docs/module-layers.md` says where code belongs and how to cut an upward name) instead of
   adding a (file, member) pair to `ci/allow/layers.txt`, which is empty and only shrinks.
-- **Re-basing a stacked PR after the one below it squashes:** on the upper branch, `git merge
-  <lower's final head>`, `git merge <squash>^`, `git merge -s ours <squash>`, then
-  `git merge origin/main`. `-s ours` on the squash alone drops whatever `main` gained before it.
-- `gh pr merge --auto --squash --match-head-commit <sha>` can fail just after a push with "expected
-  head oid does not match"; wait ~15 s and retry. It is a race, not a real mismatch.
+- **Logic never performs IO.** A machine (a screen, a `data/` store, the session owner, the player's
+  foreground lifecycle, a route planner) starts no worker, reads no process-global registry and has
+  no `cfg(test)` fork: its work leaves as a typed effect the app's runners execute, and every result
+  returns as one addressed event. `ci/check-deps.sh` freezes today's sites in the ledgers under
+  `ci/allow/{workers,globals,forks,fxlanes}/`, which only shrink: a new site fails `make check`,
+  a migration lands by deleting lines (`docs/sans-io.md`), and CI also fails a PR whose ledger counts
+  rise above its base's (`ci/check-ledger-ratchet.py`), whatever its `# count:` headers and pins say.
+  Before writing or changing a machine's code (a store, a screen, the session owner, the player
+  lifecycle or a route planner), read `docs/sans-io-guide.md`: it says what counts as IO and how each
+  move is done. A ledger line is never the fix; if a step seems to need IO, stop and say why.
+- **Landing a PR, and re-basing a stacked one after the PR below it squashes, go through
+  `tools/pr-land.py`** (gate, wait, merge, restack; the `land-pr` skill has the commands, exit codes,
+  the four-merge restack and the head-oid race). It grants no merge authority: an owner's
+  authorization is still needed. In Claude sessions outbound-guard refuses a raw `gh pr merge`, a
+  write to `.../pulls/N/merge` and a GraphQL `mergePullRequest` written on the command line or in a
+  heredoc (not one read from a query file); the owner's own manual merge takes the
+  `PLX_MERGE_BYPASS=1` prefix.
 - Preserve unrelated user changes and generated artifacts. Never clean or reset a dirty tree to
   make a task easier.
 - This repository is public. Never publish values from gitignored private files such as `.tv-host`,
@@ -146,9 +167,10 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   `tvdev` binary (`make deploy` records the profile on the set); build with `make ARM_PROFILE=release
   deploy` before any other FPS or smoothness measurement (`docs/agent-reference.md`, "ARM_PROFILE").
 - After editing `rust-modules/src/**/*.rs` or a layer crate's `rust-modules/*/src/**/*.rs`, also check the shipping feature set with
-  `make check-nodef` (`cargo check --lib --no-default-features`, non-incremental, in the checkout's
-  own `target/`: it shares the third-party units `make lint` built and adds no tree) when the
-  Claude-only release hook did not run. Keep the `CARGO_INCREMENTAL=0` prefix on every other direct
+  `make check-nodef` (`cargo check --lib --no-default-features --features play-uri,play-feed`, non-incremental, in the checkout's
+  own `target/`: it shares the third-party units `make lint` built and adds no tree), whether or not the
+  Claude-only release hook ran: that hook type-checks the bare `--no-default-features`, which drops
+  `play-uri` and `play-feed` too, so it catches an unpaired `devtriggers` cfg but never a backend's gated code. Keep the `CARGO_INCREMENTAL=0` prefix on every other direct
   `cargo` call: they bypass `make`,
   so the Makefile's linked-worktree setting cannot reach them, and a one-shot gate has no use for
   a multi-gigabyte incremental cache. `tools/build-gc.sh` also installs
@@ -171,7 +193,10 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   re-checks every path of a plan against the live machine immediately before it renames it away
   (a live or idle-window-young tree is skipped, a path that is not a derived build tree is
   refused). It never evicts the cargo seed, and unlike the other modes it does not stop for a
-  held FFmpeg cache lock. Preview a plan with `python3 tools/disk-budget.py reclaim --to GIB
+  held FFmpeg cache lock. An OPT-IN cold store (a per-user `cold-store` file naming a second volume;
+  `docs/disk-budget.md`, "The cold store") makes `--auto`, and `build-gc.sh --park` by hand, MOVE idle
+  trees there ahead of the ladder instead of deleting them; without that file nothing changes.
+  Preview a plan with `python3 tools/disk-budget.py reclaim --to GIB
   --emit > plan; tools/build-gc.sh --evict plan -n`; never run `--evict` for real from a test
   or an experiment outside a fixture. The budget is also checked at every build entry: each
   cargo-running `make` target (`make -s print-disk-entries` lists them) takes `disk-preflight` as an
@@ -185,7 +210,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   cargo-running target joins `DISK_ENTRIES` in the Makefile (`ci/test_disk_preflight.py` fails
   until it does), and a `$(MAKE)` line inside an entry passes `PLX_DISK_BUDGET_DONE=1`. `make disk`
   stays the report to read before intervening yourself, or when the volume needs relief faster than
-  the automatic trigger provides it.
+  the automatic trigger provides it. In a Claude session `.claude/hooks/disk-low-notify.py` adds a note
+  after a Bash call when free space is under the comfort line or the reserve (or a command failed with
+  "No space left on device" while it is), and says `tools/build-gc.sh --auto` was already started in the
+  background: when it appears, relief is `build-gc.sh` and `make disk`, and a volume still under the
+  reserve goes to the owner, never an `rm -rf` of build trees or a `git clean`; the same error while this
+  volume has room gets a note only (another volume may be full, and the reclaim is not started).
 - Use the `which-tier` skill to choose between host checks, `ui-sim`, and real-device verification.
   Pixel output, LG text rasterization, video-plane composition, performance, and native playback
   generally need the TV before being called verified.
@@ -205,6 +235,9 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
 - After behavior changes, use the `doc-claim-auditor` custom agent (`doc_claim_auditor` in
   Codex), or perform the same audit, to find prose that the change made false. It reports
   contradictions, not missing documentation.
+- Before opening or merging a PR, review its combined `base...head` diff once with the
+  `pr-reviewer` custom agent (`pr_reviewer` in Codex): it returns findings only and never edits,
+  comments or merges.
 
 ## Television and release safety
 

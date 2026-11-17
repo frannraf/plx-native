@@ -3,28 +3,41 @@
 //! receives immutable snapshots, never a pointer into FFmpeg's storage.
 //! Selection does not discard read-ahead. A seek replaces each source identity so a completed
 //! render from the old position cannot land in the new playback epoch.
+//! An authored track keeps the file's own bytes as its identity and is handed to the renderer with
+//! the viewer's colour pick applied to its pure-white-primary styles (`ass_ink`); a track with no
+//! such style is never restyled by the pick.
 use super::ass::{self, Content, Event, Font, Origin, Source};
 use super::text_ass::{self, Align, AlignClass, ClipCue, TextDialect};
 use super::text_style::TextStyle;
+use plx_plex::plex::session::SubtitleTone;
 use std::collections::BTreeMap;
 use std::sync::{Arc, MutexGuard};
 
 // What can be shown is never cut by a count. Every ASS track of the file keeps its header (a
 // copy of bytes FFmpeg already holds, so memory is bounded by the file's own stream headers) and
-// every attached font is admitted until the font byte budget (`ass::FontBudget`) is spent. What
-// is bounded is per-track EVENT memory and the per-push work: a forward window of
-// `MAX_EVENTS` events and `MAX_EVENT_BYTES` bytes, of which the selected track may use a whole
-// script's worth and the others share one pool of the same size.
+// every attached font is kept whole (the same, bounded by the file's own attachments). No byte
+// budget decides which font a track can use (issue #1328): the renderer hands libass the fonts the
+// track names (`ass::font_names`). What is bounded is per-track EVENT memory and the per-push work:
+// a forward window of `MAX_EVENTS` events and `MAX_EVENT_BYTES` bytes, of which the selected track
+// may use a whole script's worth and the others share one pool of the same size.
 pub const MAX_HEADER_BYTES: usize = 1024 * 1024;
-const MAX_PACKET_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_PACKET_BYTES: usize = 256 * 1024;
 const MAX_EVENTS: usize = 8192;
-const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// Byte pool the unselected tracks' events share between them (the selected track has its own).
 const OTHER_TRACKS_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// An event this far ahead of the newest packet read can only be one a backward seek left
 /// behind; the demuxer reads it again on its way forward, so it is retired first.
 const STALE_AHEAD_MS: i64 = 5_000;
 const MAX_MEDIA_KEY_BYTES: usize = 64 * 1024;
+
+/// The font list of a reopen of the same file is the one already held: same count, and the same
+/// name and size at each place. A stronger test would read every byte of fonts that are, by the
+/// file's identity, the same bytes.
+fn same_font_list(held: &[Font], fresh: &[Font]) -> bool {
+    held.len() == fresh.len()
+        && held.iter().zip(fresh).all(|(a, b)| a.name == b.name && a.data.len() == b.data.len())
+}
 
 fn trim_terminators(mut bytes: &[u8]) -> &[u8] {
     while bytes.last() == Some(&0) {
@@ -34,18 +47,35 @@ fn trim_terminators(mut bytes: &[u8]) -> &[u8] {
 }
 
 /// What the demuxer registers for one subtitle track in [`begin`].
+#[derive(Clone)]
 pub enum TrackHeader {
     /// An ASS/SSA track: the codec-private header, as the file wrote it.
     Authored(Vec<u8>),
     /// A text track (SubRip, WebVTT, mov_text, ...): there is no header in the file. The store
-    /// synthesizes one from the viewer's size and position picks and remembers the dialect its
-    /// cues are written in.
+    /// synthesizes one from the viewer's size, position and colour picks (a colour change restyles
+    /// the track, a change among white and the grays does not: a gray is a draw-time tint) and
+    /// remembers the dialect its cues are written in.
     Text(TextDialect),
+}
+
+/// An authored track as the FILE wrote it, beside the header the renderer is given for the viewer's
+/// colour pick ([`super::ass_ink`]): the file's bytes are the reopen identity and the source the pick
+/// is applied to afresh each time, never to an earlier result.
+#[derive(Clone)]
+struct AuthoredTrack {
+    file: Arc<[u8]>,
+    /// The pick the held header was built for.
+    tone: SubtitleTone,
+    /// Whether the colour pick can reach this track at all: the FILE's header has a style whose primary
+    /// is pure white ([`super::ass_ink::takes_colour`]). Read once here, from the file's bytes (the held
+    /// header reads false under a colour that already took them), so a per-frame poll never parses.
+    takes_colour: bool,
 }
 
 /// A cue as the text track received it, converted: the ASS packet it became and the ReadOrder in it.
 /// The cue's own start and end are the key it is held under ([`RawKey`]); the view's end may be
 /// clipped shorter.
+#[derive(Clone)]
 struct RawCue {
     readorder: u32,
     align: Align,
@@ -71,6 +101,7 @@ pub fn packet_identity(bytes: &[u8]) -> u64 {
 /// ([`TextTrack::view`]): each cue's end clipped to the start of the next cue of its alignment
 /// class (D10, newest wins). The view cannot answer "was this packet seen" (a clipped cue differs
 /// from the packet), which is why a text track has no entry in `Store::seen`.
+#[derive(Clone)]
 struct TextTrack {
     dialect: TextDialect,
     raw: BTreeMap<RawKey, RawCue>,
@@ -145,15 +176,20 @@ fn retire_to_fit(items: &[(i64, i64, usize)], frontier: i64, budget: usize) -> V
     retire
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Store {
     generation: u64,
+    /// Changes on every producer or presentation mutation. An off-lock source
+    /// preparation may publish only against the snapshot it read.
+    revision: u64,
     // Exact delivery identity, never logged: it may include an authentication token.
     media_key: Option<String>,
     awaiting_reopen: bool,
     tracks: BTreeMap<i32, Arc<Source>>,
     // The tracks of `tracks` that are Text origin, by track.
     text: BTreeMap<i32, TextTrack>,
+    // The tracks of `tracks` the file styled, by track.
+    authored: BTreeMap<i32, AuthoredTrack>,
     fonts: Option<Arc<[Font]>>,
     // Dedup index: the events held per track, so a reread after a seek is an O(1) lookup.
     seen: BTreeMap<i32, std::collections::HashSet<Event>>,
@@ -171,10 +207,12 @@ impl Store {
     pub const fn new() -> Self {
         Self {
             generation: 0,
+            revision: 0,
             media_key: None,
             awaiting_reopen: false,
             tracks: BTreeMap::new(),
             text: BTreeMap::new(),
+            authored: BTreeMap::new(),
             fonts: None,
             seen: BTreeMap::new(),
             selected_track: None,
@@ -183,10 +221,12 @@ impl Store {
 
     pub(super) fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
         self.media_key = None;
         self.awaiting_reopen = false;
         self.tracks.clear();
         self.text.clear();
+        self.authored.clear();
         self.seen.clear();
         self.fonts = None;
     }
@@ -196,6 +236,7 @@ impl Store {
     /// again in `begin` before it can inherit any packets.
     pub(super) fn retain_for_reload(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
         self.seek(self.generation);
         self.awaiting_reopen = true;
         self.fonts = None;
@@ -211,6 +252,7 @@ impl Store {
         }
         if let (Some(text), Some(source)) = (self.text.get_mut(&track), self.tracks.get_mut(&track)) {
             if text.style_generation != style.generation() {
+                self.revision = self.revision.wrapping_add(1);
                 text.style_generation = style.generation();
                 if let Content::Embedded { events, fonts, .. } = &source.content {
                     *source = Arc::new(Source {
@@ -226,7 +268,44 @@ impl Store {
                 }
             }
         }
+        // An authored track takes the colour pick in its white-primary styles (`ass_ink`): the header the
+        // renderer holds is rebuilt from the FILE's bytes when the pick moves, the track keeps its id and
+        // its events, and the engine swaps it in place (`ass::restyles`). A pick that changes nothing in
+        // this header (a grey, a size, a file with no white style) bumps nothing. This runs inline, under the
+        // store lock, ONCE per pick change that moves the colour, and costs a scan plus a copy of the
+        // header: at most `MAX_HEADER_BYTES` (1 MiB; a header over it is never admitted), and a real
+        // Aegisub header is hundreds of KB at most. That is far more than the few hundred bytes a text track
+        // synthesizes just above, but a bounded, rare cost, so it stays here instead of taking a worker
+        // for the header alone. A sidecar script, whose whole file is up to `SIDECAR_MAX_BYTES` (4 MiB),
+        // does the same on a worker (`sidecar::start_recolour`).
+        if let (Some(ink), Some(source)) = (self.authored.get_mut(&track), self.tracks.get_mut(&track)) {
+            if ink.tone != style.tone {
+                ink.tone = style.tone;
+                if let Content::Embedded { header, events, fonts } = &source.content {
+                    let wanted: Arc<[u8]> = super::ass_ink::recolour(&ink.file, style.tone).map_or_else(|| ink.file.clone(), Arc::from);
+                    if *header != wanted {
+                        self.revision = self.revision.wrapping_add(1);
+                        *source = Arc::new(Source {
+                            id: source.id,
+                            revision: source.revision.wrapping_add(1),
+                            origin: Origin::Authored,
+                            content: Content::Embedded { header: wanted, events: events.clone(), fonts: fonts.clone() },
+                        });
+                    }
+                }
+            }
+        }
         self.tracks.get(&track).cloned()
+    }
+
+    /// Can the viewer's colour pick reach `track`? A text track always takes it (its header is built
+    /// from the pick); an authored one when the file has a style the pick recolours; `None` for a track
+    /// the store does not hold (nothing is known, so the caller must not dim anything).
+    fn takes_colour(&self, track: i32) -> Option<bool> {
+        match self.authored.get(&track) {
+            Some(ink) => Some(ink.takes_colour),
+            None => self.text.contains_key(&track).then_some(true),
+        }
     }
 
     #[cfg(test)]
@@ -269,8 +348,7 @@ impl Store {
                 self.tracks.get(track).is_some_and(|source| match registered {
                     TrackHeader::Authored(bytes) => {
                         source.origin == Origin::Authored
-                            && matches!(&source.content, Content::Embedded { header, .. }
-                                if header.as_ref() == bytes.as_slice())
+                            && self.authored.get(track).is_some_and(|ink| ink.file.as_ref() == bytes.as_slice())
                     }
                     TrackHeader::Text(dialect) => {
                         source.origin.is_text()
@@ -290,14 +368,17 @@ impl Store {
         if !media_key.is_empty() && media_key.len() <= MAX_MEDIA_KEY_BYTES {
             self.media_key = Some(media_key.to_owned());
         }
-        // A font that does not fit the budget is skipped (a later, smaller one still fits);
-        // text that names it falls back to the app's default face, so nothing is hidden.
-        let mut budget = ass::FontBudget::default();
-        let fonts: Arc<[Font]> = fonts
-            .into_iter()
-            .filter(|f| budget.admit(f.data.len()))
-            .collect::<Vec<_>>()
-            .into();
+        // Every attached font is kept (issue #1328): which of them libass is handed is the
+        // renderer's choice, by the names the track uses (`ass::font_names`). A reopen of the same
+        // file keeps the font list the tracks already hold, so the renderer's same-fonts check is a
+        // pointer compare and not a read of every font's bytes.
+        let held = previous.values().find_map(|source| match &source.content {
+            Content::Embedded { fonts, .. } | Content::Script { fonts, .. } => Some(fonts.clone()),
+        });
+        let fonts: Arc<[Font]> = match held {
+            Some(held) if same_font_list(&held, &fonts) => held,
+            _ => fonts.into(),
+        };
         self.fonts = Some(fonts.clone());
         for (track, registered) in headers {
             let (origin, header, events) = match registered {
@@ -309,7 +390,12 @@ impl Store {
                         _ => None,
                     }).unwrap_or_else(|| Arc::from([]));
                     self.seen.insert(track, events.iter().cloned().collect());
-                    (Origin::Authored, header, events)
+                    // the renderer's header is the file's with the viewer's colour taken into its white styles
+                    let file: Arc<[u8]> = header.into();
+                    let held = super::ass_ink::recolour(&file, style.tone).map_or_else(|| file.clone(), Arc::from);
+                    let takes_colour = super::ass_ink::takes_colour(&file);
+                    self.authored.insert(track, AuthoredTrack { file, tone: style.tone, takes_colour });
+                    (Origin::Authored, held, events)
                 }
                 TrackHeader::Text(dialect) => {
                     // The header is built for the picks of now, so the generation is the current one
@@ -321,7 +407,7 @@ impl Store {
                     text.style_generation = style.generation();
                     let events = text.view();
                     self.text.insert(track, text);
-                    (Origin::Text(style), text_ass::header(&style).into_bytes(), events)
+                    (Origin::Text(style), text_ass::header(&style).into_bytes().into(), events)
                 }
             };
             self.tracks.insert(
@@ -331,7 +417,7 @@ impl Store {
                     revision: 0,
                     origin,
                     content: Content::Embedded {
-                        header: header.into(),
+                        header,
                         events,
                         fonts: fonts.clone(),
                     },
@@ -370,6 +456,7 @@ impl Store {
         if seen.contains(&event) {
             return; // reread after a backward seek: preserve one source event and its budget
         }
+        self.revision = self.revision.wrapping_add(1);
         let mut kept: Vec<Event> = Vec::with_capacity(events.len() + 1);
         for e in events.iter() {
             if e.start_ms.saturating_add(e.duration_ms) >= floor_ms {
@@ -489,6 +576,7 @@ impl Store {
             return None;
         }
         held.next_readorder = readorder.checked_add(1)?;
+        self.revision = self.revision.wrapping_add(1);
         let shown = text_ass::visible_chars(&converted.body);
         let before_prune = held.raw.len();
         held.raw.retain(|(_, end, _), _| *end >= floor_ms);
@@ -526,6 +614,7 @@ impl Store {
         if generation != self.generation {
             return;
         }
+        self.revision = self.revision.wrapping_add(1);
         for source in self.tracks.values_mut() {
             let Content::Embedded {
                 header,
@@ -557,26 +646,74 @@ pub fn begin(media_key: &str, headers: Vec<(i32, TrackHeader)>, fonts: Vec<Font>
     store().begin_styled(media_key, headers, fonts, style)
 }
 
+/// The owned source inventory. Repreparing after a concurrent store change
+/// reuses these facts without rereading FFmpeg's released metadata.
+pub(crate) struct SourceInventory {
+    media_key: String,
+    headers: Vec<(i32, TrackHeader)>,
+    fonts: Vec<Font>,
+}
+
+impl SourceInventory {
+    pub(crate) fn new(media_key: &str, headers: Vec<(i32, TrackHeader)>, fonts: Vec<Font>) -> Self {
+        Self { media_key: media_key.to_owned(), headers, fonts }
+    }
+}
+
+pub(crate) fn begin_inventory(inventory: SourceInventory) -> u64 {
+    begin(&inventory.media_key, inventory.headers, inventory.fonts)
+}
+
+pub(crate) struct PreparedBegin {
+    expected_revision: u64,
+    next: Store,
+    generation: u64,
+}
+
+/// Clone the bounded cue index and merge the next ASS source off the native
+/// retirement barrier. The source's payloads and fonts remain shared Arcs.
+pub(crate) fn prepare_begin(inventory: &SourceInventory) -> PreparedBegin {
+    let style = TextStyle::current();
+    let mut next = store().clone();
+    let expected_revision = next.revision;
+    let generation = next.begin_styled(
+        &inventory.media_key, inventory.headers.clone(), inventory.fonts.clone(), style,
+    );
+    PreparedBegin { expected_revision, next, generation }
+}
+
+/// Only the pointer/map swap runs under the native epoch barrier. If cues,
+/// style or a reset changed during preparation, the caller must reprepare.
+pub(crate) fn commit_prepared(prepared: PreparedBegin) -> Result<(u64, Store), PreparedBegin> {
+    let mut active = store();
+    if active.revision != prepared.expected_revision { return Err(prepared); }
+    let old = std::mem::replace(&mut *active, prepared.next);
+    Ok((prepared.generation, old))
+}
+
 /// One cue of a text track (`text` is UTF-8, in the track's dialect), `start_ns`/`end_ns` in the
 /// clock of the subtitle stream; `identity` is the [`packet_identity`] of the packet before its
 /// charset step. The cue is converted to ASS and joins the track's source; see
 /// [`Store::push_text`]. Logs `sub cue [a..bms] len=N` for the selected track when the cue is new:
 /// the cue's length, never its text (subtitle text is viewing content and the event log is shared
 /// in issue threads), which `tests/run.py` reads to see that a text cue arrived.
-pub fn push_text(generation: u64, track: i32, start_ns: i64, end_ns: i64, text: &str, identity: u64) {
-    let floor_ms = super::subtitle_floor_ns() / 1_000_000;
+pub fn push_text(generation: u64, track: i32, start_ns: i64, end_ns: i64, text: &str, identity: u64, retention: plx_playback_contract::subtitle::CaptionRetention) {
+    let floor_ms = super::subtitle_floor_ns(retention) / 1_000_000;
     let (start_ms, end_ms) = (start_ns / 1_000_000, end_ns / 1_000_000);
     let selected = Some(super::desired_sub_idx()).filter(|&t| t >= 0);
     let shown = {
         let mut store = store();
-        store.selected_track = selected;
+        if store.selected_track != selected {
+            store.selected_track = selected;
+            store.revision = store.revision.wrapping_add(1);
+        }
         store.push_text_keyed(generation, track, start_ms, end_ms, text, identity, floor_ms)
     };
     if let Some(len) = shown.filter(|_| selected == Some(track)) {
         super::log(&format!("sub cue [{start_ms}..{end_ms}ms] len={len}"));
     }
 }
-pub fn push(generation: u64, track: i32, start_ns: i64, end_ns: i64, payload: &[u8]) {
+pub fn push(generation: u64, track: i32, start_ns: i64, end_ns: i64, payload: &[u8], retention: plx_playback_contract::subtitle::CaptionRetention) {
     if payload.len() > MAX_PACKET_BYTES {
         return;
     }
@@ -585,7 +722,11 @@ pub fn push(generation: u64, track: i32, start_ns: i64, end_ns: i64, payload: &[
         return;
     }
     let mut store = store();
-    store.selected_track = Some(super::desired_sub_idx()).filter(|&t| t >= 0);
+    let selected = Some(super::desired_sub_idx()).filter(|&t| t >= 0);
+    if store.selected_track != selected {
+        store.selected_track = selected;
+        store.revision = store.revision.wrapping_add(1);
+    }
     store.push(
         generation,
         track,
@@ -594,7 +735,7 @@ pub fn push(generation: u64, track: i32, start_ns: i64, end_ns: i64, payload: &[
             duration_ms: end_ns.saturating_sub(start_ns) / 1_000_000,
             payload: payload.into(),
         },
-        super::subtitle_floor_ns() / 1_000_000,
+        super::subtitle_floor_ns(retention) / 1_000_000,
     );
 }
 pub fn seek(generation: u64) {
@@ -612,6 +753,12 @@ pub fn font_snapshot() -> (u64, Arc<[Font]>) {
 pub fn selected(track: i32) -> Option<Arc<Source>> {
     let style = TextStyle::current();
     store().selected_styled(track, style)
+}
+
+/// Can the viewer's colour pick reach embedded track `track` ([`Store::takes_colour`])? `None` while the
+/// store holds no such track.
+pub fn takes_colour(track: i32) -> Option<bool> {
+    store().takes_colour(track)
 }
 
 /// Interpolate the sparse native clock only while it is advancing. Limit extrapolation to
@@ -654,7 +801,42 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
+    use plx_play_feed::shared::FEED_SHARED;
     use super::*;
+
+    fn fixture_retention() -> plx_playback_contract::subtitle::CaptionRetention {
+        plx_playback_contract::subtitle::CaptionRetention { playhead_ns: None, seek_target_ns: None }
+    }
+
+    #[test]
+    fn prepared_reopen_rebases_after_a_concurrent_cue() {
+        let _serial = plx_base::testlock::serial();
+        reset();
+        let header = b"[Script Info]\n".to_vec();
+        let generation = begin("fixture", vec![(0, TrackHeader::Authored(header.clone()))], Vec::new());
+        let inventory = SourceInventory::new(
+            "fixture", vec![(0, TrackHeader::Authored(header))], Vec::new(),
+        );
+        let stale = prepare_begin(&inventory);
+        push(generation, 0, 1_000_000_000, 3_000_000_000,
+            b"0,0,Default,,0,0,0,,SIGN", fixture_retention());
+        let stale = match commit_prepared(stale) {
+            Ok(_) => panic!("the prepared reopen erased a cue arriving after its snapshot"),
+            Err(stale) => stale,
+        };
+        drop(stale);
+        let fresh = prepare_begin(&inventory);
+        let (next_generation, old) = match commit_prepared(fresh) {
+            Ok(committed) => committed,
+            Err(_) => panic!("no concurrent mutation occurred during the retry"),
+        };
+        drop(old);
+        assert_ne!(generation, next_generation);
+        let selected = selected(0).expect("the authored track survives its reopen");
+        let Content::Embedded { events, .. } = &selected.content else { panic!("embedded source") };
+        assert_eq!(events.len(), 1, "the cue received during preparation is retained");
+        reset();
+    }
 
     #[test]
     fn begin_keeps_empty_headers_but_bounds_raw_bytes_before_trimming() {
@@ -677,7 +859,7 @@ mod tests {
     #[test]
     fn terminators_are_trimmed_from_headers_and_packets_but_a_zero_inside_is_not() {
         let _guard = plx_base::testlock::serial();
-        super::super::SHARED.playpos_ns.store(0, std::sync::atomic::Ordering::Relaxed);
+        FEED_SHARED.playpos_ns.store(0, std::sync::atomic::Ordering::Relaxed);
         let generation = begin(
             "fixture",
             vec![
@@ -699,7 +881,7 @@ mod tests {
             hidden_zero.as_slice(),
             second.as_slice(),
         ] {
-            push(generation, 0, 1_000_000_000, 3_000_000_000, payload);
+            push(generation, 0, 1_000_000_000, 3_000_000_000, payload, fixture_retention());
         }
 
         let track = |n| selected(n).unwrap();
@@ -997,21 +1179,72 @@ mod tests {
         assert!(held.iter().any(|f| f.name == "f199.ttf"), "a font late in the list is found");
     }
 
+    /// A demux reopen of the same file hands `begin` a fresh copy of every font. The tracks keep the
+    /// list they already hold, so the renderer's same-fonts check (`Arc` equality, a pointer
+    /// compare when it is the same `Arc`) neither reads every byte nor opens a new renderer; a
+    /// different file, or a list that differs in a name or a size, is taken as it comes.
     #[test]
-    fn fonts_past_the_byte_budget_are_skipped_not_fatal() {
+    fn a_reopen_of_the_same_file_keeps_the_font_list_it_already_held() {
+        fn held(s: &mut Store) -> Arc<[Font]> {
+            match &s.selected(0).unwrap().content {
+                Content::Embedded { fonts, .. } | Content::Script { fonts, .. } => fonts.clone(),
+            }
+        }
+        let font = |name: &str, len: usize| Font { name: name.into(), data: Arc::from(vec![1u8; len]) };
+        let headers = || vec![(0, TrackHeader::Authored(b"header".to_vec()))];
         let mut s = Store::new();
-        let big = |name: &str, mib: usize| Font {
-            name: name.into(),
-            data: Arc::from(vec![1u8; mib * 1024 * 1024]),
-        };
-        let fonts = vec![big("a.ttf", 20), big("b.ttf", 20), big("c.ttf", 4), big("d.ttf", 1)];
+        s.begin("fixture", headers(), vec![font("a.ttf", 4096), font("b.ttf", 8192)]);
+        let first = held(&mut s);
+        s.retain_for_reload();
+        s.begin("fixture", headers(), vec![font("a.ttf", 4096), font("b.ttf", 8192)]);
+        assert!(Arc::ptr_eq(&first, &held(&mut s)), "same file, same fonts: the held list is kept");
+        s.begin("fixture", headers(), vec![font("a.ttf", 4096), font("b.ttf", 9000)]);
+        let changed = held(&mut s);
+        assert!(!Arc::ptr_eq(&first, &changed), "a font of another size is another list");
+        assert_eq!(changed[1].data.len(), 9000);
+        s.begin("other file", headers(), vec![font("b.ttf", 9000)]);
+        assert_eq!(held(&mut s).len(), 1, "another file starts from its own fonts");
+    }
+
+    /// Issue #1328: an anime MKV attaches 17 fonts (83 MB). The five the opening's karaoke styles
+    /// name sat after the first seven had spent a 32 MiB cap (since removed; twelve were held in
+    /// all), so libass never saw them and those lines fell back to the default face. A cap on
+    /// content the file legitimately carries is a bug, so the store must hold every attachment, in
+    /// order; which of them libass is given is the renderer's choice (`ass::font_names`).
+    /// Sizes and names are the report's (`tests/fixtures/make_ass_stress.py`, `fonts-over-budget`).
+    #[test]
+    fn every_attached_font_reaches_the_renderer_issue_1328() {
+        const ATTACHED: [(&str, usize); 17] = [
+            ("AP-OTF-KizaKinryouStd-Bol.otf", 6_220_620),
+            ("Comiccity.ttf", 32_904),
+            ("DFMaruGothicPro6N-W9.otf", 11_229_304),
+            ("FOT-Accordion.otf", 37_300),
+            ("FOT-DotGothic12 Std M.ttf", 43_840),
+            ("FOT-MatissePro-B.otf", 9_883_924),
+            ("FOT-PopFury Std B.otf", 4_808_652),
+            ("FOT-TelopMinPro-D.otf", 7_477_668),
+            ("FOT-TsukuAOldMinPr6N-M.otf", 13_188_132),
+            ("HOT-KarakusaStd-R.otf", 6_102_048),
+            ("KizaJJK-B.ttf", 9_705_124),
+            ("KizaKinryouStdJJK-B.ttf", 13_715_688),
+            ("LEHN084.TTF", 47_816),
+            ("MastroSans-SemiBold.ttf", 245_796),
+            ("MastroSans-SemiBoldItalic.ttf", 262_448),
+            ("Roboto-Regular.ttf", 146_004),
+            ("stylus.ttf", 32_972),
+        ];
+        let total: usize = ATTACHED.iter().map(|&(_, len)| len).sum();
+        assert!(total > 32 * 1024 * 1024, "the report's file is over the old 32 MiB cap: {total} bytes");
+        let mut s = Store::new();
+        let fonts = ATTACHED
+            .iter()
+            .map(|&(name, len)| Font { name: name.into(), data: Arc::from(vec![1u8; len]) })
+            .collect();
         s.begin("fixture", vec![(0, TrackHeader::Authored(b"header".to_vec()))], fonts);
         let held = s.fonts.clone().unwrap();
         let names: Vec<_> = held.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["a.ttf", "c.ttf", "d.ttf"], "b does not fit; smaller later fonts still do");
-        let total: usize = held.iter().map(|f| f.data.len()).sum();
-        assert!(total <= ass::MAX_FONT_BYTES);
-        assert!(s.selected(0).is_some(), "the track itself is never refused");
+        let wanted: Vec<_> = ATTACHED.iter().map(|&(name, _)| name).collect();
+        assert_eq!(names, wanted, "every attached font is held, in container order");
     }
 
     fn timed(n: i64) -> Event {
@@ -1026,18 +1259,24 @@ mod tests {
     fn a_backward_seek_after_a_deep_read_keeps_the_events_at_the_target() {
         let mut s = Store::new();
         let g = s.begin("fixture", vec![(0, TrackHeader::Authored(b"header".to_vec()))], vec![]);
-        // A typeset-heavy file read 30 000 events in; the window holds the latest 8 192.
-        for n in 0..30_000 {
+        // A typeset-heavy file read past the window: the window holds the latest 8 192, and every
+        // event the file has to give is behind its first one. (A push copies and ranks the whole
+        // window, so reading further than this only repeats the same eviction at a quadratic cost;
+        // the 30 000 events this once read held the identical 8 192 latest at the seek.)
+        let read = MAX_EVENTS as i64 + 300;
+        for n in 0..read {
             s.push(g, 0, timed(n), 0);
         }
-        // The viewer rewinds to event 10 000 (the floor follows the rebased clock).
+        assert_eq!(embedded(&s, 0).len(), MAX_EVENTS, "the window is full");
+        // The viewer rewinds to event 100, more than `STALE_AHEAD_MS` behind everything the window
+        // holds (the floor follows the rebased clock).
         s.seek(g);
-        let floor_ms = 10_000_000 - 62_000;
-        for n in 10_000..10_100 {
+        let floor_ms = 100_000 - 62_000;
+        for n in 100..200 {
             s.push(g, 0, timed(n), floor_ms);
         }
         let held = embedded(&s, 0);
-        for n in 10_000..10_100 {
+        for n in 100..200 {
             assert!(held.contains(&timed(n)), "event {n} at the seek target was lost");
         }
         assert!(held.len() <= 8192);
@@ -1515,13 +1754,138 @@ mod tests {
         assert_eq!(s.push_text(g, 0, 1000, 2000, "cue", 0), None);
     }
 
+    // ---- the colour pick on an authored track (`ass_ink`) ----
+
+    /// An authored header with a white-primary `Default` and a blue `Sign` style.
+    fn authored_header() -> Vec<u8> {
+        let style = |name: &str, primary: &str| format!(
+            "Style: {name},Arial,48,{primary},&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1\n");
+        format!(
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n{}{}\n[Events]\n",
+            style("Default", "&H00FFFFFF"), style("Sign", "&H00FF0000")
+        ).into_bytes()
+    }
+
+    /// **An embedded ASS track takes the viewer's colour in its white styles** (an SRT converted to ASS is
+    /// one): the renderer's header is the file's with `ass_ink::recolour` applied, rebuilt in place when the
+    /// pick moves, while the store keeps the file's own bytes (the reopen identity) and the events.
+    #[test]
+    fn an_authored_track_takes_the_colour_pick_in_its_white_styles_and_keeps_the_files_own_bytes() {
+        use plx_plex::plex::session::{SubtitlePosition, SubtitleSize, SubtitleTone};
+        let file = authored_header();
+        let white = TextStyle::default();
+        let yellow = TextStyle { tone: SubtitleTone::Yellow, ..white };
+        let header_of = |source: &Arc<Source>| match &source.content {
+            Content::Embedded { header, .. } => header.to_vec(),
+            Content::Script { .. } => panic!(),
+        };
+        let mut s = Store::default();
+        let g = s.begin_styled("f", vec![(0, TrackHeader::Authored(file.clone()))], vec![], white);
+        s.push(g, 0, event("hello", 1000), 0);
+        let before = s.selected_styled(0, white).unwrap();
+        assert_eq!((before.origin, header_of(&before)), (Origin::Authored, file.clone()), "white is the file's own ink: nothing is rewritten");
+        let after = s.selected_styled(0, yellow).unwrap();
+        assert_eq!((after.id, after.origin), (before.id, Origin::Authored), "authored geometry, same identity");
+        assert_eq!(after.revision, before.revision.wrapping_add(1), "one bump for the new pick");
+        assert_eq!(header_of(&after), super::super::ass_ink::recolour(&file, SubtitleTone::Yellow).unwrap());
+        assert!(Arc::ptr_eq(&after, &s.selected_styled(0, yellow).unwrap()), "once only");
+        let Content::Embedded { events, .. } = &after.content else { panic!() };
+        assert_eq!(events.len(), 1, "the held events are untouched");
+        // a size or position pick is not this track's business, and a grey is a draw-time tint
+        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::High, ..yellow };
+        assert!(Arc::ptr_eq(&after, &s.selected_styled(0, large).unwrap()));
+        // a cue arriving later is held under the recoloured header, and white puts the file's own back
+        s.push(g, 0, event("again", 3000), 0);
+        assert_eq!(header_of(&s.selected_styled(0, yellow).unwrap()), header_of(&after));
+        let back = s.selected_styled(0, white).unwrap();
+        assert_eq!(header_of(&back), file);
+        assert_ne!(back.revision, after.revision, "white is a change of pick too");
+        // the same file reopened under a pick still matches by the FILE's bytes and keeps its events
+        s.selected_styled(0, yellow);
+        s.begin_styled("f", vec![(0, TrackHeader::Authored(file.clone()))], vec![], yellow);
+        let Content::Embedded { events, .. } = &s.selected_styled(0, yellow).unwrap().content else { panic!() };
+        assert_eq!(events.len(), 2, "a reopen under a coloured pick is the same file");
+    }
+
+    #[test]
+    fn an_authored_track_with_no_white_style_is_never_restyled_by_the_pick() {
+        use plx_plex::plex::session::SubtitleTone;
+        let coloured = String::from_utf8(authored_header()).unwrap().replace("&H00FFFFFF", "&H0000FFFF").into_bytes();
+        let yellow = TextStyle { tone: SubtitleTone::Yellow, ..TextStyle::default() };
+        let mut s = Store::default();
+        s.begin_styled("f", vec![(0, TrackHeader::Authored(coloured))], vec![], TextStyle::default());
+        let before = s.selected_styled(0, TextStyle::default()).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.selected_styled(0, yellow).unwrap()), "nothing for the pick to take");
+    }
+
+    /// **Whether the pick reaches a track is a fact of the track, read from the FILE's bytes**: a white
+    /// primary takes it, a coloured-only script does not, a text track always does, a track the store does
+    /// not hold is unknown — and none of that moves with the pick (the held header of a track that took
+    /// yellow has no white style left to find).
+    #[test]
+    fn a_track_knows_whether_the_colour_pick_reaches_it_whatever_the_pick_is() {
+        use plx_plex::plex::session::SubtitleTone;
+        let coloured = String::from_utf8(authored_header()).unwrap().replace("&H00FFFFFF", "&H0000FFFF").into_bytes();
+        let yellow = TextStyle { tone: SubtitleTone::Yellow, ..TextStyle::default() };
+        let mut s = Store::default();
+        s.begin_styled(
+            "f",
+            vec![(0, TrackHeader::Authored(authored_header())), (1, TrackHeader::Authored(coloured)), (2, TrackHeader::Text(TextDialect::Srt))],
+            vec![],
+            yellow,
+        );
+        let answers = |s: &Store| [s.takes_colour(0), s.takes_colour(1), s.takes_colour(2), s.takes_colour(3)];
+        assert_eq!(answers(&s), [Some(true), Some(false), Some(true), None], "opened under yellow");
+        s.selected_styled(0, TextStyle::default());
+        assert_eq!(answers(&s), [Some(true), Some(false), Some(true), None], "the pick moved off the colour");
+        s.selected_styled(0, yellow);
+        assert_eq!(answers(&s), [Some(true), Some(false), Some(true), None], "and back");
+    }
+
+    /// **`player::subtitle_takes_colour` is the one answer the menu reads**: pictures never, text always,
+    /// ASS by the header of the selected sidecar, else of the embedded track being fed, and yes while that
+    /// header is unknown. The header's half reaches it through the session's readout, delivered once a
+    /// tick by `player::deliver_subtitle_ink`: asked before a delivery, the answer is still the last one.
+    #[test]
+    fn the_subtitle_takes_colour_fact_follows_the_codec_and_the_selected_track() {
+        let _guard = plx_base::testlock::serial();
+        reset();
+        super::super::sidecar::reset();
+        let coloured = String::from_utf8(authored_header()).unwrap().replace("&H00FFFFFF", "&H0000FFFF").into_bytes();
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let mut takes = |codec: &str| {
+            super::super::deliver_subtitle_ink(&mut ps);
+            super::super::subtitle_takes_colour(&ps, codec)
+        };
+        assert!(!takes("pgs") && !takes("hdmv_pgs_subtitle") && !takes("dvd_subtitle"), "a picture never takes a colour");
+        assert!(takes("srt") && takes("subrip") && takes("webvtt") && takes("mov_text"), "text always does");
+        assert!(takes("ass"), "nothing known yet: nothing is dimmed");
+        begin("fixture", vec![(0, TrackHeader::Authored(authored_header())), (1, TrackHeader::Authored(coloured.clone()))], vec![]);
+        super::super::request_subtitle(0);
+        assert!(takes("ass") && takes("ssa"), "a white-primary style");
+        super::super::request_subtitle(1);
+        assert!(!takes("ass") && !takes("ssa"), "no white-primary style");
+        // a selected sidecar answers instead of the embedded track
+        let with_event = |mut file: Vec<u8>| {
+            file.extend_from_slice(b"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello\n");
+            file
+        };
+        super::super::sidecar::select_loaded_for_test(7, &with_event(authored_header()));
+        assert!(takes("ass"), "the sidecar has a white style, the embedded track does not");
+        super::super::sidecar::select_loaded_for_test(7, &with_event(coloured));
+        super::super::request_subtitle(0);
+        assert!(!takes("ass"), "the sidecar has none, the embedded track does");
+        super::super::sidecar::reset();
+        reset();
+    }
+
     // ---- lazy restyle by style generation (plan §2.5) ----
 
     #[test]
     fn a_restyle_bumps_the_revision_once_and_keeps_the_events_and_the_identity() {
         use plx_plex::plex::session::{SubtitlePosition, SubtitleSize};
-        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low };
-        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::Low };
+        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low, ..TextStyle::default() };
+        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::Low, ..TextStyle::default() };
         let mut s = Store::default();
         let g = s.begin_styled("f", vec![(0, TrackHeader::Text(TextDialect::Srt))], vec![], small);
         s.push_text(g, 0, 1000, 2000, "cue", 0);
@@ -1550,8 +1914,8 @@ mod tests {
     #[test]
     fn a_reopen_after_a_pick_change_builds_the_header_for_the_new_picks_without_a_second_bump() {
         use plx_plex::plex::session::{SubtitlePosition, SubtitleSize};
-        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low };
-        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::High };
+        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low, ..TextStyle::default() };
+        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::High, ..TextStyle::default() };
         let mut s = Store::default();
         let g = s.begin_styled("f", vec![(0, TrackHeader::Text(TextDialect::Srt))], vec![], small);
         s.push_text(g, 0, 1000, 2000, "cue", 0);
@@ -1567,8 +1931,8 @@ mod tests {
     #[test]
     fn a_text_track_is_restyled_only_when_it_is_asked_for() {
         use plx_plex::plex::session::{SubtitlePosition, SubtitleSize};
-        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low };
-        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::Low };
+        let small = TextStyle { size: SubtitleSize::Small, position: SubtitlePosition::Low, ..TextStyle::default() };
+        let large = TextStyle { size: SubtitleSize::Large, position: SubtitlePosition::Low, ..TextStyle::default() };
         let mut s = Store::default();
         s.begin_styled(
             "f",
@@ -1593,9 +1957,12 @@ mod tests {
         );
         super::super::request_subtitle(1);
         let log = plx_base::eventlog::with_private_log(|| {
-            push_text(generation, 0, 1_000_000_000, 2_500_000_000, "not the selected track", packet_identity("not the selected track".as_bytes()));
-            push_text(generation, 1, 1_000_000_000, 2_500_000_000, "Secret <i>dialogue</i>", packet_identity("Secret <i>dialogue</i>".as_bytes()));
-            push_text(generation, 1, 1_000_000_000, 2_500_000_000, "Secret <i>dialogue</i>", packet_identity("Secret <i>dialogue</i>".as_bytes()));
+            let retention = plx_playback_contract::subtitle::CaptionRetention {
+                playhead_ns: Some(0), seek_target_ns: None,
+            };
+            push_text(generation, 0, 1_000_000_000, 2_500_000_000, "not the selected track", packet_identity("not the selected track".as_bytes()), retention);
+            push_text(generation, 1, 1_000_000_000, 2_500_000_000, "Secret <i>dialogue</i>", packet_identity("Secret <i>dialogue</i>".as_bytes()), retention);
+            push_text(generation, 1, 1_000_000_000, 2_500_000_000, "Secret <i>dialogue</i>", packet_identity("Secret <i>dialogue</i>".as_bytes()), retention);
             std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
         });
         super::super::request_subtitle(-1);

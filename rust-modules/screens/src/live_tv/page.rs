@@ -116,6 +116,8 @@ enum Readout {
 
 pub struct LiveTvScreen {
     entry: EntryId,
+    /// Something a helper changed is owed a frame: the next step reports it (`fx.invalidate`).
+    dirty: bool,
     view: LiveTvView,
     fed: bool,
     mode: Mode,
@@ -195,6 +197,7 @@ impl LiveTvScreen {
     pub fn loading(entry: EntryId) -> Self {
         Self {
             entry,
+            dirty: false,
             view: LiveTvView::default(),
             fed: false,
             mode: Mode::Guide,
@@ -317,7 +320,7 @@ impl LiveTvScreen {
         // airing filled in): keep it in view, where it will stand once the focus has followed.
         let focus = moved.map(|(_, to)| to).or(standing).and_then(model::rec_of).unwrap_or(self.rec_top);
         self.rec_top = model::rec_settle(&self.recs, self.rec_top, focus);
-        plx_machine::idle::invalidate();
+        self.dirty = true;
     }
 
     /// The guide the page wants read now (`None` until it knows the time and the lineup).
@@ -645,7 +648,7 @@ impl LiveTvScreen {
             o.edits.retain(|(id, _)| *id != s.id);
             o.edits.push((s.id.clone(), next));
         }
-        plx_machine::idle::invalidate();
+        self.dirty = true;
     }
 
     /// Record (or Save) with the settings as the panel left them.
@@ -962,7 +965,7 @@ impl LiveTvScreen {
                     *first = model::wo_col_follow(*first, i);
                 }
             }
-            plx_machine::idle::invalidate();
+            self.dirty = true;
             return;
         }
         // the options panel's rows scroll to keep the focused one in view
@@ -972,7 +975,7 @@ impl LiveTvScreen {
             } else if i >= o.top + OPT_ROWS {
                 o.top = i + 1 - OPT_ROWS;
             }
-            plx_machine::idle::invalidate();
+            self.dirty = true;
             return;
         }
         // Landed, wherever: the re-seat a read asked for is spent. A row landed on is the one the
@@ -990,7 +993,7 @@ impl LiveTvScreen {
             }
         }
         if !scroll {
-            plx_machine::idle::invalidate();
+            self.dirty = true;
             return;
         }
         if model::row_of(elem).is_some() {
@@ -998,7 +1001,7 @@ impl LiveTvScreen {
         } else if let Some(i) = model::rec_of(elem) {
             self.rec_top = model::rec_follow(&self.recs, self.rec_top, i);
         }
-        plx_machine::idle::invalidate();
+        self.dirty = true;
     }
 
     fn tick<H: ContentLike>(&mut self, ms: u32, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
@@ -1009,7 +1012,8 @@ impl LiveTvScreen {
         self.last_tick = Some(ms);
         let target = self.wash_target();
         // decorative: the wash dissolving between programs moves no layout
-        plx_machine::idle::decorative(|| self.wash.step(target, AmbientWash::K, dt));
+        self.wash.step(target, AmbientWash::K, dt);
+        let mut moving = !self.wash.at_rest();
         let tabs = model::tab_sources(&self.view.snap).len();
         self.tab_grow.resize(tabs, plx_ui::Spring::at(0.0));
         let focused_tab = self.focus.and_then(model::tab_of);
@@ -1017,11 +1021,13 @@ impl LiveTvScreen {
             let to = if focused_tab == Some(i) { 1.0 } else { 0.0 };
             if !g.land(to, dt) {
                 g.step(to, TAB_K, dt);
+                moving = true;
             }
         }
         let scroll = self.tab_scroll_target(cx.measure);
         if !self.tab_scroll.land(scroll, dt) {
             self.tab_scroll.step(scroll, TAB_K, dt);
+            moving = true;
         }
         // the focused cell grows, every other one on the list shrinks back and leaves it at rest
         let (focus, panel_up) = (self.focus, self.panel.is_some());
@@ -1029,17 +1035,21 @@ impl LiveTvScreen {
             let to = if focus == Some(*e) && !panel_up { 1.0 } else { 0.0 };
             if !g.land(to, dt) {
                 g.step(to, CELL_K, dt);
+                moving = true;
             }
         }
         self.cell_grow.retain(|(e, g)| focus == Some(*e) || g.pos > 0.002 || g.vel.abs() > 0.002);
         self.frame.grown = self.grown_rows();
+        if moving {
+            fx.note(plx_machine::present::PresentEvent::Motion);
+        }
         if let Some((_, until)) = &mut self.notice {
             let at = *until.get_or_insert(ms.wrapping_add(NOTICE_MS));
             // the tick clock wraps: gone once `ms` passes `at`
             if ms.wrapping_sub(at) as i32 >= 0 {
                 self.notice = None;
             }
-            plx_machine::idle::invalidate();
+            self.dirty = true;
         }
         if let TunePhase::Failed { channel, reason } = &self.view.snap.tune {
             if !self.tune_failure_shown {
@@ -1289,7 +1299,7 @@ impl LiveTvScreen {
     /// change reads its own hour, as the player's bar does), else the guide's.
     fn time_of(&self, t: i64) -> String {
         let local = (t + plx_platform::i18n::utc_offset_s(t)).rem_euclid(86_400);
-        plx_platform::i18n::current().time_of_day((local / 3_600) as u8, ((local % 3_600) / 60) as u8)
+        plx_platform::i18n::current().time_of_day([(local / 3_600) as i32, ((local % 3_600) / 60) as i32]).unwrap_or_default()
     }
 
     /// The airing the hero describes: the focused cell's (else the one on now in the first row
@@ -2372,6 +2382,17 @@ impl<H: ContentLike> Machine<H> for LiveTvScreen {
     type Ev = ScreenEvent<H>;
 
     fn step(&mut self, ev: &Self::Ev, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
+        let handled = self.step_event(ev, cx, fx);
+        // what a helper changed (a landing, a scroll, a setting) is drawn on the next frame
+        if std::mem::take(&mut self.dirty) {
+            fx.invalidate(Provenance::Input);
+        }
+        handled
+    }
+}
+
+impl LiveTvScreen {
+    fn step_event<H: ContentLike>(&mut self, ev: &ScreenEvent<H>, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
         // The reader acting first makes the arrival theirs.
         if let ScreenEvent::Input(InputEvent { kind: InputKind::Key { edge: Edge::Down, .. } | InputKind::Click { .. }, .. }) = ev {
             self.seat_pending = false;
@@ -2832,6 +2853,11 @@ mod tests {
         type Init = crate::registry::NoInit;
         type Memory = crate::registry::PageMemory;
     }
+    impl crate::registry::ScreenInputsLike for TestHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs {
+            crate::registry::empty_fixture()
+        }
+    }
 
     fn cx(focus: Option<u32>) -> Cx<'static, TestHost> {
         Cx {
@@ -2841,6 +2867,9 @@ mod tests {
             press: PressRead::default(),
             focus: FocusRead { current: focus.map(|elem| FocusKey { entry: EntryId(0), elem }), ..Default::default() },
             owner: InputOwner::Entry(EntryId(0)),
+            modal: Default::default(),
+            page_image: Default::default(),
+            hold_hint: Default::default(),
         }
     }
 

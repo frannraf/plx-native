@@ -517,7 +517,7 @@ mod composed {
     /// twin of `page.step(...)` for the half of the focus protocol a screen's own `step`
     /// never answers.
     fn go(engine: &mut FocusEngine<u32>, owner: InputOwner, page: &ConsentPage, dir: Dir, c: &Cx<'_, InnerHost>) -> Outcome<u32> {
-        engine.move_dir(owner, &page.view(), &[], dir, c)
+        engine.move_dir(owner, &page.view(plx_machine::machine::PressRead::<u32>::default()), &[], dir, c)
     }
 
     /// **The second half of this audit's LEFT-escape defect, and the RIGHT half legacy never
@@ -684,7 +684,7 @@ fn translated_first_run_disclosures_fit_above_one_row_of_complete_answers() {
             assert!(layout.content.w >= table.measured_width(&measure) * plx_ui::fit::HEADROOM,
                 "{name} product={product}: content {} < measured {}", layout.content.w, table.measured_width(&measure));
             let band = BandPart { layout, labels: &labels, group: BAND_GROUP, entry: EntryId(1),
-                uncommitted: false, scales: [1.0, 1.0], palette: palette(), danger: None };
+                uncommitted: false, scales: [1.0, 1.0], palette: palette(), danger: None, note: None };
             let rects = band.rects(&measure);
             assert_eq!(rects[0].y, rects[1].y, "{name}: both answers must stay in one row: available={}, first={}, second={}, link_min={}, labels={labels:?}", layout.action.w, rects[0].w, rects[1].w, table.measured_width(&measure));
             assert_eq!(rects[0].h, rects[1].h, "both answers retain equal treatment");
@@ -741,13 +741,13 @@ fn overflowing_disclosure_scrolls_before_draw_with_visible_choice_focus_and_repl
         assert!(page.place(&BAND, &cx, At::SpringTarget).is_some(), "the visible action keeps the input focus");
         assert!(out.is_empty(), "reading cannot submit or change focus");
         assert_eq!(page.draft, (false, false));
-        let outcome = engine.move_dir(owner, &page.view(), &[], Dir::Right, &cx);
+        let outcome = engine.move_dir(owner, &page.view(plx_machine::machine::PressRead::<u32>::default()), &[], Dir::Right, &cx);
         assert!(matches!(outcome, Outcome::Moved { .. }));
         cx.focus.current = engine.current(owner);
         assert_eq!(cx.focus.current.unwrap().elem, BAND + 1, "the other answer stays directly reachable");
         page.step(&key_down(Key::Up), &cx, &mut mk_fx(&mut out, &mut present));
         assert_eq!(page.state.hash(), before, "either answer can scroll back to the same position");
-        engine.move_dir(owner, &page.view(), &[], Dir::Right, &cx);
+        engine.move_dir(owner, &page.view(plx_machine::machine::PressRead::<u32>::default()), &[], Dir::Right, &cx);
         assert!(engine.current(owner).is_some_and(|key| page.form.index_of_key(RowKey(key.elem)).is_some()));
         page.step(&key_down(Key::Back), &cx, &mut mk_fx(&mut out, &mut present));
         assert!(out.iter().any(|event| matches!(event.fx, Fx::App(AppFx::Loop(LoopReq::BackAtRoot)))));

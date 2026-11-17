@@ -3,7 +3,7 @@
 //!
 //! # Why the app needs to know, when it never did before
 //!
-//! Until now the only thing it asked was "does `libAcbAPI` exist" (`starfish.c`'s `vp_mode`), which
+//! Until now the only thing it asked was "does `libAcbAPI` exist" (`video_plane.c`'s `vp_mode`), which
 //! splits the world at exactly webOS 5.0 and nowhere else. That was enough while 4.x was the only
 //! target. It is not enough now: Kodi — which plays video on 5, 6 and 10 — carries gates at
 //! `>= 6` (audio re-setup) and `< 11` / `>= 11` (a seek fallback, a changed signature), and with a
@@ -15,7 +15,8 @@
 //!
 //! # Where it comes from
 //!
-//! `/var/run/nyx/os_info.json`, read once, at boot. Kodi asks
+//! `/var/run/nyx/os_info.json`, read once, at boot (and `/usr/lib/os-release`, for the release only,
+//! when that file cannot be read: see [`probe`]). Kodi asks
 //! `luna://com.webos.service.config/getConfigs` for `tv.nyx.platformCode`; this is the same
 //! information from the file nyx writes, and it needs no LS2 client, no subscription and no
 //! thread. Verified present on the dev set (webOS 4.5), which reports:
@@ -29,6 +30,11 @@
 //! bucket (their `library-version` guide — `goldilocks` is 4.0~4.4, `goldilocks2` 4.5~4.10). So
 //! logging it says which of THEIR buckets a report belongs to, not just a number.
 //!
+//! The fallback exists because the nyx file is not always there: a set whose first boot of the app
+//! found it missing (issue #1351, a 6.5.3 set) logged the version as unknown. `/usr/lib/os-release`
+//! is mounted read-only in the developer-mode jail and carries `VERSION_ID`, which is the release
+//! and nothing else: no codename, no API version and no build id, so those stay empty.
+//!
 //! Parsed by hand because this is a flat object of string values and a parser that cannot fail is
 //! the right shape for something that must never keep the app from booting. This is not a pattern
 //! for service replies: [`caps`] uses `serde_json` and strict types because uncertainty there is a
@@ -39,6 +45,8 @@ use crate::tv::device::{Hardware, Info, NyxFile};
 pub mod jail_repair;
 pub mod caps;
 pub mod toast;
+#[cfg(all(not(feature = "hostsim"), not(test)))]
+pub mod video_sink;
 
 const OS_INFO: &str = "/var/run/nyx/os_info.json";
 
@@ -63,8 +71,13 @@ fn parse(s: &str) -> Info {
         .next()
         .and_then(|m| m.parse::<u32>().ok())
         .unwrap_or(0);
+    let build = match get("core_os_release") {
+        b if b.is_empty() => release.clone(),
+        b => b,
+    };
     Info {
         release,
+        build,
         codename: get("webos_release_codename"),
         api: get("webos_api_version"),
         name: get("webos_name"),
@@ -72,7 +85,8 @@ fn parse(s: &str) -> Info {
     }
 }
 
-/// Read it once and log it. Called at boot; safe to call when the file does not exist.
+/// Read it once and log it. Called at boot; safe to call when the file does not exist. When
+/// nyx's file cannot be read, `/usr/lib/os-release` is read for the release.
 pub fn probe() {
     let text = match std::fs::read_to_string(OS_INFO) {
         Ok(s) => Some(s),
@@ -83,8 +97,16 @@ pub fn probe() {
             None
         }
     };
-    let (info, os_info) = os_info_from(text.as_deref());
-    if info.major > 0 {
+    let os_release = if text.is_none() { std::fs::read_to_string(OS_RELEASE).ok() } else { None };
+    let Firmware { info, os_info, from_os_release } = firmware_from(text.as_deref(), os_release.as_deref());
+    if from_os_release {
+        plx_base::eventlog::log(&format!(
+            "webos: release={} major={} (from {OS_RELEASE}; nyx os_info.json {})",
+            info.release,
+            info.major,
+            os_info.code()
+        ));
+    } else if info.major > 0 {
         plx_base::eventlog::log(&format!(
             "webos: {} release={} codename={} api={} major={}",
             info.name, info.release, info.codename, info.api, info.major
@@ -129,6 +151,74 @@ fn os_info_from(text: Option<&str>) -> (Info, NyxFile) {
         || !info.api.is_empty()
         || !info.name.is_empty();
     (info, if answered { NyxFile::Ok } else { NyxFile::NoKeys })
+}
+
+/// The firmware's own release file. The developer-mode jail mounts `/usr/lib` read-only, so it is
+/// readable where nyx's `/var/run/nyx/os_info.json` is not, and it names the release on every
+/// firmware image from 5.5 to 11.2 that was checked.
+const OS_RELEASE: &str = "/usr/lib/os-release";
+
+/// The lowest major whose firmware ships [`OS_RELEASE`]. Measured on every unpacked image: none of
+/// 3.4.3, 3.9.2, 4.4.2, 4.4.3, 4.10.0 and 4.10.2 has the file, every one from 5.5.0 to 11.2.0 has it.
+const OS_RELEASE_FIRST_MAJOR: u32 = 5;
+
+/// The value of `key` in an os-release(5) text: `KEY=value`, the value bare or in one pair of
+/// single or double quotes. The last assignment of a key wins, as it does when a shell sources the
+/// file; a comment line or a longer key that merely ends in `key` never answers.
+fn os_release_value<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    s.lines()
+        .filter_map(|line| {
+            let (k, v) = line.trim().split_once('=')?;
+            let v = v.trim();
+            let unquoted = ['"', '\'']
+                .into_iter()
+                .find_map(|q| v.strip_prefix(q).and_then(|v| v.strip_suffix(q)));
+            (k == key).then_some(unquoted.unwrap_or(v))
+        })
+        .next_back()
+}
+
+/// PURE: the release an `/usr/lib/os-release` text names, from `VERSION_ID` (`6.5.3`) and its first
+/// component, or `None` when the text is not webOS TV's (`ID=starfish` on every image checked),
+/// `VERSION_ID` is missing or not dotted decimal numbers, or its major is below
+/// [`OS_RELEASE_FIRST_MAJOR`]: no firmware older than that writes this file, so such a text is not
+/// this set's own, and a major 1 to 4 would flip the decisions that read it (the credential
+/// default, VP9 10-bit, the DV platform gate, the old-ABI seek). The ID check is what keeps a Linux
+/// host that runs the simulator from reading its distribution's `VERSION_ID` as a firmware.
+///
+/// The file carries no codename, API version or build id, so those stay empty rather than invented;
+/// in particular [`Info::build`] stays empty, not the release, so that this boot and a nyx boot of
+/// the same set (`6.5.3-47`) never read as two builds.
+fn os_release_info(s: &str) -> Option<Info> {
+    if os_release_value(s, "ID") != Some("starfish") {
+        return None;
+    }
+    let release = os_release_value(s, "VERSION_ID")?;
+    if !release.split('.').all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let major = release.split('.').next()?.parse::<u32>().ok().filter(|m| *m >= OS_RELEASE_FIRST_MAJOR)?;
+    Some(Info { release: release.to_string(), major, ..Info::default() })
+}
+
+/// What [`probe`] publishes about the firmware, and where it came from.
+struct Firmware {
+    info: Info,
+    /// The verdict on nyx's `os_info.json` itself: `Unreadable` stays `Unreadable` when the
+    /// release came from `/usr/lib/os-release`.
+    os_info: NyxFile,
+    from_os_release: bool,
+}
+
+/// PURE: the firmware from both files' text (`None` is a file that could not be read). nyx's file
+/// answers whenever it was read, whatever it holds; `/usr/lib/os-release` is consulted only when
+/// the nyx read FAILED, and then fills the version only, never the nyx verdict.
+fn firmware_from(nyx: Option<&str>, os_release: Option<&str>) -> Firmware {
+    let (info, os_info) = os_info_from(nyx);
+    match nyx.is_none().then(|| os_release.and_then(os_release_info)).flatten() {
+        Some(info) => Firmware { info, os_info, from_os_release: true },
+        None => Firmware { info, os_info, from_os_release: false },
+    }
 }
 
 /// PURE: the SoC class from `/etc/prefs/properties/machineName`, for a set whose
@@ -425,29 +515,59 @@ pub fn activate_storage_helper(_service: &str) -> crate::storage::wire::failure:
     Detail::new(Stage::Unsupported, None)
 }
 
+/// One `getSystemSettings` round trip on a fresh anonymous registration (any thread: the
+/// registration owns its glib context). `None` when the bus refused or timed out. `budget` bounds
+/// the call only: registration and unregistration are not bounded by it (`ls2`'s own doc says so).
+#[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+fn settings_reply(payload: &str, budget: std::time::Duration) -> Option<String> {
+    ls2::register()
+        .map_err(ls2::Fail::from)
+        .and_then(|client| client.call("luna://com.webos.settingsservice/getSystemSettings", payload, budget))
+        .ok()
+}
+
 /// What the platform's settings service says about the locale; `i18n` owns the parse and the log
 /// lines. The same 600 ms bus budget as a root press, and for the same reason: the caller is the
 /// main thread at boot.
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
 pub fn system_locale() -> crate::tv::LocaleReply {
-    let result = ls2::register()
-        .map_err(ls2::Fail::from)
-        .and_then(|client| {
-            client.call(
-                "luna://com.webos.settingsservice/getSystemSettings",
-                r#"{"keys":["localeInfo"]}"#,
-                std::time::Duration::from_millis(600),
-            )
-        });
-    match result {
-        Ok(raw) => crate::tv::LocaleReply::Reply(raw),
-        Err(_) => crate::tv::LocaleReply::Unavailable,
+    match settings_reply(r#"{"keys":["localeInfo"]}"#, std::time::Duration::from_millis(600)) {
+        Some(raw) => crate::tv::LocaleReply::Reply(raw),
+        None => crate::tv::LocaleReply::Unavailable,
     }
 }
 
 #[cfg(any(feature = "hostsim", test, feature = "test-support"))]
 pub fn system_locale() -> crate::tv::LocaleReply {
     crate::tv::LocaleReply::NoPlatform
+}
+
+/// What the settings service says about the active sound output; `tv::sound` owns the parse and the
+/// log line. The caller is the player's Load thread (never the frame thread), once per PCM Load, only on
+/// a stack whose lead follows the output (`liblxa`, `audiosink_new`; see `plx_play_feed::pcm_lead::pcm_lead_plan`);
+/// other stacks never ask. The Load waits for it.
+///
+/// **What 300 ms bounds, and what it does not.** It bounds the call: a healthy round trip is tens of
+/// milliseconds (not yet measured on the set; `tv::sound::output` logs it per read), so 300 ms has
+/// room to spare, and the answer moves the lead by at most 150 ms (400 to 250), so a longer wait is
+/// not worth a later start. It does NOT bound the registration in front of the call or the unregistration
+/// behind it (`ls2`'s own doc: they sit outside the budget), and no bounded registration exists in
+/// `ls2` to use instead. On a wedged luna hub the Load thread therefore blocks in `ls2::register()`
+/// before `Load` is ever called, for as long as the hub takes: this Load is delayed by that, and is
+/// failed by the pump's `NATIVE_LOAD_BUDGET` if the wait outlasts it. A hub that answers the
+/// registration and then stays silent costs the call's 300 ms and keeps the 400 ms default.
+#[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+pub fn sound_output() -> crate::tv::sound::Reply {
+    use crate::tv::sound::Reply;
+    match settings_reply(r#"{"category":"sound","keys":["soundOutput"]}"#, std::time::Duration::from_millis(300)) {
+        Some(raw) => Reply::Reply(raw),
+        None => Reply::Unavailable,
+    }
+}
+
+#[cfg(any(feature = "hostsim", test, feature = "test-support"))]
+pub fn sound_output() -> crate::tv::sound::Reply {
+    crate::tv::sound::Reply::NoPlatform
 }
 
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
@@ -525,12 +645,22 @@ pub fn bind_window(win: *mut std::os::raw::c_void) {
 #[cfg(any(feature = "hostsim", test, feature = "test-support"))]
 pub fn bind_window(_win: *mut std::os::raw::c_void) {}
 
+/// The URI media pipe the port installs (`tv::Port::uri_media`): the explicitly enabled bus
+/// worker on the television, or `NoUriMedia` in a feature-off build, simulator or test.
+/// This does not select the URI playback route.
+#[cfg(all(feature = "uri-transport", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+pub const URI_MEDIA: &dyn crate::tv::uri::UriMedia = &ls2::uri::Transport;
+
+#[cfg(not(all(feature = "uri-transport", not(feature = "hostsim"), not(any(test, feature = "test-support")))))]
+pub const URI_MEDIA: &dyn crate::tv::uri::UriMedia = &crate::tv::uri::NoUriMedia;
+
 /// One LS2 request/reply, on the calling thread.
 ///
-/// **The one LS2 client this process has**, shared by every caller that speaks to the bus from
-/// this application: [`super::launch_home`] (one 600 ms call on the SDL main thread) and
-/// `keymanager::platform::Client` (a registration kept alive across begin → finish, 4 s budget).
-/// Until 2026-09-04 it was two private copies, both registering with
+/// **The one LS2 client the frame-thread callers share**, [`super::launch_home`] (one 600 ms call
+/// on the SDL main thread) and `keymanager::platform::Client` (a registration kept alive across
+/// begin → finish, 4 s budget). An explicitly enabled URI transport runs a separate client on
+/// its own thread (`ls2::uri`).
+/// Until 2026-09-04 that client was two private copies, both registering with
 /// `LSRegisterApplicationService(NULL, app_id)`, and on this set that registration is REFUSED:
 /// `ls-hubd LSHUB_ROLE_FILE: Can not find service "" permissions for executable ".../plxnative"`
 /// once per root press, the app logging `stage=register after 2ms` having freed the LSError
@@ -543,14 +673,18 @@ pub fn bind_window(_win: *mut std::os::raw::c_void) {}
 ///
 /// | registration | answer |
 /// |---|---|
-/// | `LSRegisterApplicationService(app_id, app_id)` | `-1028 Attempted to register for a service name that already exists` — this PROCESS already holds the app id: `ls-monitor -l` lists it beside an anonymous client, both ours, from boot; ACB is the one component handed the app id (`AcbAPI_initialize`, `player::acb_init` at boot) |
+/// | `LSRegisterApplicationService(app_id, app_id)` | `-1028 Attempted to register for a service name that already exists` — this PROCESS already holds the app id: `ls-monitor -l` lists it beside an anonymous client, both ours, from boot; ACB is the one component handed the app id (`AcbAPI_initialize`, the app's `adapters::backends::acb_init` at boot) |
 /// | `LSRegisterApplicationService(NULL, app_id)` | `-1027 Invalid permissions for (null)` — the `""` name has no permissions entry |
 /// | **`LSRegister(NULL)`** | registered, and `com.webos.applicationManager/getForegroundAppInfo` answered it |
 ///
-/// So every caller registers as a plain anonymous client, [`register`]. The role file still
-/// decides what such a client may CALL — the probe proves SAM's read-only method; `launch_home`
-/// grades the reply of the one that matters — and the hub's refusal, when there is one, travels
-/// in [`RegisterFail`] to the caller's log line instead of being freed. Anonymous clients do not
+/// Ordinary frame-thread callers register as plain anonymous clients, [`register`]. The
+/// feature-gated URI worker (`ls2::uri`) owns its own handle and thread and registers as the shape its
+/// caller gives it: `com.webos.media.client.plxprobe` first, preserving the probe's measured identity, then
+/// the anonymous client (`play-uri`'s `register_ladder`, which both the probe and the product driver ask).
+/// The role file still decides what such a client may
+/// CALL — the probe proves SAM's read-only method; `launch_home` grades the reply of the one that
+/// matters — and the hub's refusal, when there is one, travels in [`RegisterFail`] to the
+/// caller's log line instead of being freed. Anonymous clients do not
 /// collide with each other, so nothing here is serialised; a registration lives for one caller's
 /// use and is unregistered on drop, as both copies always did.
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
@@ -558,6 +692,10 @@ pub mod ls2 {
     use std::ffi::{CStr, CString};
     use std::os::raw::{c_char, c_int, c_void};
     use std::time::{Duration, Instant};
+
+    /// The explicitly enabled URI transport: a worker that owns its own bus handle.
+    #[cfg(feature = "uri-transport")]
+    pub(super) mod uri;
 
     /// How long [`call_once`] waits for SAM's reply.
     ///
@@ -598,6 +736,18 @@ pub mod ls2 {
         fn LSGmainContextAttach(
             handle: *mut c_void,
             context: *mut c_void,
+            error: *mut LSError,
+        ) -> bool;
+        /// `LSCall`: the call that keeps its token and delivers EVERY message the callee sends on
+        /// it. The URI transport's subscription needs that; every other caller wants one reply.
+        #[cfg(feature = "uri-transport")]
+        fn LSCall(
+            handle: *mut c_void,
+            uri: *const c_char,
+            payload: *const c_char,
+            callback: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+            context: *mut c_void,
+            token: *mut libc::c_ulong,
             error: *mut LSError,
         ) -> bool;
         fn LSCallOneReply(
@@ -671,13 +821,25 @@ pub mod ls2 {
         }
     }
 
-    /// Why there is no registration: the STAGE (`app-id`, `glib-context`, `register`, `attach`)
-    /// and, when the hub gave one, its own message.
+    /// Registration failure and its stage. `register-unregister` / `attach-unregister` retain
+    /// unresolved handles and contexts; other stages have confirmed cleanup.
     #[derive(Debug)]
     pub enum RegisterFail {
         Setup { stage: &'static str, detail: String,
             #[allow(dead_code)] // Numeric diagnostics are consumed by the ARM helper activation path.
             code: Option<i32> },
+    }
+
+    impl RegisterFail {
+        #[cfg(feature = "uri-transport")]
+        fn uri_diagnostic(&self) -> (&'static str, Option<i32>) {
+            match self { Self::Setup {stage, code, ..} => (*stage, *code) }
+        }
+
+        #[cfg(feature = "uri-transport")]
+        fn release_confirmed(&self) -> bool {
+            !matches!(self, Self::Setup { stage: "attach-unregister" | "register-unregister", .. })
+        }
     }
 
     impl std::fmt::Display for RegisterFail {
@@ -704,6 +866,13 @@ pub mod ls2 {
     /// Register as a plain anonymous client — the one shape the hub accepts from this process
     /// (module doc) — on a private glib context.
     pub fn register() -> Result<Registration, RegisterFail> {
+        register_as(None)
+    }
+
+    /// [`register`] under `name`, or anonymously for `None`. The named shape is the URI
+    /// transport's first rung (`uri`; the order is `play-uri`'s `register_ladder`): a name the Developer
+    /// Mode role file grants outbound permission to.
+    pub fn register_as(name: Option<&CStr>) -> Result<Registration, RegisterFail> {
         let mut error: LSError = unsafe { std::mem::zeroed() };
         unsafe { LSErrorInit(&mut error) };
         let context = unsafe { g_main_context_new() };
@@ -715,16 +884,16 @@ pub mod ls2 {
             });
         }
         let mut handle = std::ptr::null_mut();
-        let registered = unsafe { LSRegister(std::ptr::null(), &mut handle, &mut error) };
+        let registered = unsafe { LSRegister(name.map_or(std::ptr::null(), CStr::as_ptr), &mut handle, &mut error) };
         if !registered || handle.is_null() {
             let code = Some(error.error_code);
             let detail = error_text(&error);
-            unsafe {
-                LSErrorFree(&mut error);
-                g_main_context_unref(context);
-            }
+            reset(&mut error);
+            let released = handle.is_null() || unsafe { LSUnregister(handle, &mut error) };
+            unsafe { LSErrorFree(&mut error) };
+            if released { unsafe { g_main_context_unref(context) }; }
             return Err(RegisterFail::Setup {
-                stage: "register",
+                stage: if released { "register" } else { "register-unregister" },
                 detail, code,
             });
         }
@@ -733,13 +902,12 @@ pub mod ls2 {
             let code = Some(error.error_code);
             let detail = error_text(&error);
             reset(&mut error);
-            unsafe {
-                LSUnregister(handle, &mut error);
-                LSErrorFree(&mut error);
-                g_main_context_unref(context);
-            }
+            let released = unsafe { LSUnregister(handle, &mut error) };
+            unsafe { LSErrorFree(&mut error) };
+            if released { unsafe { g_main_context_unref(context) }; }
+            // Failed cleanup leaves the handle and context alive. URI ownership must quarantine.
             return Err(RegisterFail::Setup {
-                stage: "attach",
+                stage: if released { "attach" } else { "attach-unregister" },
                 detail, code,
             });
         }
@@ -747,23 +915,35 @@ pub mod ls2 {
         Ok(Registration { handle, context })
     }
 
-    impl Drop for Registration {
-        fn drop(&mut self) {
+    impl Registration {
+        /// Unregister and free the context. `false` when the hub refused: the handle is then still
+        /// attached to the context, which is leaked rather than freed under it, so anything its
+        /// callbacks point at must stay valid too. Idempotent: once it has succeeded, a second
+        /// call (and the drop after it) does nothing.
+        fn unregister(&mut self) -> bool {
+            if self.handle.is_null() {
+                return true;
+            }
             let mut error: LSError = unsafe { std::mem::zeroed() };
             unsafe { LSErrorInit(&mut error) };
             let unregistered = unsafe { LSUnregister(self.handle, &mut error) };
             if unregistered {
                 unsafe { g_main_context_unref(self.context) };
+                self.handle = std::ptr::null_mut();
             } else {
                 // A handle that would not unregister is still attached to this context, so the
                 // context is leaked rather than freed under it — a bounded leak, once per failed
                 // teardown, against a use-after-free (Codex review, 2026-09-04).
-                plx_base::eventlog::log(&format!(
-                    "ls2: unregister refused — leaking its glib context ({})",
-                    error_text(&error)
-                ));
+                plx_base::eventlog::log("ls2: unregister refused — retaining its glib context");
             }
             unsafe { LSErrorFree(&mut error) };
+            unregistered
+        }
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            self.unregister();
         }
     }
 
@@ -1022,6 +1202,9 @@ mod tests {
 
     #[test]
     fn reads_the_dev_sets_real_os_info() {
+        assert_eq!(parse(REAL).build, "4.10.2-31", "the build is nyx's core_os_release");
+        assert_eq!(parse(r#"{"webos_release": "4.10.2"}"#).build, "4.10.2", "without the key the release stands in");
+        assert_eq!(parse("").build, "");
         assert_eq!(field(REAL, "webos_release"), Some("4.10.2"));
         assert_eq!(
             field(REAL, "webos_release_codename"),
@@ -1129,6 +1312,119 @@ mod tests {
         assert_eq!(status, NyxFile::Unreadable);
         assert_eq!(info.major, 0);
         assert!(info.release.is_empty());
+    }
+
+    /// `/usr/lib/os-release` as 6.5.3 firmware ships it, verbatim (quoted values).
+    const OS_RELEASE_653: &str = "ID=\"starfish\"\nNAME=\"webOS TV\"\nVERSION=\"6.5.3\"\nVERSION_ID=\"6.5.3\"\nPRETTY_NAME=\"webOS TV 6.5.3\"\n";
+    /// 5.6.2 firmware: the same five lines.
+    const OS_RELEASE_562: &str = "ID=\"starfish\"\nNAME=\"webOS TV\"\nVERSION=\"5.6.2\"\nVERSION_ID=\"5.6.2\"\nPRETTY_NAME=\"webOS TV 5.6.2\"\n";
+    /// 11.2.0 firmware: unquoted values, and a sixth line.
+    const OS_RELEASE_1120: &str = "ID=starfish\nNAME=\"webOS TV\"\nVERSION=\"11.2.0\"\nVERSION_ID=11.2.0\nPRETTY_NAME=\"webOS TV 11.2.0\"\nCPE_NAME=\"cpe:/o:openembedded:starfish:11.2.0\"\n";
+    /// What a Linux host (the simulator under WSLg, a CI runner) has at the same path.
+    const OS_RELEASE_UBUNTU: &str = "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
+
+    #[test]
+    fn os_release_names_the_release_and_the_major_and_nothing_more() {
+        let i = os_release_info(OS_RELEASE_653).expect("6.5.3 firmware names its release");
+        assert_eq!((i.release.as_str(), i.major), ("6.5.3", 6));
+        // No codename, API version or name is in the file, and none is invented. Nor is a build:
+        // `core_os_release` ("6.5.3-47") carries a build id this file does not, and a build that
+        // read "6.5.3" on this boot and "6.5.3-47" on a nyx boot would look like two builds.
+        assert!(i.codename.is_empty() && i.api.is_empty() && i.name.is_empty() && i.build.is_empty(), "{i:?}");
+        let i = os_release_info(OS_RELEASE_562).expect("5.6.2 firmware names its release");
+        assert_eq!((i.release.as_str(), i.major), ("5.6.2", 5));
+    }
+
+    #[test]
+    fn os_release_values_may_be_quoted_or_bare() {
+        let i = os_release_info(OS_RELEASE_1120).expect("bare values");
+        assert_eq!((i.release.as_str(), i.major), ("11.2.0", 11), "a two-digit major, not its first digit");
+        let single = "ID='starfish'\nVERSION_ID='7.6.0'\n";
+        assert_eq!(os_release_info(single).map(|i| i.major), Some(7));
+        // Whitespace around a line, CRLF line ends, a comment that names the key, a later line
+        // for the same key (the shell's reading: the last assignment wins).
+        let noisy = "# VERSION_ID=\"1.0.0\"\r\n  ID=starfish\r\nVERSION_ID=\"9.2.4\"\r\n\r\nVERSION_ID=\"9.2.5\"\r\n";
+        let i = os_release_info(noisy).expect("noisy file");
+        assert_eq!(i.release, "9.2.5");
+    }
+
+    #[test]
+    fn os_release_without_a_numeric_version_id_names_nothing() {
+        for text in [
+            "",
+            "ID=starfish\n",
+            "ID=starfish\nVERSION_ID=\n",
+            "ID=starfish\nVERSION_ID=\"\"\n",
+            "ID=starfish\nVERSION_ID=\"abc\"\n",
+            "ID=starfish\nVERSION_ID=\"6.x\"\n",
+            "ID=starfish\nVERSION_ID=\"6..3\"\n",
+            "ID=starfish\nVERSION_ID=\"+6.5.3\"\n",
+            "ID=starfish\nVERSION_ID=\"6.5.3-47\"\n",
+            "ID=starfish\nVERSION_ID=\"0.0.0\"\n",
+            "ID=starfish\n# VERSION_ID=\"6.5.3\"\n",
+            "ID=starfish\nXVERSION_ID=\"6.5.3\"\n",
+        ] {
+            assert!(os_release_info(text).is_none(), "{text:?}");
+        }
+    }
+
+    /// The probe also runs in the simulator, which installs the webOS port's table: on a Linux
+    /// host `/usr/lib/os-release` is the host's, and Ubuntu's `VERSION_ID` is numeric. Only a file
+    /// that says it is webOS TV's (`ID=starfish`, on every firmware image checked from 5.5 to
+    /// 11.2) may name a firmware.
+    #[test]
+    fn a_linux_hosts_os_release_does_not_name_a_webos() {
+        assert!(os_release_info(OS_RELEASE_UBUNTU).is_none());
+        assert!(os_release_info("VERSION_ID=\"6.5.3\"\n").is_none(), "no ID at all");
+    }
+
+    /// No 3.x or 4.x firmware image ships `/usr/lib/os-release` (measured on every unpacked image:
+    /// 3.4.3, 3.9.2, 4.4.2, 4.4.3, 4.10.0 and 4.10.2 have none; 5.5.0 to 11.2.0 all have it), so a
+    /// `VERSION_ID` below 5 is not a file this firmware wrote. Naming a major 1 to 4 would flip the
+    /// decisions that read it (credential default, VP9 10-bit, DV gate, the old-ABI seek).
+    #[test]
+    fn an_os_release_below_webos_5_names_nothing() {
+        for release in ["4.10.2", "4.4.3", "3.9.2", "1.0.0"] {
+            let text = format!("ID=starfish\nVERSION_ID=\"{release}\"\n");
+            assert!(os_release_info(&text).is_none(), "{release}");
+            let fw = firmware_from(None, Some(&text));
+            assert_eq!((fw.info.major, fw.os_info, fw.from_os_release), (0, NyxFile::Unreadable, false), "{release}");
+        }
+        assert_eq!(os_release_info("ID=starfish\nVERSION_ID=\"5.0.0\"\n").map(|i| i.major), Some(5), "5 is the lowest");
+    }
+
+    #[test]
+    fn a_nyx_file_that_was_read_is_never_second_guessed() {
+        let fw = firmware_from(Some(REAL), Some(OS_RELEASE_653));
+        assert_eq!((fw.info.release.as_str(), fw.info.major), ("4.10.2", 4));
+        assert_eq!(fw.info.codename, "goldilocks2-grampians");
+        assert_eq!(fw.info.build, "4.10.2-31");
+        assert_eq!(fw.os_info, NyxFile::Ok);
+        assert!(!fw.from_os_release);
+        // A file that was read but carries no keys stays "no keys" and unknown: only a read that
+        // FAILED falls back.
+        let fw = firmware_from(Some("{}"), Some(OS_RELEASE_653));
+        assert_eq!((fw.info.major, fw.os_info, fw.from_os_release), (0, NyxFile::NoKeys, false));
+    }
+
+    #[test]
+    fn an_unreadable_nyx_file_falls_back_to_os_release_and_is_still_reported_unreadable() {
+        let fw = firmware_from(None, Some(OS_RELEASE_653));
+        assert_eq!((fw.info.release.as_str(), fw.info.major), ("6.5.3", 6));
+        assert!(fw.info.codename.is_empty() && fw.info.api.is_empty() && fw.info.build.is_empty());
+        // The verdict on nyx's own file (the event log line and the crash report's `hardware.probe`
+        // field) stays `unreadable`; it is not a statement about whether the release is known.
+        assert_eq!(fw.os_info, NyxFile::Unreadable);
+        assert!(fw.from_os_release);
+    }
+
+    #[test]
+    fn with_neither_source_the_firmware_stays_unknown() {
+        for os_release in [None, Some(""), Some("ID=starfish\nVERSION_ID=\"abc\"\n"), Some(OS_RELEASE_UBUNTU)] {
+            let fw = firmware_from(None, os_release);
+            assert_eq!((fw.info.major, fw.os_info, fw.from_os_release), (0, NyxFile::Unreadable, false), "{os_release:?}");
+            assert!(fw.info.release.is_empty() && fw.info.build.is_empty());
+        }
     }
 
     /// Absent key, present file.

@@ -19,6 +19,9 @@ fn content(arg: &plx_screens::registry::ContentArg) -> Value {
 fn argument(arg: &plx_screens::registry::AppArg) -> Result<Value, &'static str> {
     match arg {
         plx_screens::registry::AppArg::Home => Ok(json!("home")),
+        plx_screens::registry::AppArg::Library => Ok(json!("library")),
+        plx_screens::registry::AppArg::LibraryCollections { section } => Ok(json!({"library_collections":section})),
+        plx_screens::registry::AppArg::LibraryRecommended { section } => Ok(json!({"library_recommended":section})),
         plx_screens::registry::AppArg::Content(arg) => Ok(content(arg)),
         _ => Err("unsupported controlled navigation argument"),
     }
@@ -116,6 +119,7 @@ pub(crate) fn input(event: &plx_machine::machine::InputEvent<u32>) -> Result<Val
             json!({"kind":match event.kind { InputKind::Pointer {..} => "pointer", InputKind::Click {..} => "click", _ => "drag" },
                 "x_bits":x.to_bits(),"y_bits":y.to_bits(),"hit":hit}),
         InputKind::Wheel { dy } => json!({"wheel_bits":dy.to_bits()}),
+        InputKind::Pan { dx, x, y } => json!({"pan_bits":[dx.to_bits(),x.to_bits(),y.to_bits()]}),
         InputKind::PointerHidden => json!({"pointer_hidden":true}),
         InputKind::SystemKeyboard(up) => json!({"keyboard":up}),
         InputKind::Text(_) => return Err("unsupported Home text input"),
@@ -183,6 +187,7 @@ fn content_request(request: &plx_screens::registry::ContentReq) -> Result<Value,
         ContentReq::ItemMenu => json!("itemmenu"),
         ContentReq::Panel(panel) => json!({"panel":match panel {
             ContentPanel::AltSources { anchor } => json!({"alt_sources":anchor}),
+            ContentPanel::Versions { anchor } => json!({"versions":anchor}),
             ContentPanel::Tracks { page } => json!({"tracks":page}),
             ContentPanel::About => json!("about"),
             ContentPanel::Bio => json!("bio"),
@@ -197,13 +202,42 @@ pub(crate) fn app(effect: &AppFx) -> Result<Value, &'static str> {
     Ok(match effect {
         AppFx::Session(command) => json!({"session":wire(command)?}),
         AppFx::SessionEffect(effect) => json!({"session_effect":wire(effect)?}),
+        AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status) => json!({"playback_trace":"status"}),
         AppFx::Preferences(_) => return Err("unsupported controlled preferences effect"),
+        // Yielding is not authorization: these heads must refuse before any MainThread,
+        // recorder, catalog write or native player resource is borrowed by the runner.
+        AppFx::Loop(_) | AppFx::Player(_) | AppFx::Catalog(_) => return Err("unsupported Home application effect"),
         AppFx::Store(id, command) => json!({"store":id.ord().0,"command":store(command)?}),
         AppFx::StoreWork(work) => json!({"work":work_value(work)?}),
         AppFx::Content(req) => json!({"content":content_request(req)?}),
         AppFx::Home(plx_screens::registry::HomeReq::FoldToHero) => json!({"home":"fold"}),
         _ => return Err("unsupported Home application effect"),
     })
+}
+
+/// Validate the already-partitioned head without widening it back to `AppFx`.
+pub(crate) fn external(effect: &plx_screens::registry::ExternalAppFx) -> Result<Value, &'static str> {
+    use plx_screens::registry::ExternalAppFx;
+    match effect {
+        ExternalAppFx::SessionEffect(effect) => Ok(json!({"session_effect":wire(effect)?})),
+        ExternalAppFx::Content(req) => Ok(json!({"content":content_request(req)?})),
+        ExternalAppFx::Home(plx_screens::registry::HomeReq::FoldToHero) => Ok(json!({"home":"fold"})),
+        ExternalAppFx::Preferences(_) => Err("unsupported controlled preferences effect"),
+        ExternalAppFx::Loop(_) | ExternalAppFx::Player(_) | ExternalAppFx::Catalog(_)
+        | ExternalAppFx::Home(_) | ExternalAppFx::Library(_) | ExternalAppFx::Search(_)
+        | ExternalAppFx::Watchlist(_) | ExternalAppFx::ItemMenu(_) | ExternalAppFx::LiveTv(_) => Err("unsupported Home application effect"),
+    }
+}
+
+pub(crate) fn inline(effect: &plx_screens::registry::InlineAppFx) -> Result<Value, &'static str> {
+    use plx_screens::registry::InlineAppFx;
+    match effect {
+        InlineAppFx::Session(command) => Ok(json!({"session":wire(command)?})),
+        InlineAppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status) => Ok(json!({"playback_trace":"status"})),
+        InlineAppFx::Store(id, command) => Ok(json!({"store":id.ord().0,"command":store(command)?})),
+        InlineAppFx::StoreWork(work) => Ok(json!({"work":work_value(work)?})),
+        InlineAppFx::PlaybackTrace(_) | InlineAppFx::Consent(_) | InlineAppFx::Huds(_) => Err("unsupported Home application effect"),
+    }
 }
 
 fn work_value(work: &plx_data::stores::StoreWork) -> Result<Value, &'static str> {
@@ -273,12 +307,44 @@ pub(crate) fn message(message: &AppMsg) -> Result<Value, &'static str> {
             SessionEvent::Pump => json!("pump"),
             _ => return Err("unsupported Home Session delivery"),
         },
+        AppMsg::PlaybackTrace(plx_platform::playback_trace::Status::Off) => json!({"playback_trace":"off"}),
         AppMsg::Store(command) => store(command)?,
+        AppMsg::PersonCommand { command, .. } => store(&plx_data::stores::StoreCmd::Person(command.clone()))?,
         AppMsg::StoreWork(work) => work_value(work)?,
         AppMsg::HubsResult(result) => plx_data::pms::record::encode(result),
         AppMsg::Home(command) => json!({"home_command":home_command(command)}),
+        // Pure addressed owner inputs are observable; this does not authorize native
+        // playback commands, compiled resources, or a controlled playback bootstrap.
+        AppMsg::PlayerPinHud { now, duration_ms, tab } =>
+            json!({"player_pin_hud":{"now":now,"duration_ms":duration_ms,"tab":tab}}),
+        AppMsg::PlayerPresented { watch, paired } => json!({"player_presented":{"codec":1,"paired":paired,
+            "watch":watch.map(|id| json!({"scope":id.scope,"entry":id.entry,"playback":id.playback,"marker":id.marker}))}}),
+        AppMsg::PlayerTransportReset { for_reload } => json!({"player_transport_reset":for_reload}),
+        AppMsg::PlayerExtendHud { now, duration_ms } =>
+            json!({"player_extend_hud":{"now":now,"duration_ms":duration_ms}}),
         _ => return Err("unsupported Home message"),
     })
+}
+
+/// The retained Person sender duplicates the effect envelope, not the legacy delivery payload.
+/// Validate that equality before using the historical wire spelling; never erase forged provenance.
+/// Closed pure-owner observation alphabet. This never authorizes the persistence writer.
+pub(crate) fn validate_hold_hint(value: &Value) -> Result<(), &'static str> {
+    if value.as_object().is_none_or(|object| object.len() != 1)
+        || !matches!(value["hold_hint"].as_str(), Some("learned" | "read_card" | "read_pill")) {
+        return Err("invalid controlled hold-hint observation");
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_from(from: plx_machine::machine::MachineId,
+    effect: &Fx<super::super::bridge::AppHost>) -> Result<Value, &'static str> {
+    if let Fx::Deliver(to, Delivery::Machine(AppMsg::PersonCommand { from: sender, .. })) = effect {
+        if *sender != from || *to != plx_machine::machine::MachineId::Store(plx_data::stores::StoreId::Person.ord()) {
+            return Err("mismatched controlled Person sender or destination");
+        }
+    }
+    encode(effect)
 }
 
 pub(crate) fn encode(effect: &Fx<super::super::bridge::AppHost>) -> Result<Value, &'static str> {
@@ -295,8 +361,11 @@ pub(crate) fn encode(effect: &Fx<super::super::bridge::AppHost>) -> Result<Value
                 NavOp::Present(a) => json!({"present":argument(a)?}),
                 NavOp::Replace(a) => json!({"replace":argument(a)?}),
                 NavOp::SelectTab(a) => json!({"select_tab":argument(a)?}),
+                NavOp::SelectTabWithChild { tab, child } =>
+                    json!({"select_tab_with_child":[argument(tab)?, argument(child)?]}),
                 NavOp::Pop => json!({"pop":true}),
                 NavOp::PopTo(id) => json!({"pop_to":id.0}),
+                NavOp::PopToArg(a) => json!({"pop_to_arg":argument(a)?}),
                 NavOp::Dismiss(id) => json!({"dismiss":id.0}),
                 NavOp::Cancel => json!({"cancel":true}),
             }
@@ -306,6 +375,11 @@ pub(crate) fn encode(effect: &Fx<super::super::bridge::AppHost>) -> Result<Value
         Fx::Remember { group, elem } => json!({"group":group.0,"elem":elem}),
         Fx::Press(arm) => json!({"press":{"key":focus(arm.key),"from":match arm.from {
             plx_machine::machine::PressFrom::Key => "key", plx_machine::machine::PressFrom::Pointer => "pointer" },"holdable":arm.holdable}}),
+        Fx::HoldHint(event) => json!({"hold_hint":match event {
+            plx_machine::machine::HoldHintEvent::Learned => "learned",
+            plx_machine::machine::HoldHintEvent::ReadCard => "read_card",
+            plx_machine::machine::HoldHintEvent::ReadPill => "read_pill",
+        }}),
         Fx::Log(line) => json!({"log":line.0}),
         Fx::Deliver(to, delivery) => {
             let body = match delivery {
@@ -351,6 +425,9 @@ pub(crate) fn encode(effect: &Fx<super::super::bridge::AppHost>) -> Result<Value
                             "to":focus(*to),"by":match by { plx_ui::screen::By::Dir => "dir",
                                 plx_ui::screen::By::Pointer => "pointer", plx_ui::screen::By::Restore => "restore",
                                 plx_ui::screen::By::Reconcile => "reconcile" }}),
+                        ScreenEvent::Presented(receipt) => json!({"paint_frame":receipt.frame(),
+                            "entry":receipt.entry().0,"instance":receipt.instance().0,
+                            "message":message(receipt.message())?}),
                         ScreenEvent::App(msg) => message(msg)?,
                         ScreenEvent::Async(req, msg) => json!({"req":req.0,"message":message(msg)?}),
                     };
@@ -367,6 +444,47 @@ mod tests {
     use super::encode;
     use plx_screens::registry::AppArg;
     use plx_machine::machine::{Fx, NavOp};
+
+    #[test]
+    fn controlled_person_delivery_retains_the_recorded_open_close_and_reset_payloads() {
+        use plx_data::stores::{StoreCmd, person::PersonCmd};
+        use plx_machine::machine::{Delivery, MachineId};
+        use plx_screens::registry::AppMsg;
+        use serde_json::json;
+        let from = MachineId::Instance(plx_machine::machine::InstanceId(3));
+        let to = MachineId::Store(plx_data::stores::StoreId::Person.ord());
+        for (command, body) in [
+            (PersonCmd::Open { sid: plx_plex::plex::ServerId::from_raw(0), key: "19".into(),
+                guid: "sf06c144a".into(), name: "s025b413f".into(),
+                thumb: "/library/metadata/people/19/thumb/1".into() },
+                json!({"person":{"open":[0,"19","sf06c144a","s025b413f","/library/metadata/people/19/thumb/1"]}})),
+            (PersonCmd::Close, json!({"person":"close"})),
+            (PersonCmd::Reset, json!({"person":"reset"})),
+        ] {
+            let legacy = Fx::Deliver(to, Delivery::Machine(AppMsg::Store(StoreCmd::Person(command.clone()))));
+            let addressed = Fx::Deliver(to, Delivery::Machine(AppMsg::PersonCommand { from, command: command.clone() }));
+            let misrouted = Fx::Deliver(MachineId::Session, Delivery::Machine(AppMsg::PersonCommand { from, command }));
+            assert_eq!(super::encode_from(from, &misrouted),
+                Err("mismatched controlled Person sender or destination"));
+            let expected = json!({"to":"store:4","delivery":body});
+            assert_eq!(serde_json::to_vec(&encode(&legacy).unwrap()).unwrap(),
+                serde_json::to_vec(&super::encode_from(from, &addressed).unwrap()).unwrap());
+            assert_eq!(encode(&legacy), Ok(expected.clone()));
+            assert_eq!(super::encode_from(from, &addressed), Ok(expected));
+            assert_eq!(super::encode_from(MachineId::Nav, &addressed),
+                Err("mismatched controlled Person sender or destination"));
+        }
+    }
+
+    #[test]
+    fn controlled_diagnostics_only_records_the_deterministic_off_query() {
+        use plx_platform::playback_trace::{Command, Status};
+        use plx_screens::registry::{AppFx, AppMsg};
+        assert_eq!(super::app(&AppFx::PlaybackTrace(Command::Status)), Ok(serde_json::json!({"playback_trace":"status"})));
+        assert_eq!(super::message(&AppMsg::PlaybackTrace(Status::Off)), Ok(serde_json::json!({"playback_trace":"off"})));
+        assert!(super::app(&AppFx::PlaybackTrace(Command::Start)).is_err());
+        assert!(super::message(&AppMsg::PlaybackTrace(Status::Recording)).is_err());
+    }
 
     #[test]
     fn controlled_content_records_preview_and_panel_payloads() {
@@ -459,5 +577,25 @@ mod tests {
         let tab = encode(&Fx::Nav(NavOp::SelectTab(AppArg::Home))).unwrap();
         assert_eq!(root, serde_json::json!({"root": "home"}));
         assert_ne!(root, tab);
+    }
+
+    #[test]
+    fn player_owner_observations_keep_payload_truth_without_authorizing_native_playback() {
+        use super::message;
+        use plx_screens::registry::{AppFx, AppMsg};
+        use serde_json::json;
+        let pin = |now, duration_ms, tab| message(&AppMsg::PlayerPinHud { now, duration_ms, tab }).unwrap();
+        let expected = pin(10, 500, Some(1));
+        assert_eq!(expected, json!({"player_pin_hud":{"now":10,"duration_ms":500,"tab":1}}));
+        for changed in [pin(11, 500, Some(1)), pin(10, 501, Some(1)), pin(10, 500, None)] {
+            assert_ne!(expected, changed);
+        }
+        assert_ne!(message(&AppMsg::PlayerTransportReset { for_reload: true }).unwrap(),
+            message(&AppMsg::PlayerTransportReset { for_reload: false }).unwrap());
+        assert_ne!(message(&AppMsg::PlayerExtendHud { now: 10, duration_ms: 500 }).unwrap(), expected);
+        assert!(encode(&Fx::App(AppFx::Player(plx_screens::registry::PlayerReq::ExtendHud(500)))).is_err(),
+            "observing a message never authorizes a native application command");
+        assert!(message(&AppMsg::PlayerCompiled(plx_appkit::player_hud::loaded::classic_for_test())).is_err(),
+            "compiled resources still require a separate replay contract");
     }
 }

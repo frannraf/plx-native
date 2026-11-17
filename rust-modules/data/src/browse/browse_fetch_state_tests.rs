@@ -45,7 +45,7 @@ fn a_served_page_leaves_the_section_ready() {
 fn a_seeded_listing_is_not_overwritten_by_the_request_that_was_out_when_it_was_seeded() {
     let _g = plx_base::testlock::serial();
     let (_cleanup, mut browse, _, client) = registered_page_source();
-    *browse.adapter.page_result.lock().unwrap_or_else(|e| e.into_inner()) = Some(PageResult {
+    browse.adapter.page.post(PageResult {
         client,
         token_gen: client.token_gen(),
         gen: browse.state.query_gen(),
@@ -55,7 +55,7 @@ fn a_seeded_listing_is_not_overwritten_by_the_request_that_was_out_when_it_was_s
         total: -1,
         sorts: None, restored: None, genres: None, genre: None,
         resolved: Default::default(),
-    });
+    }, |_| true);
     seed_items_for_owner_test(&mut browse.state, 37);
     let _outcome = browse.pump();
     assert_eq!(browse.fetch_state(), SecFetch::Ready, "the late failure is for a query that has been answered");
@@ -98,13 +98,13 @@ fn a_source_that_did_not_answer_is_observable_rather_than_an_eternal_spinner() {
     let mut browse = TestBrowse::default();
     seed_one_source(&mut browse, true, false);
     assert_eq!(
-        browse.state.cur_source_state(),
+        browse.state.cur_source_state(browse.state.sources()[0].sid),
         SecFetch::Loading,
         "nobody has asked it anything yet"
     );
     browse.state.source_mut(0).unwrap().set_reachable(false);
     assert_eq!(
-        browse.state.cur_source_state(),
+        browse.state.cur_source_state(browse.state.sources()[0].sid),
         SecFetch::Failed,
         "the screen must be able to see this"
     );
@@ -118,7 +118,7 @@ fn a_source_with_no_browsable_library_answered_and_did_not_fail() {
     let mut browse = TestBrowse::default();
     seed_one_source(&mut browse, true, true);
     assert_eq!(
-        browse.state.cur_source_state(),
+        browse.state.cur_source_state(browse.state.sources()[0].sid),
         SecFetch::Ready,
         "an empty answer is an answer"
     );
@@ -131,7 +131,7 @@ fn a_served_table_clears_the_failure_and_seeds_its_states() {
     let _g = plx_base::testlock::serial();
     let mut browse = TestBrowse::default();
     seed_one_source(&mut browse, false, false);
-    assert_eq!(browse.state.cur_source_state(), SecFetch::Failed);
+    assert_eq!(browse.state.cur_source_state(browse.state.sources()[0].sid), SecFetch::Failed);
     {
         let s = browse.state.source_mut(0).unwrap();
         s.set_reachable(true);
@@ -144,7 +144,7 @@ fn a_served_table_clears_the_failure_and_seeds_its_states() {
             (2, "Film Club".into(), SecKind::Movie),
         ],
     );
-    assert_eq!(browse.state.cur_source_state(), SecFetch::Ready);
+    assert_eq!(browse.state.cur_source_state(browse.state.sources()[0].sid), SecFetch::Ready);
     assert_eq!(browse.section_count(), 2);
     assert!(browse.loading_initial(), "a fresh section has not answered yet");
 }

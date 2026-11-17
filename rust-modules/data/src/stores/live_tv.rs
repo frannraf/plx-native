@@ -156,7 +156,6 @@ pub struct Post {
 impl Post {
     pub fn post(&self, landing: Landing) {
         self.inbox.lock().unwrap_or_else(|e| e.into_inner()).push((self.epoch, landing));
-        plx_machine::idle::invalidate();
         plx_machine::present::wake_from_worker();
     }
 }

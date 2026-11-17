@@ -1,10 +1,14 @@
 //! The television, as everything outside the port sees it (step L15, docs/module-layers.md).
 pub mod device;
 pub mod home;
+pub mod launch;
+pub mod plane;
 pub mod sandbox;
 pub mod secure;
 pub mod sink;
+pub mod sound;
 pub mod toast;
+pub mod uri;
 pub mod window;
 
 use std::os::raw::c_void;
@@ -22,6 +26,7 @@ pub struct Port {
     pub open: fn(&secure::Sealed) -> Option<Vec<u8>>,
     pub remove: fn(&secure::Backend, &str),
     pub system_locale: fn() -> LocaleReply,
+    pub sound_output: fn() -> sound::Reply,
     pub go_home: fn(),
     pub poll_home: fn(),
     pub deliver_toast: fn(&str, toast::Identity) -> toast::Sent,
@@ -42,6 +47,11 @@ pub struct Port {
     /// The Starfish-shaped verb sink (see `sink::VideoSink`); the OS-neutral sink is step L15b.
     /// Read only by [`sink::installed`], the one way out of `tv` for it.
     pub sink: &'static dyn sink::VideoSink,
+    /// Shared display binding, available independently of a packet-feed executor.
+    pub display_sink: &'static dyn sink::DisplaySink,
+    /// The URI media pipe; the absent port and feature-off webOS port provide `NoUriMedia`.
+    /// Read only by [`uri::installed`].
+    pub uri_media: &'static dyn uri::UriMedia,
 }
 
 fn nothing() {}
@@ -57,6 +67,7 @@ static ABSENT: Port = Port {
     open: |_| None,
     remove: |_, _| {},
     system_locale: || LocaleReply::NoPlatform,
+    sound_output: || sound::Reply::NoPlatform,
     go_home: nothing,
     poll_home: nothing,
     deliver_toast: toast::deliver_without_port,
@@ -74,6 +85,8 @@ static ABSENT: Port = Port {
     frame_probe_acquired: nothing,
     frame_probe_fields: String::new,
     sink: &sink::NoSink,
+    display_sink: &sink::NoSink,
+    uri_media: &uri::NoUriMedia,
 };
 
 static INSTALLED: OnceLock<&'static Port> = OnceLock::new();
@@ -82,7 +95,8 @@ static INSTALLED: OnceLock<&'static Port> = OnceLock::new();
 pub fn install(port: &'static Port) -> Result<(), &'static Port> { INSTALLED.set(port) }
 
 /// The installed port. Only `tv`'s own modules read the table, so no other module can issue a
-/// verb the interfaces below do not offer; the sink leaves through [`sink::installed`].
+/// verb the interfaces below do not offer; the sink leaves through [`sink::installed`] and the
+/// URI media pipe through `uri::installed`.
 pub(in crate::tv) fn port() -> &'static Port { INSTALLED.get().copied().unwrap_or_else(absent) }
 
 /// Nothing installed. A host test expects that; the shipping build never should, and a silent

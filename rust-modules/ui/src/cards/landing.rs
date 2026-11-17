@@ -65,7 +65,7 @@
 //! `idle::decorative`: while they run the dispatcher keeps a page image held. A landing that
 //! arrives while the page IS an image starts at once, so its first live frame shows the start
 //! state (the old slots and a full-alpha ghost), but it does not step while the image is held
-//! ([`page_image_held`](crate::containers::transition::page_image_held)); the stepping begins on
+//! (`Cx::page_image`, derived from this owner's page capture); the stepping begins on
 //! the first tick after the image is released.
 //!
 //! The springs step on the frame's own `dt` through [`Spring::step`](crate::Spring::step); the
@@ -137,7 +137,7 @@ struct Slide {
 
 impl Slide {
     fn settled(&self) -> bool {
-        use plx_machine::idle::settled;
+        use plx_machine::motion::report::settled;
         settled(self.x.pos, 0.0, self.x.vel) && settled(self.y.pos, 0.0, self.y.vel)
     }
 }
@@ -162,7 +162,7 @@ struct Anim {
 
 impl Anim {
     fn retain_live(&mut self) {
-        use plx_machine::idle::settled;
+        use plx_machine::motion::report::settled;
         self.off.retain(|_, s| !s.settled());
         self.fade.retain(|_, s| !settled(s.pos, 1.0, s.vel));
         let fade = &self.fade;
@@ -177,6 +177,8 @@ impl Anim {
 
 pub(crate) struct Landing {
     on: bool,
+    /// Runtime enabling adopts the rows already on screen before observing future changes.
+    adopt_next: bool,
     /// The cards (element keys) the section last adopted.
     keys: Vec<u64>,
     /// Whether any of them had content (a section of placeholders has nothing to animate from).
@@ -203,10 +205,13 @@ pub(crate) struct Landing {
 
 impl Landing {
     pub(crate) const fn new() -> Self {
-        Self { on: false, keys: Vec::new(), loaded: false, window: (0, 0), revision: None, shift: (0.0, 0.0), anim: None, paused: false, fresh: false, stepped: false, hold_first: false }
+        Self { on: false, adopt_next: false, keys: Vec::new(), loaded: false, window: (0, 0), revision: None, shift: (0.0, 0.0), anim: None, paused: false, fresh: false, stepped: false, hold_first: false }
     }
 
     pub(crate) const fn set_enabled(&mut self, on: bool) {
+        if on && !self.on && self.anim.is_none() {
+            self.adopt_next = true;
+        }
         self.on = on;
     }
 
@@ -217,6 +222,7 @@ impl Landing {
 
     /// Take the cards as they are, with nothing to play (a first load, a dormant section, a slid window).
     fn adopt<H: Host, S: CardSource<H>>(&mut self, src: &S) {
+        self.adopt_next = false;
         let n = src.len();
         self.keys.clear();
         self.keys.extend((0..n).map(|i| key(&src.elem(i))));
@@ -244,8 +250,8 @@ impl Landing {
 
     /// Whether a landing has started but waits for the page image to go, so a frame must follow
     /// the release.
-    pub(crate) fn held(&self) -> bool {
-        self.anim.is_some() && crate::containers::transition::page_image_held()
+    pub(crate) fn held(&self, page_image: plx_machine::machine::PageImageRead) -> bool {
+        self.anim.is_some() && page_image.is_held()
     }
 
     /// A landing is playing but its last step did not run: the menu's veil has not yet dropped
@@ -324,6 +330,10 @@ impl Landing {
     /// change plays; whether it started one.
     pub(crate) fn observe<H: Host, S: CardSource<H>>(&mut self, src: &S, scene: &Scene<'_>) -> bool {
         if !self.on {
+            return false;
+        }
+        if self.adopt_next {
+            self.adopt(src);
             return false;
         }
         let n = src.len();
@@ -461,10 +471,10 @@ impl Landing {
     /// after the previous tick never shows its end before it moves. `occupy` is the grid's
     /// cells: an arriving card waits at alpha 0 until the moving survivors cover less than half of
     /// its cell (their rects as they stand after this step).
-    pub(crate) fn step(&mut self, dt: f32, k: (f32, f32), occupy: Option<&Occupancy<'_>>) {
+    pub(crate) fn step(&mut self, dt: f32, k: (f32, f32), occupy: Option<&Occupancy<'_>>, modal: plx_machine::machine::ModalRead, page_image: plx_machine::machine::PageImageRead) {
         let Some(a) = self.anim.as_mut() else { return };
         self.paused = true;
-        if crate::containers::transition::page_image_held() || crate::containers::modal::page_veiled() {
+        if page_image.is_held() || modal.page_veiled() {
             // a held image, or the menu's own fade presenting these frames: nothing of the page
             // moves, and what is drawn meanwhile IS the start state, so the first live step is
             // not skipped

@@ -2,7 +2,7 @@
 // "focus never switches the library" rule. Included from `navigation_tests` for its `Fixture`.
 use super::*;
 use super::header::pack_names;
-use plx_machine::machine::{InputEvent, InputKind, Source};
+use plx_machine::machine::{InputEvent, InputKind, Measure, Source};
 
 fn key_press(key: Key) -> ScreenEvent<TestHost> {
     ScreenEvent::Input(InputEvent {
@@ -26,6 +26,103 @@ fn grid_page(libraries: usize) -> (Fixture, LibraryScreen, FocusEngine<u32>) {
 }
 
 fn at(engine: &FocusEngine<u32>) -> u32 { engine.current(OWNER).unwrap().elem }
+
+#[test]
+fn library_options_stays_available_with_one_or_two_visible_favorites() {
+    let _guard = plx_base::testlock::serial();
+    for count in [1, 2] {
+        let (_, page, _) = grid_page(count);
+        assert_eq!(page.libraries.len(), count + 1);
+        assert_eq!(page.libraries.last().map(|(elem, _)| *elem), Some(MORE));
+    }
+}
+
+#[test]
+fn a_non_favorite_gets_one_selected_temporary_pill_after_the_favorites() {
+    let _guard = plx_base::testlock::serial();
+    let mut fixture = Fixture::new(4, 36, 0);
+    fixture.sections[2].row.pinned = false;
+    fixture.sections[3].row.pinned = false;
+    fixture.publish(0, 36);
+    let mut page = fixture.screen();
+    let engine = FocusEngine::new();
+    let more = page.header_rect(MORE, At::Drawn).unwrap();
+    let favorite_rects: Vec<_> = page.libraries.iter().filter(|(elem, _)| *elem != MORE)
+        .map(|(elem, index)| (*index, page.header_rect(*elem, At::Drawn).unwrap())).collect();
+    for current in [2, 3] {
+        fixture.publish(current, 36);
+        page.sync(&fixture.cx(&engine));
+        let names: Vec<_> = page.libraries.iter().filter(|(elem, _)| *elem != MORE).map(|(_, index)| *index).collect();
+        assert_eq!(names, [0, 1, current], "one selected visit pill follows the fixed favorites");
+        for (index, before) in &favorite_rects {
+            let elem = page.libraries.iter().find(|(_, section)| section == index).unwrap().0;
+            assert_eq!(page.header_rect(elem, At::Drawn).unwrap(), *before);
+        }
+        let items = &page.header.row().unwrap().page.spec().left;
+        assert_eq!(items.iter().filter(|item| item.selected_plate).count(), 1);
+        assert!(items[3].selected_plate);
+        assert_eq!(page.header_rect(MORE, At::Drawn), Some(more), "the menu anchor stays with the shortcuts");
+        assert_eq!(page.layout.row_y(0, 0.0), layout::LIBRARY_GRID_TOP, "no extra identity row");
+    }
+    fixture.publish(1, 36);
+    page.sync(&fixture.cx(&engine));
+    assert_eq!(page.libraries.iter().filter(|(elem, _)| *elem != MORE).count(), 2);
+    assert_eq!(page.header_rect(MORE, At::Drawn), Some(more));
+}
+
+#[test]
+fn the_library_pill_shows_the_owner_only_if_the_full_credit_fits() {
+    let measure = plx_base::fontcov::advances::ShippedMeasure;
+    let title = "LDN Films";
+    let owner = "by a friend";
+    let full = toolbar::joined_name(title, owner);
+    let width = |s| measure.width_str(s, plx_ui::theme::size::BODY, false);
+    assert_eq!(header::fit_name(title, owner, width(&full), &measure), full);
+    assert_eq!(header::fit_name(title, owner, width("LDN Films b…"), &measure), title);
+    let short = header::fit_name(title, owner, width("LDN Fi…"), &measure);
+    assert!(short.ends_with('…') && title.starts_with(short.trim_end_matches('…')));
+}
+
+#[test]
+fn long_favorite_names_leave_room_for_options_in_every_language() {
+    let _guard = plx_base::testlock::serial();
+    let measure = plx_base::fontcov::advances::ShippedMeasure;
+    for language in plx_platform::i18n::SHIPPED {
+        let _language = plx_platform::i18n::language_on_this_thread_for_test(language);
+        let mut fixture = Fixture::new(3, 36, 0);
+        for section in &mut fixture.sections {
+            section.row.title = format!("{} — {}", section.row.title, "International cinema and restored classics ".repeat(5));
+        }
+        fixture.sections[2].row.pinned = false;
+        fixture.publish(2, 36);
+        let engine = FocusEngine::new();
+        let cx = Cx { measure: &measure, ..fixture.cx(&engine) };
+        let mut page = LibraryScreen::new(ENTRY, InstanceId(19), SecKind::Movie);
+        page.sync(&cx);
+        let row = page.header.row().unwrap();
+        assert_eq!(page.libraries[2].0, MORE, "{}", language.tag());
+        let names: Vec<_> = row.page.spec().left.iter().filter(|item| item.glyph.is_none()).collect();
+        assert!(!names.is_empty(), "{}: a frequent library remains directly reachable", language.tag());
+        assert!(names.iter().all(|item| item.label.ends_with('…')), "{}", language.tag());
+        let mut stops: Vec<_> = page.header_elems().into_iter().map(|elem| page.header_rect(elem, At::Drawn).unwrap()).collect();
+        stops.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert!(stops.windows(2).all(|pair| pair[0].x + pair[0].w <= pair[1].x), "{}: controls overlap", language.tag());
+        assert_eq!(names.len(), 3, "{}: both favorites and the active visit fit", language.tag());
+        assert!(names[2].selected_plate);
+    }
+}
+
+#[test]
+fn the_temporary_library_pill_keeps_the_single_row_grid_geometry() {
+    let _guard = plx_base::testlock::serial();
+    let mut fixture = Fixture::new(3, 36, 0);
+    fixture.sections[2].row.pinned = false;
+    fixture.publish(2, 36);
+    let page = fixture.screen();
+    assert_eq!(page.layout.row_y(0, 0.0), layout::LIBRARY_GRID_TOP);
+    let selected = page.header.row().unwrap().page.spec().left.iter().filter(|item| item.selected_plate).count();
+    assert_eq!(selected, 1);
+}
 
 #[test]
 fn the_header_row_stands_at_148_and_the_grid_starts_at_244() {
@@ -87,38 +184,108 @@ fn the_collections_control_is_on_the_row_only_with_a_known_count_for_this_librar
 
 /// **One rule spaces the right cluster** (the owner's photo: `Collections · 4` and `Recommended`
 /// stood a wide gap apart and `Recommended` and `Sort & Filter` a narrow one). Every adjacent pair
-/// of the cluster's items stands exactly one `GAP` apart on the drawn text, whatever the count
-/// is, or whether the control is there at all. (The slot the count is placed for sizes only the
-/// budget the names pack into.)
+/// of the cluster's controls stands exactly one `GAP` apart on the drawn text, whatever the count
+/// is, or whether the control is there at all; the divider before the sort control adds its own
+/// width and both its margins to the gap it stands in, and the controls it separates stay that
+/// gap apart plus exactly that. (The slot the count is placed for sizes only the budget the names
+/// pack into.)
 #[test]
 fn every_gap_of_the_right_cluster_is_one_gap_whatever_the_collections_count_is() {
-    use plx_ui::page_header::{Slot, GAP};
+    use plx_ui::page_header::{Slot, DIVIDER_MARGIN, DIVIDER_W, GAP};
     let _guard = plx_base::testlock::serial();
     for answer in [Ok(4), Ok(6), Ok(123), Ok(1_234), Ok(0)] {
         knows_collections(&[(1, answer)]);
         let (_, page, _) = grid_page(2);
         let row = page.header.row().unwrap();
         let cluster: Vec<_> = row.layout.items.iter()
-            .filter_map(|rect| match rect.slot { Slot::Right(i) => Some((rect, &row.page.spec().right[i])), _ => None }).collect();
+            .filter_map(|rect| match rect.slot { Slot::Right(i) => Some((rect, &row.page.spec().right[i])), _ => None })
+            .filter(|(_, item)| !item.divider).collect();
         assert_eq!(cluster.len(), if answer == Ok(0) { 2 } else { 3 }, "{answer:?}: the controls on the row");
         for pair in cluster.windows(2) {
             let gap = pair[1].0.text.x - (pair[0].0.text.x + pair[0].0.text.w);
-            assert!((gap - GAP).abs() < 0.01, "{answer:?}: {} -> {} is {gap} apart, not {GAP}", pair[0].1.label, pair[1].1.label);
+            // The sort control is the one a divider stands before.
+            let want = GAP + if pair[1].1.glyph.is_some() { DIVIDER_W + 2.0 * DIVIDER_MARGIN } else { 0.0 };
+            assert!((gap - want).abs() < 0.01, "{answer:?}: {} -> {} is {gap} apart, not {want}", pair[0].1.label, pair[1].1.label);
         }
         let last = cluster.last().unwrap().0.text;
         assert!((last.x + last.w - plx_ui::page_header::TEXT_X1).abs() < 0.01, "{answer:?}: the cluster ends at the right text edge");
     }
 }
 
+/// **The board's cluster, declared**: Collections and Recommended are places (a chevron), the
+/// divider is no stop, and the sort control is its icon + the criterion + a down chevron whose
+/// name ("Sort & Filter") is carried and not drawn. The stops are exactly the old three, in order.
 #[test]
-fn one_library_draws_no_names_and_two_draw_both() {
+fn the_cluster_declares_places_a_divider_and_a_value_only_sort_control() {
+    use plx_ui::page_header::Slot;
     let _guard = plx_base::testlock::serial();
-    assert!(grid_page(1).1.libraries.is_empty(), "one library: only the three controls");
-    assert_eq!(grid_page(2).1.libraries.len(), 2);
+    knows_collections(&[(1, Ok(4))]);
+    let (_, page, _) = grid_page(2);
+    let row = page.header.row().unwrap();
+    let right = &row.page.spec().right;
+    assert_eq!(right.iter().map(|it| (it.place, it.divider)).collect::<Vec<_>>(),
+        [(true, false), (true, false), (false, true), (false, false)], "Collections, Recommended, divider, sort");
+    let divider = row.layout.items.iter().find(|r| r.slot == Slot::Right(2)).unwrap();
+    assert!(!divider.focusable && !right[2].focusable, "the divider is no stop");
+    let sort = &right[3];
+    assert_eq!(sort.label, plx_platform::i18n::msg::library_header_sort_filter(), "its name stays 'Sort & Filter'");
+    assert!(sort.value_only && sort.fold_glyph && sort.fold_quiet && sort.glyph == Some(plx_ui::icons::Icon::Sort));
+    assert!(sort.value.is_some());
+    let elems: Vec<u32> = row.stops.iter().map(|(elem, _)| *elem).collect();
+    assert_eq!(&elems[elems.len() - 3..], [COLLECTIONS, RECOMMENDED, SORTFILTER]);
+    assert_eq!(&elems[elems.len() - 3..], page.toolbar_elems());
+    knows_collections(&[]);
+}
+
+/// **No reserved slot for the criterion, in any shipped language**: the longest criterion every
+/// language has neither truncates nor moves the library names, which are packed against the room
+/// the WIDEST criterion leaves, so a short value ("Year") beside them leaves no hole and a long one
+/// ("Last episode added" in Russian) does not push them.
+#[test]
+fn a_criterion_in_every_language_takes_its_own_width_and_never_moves_the_names() {
+    use plx_ui::page_header::{Slot, TEXT_X1};
+    let _guard = plx_base::testlock::serial();
+    knows_collections(&[(1, Ok(4))]);
+    let (fixture, page, engine) = grid_page(2);
+    let cx = fixture.cx(&engine);
+    let criteria = ["Year", "Date added", "Последняя добавленная серия", "Zuletzt hinzugefügte Folge", "Aggiunti di recente al catalogo"];
+    let (right, mut widest) = page.header_right(&cx);
+    // The page's own widest case holds the longest of the LISTING's sorts; these criteria are the
+    // longest a language has, so the widest case is rebuilt around the longest of them, as it is
+    // for a listing that declares them.
+    let width = |text: &str| plx_ui::page_header::cluster_width(&[plx_ui::page_header::HeaderItem::sort_control("", text)], cx.measure);
+    let longest = criteria.iter().copied().max_by(|a, b| width(a).total_cmp(&width(b))).unwrap();
+    let last_widest = widest.len() - 1;
+    widest[last_widest] = plx_ui::page_header::HeaderItem::sort_control(widest[last_widest].label.clone(), longest);
+    let names_budget = |items: &[plx_ui::page_header::HeaderItem]| {
+        plx_ui::page_header::PageHeader::new(
+            plx_ui::page_header::PageHeaderSpec { right: items.to_vec(), ..Default::default() }, &widest, cx.measure)
+            .layout(plx_ui::consts::SCR_W, cx.measure)
+    };
+    let base = names_budget(&right);
+    for criterion in criteria {
+        let mut items = right.clone();
+        let last = items.len() - 1;
+        items[last] = plx_ui::page_header::HeaderItem::sort_control(items[last].label.clone(), criterion);
+        let placed = names_budget(&items);
+        assert_eq!(placed.left_budget, base.left_budget, "{criterion}: the names' room does not move");
+        let sort = placed.items.iter().find(|r| r.slot == Slot::Right(last)).unwrap().text;
+        assert!((sort.x + sort.w - TEXT_X1).abs() < 0.01, "{criterion}: the control ends at the text edge");
+        let width = plx_ui::page_header::cluster_width(&[items[last].clone()], cx.measure);
+        assert!((sort.w - width).abs() < 0.01, "{criterion}: the control is as wide as what it draws, with no slot");
+    }
+    knows_collections(&[]);
 }
 
 #[test]
-fn the_picked_library_takes_the_last_visible_slot() {
+fn favorite_names_and_options_are_shown_even_for_one_library() {
+    let _guard = plx_base::testlock::serial();
+    assert_eq!(grid_page(1).1.libraries.len(), 2, "one favorite and options");
+    assert_eq!(grid_page(2).1.libraries.len(), 3);
+}
+
+#[test]
+fn the_favorite_prefix_never_reorders_when_an_overflow_library_is_picked() {
     let widths = [200.0, 180.0, 220.0, 160.0, 240.0];
     assert_eq!(pack_names(&widths, 0, 4000.0, 90.0, 8), [0, 1, 2, 3, 4], "everything fits: all names, in order");
     let gap = plx_ui::page_header::GAP;
@@ -126,9 +293,9 @@ fn the_picked_library_takes_the_last_visible_slot() {
     let cut = pack_names(&widths, 1, tight, 90.0, 8);
     assert_eq!(cut, [0, 1, 2], "a pick inside the cut keeps its place");
     let cut = pack_names(&widths, 4, tight, 90.0, 8);
-    assert_eq!(cut.last(), Some(&4), "a pick past the cut replaces the last visible name");
-    assert_eq!(cut.len(), 2, "[0, 4] is what the room holds");
-    assert_eq!(pack_names(&widths, 3, 10.0, 90.0, 8), [3], "never fewer than the picked library");
+    assert_eq!(cut, [0, 1, 2], "a hidden pick never replaces a shortcut");
+    assert_eq!(cut.len(), 3);
+    assert!(pack_names(&widths, 3, 10.0, 90.0, 8).is_empty(), "options keeps its reserved space");
     assert!(pack_names(&[], 0, 100.0, 10.0, 8).is_empty());
 }
 
@@ -157,6 +324,7 @@ fn up_lands_on_the_selected_library_then_on_the_last_control_used() {
     let selected = page.libraries.iter().find(|(_, index)| Some(*index) == page.view_section(&fixture.cx(&engine))).unwrap().0;
     fixture.direction(&mut page, &mut engine, Dir::Up);
     assert_eq!(at(&engine), selected, "the first Up lands on the library on view");
+    fixture.direction(&mut page, &mut engine, Dir::Right);
     fixture.direction(&mut page, &mut engine, Dir::Right);
     fixture.direction(&mut page, &mut engine, Dir::Right);
     assert_eq!(at(&engine), COLLECTIONS, "Right walks names then the controls");
@@ -367,7 +535,7 @@ fn the_overflow_stays_visible_wherever_focus_is_in_the_row() {
 #[test]
 fn a_one_library_row_stands_at_y_158_and_a_multi_library_row_at_148() {
     let _guard = plx_base::testlock::serial();
-    for (libraries, top) in [(1, 158.0), (2, 148.0)] {
+    for (libraries, top) in [(1, 148.0), (2, 148.0)] {
         let (fixture, page, engine) = grid_page(libraries);
         let cx = fixture.cx(&engine);
         let control = <LibraryScreen as Focusable<TestHost>>::place(&page, &SORTFILTER, &cx, At::Drawn).unwrap().rect;
@@ -444,10 +612,185 @@ fn every_header_opener_is_lit_by_the_lift_while_its_menu_is_open() {
         let rects: Vec<_> = pills.iter().filter(|(tag, _)| *tag == 2).map(|(_, r)| *r).collect();
         assert!(rects.len() == 1 && (rects[0].x - pill.x).abs() < 0.5 && (rects[0].w - pill.w).abs() < 0.5 && (rects[0].h - pill.h).abs() < 0.5,
             "elem {elem}: one accent pill at {pill:?}, got {rects:?}");
-        assert!(!runs.is_empty() && runs.iter().all(|run| words(run.at)
+        assert!((elem == MORE || !runs.is_empty()) && runs.iter().all(|run| words(run.at)
             && run.ink.iter().zip(plx_ui::ACCENT_INK).all(|(a, b)| (a - b).abs() < 0.01)),
             "elem {elem}: the face is on the pill, in the focused ink: {runs:?}");
     }
+}
+
+/// **A sort picked from the menu is seen through the lift** (the press path: the menu's pick pushes
+/// the `LibraryEdit` and dismisses itself on the same frame, so the opener lift is the only thing
+/// that draws the sort control until the menu is gone). The existing swap tests draw the page's
+/// pass with `lifted = None`, which is how the lift painted the NEW criterion whole from its first
+/// frame while the places slid underneath and then popped when it stood down. Driven through real
+/// ticks and the lift (`Screen::redraw_focused`): the old criterion starts the swap and falls as the
+/// new one rises, and the settled lift draws the new one alone.
+#[test]
+fn a_picked_sort_swaps_its_criterion_through_the_opener_lift() {
+    use plx_platform::i18n::msg;
+    use plx_ui::screen::Screen;
+    let _guard = plx_base::testlock::serial();
+    let (mut fixture, mut page, mut engine) = grid_page(2);
+    let key = page.key(SORTFILTER);
+    engine.set(OWNER, key, Some(page.pair.groups_config().detail), By::Restore);
+    let mut ms = 0;
+    for _ in 0..60 { ms += 16; fixture.step(&mut page, &mut engine, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 })); }
+    let (old, new) = (msg::sort_facts_title(), msg::sort_facts_date_added());
+    // What the pick publishes: the same section under a new query, sorted by Date added.
+    fixture.listing = fixture.listing.clone().with_sort_key("addedAt").with_query(2);
+    // `(opacity of the old criterion, of the new one)` as the lift draws them now.
+    let lifted = |page: &LibraryScreen, engine: &FocusEngine<u32>| {
+        let cx = fixture.cx(engine);
+        let mut frame = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::recording());
+        let runs = plx_ui::draw_census::capture_runs(|| Screen::<TestHost>::redraw_focused(page, &mut frame, Some(key)));
+        let opacity = |text: &str| runs.iter().find(|run| run.text == text).map_or(0.0, |run| run.ink[3]);
+        (opacity(old), opacity(new))
+    };
+    let mut last: Option<(f32, f32)> = None;
+    for frame in 0..240 {
+        ms += 16;
+        fixture.step(&mut page, &mut engine, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }));
+        if frame == 0 { assert!(page.header_swap.is_sliding(), "premise: the pick began a criterion swap"); }
+        let (out, arriving) = lifted(&page, &engine);
+        assert!((out + arriving - 1.0).abs() < 1e-3, "frame {frame}: the lift draws the criteria at {out} + {arriving}, which is not one");
+        if frame == 0 { assert!(out > 0.9 && arriving < 0.1, "frame {frame}: the lift starts on the OLD criterion: {out}, {arriving}"); }
+        if let Some((was_out, was_arriving)) = last {
+            assert!(out <= was_out + 1e-3 && arriving >= was_arriving - 1e-3, "frame {frame}: the cross-fade runs one way");
+        }
+        last = Some((out, arriving));
+        if !page.header_swap.is_active() { break; }
+    }
+    assert!(!page.header_swap.is_active(), "the swap landed");
+    assert_eq!(lifted(&page, &engine), (0.0, 1.0), "the settled lift draws the new criterion alone");
+}
+
+/// The sorts the read-out tests' listing offers: the first is the one in force.
+const READOUT_SORTS: [(&str, &str); 2] = [("titleSort", "Title"), ("addedAt", "Date added")];
+
+/// A settled two-library page of 36 films with its Collections count known, whose listing the
+/// Unwatched filter then narrows to 12 (the unfiltered total is learnt first, as the real page
+/// learns it): the row carries its "12 of 36" read-out. Returns the next tick's time too.
+fn filtered_page() -> (Fixture, LibraryScreen, FocusEngine<u32>, u32) {
+    knows_collections(&[(1, Ok(7))]);
+    let (mut fixture, mut page, mut engine) = grid_page(2);
+    fixture.listing = fixture.listing.clone().with_sorts(&READOUT_SORTS, 0);
+    let mut ms = 0;
+    let mut settle = |fixture: &Fixture, page: &mut LibraryScreen, engine: &mut FocusEngine<u32>, frames: u32| {
+        for _ in 0..frames { ms += 16; fixture.step(page, engine, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 })); }
+    };
+    settle(&fixture, &mut page, &mut engine, 30);
+    assert!(page.header.row().is_some_and(|row| row.readout().is_none()), "premise: unfiltered, no read-out");
+    fixture.listing = fixture.listing.clone().with_unwatched(true).with_query(2).with_total(12);
+    settle(&fixture, &mut page, &mut engine, 120);
+    assert!(page.header.row().is_some_and(|row| row.readout().is_some()), "premise: the filter puts the read-out on the row");
+    (fixture, page, engine, ms)
+}
+
+/// What the header row draws now.
+fn drawn_header(fixture: &Fixture, page: &LibraryScreen, engine: &FocusEngine<u32>) -> Vec<plx_ui::draw_census::Run> {
+    let cx = fixture.cx(engine);
+    let frame = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::recording());
+    plx_ui::draw_census::capture_runs(|| page.draw_header(&frame))
+}
+
+/// A query edit as the menu delivers it, to the listing the page shows.
+fn pick(fixture: &Fixture, page: &mut LibraryScreen, engine: &mut FocusEngine<u32>, edit: plx_data::stores::browse::QueryEdit) {
+    let id = fixture.listing.view().id().unwrap();
+    let target = SectionAddress { epoch: id.epoch, sid: id.sid, section: id.section };
+    fixture.step(page, engine, ScreenEvent::App(AppMsg::LibraryEdit { target, edit }));
+}
+
+fn commits(effects: &[AppFx]) -> bool {
+    effects.iter().any(|fx| matches!(fx, AppFx::Store(_, StoreCmd::Browse(BrowseCmd::Addressed { work: LibraryWork::Commit { .. }, .. }))))
+}
+
+/// **A sort picked under a filter keeps the "12 of 36" read-out on the row and gliding with its
+/// neighbours through the reload.** The pick fades the grid out, then commits: the store forgets
+/// the listing (`Loading`, total -1) under the SAME filter terms, and the read-out cannot be read
+/// off a listing that has no total. It used to leave the row there, ~4 frames into the criterion's
+/// slide (it left through the swap's leaving face at the previous row's x) and fade back in when the
+/// listing landed, beside neighbours that travelled on the slide's spring. Driven through the real
+/// ticks, the real commit effect and a `Loading` listing, then the landing: on every frame the
+/// read-out is drawn ONCE at its resting opacity, as far along its way as Collections is along its.
+#[test]
+fn the_filter_readout_stays_and_glides_while_a_picked_sort_reloads_the_listing() {
+    use plx_data::stores::browse::QueryEdit;
+    let _guard = plx_base::testlock::serial();
+    let (mut fixture, mut page, mut engine, mut ms) = filtered_page();
+    let readout = page.header.row().and_then(|row| row.readout()).unwrap().to_owned();
+    let collections = plx_platform::i18n::msg::library_header_collections();
+    let x_of = |runs: &[plx_ui::draw_census::Run], text: &str, frame: &str| {
+        runs.iter().find(|run| run.text == text).unwrap_or_else(|| panic!("{frame}: {text} is drawn")).at.x
+    };
+    let rest = drawn_header(&fixture, &page, &engine);
+    let from = (x_of(&rest, &readout, "at rest"), x_of(&rest, collections, "at rest"));
+    let ink = plx_ui::theme::COUNT_FILTERED_INK[3];
+
+    pick(&fixture, &mut page, &mut engine, QueryEdit::Sort { key: "addedAt".into(), desc: false });
+    let reloading = fixture.listing.clone().with_sorts(&READOUT_SORTS, 1).with_query(3).with_total(0).with_fetch(SecFetch::Loading, -1);
+    let landed = fixture.listing.clone().with_sorts(&READOUT_SORTS, 1).with_query(3).with_total(12).with_fetch(SecFetch::Ready, 12);
+    let (mut committed, mut positions) = (None, Vec::new());
+    for frame in 0..240u32 {
+        ms += 16;
+        let effects = fixture.step(&mut page, &mut engine, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }));
+        if committed.is_none() && commits(&effects) {
+            committed = Some(frame);
+            // `browse::requery`: the same section under the new sort, forgotten and loading.
+            fixture.listing = reloading.clone();
+        }
+        if committed.is_some_and(|at| frame == at + 8) { fixture.listing = landed.clone(); }
+        let runs = drawn_header(&fixture, &page, &engine);
+        let said: Vec<_> = runs.iter().filter(|run| run.text == readout).collect();
+        assert_eq!(said.len(), 1, "frame {frame} (committed at {committed:?}): the read-out is drawn once: {said:?}");
+        assert!((said[0].ink[3] - ink).abs() < 1e-4, "frame {frame}: at its resting opacity, not fading: {}", said[0].ink[3]);
+        let label = format!("frame {frame}");
+        positions.push((x_of(&runs, &readout, &label), x_of(&runs, collections, &label)));
+        if committed.is_some_and(|at| frame > at + 8) && !page.header_swap.is_active() { break; }
+    }
+    assert!(committed.is_some(), "premise: the pick committed");
+    assert!(!page.header_swap.is_active(), "the swap landed");
+    let to = *positions.last().unwrap();
+    assert!((to.0 - from.0).abs() > 1.0 && ((to.0 - from.0) - (to.1 - from.1)).abs() < 0.01,
+        "premise: the new criterion moves the read-out as far as Collections ({from:?} to {to:?})");
+    for (frame, (readout_x, collections_x)) in positions.iter().enumerate() {
+        let (a, b) = ((readout_x - from.0) / (to.0 - from.0), (collections_x - from.1) / (to.1 - from.1));
+        assert!((a - b).abs() < 1e-3, "frame {frame}: the read-out is {a} of the way, Collections {b}");
+    }
+}
+
+/// **A held read-out belongs to its library and its filter terms.** The count the read-out keeps
+/// across a reload (above) is dropped the moment the reload is for other terms: with the filter
+/// turned off the read-out is gone, and a filter turned on again does not bring the old count back
+/// while its own listing loads; and it is gone for good when the listing lands unfiltered.
+#[test]
+fn a_held_readout_is_dropped_when_the_filter_terms_change() {
+    use plx_data::stores::browse::QueryEdit;
+    let _guard = plx_base::testlock::serial();
+    let (mut fixture, mut page, mut engine, mut ms) = filtered_page();
+    let readout = |page: &LibraryScreen| page.header.row().and_then(|row| row.readout()).map(str::to_owned);
+    let tick = |fixture: &Fixture, page: &mut LibraryScreen, engine: &mut FocusEngine<u32>, ms: &mut u32, frames: u32| {
+        for _ in 0..frames { *ms += 16; fixture.step(page, engine, ScreenEvent::Tick(Tick { ms: *ms, dt_us: 16_667 })); }
+    };
+    let held = readout(&page).expect("premise: 12 of 36");
+    // The same terms reloading (a sort pick's requery) keep it.
+    let base = fixture.listing.clone();
+    fixture.listing = base.clone().with_query(3).with_total(0).with_fetch(SecFetch::Loading, -1);
+    tick(&fixture, &mut page, &mut engine, &mut ms, 10);
+    assert_eq!(readout(&page), Some(held.clone()), "the same terms, reloading: the read-out holds");
+    // The filter is turned off: its requery is for other terms, and nothing is held.
+    pick(&fixture, &mut page, &mut engine, QueryEdit::Unwatched(false));
+    fixture.listing = base.clone().with_unwatched(false).with_query(4).with_total(0).with_fetch(SecFetch::Loading, -1);
+    tick(&fixture, &mut page, &mut engine, &mut ms, 60);
+    assert_eq!(readout(&page), None, "the filter is off: no read-out while the listing loads");
+    // The filter is put back: ITS listing is loading, and the count of the one before is not shown.
+    fixture.listing = base.clone().with_unwatched(true).with_query(5).with_total(0).with_fetch(SecFetch::Loading, -1);
+    tick(&fixture, &mut page, &mut engine, &mut ms, 60);
+    assert_eq!(readout(&page), None, "a filter turned on again shows no count until its own listing lands");
+    // And it lands: the read-out is the new listing's own.
+    fixture.listing = base.with_query(5).with_total(9).with_fetch(SecFetch::Ready, 9);
+    tick(&fixture, &mut page, &mut engine, &mut ms, 60);
+    let landed = readout(&page).expect("the landed listing carries its read-out");
+    assert_ne!(landed, held, "and it counts the landed listing");
 }
 
 /// The kinds one descriptive draw of `page`, scrolled one grid pitch (the chrome fully tucked),
@@ -488,9 +831,9 @@ fn a_scrolled_page_wears_the_capsule_only_when_its_header_names_libraries() {
     let (fixture, mut one, engine) = grid_page(1);
     let kinds = tucked_draw_kinds(&fixture, &mut one, &engine);
     assert!(kinds.iter().any(|(k, r)| k == "rect" && r[0] == 0.0 && r[1] == 0.0 && r[3] == plx_ui::scroll_capsule::FADE_STEP), "the top fade stays");
-    assert!(kinds.iter().all(|(k, _)| k != "glass"), "one library: no names in the header, no capsule");
-    assert_eq!(kinds.iter().filter(|(k, r)| k == "rect" && r[0] == 0.0 && r[3] == plx_ui::scroll_capsule::FADE_STEP && r[1] < 200.0)
-        .map(|(_, r)| r[1] + r[3]).fold(0.0f32, f32::max), plx_ui::scroll_capsule::FADE_H, "and the fade stays the plain 72 deep");
+    assert!(kinds.iter().any(|(k, _)| k == "glass"), "a singleton keeps its library identity in the capsule");
+    assert_eq!(kinds.iter().filter(|(k, r)| k == "rect" && r[0] == 0.0 && r[3] <= plx_ui::scroll_capsule::FADE_STEP && r[1] < 200.0)
+        .map(|(_, r)| r[1] + r[3]).fold(0.0f32, f32::max), plx_ui::scroll_capsule::Y + plx_ui::scroll_capsule::H + plx_ui::scroll_capsule::FADE_BELOW_CAPSULE, "the fade reaches through the capsule");
     let (fixture, mut two, engine) = grid_page(2);
     let kinds = tucked_draw_kinds(&fixture, &mut two, &engine);
     assert!(kinds.iter().any(|(k, r)| k == "glass" && r[1] == plx_ui::scroll_capsule::Y), "two libraries: the capsule, as live glass");
@@ -502,6 +845,100 @@ fn a_scrolled_page_wears_the_capsule_only_when_its_header_names_libraries() {
     };
     assert_eq!(depth(&kinds), plx_ui::scroll_capsule::Y + plx_ui::scroll_capsule::H + plx_ui::scroll_capsule::FADE_BELOW_CAPSULE);
     assert!(kinds.iter().all(|(k, _)| k != "glass_frozen"));
+}
+
+/// **The scrolled capsule carries the sort the header's control shows** ("Films 1,284 · Date
+/// viewed"): the library, the count, a dot, then the listing's CURRENT sort label, the one string
+/// the header's sort control wears (`sort_value`, a queued edit included), drawn once each; and the
+/// capsule's rect, which the top fade reaches through, is as wide as those four pieces.
+#[test]
+fn the_scrolled_capsule_carries_the_sort_the_header_shows() {
+    use plx_ui::screen::Screen;
+    let _guard = plx_base::testlock::serial();
+    let (fixture, mut page, engine) = grid_page(2);
+    let pitch = page.layout.grid_pitch();
+    page.scroll.jump(pitch);
+    page.scroll_target = pitch;
+    let worn = page.capsule_wanted();
+    page.handoff.step(0.0, pitch, pitch, pitch, worn);
+    let cx = fixture.cx(&engine);
+    let sources = std::rc::Rc::new(std::cell::RefCell::new(plx_ui::frame::backdrop::Sources::default()));
+    sources.borrow_mut().begin(vec![]);
+    let runs = {
+        let _walk = plx_ui::frame::backdrop::discover(sources.clone());
+        let mut frame = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::root());
+        plx_ui::draw_census::capture_runs(|| page.draw(&mut frame))
+    };
+    let (top, bottom) = (plx_ui::scroll_capsule::Y, plx_ui::scroll_capsule::Y + plx_ui::scroll_capsule::H);
+    let capsule: Vec<&plx_ui::draw_census::Run> = runs.iter().filter(|r| r.at.y >= top && r.at.y + r.at.h <= bottom + 1.0).collect();
+    let texts: Vec<&str> = capsule.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(texts.len(), 4, "the library, the count, the dot and the criterion, each once: {texts:?}");
+    let sort = page.sort_value(&cx);
+    assert_eq!(texts[2], "\u{b7}");
+    assert_eq!(texts[3], sort, "the criterion is the listing's current sort label");
+    let control = page.header.row().and_then(|row| row.page.spec().right.last().and_then(|item| item.value.clone()));
+    assert_eq!(control.as_deref(), Some(sort), "and the header's control shows the same string");
+    let last = capsule[3];
+    assert!(last.at.x + last.at.w + plx_ui::scroll_capsule::PAD_R <= SCR_W, "the capsule stays on the screen");
+}
+
+/// **The scrolled capsule builds its strings when its text changes, not on every frame it is up**
+/// (`CapsuleText::get_keyed`, keyed on the library's title and owner pieces, the total and the
+/// criterion): any number of frames on one library build them once, and a renamed library or another
+/// section on view builds them once more, naming what is on view.
+#[test]
+fn the_capsule_builds_its_strings_only_when_the_library_on_view_or_its_name_changes() {
+    use plx_ui::screen::Screen;
+    let _guard = plx_base::testlock::serial();
+    let (mut fixture, mut page, engine) = grid_page(2);
+    let pitch = page.layout.grid_pitch();
+    page.scroll.jump(pitch);
+    page.scroll_target = pitch;
+    let worn = page.capsule_wanted();
+    page.handoff.step(0.0, pitch, pitch, pitch, worn);
+    // The capsule's words as one draw says them, the library's name first.
+    let words = |fixture: &Fixture, page: &mut LibraryScreen| -> Vec<String> {
+        let cx = fixture.cx(&engine);
+        let sources = std::rc::Rc::new(std::cell::RefCell::new(plx_ui::frame::backdrop::Sources::default()));
+        sources.borrow_mut().begin(vec![]);
+        let _walk = plx_ui::frame::backdrop::discover(sources.clone());
+        let mut frame = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::root());
+        let (top, bottom) = (plx_ui::scroll_capsule::Y, plx_ui::scroll_capsule::Y + plx_ui::scroll_capsule::H);
+        plx_ui::draw_census::capture_runs(|| page.draw(&mut frame)).into_iter()
+            .filter(|run| run.at.y >= top && run.at.y + run.at.h <= bottom + 1.0).map(|run| run.text).collect()
+    };
+    assert_eq!(page.capsule_text.builds(), 0, "premise: nothing drawn yet");
+    assert_eq!(words(&fixture, &mut page).first().map(String::as_str), Some("Library 0"), "premise: the capsule names the library on view");
+    assert_eq!(page.capsule_text.builds(), 1);
+    for _ in 0..5 { assert_eq!(words(&fixture, &mut page).first().map(String::as_str), Some("Library 0")); }
+    assert_eq!(page.capsule_text.builds(), 1, "five more frames on the same library build nothing");
+    // The library is renamed (the same section, another title): built once more.
+    fixture.sections[0].row.title = "Renamed".into();
+    fixture.publish(0, 36);
+    for _ in 0..3 { assert_eq!(words(&fixture, &mut page).first().map(String::as_str), Some("Renamed")); }
+    assert_eq!(page.capsule_text.builds(), 2, "a renamed library builds its strings once");
+    // Another section is on view: built once more.
+    fixture.publish(1, 36);
+    for _ in 0..3 { assert_eq!(words(&fixture, &mut page).first().map(String::as_str), Some("Library 1")); }
+    assert_eq!(page.capsule_text.builds(), 3, "another section on view builds its strings once");
+}
+
+/// **Whatever a language calls its criterion, the capsule stays on the screen and clear of the
+/// page's right margin**: the longest label every shipped language has for a sort, beside a long
+/// library name and a five-figure count, measured the way the device sums advances. The criterion
+/// is app-owned text, so it is never cut; only a library name past about 60 characters could push
+/// the capsule off, and that name is the server's own text (it already grew the capsule unbounded).
+#[test]
+fn the_capsule_with_the_longest_criterion_in_every_language_ends_before_the_right_margin() {
+    use plx_base::fontcov::advances::ShippedMeasure;
+    let _guard = plx_base::testlock::serial();
+    let measure = ShippedMeasure;
+    let criteria = ["Date viewed", "Последняя добавленная серия", "Zuletzt hinzugefügte Folge", "Aggiunti di recente al catalogo"];
+    for criterion in criteria {
+        let (name, count, k) = plx_ui::scroll_chrome::capsule_parts("Documentaries and Concerts", 12_345, Some(criterion));
+        let rect = plx_ui::scroll_capsule::rect(&name, &count, k.as_deref(), &measure);
+        assert!(rect.x + rect.w <= SCR_W - plx_ui::consts::MARGIN_X, "{criterion}: the capsule ends at {}", rect.x + rect.w);
+    }
 }
 
 /// **A two-library page declares no live glass while its chrome is still on screen, either way.**
@@ -647,6 +1084,59 @@ fn a_library_switch_keeps_the_rows_pill_and_travels_the_plate_to_the_picked_name
             assert!(frame > 1 || left > 1.0, "the plate is on its way on the first frame, not cut onto the name ({at} vs {})", plate.cx());
         }
     }
+}
+
+#[test]
+fn the_selection_arrives_on_a_new_visit_and_does_not_sweep_its_slot_on_return() {
+    let _guard = plx_base::testlock::serial();
+    let mut fixture = Fixture::new(3, 36, 0);
+    fixture.sections[2].row.pinned = false;
+    fixture.publish(0, 36);
+    let mut page = fixture.screen();
+    page.initial = false;
+    let first = page.libraries[0].0;
+    let second = page.libraries[1].0;
+    let mut engine = FocusEngine::new();
+    engine.set(OWNER, page.key(MORE), Some(LIBRARY_GROUP), By::Restore);
+    for frame in 1..=90 {
+        header_rrects_after_a_frame(&fixture, &mut page, &mut engine, frame * 16);
+    }
+    let more = page.header.row().unwrap().plate(MORE).unwrap();
+
+    fixture.step(&mut page, &mut engine, ScreenEvent::App(AppMsg::LibrarySelect(SectionAddress {
+        epoch: fixture.epoch, sid: plx_plex::plex::ServerId::UNSET, section: 3,
+    })));
+    let visit = page.header.row().unwrap().selected_stop().unwrap();
+    let visit_plate = page.header.row().unwrap().plate(visit).unwrap();
+    assert_eq!(at(&engine), visit);
+    let plate = |rects: &[Rect]| rects.iter().find(|r| (r.h - plx_ui::page_header::HEIGHT).abs() < 0.01).copied();
+    let frame = header_rrects_after_a_frame(&fixture, &mut page, &mut engine, 91 * 16);
+    assert_eq!(plate(&frame), Some(visit_plate), "the selection starts inside the inserted slot");
+    let focus = frame.iter().find(|r| r.h > plx_ui::page_header::HEIGHT + 1.0).unwrap();
+    assert!(more.cx() < focus.cx() && focus.cx() < visit_plate.cx(), "focus glides from the fixed menu to the visit");
+
+    for n in 92..=95 {
+        header_rrects_after_a_frame(&fixture, &mut page, &mut engine, n * 16);
+    }
+    fixture.publish(2, 36);
+    fixture.step(&mut page, &mut engine, ScreenEvent::StoreChanged(StoreId::Browse.ord(), 1));
+    for n in 96..=180 {
+        let frame = header_rrects_after_a_frame(&fixture, &mut page, &mut engine, n * 16);
+        assert_eq!(plate(&frame), Some(visit_plate), "the listing landing does not move the selection");
+    }
+    assert_eq!(at(&engine), visit);
+    fixture.direction(&mut page, &mut engine, Dir::Left);
+    assert_eq!(at(&engine), MORE);
+    fixture.direction(&mut page, &mut engine, Dir::Left);
+    assert_eq!(at(&engine), second);
+    fixture.direction(&mut page, &mut engine, Dir::Left);
+    assert_eq!(at(&engine), first);
+    fixture.step(&mut page, &mut engine, ScreenEvent::Activate(first));
+    let favorite_plate = page.header.row().unwrap().plate(first).unwrap();
+    assert!(page.header.row().unwrap().plate(visit).is_none());
+    assert_eq!(page.header.row().unwrap().plate(MORE), Some(more));
+    let frame = header_rrects_after_a_frame(&fixture, &mut page, &mut engine, 181 * 16);
+    assert_eq!(plate(&frame), Some(favorite_plate), "the removed slot leaves no traveling selection behind");
 }
 
 /// **While the Sort & Filter menu is up, the control's accent pill is not under its panel.** The

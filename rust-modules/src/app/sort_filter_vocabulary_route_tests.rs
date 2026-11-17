@@ -98,7 +98,7 @@ fn both_sort_and_filter_panels_name_facts_and_directions_the_same_way() {
     let entry = |key: &str, title: &str, default_desc: bool| plx_data::browse::SortEntry {
         key: key.into(), desc_key: String::new(), title: title.into(), default_desc };
     // What a PMS declares for a movie library (tests/mock_pms.py), titles as the server writes them.
-    w.bridge.stores.browse.borrow_mut().seed_query_choices_for_test(vec![
+    w.bridge.bridge().stores.browse.borrow_mut().seed_query_choices_for_test(vec![
         entry("titleSort", "Title", false), entry("addedAt", "Date Added", true),
         entry("originallyAvailableAt", "Release Date", true), entry("rating", "Critic Rating", true),
         entry("lastViewedAt", "Date Viewed", true)], Vec::new());
@@ -111,7 +111,11 @@ fn both_sort_and_filter_panels_name_facts_and_directions_the_same_way() {
     w.press(Key::Ok);
     let lib = library_panel(&w);
     let headings: Vec<_> = lib.iter().map(|(h, _)| h.as_str()).collect();
-    assert_eq!(headings, ["Sort", "Filter"], "a Movies library offers one type, so no Show section");
+    assert_eq!(
+        headings,
+        ["Sort", "Filter"],
+        "Sort & Filter contains only controls for the current listing"
+    );
     let sort = section(&lib, "Sort");
     let labels: Vec<_> = sort.iter().map(|(l, _)| l.as_str()).collect();
     for (ours, theirs) in [("Title", "Title"), ("Date added", "Date Added"), ("Release date", "Release Date"), ("Score", "Critic Rating")] {

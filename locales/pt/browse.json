@@ -42,6 +42,7 @@
   "browse.detail.mark_show_unwatched": "Marcar série como não vista",
   "browse.detail.play_start": "Reproduzir do início",
   "browse.detail.trailer": "Trailer",
+  "browse.detail.play_version": "Reproduzir versão",
   "browse.detail.resume": "Retomar",
   "browse.detail.play": "Reproduzir",
   "browse.detail.created_by": "Criado por",
@@ -76,6 +77,8 @@
   "browse.menu.go_season": "Ir para a temporada",
   "browse.menu.go_movie": "Ir para o filme",
   "browse.menu.remove_deck": "Remover de Continuar a ver",
+  "browse.menu.play_version": "Reproduzir versão…",
+  "browse.menu.play_version_title": "Reproduzir versão",
   "browse.login.deleted": "Dados locais eliminados",
   "browse.login.deleted_detail": "As credenciais, preferências, telemetria e diagnósticos locais foram removidos.",
   "browse.login.partial": "Sessão terminada e a maioria dos dados locais eliminada",
@@ -278,5 +281,8 @@
   "browse.clock.notice_year": "O relógio do televisor parece errado ({year}). Ligado com a chave memorizada.",
   "browse.clock.notice": "O relógio do televisor parece errado. Ligado com a chave memorizada.",
   "browse.clock.no_key": "O relógio deste televisor parece errado. Ligue o televisor à Internet uma vez e tente novamente.",
-  "browse.clock.key_changed": "A chave do seu servidor mudou. Ligue o televisor à Internet uma vez para que a app a possa verificar novamente."
+  "browse.clock.key_changed": "A chave do seu servidor mudou. Ligue o televisor à Internet uma vez para que a app a possa verificar novamente.",
+  "browse.detail.mark_episode_watched": "Marcar episódio como visto",
+  "browse.detail.mark_episode_unwatched": "Marcar episódio como não visto",
+  "browse.detail.minutes_left": "Faltam {minutes} min"
 }

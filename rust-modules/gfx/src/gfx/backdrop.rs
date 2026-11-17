@@ -28,6 +28,7 @@
 // `ui/mod.rs` blankets its whole tree with this attribute, which is what kept the walk's accessors
 // that only one configuration or one test calls from being dead code while this lived there.
 #![allow(dead_code)]
+use crate::gfx::scrim::GroundShade;
 use crate::gfx::Rect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -206,9 +207,16 @@ pub struct Ground {
     pub corners: [[f32; 3]; 4],
     /// `[x, y, w, h]`, authored px.
     pub rect: [f32; 4],
-    /// The ink ramp's colour and its alpha at the rect's top and bottom edge.
+    /// The ink ramp's colour and its alpha at the rect's top and bottom edge. With a `scrim` the
+    /// alphas are the whole ink's at those edges down the rect's centre column (the ramp and the
+    /// shade there: a shade is a function of x as well, which a ramp is not), which is what the
+    /// delta's weight is read from.
     pub ink: [f32; 3],
     pub ink_a: [f32; 2],
+    /// The ground scrim laid over the field with the same ink ([`GroundShade::NONE`] for none), in
+    /// the device frame the rect is in. It is part of WHICH ground this is: a scrim that moved is a
+    /// different source, never a delta.
+    pub scrim: GroundShade,
 }
 
 /// The command word the wash is recorded under in a glass's signature while that glass takes it as
@@ -221,13 +229,19 @@ impl Ground {
     fn key(&self) -> Vec<u64> {
         let mut v = vec![GROUND_COMMAND];
         v.extend(self.rect.iter().chain(&self.ink).chain(&self.ink_a).map(|f| u64::from(f.to_bits())));
+        v.extend(self.scrim.uniforms().iter().flatten().map(|f| u64::from(f.to_bits())));
         v
     }
     /// The delta a glass whose source holds `baked` owes this frame, or `None` when it owes nothing
     /// (the same corners) or the two are not the same field (a different rect or ink: the compare
     /// has already refused that, so this is only a guard).
     pub fn delta(&self, baked: &Ground) -> Option<GroundDelta> {
-        if self.corners == baked.corners || self.rect != baked.rect || self.ink != baked.ink || self.ink_a != baked.ink_a {
+        if self.corners == baked.corners
+            || self.rect != baked.rect
+            || self.ink != baked.ink
+            || self.ink_a != baked.ink_a
+            || self.scrim != baked.scrim
+        {
             return None;
         }
         Some(GroundDelta {
@@ -474,26 +488,10 @@ fn paint_with(rect: Rect, values: Vec<u64>, dim: Option<Dim>, ground: Option<Gro
         let Some(w) = w.as_ref().filter(|w| w.discovery) else {
             return;
         };
-        // Nothing at or above the surfaces band is recorded, because nothing ever reads a
-        // `Paint` recorded there: a glass's source is the prefix of paints BELOW its own z, and
-        // a glass in a surface (no shipped surface has one: a menu's glass stands on frozen
-        // ground, `ui::popover_glass`, and requests no entry) has the page and the modal scrim
-        // under the band as its prefix. Its entry is requested by `surface_with`, not here, so it
-        // resolves; dropping its command word only matters to a glass stacked above it in a
-        // higher surface, which would read nothing of the surface between: such a glass
-        // presented over another surface (`ModalStack::present` stacks) would
-        // miss that surface's changes in its cached blur — a known limit, not ruled out by
-        // any gate, and the reason a second glass surface band would need recording. The surfaces
-        // loop in `dispatch.rs::draw_with` (Settings/AccountMenu/ItemMenu/About's own content)
-        // runs unconditionally on both the no-GL discovery pass and the real draw pass —
-        // recording its entire primitive stream every discovered frame, whether or not anything
-        // changed, was pure waste, and the heaviest-text screens paid for it most (see the dated
-        // addendum in docs/backdrop-blur-profiling.md). This is the authoritative gate;
-        // `Painter::declare`'s `recording_excluded` check exists only to skip building `values`
-        // in the first place for this same content.
-        if w.current >= Z::surface(0) {
-            return;
-        }
+        // Ordinary modal content stays unrecorded. A current-frame live-glass request
+        // triggers a second declaration traversal that includes only the needed surface
+        // prefix, avoiding the old heavy-text cost on Settings and frozen-menu frames.
+        if surface_recording_excluded(w) { return; }
         let Some(rect) = w.clip.map_or(Some(rect), |c| intersection(c, rect)) else {
             return;
         };
@@ -524,15 +522,13 @@ fn paint_with(rect: Rect, values: Vec<u64>, dim: Option<Dim>, ground: Option<Gro
         }));
     });
 }
-/// Fast pre-check for `ui::Painter::declare`: true once the current walk position has
-/// reached the surfaces band, where [`paint`] discards everything anyway. Checking here lets a
-/// caller skip building the primitive's `Vec<u64>` (and, for text, the byte-packing in
-/// [`text_value`]) instead of building it only to have `paint` throw it away.
+/// Fast pre-check for `ui::Painter::declare`: skip arguments outside this discovery
+/// traversal's required surface prefix, or hidden under an opaque replacement.
 pub fn recording_excluded() -> bool {
     WALK.with(|w| {
         w.borrow().as_ref().is_some_and(|w| {
             w.discovery
-                && (w.current >= Z::surface(0) || fully_occluded(w.current, &w.sources.borrow().layers))
+                && (surface_recording_excluded(w) || fully_occluded(w.current, &w.sources.borrow().layers))
         })
     })
 }
@@ -585,7 +581,7 @@ fn kind_name(tag: u64) -> String {
         12 => "tex_uv".into(),
         13 => "tex_stroked".into(),
         14 => "tex_carded".into(),
-        15 => "hero_ground".into(),
+        15 => "tex_premultiplied".into(),
         16 => "ambient".into(),
         17 => "grad4".into(),
         18 => "field".into(),
@@ -595,6 +591,7 @@ fn kind_name(tag: u64) -> String {
         // Two painters declare tag 22 (`ambient_art`, `tex_carded_still`); the words cannot tell them apart.
         22 => "ambient_art|tex_carded_still".into(),
         23 => "ambient_inked".into(),
+        26 => "scrim_layer".into(),
         100 => "text".into(),
         101 => "text_fade".into(),
         102 => "text_fade_v".into(),
@@ -814,24 +811,9 @@ impl Sources {
     }
     pub fn begin(&mut self, layers: Vec<Layer>) {
         self.frame += 1;
-        self.paints.clear();
-        self.assignments.clear();
         self.layers = layers;
-        for layer in &self.layers {
-            self.paints.push(Rc::new(Paint {
-                z: layer.z,
-                bounds: [layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h].map(f32::to_bits),
-                values: vec![u64::MAX, layer.revision],
-                glass: None,
-                source: Vec::new(),
-                dim: None,
-                ground: None,
-                resting: false,
-            }));
-        }
+        self.reset_discovery();
         for (&z, e) in &mut self.entries {
-            e.wanted.clear();
-            e.wanted_rises = false;
             if e.members.iter().any(|&rect| {
                 decide(
                     Request {
@@ -851,6 +833,36 @@ impl Sources {
             }
         }
         self.damage.clear();
+    }
+    /// Repeat declarations in this SAME frame, retaining captured images and damage decisions.
+    fn reset_discovery(&mut self) {
+        self.paints.clear();
+        self.assignments.clear();
+        for layer in &self.layers {
+            self.paints.push(Rc::new(Paint {
+                z: layer.z,
+                bounds: [layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h].map(f32::to_bits),
+                values: vec![u64::MAX, layer.revision],
+                glass: None,
+                source: Vec::new(),
+                dim: None,
+                ground: None,
+                resting: false,
+            }));
+        }
+        for e in self.entries.values_mut() {
+            e.wanted.clear();
+            e.wanted_rises = false;
+            e.seen = self.frame.wrapping_sub(1);
+        }
+    }
+
+    fn required_surface_prefix(&self) -> Z {
+        self.entries.range(Z::surface(0)..).rev().find_map(|(&z, e)| {
+            (e.seen == self.frame && e.wanted.iter().any(|&rect|
+                decide(Request { z, rect, valid: e.valid }, &self.layers, &[]).draw))
+                .then_some(z)
+        }).unwrap_or(Z::surface(0))
     }
     /// Resolve CURRENT declarations before any capture. This is a geometry-only traversal of
     /// the same draw tree, not a predictor based on the previous present's set of surfaces.
@@ -1197,6 +1209,7 @@ struct Walk {
     shared: bool,
     stopped: bool,
     discovery: bool,
+    record_surface_until: Z,
     clip: Option<Rect>,
     current: Z,
     glasses: Vec<Rect>,
@@ -1236,6 +1249,7 @@ pub fn enter(sources: Rc<RefCell<Sources>>, ceiling: Z) -> Scope {
             shared: false,
             stopped: false,
             discovery: false,
+            record_surface_until: Z::surface(0),
             clip: Some(canvas()),
             current: Z::PAGE,
             glasses: Vec::new(),
@@ -1243,10 +1257,42 @@ pub fn enter(sources: Rc<RefCell<Sources>>, ceiling: Z) -> Scope {
         }))
     }))
 }
+/// One cheap declaration traversal. Scene runners use `discover_with` so newly declared
+/// live glass can also obtain an exact prefix inside a modal surface.
 pub fn discover(sources: Rc<RefCell<Sources>>) -> Scope {
+    discover_until(sources, Z::surface(0))
+}
+fn discover_until(sources: Rc<RefCell<Sources>>, record_surface_until: Z) -> Scope {
     let scope = enter(sources, Z::ALL);
-    WALK.with(|w| w.borrow_mut().as_mut().unwrap().discovery = true);
+    WALK.with(|w| {
+        let mut w = w.borrow_mut();
+        let w = w.as_mut().unwrap();
+        w.discovery = true;
+        w.record_surface_until = record_surface_until;
+    });
     scope
+}
+fn surface_recording_excluded(w: &Walk) -> bool {
+    w.current >= Z::surface(0) && w.current >= w.record_surface_until
+}
+
+/// Discover this frame's actual consumers first. Only live glass inside surfaces needs the
+/// additional argument-recording traversal; frozen menus retain the original cheap walk.
+/// Each pass owns a fresh walk ID and snapshot ledger. The callback draws the same scene twice
+/// without advancing it, just as an ordinary source replay does.
+pub fn discover_with(sources: Rc<RefCell<Sources>>, mut draw: impl FnMut()) {
+    {
+        let _scope = discover(sources.clone());
+        draw();
+    }
+    let until = sources.borrow().required_surface_prefix();
+    if until > Z::surface(0) {
+        sources.borrow_mut().reset_discovery();
+        let _scope = discover_until(sources.clone(), until);
+        draw();
+        debug_assert!(sources.borrow().required_surface_prefix() <= until,
+            "a declaration traversal must not add new glass while repeating the same scene");
+    }
 }
 pub fn active() -> bool {
     WALK.with(|w| w.borrow().is_some())
@@ -1345,12 +1391,15 @@ pub fn surface_with(rect: Rect, rises: bool) -> Option<Surface> {
         );
         let key = (w.layer, w.next);
         let z = if w.discovery {
-            let r = crate::gfx::blur_region_for(rises, rect.x, rect.y, rect.w, rect.h);
-            let footprint = Rect::new(r[0], r[1], r[2], r[3]);
+            // The DRAWN rect, not its sampling footprint, decides whether this glass leaves a
+            // shared band: neighbours that merely sit within each other's `BLUR_REACH` sample
+            // the page, never each other, so they keep one source and one page pass
+            // ("adjacent glass samples the page", docs/liquid-glass.md). Only a glass whose
+            // body overlaps an earlier one's has that glass underneath it and needs its own band.
             let overlaps = w.glasses.iter().any(|&old| {
                 intersects(
                     Rect::new(old.x - 4.0, old.y - 4.0, old.w + 8.0, old.h + 8.0),
-                    footprint,
+                    rect,
                 )
             });
             let z = if w.shared && !overlaps && w.current == w.layer {
@@ -1420,6 +1469,30 @@ pub fn image(z: Z) -> Option<Rc<crate::gfx::BackdropImage>> {
             .get(&z)?
             .image
             .clone()
+    })
+}
+/// **The current image of the band that draws a glass at exactly `rect`**, with its z — for a
+/// consumer that wants the ground a glass sits on (the top bar's ground probe), asked from the
+/// VISIBLE walk after the frame's source jobs have run.
+///
+/// "Current" is `valid` and seen this frame: an image a refused job left behind describes an older
+/// page. The match is on the band's drawn members, not on coverage: a band above this glass covers
+/// the same rect and holds the glass in its image. `None` in a discovery or source walk (the
+/// image is not final, or is being made), with no walk, and for a rect no band lists.
+pub fn member_image(rect: Rect) -> Option<(Z, Rc<crate::gfx::BackdropImage>)> {
+    WALK.with(|w| {
+        let w = w.borrow();
+        let w = w.as_ref()?;
+        if w.discovery || w.ceiling != Z::ALL {
+            return None;
+        }
+        let sources = w.sources.borrow();
+        sources.entries.iter().find_map(|(&z, e)| {
+            let listed = e.members.contains(&rect);
+            (listed && e.valid && e.seen == sources.frame)
+                .then(|| e.image.clone().map(|image| (z, image)))
+                .flatten()
+        })
     })
 }
 /// Does the source at `z` have a rising member — the margin its region is grown by.
@@ -1562,6 +1635,64 @@ mod tests {
     }
 
     #[test]
+    fn surface_glass_tracks_its_texture_and_dissolve_mix_and_reuses_unchanged_content() {
+        let _guard = plx_base::testlock::serial();
+        let sources = Rc::new(RefCell::new(Sources::default()));
+        for (step, (texture_revision, mix)) in [(1, 0), (1, 0), (1, 40), (1, 40), (2, 40), (2, 40)]
+            .into_iter().enumerate() {
+            sources.borrow_mut().begin(vec![]);
+            let mut walks = Vec::new();
+            discover_with(sources.clone(), || {
+                walks.push(walk_serial());
+                assert!(claim_snapshot(Z::PAGE), "each traversal needs its own snapshot ledger");
+                let _surface = layer(Z::surface(0), false);
+                // The ordinary painter's fast pre-check must permit arguments needed by glass.
+                if !recording_excluded() { paint(rect(0.0), vec![1, texture_revision, mix]); }
+                let _glass = surface(rect(0.0)).expect("active discovery");
+            });
+            assert_eq!(walks.len(), 2);
+            assert_ne!(walks[0], walks[1], "render history must distinguish traversals");
+            sources.borrow_mut().resolve();
+            assert_eq!(!sources.borrow().entries[&Z(Z::surface(0).0 + 1)].valid,
+                step % 2 == 0, "changed texture/mix must invalidate; identical content must reuse: step {step}");
+            commit(&sources);
+        }
+    }
+
+    #[test]
+    fn surface_without_live_glass_keeps_one_discovery_walk_and_skips_argument_building() {
+        let _guard = plx_base::testlock::serial();
+        let sources = Rc::new(RefCell::new(Sources::default()));
+        sources.borrow_mut().begin(vec![]);
+        let (mut walks, mut built) = (0, 0);
+        discover_with(sources.clone(), || {
+            walks += 1;
+            paint(rect(0.0), vec![1]);
+            let _surface = layer(Z::surface(0), false);
+            if !recording_excluded() { built += 1; paint(rect(0.0), vec![2]); }
+        });
+        assert_eq!(walks, 1);
+        assert_eq!(built, 0, "ordinary modal text must keep its cheap pre-check");
+        assert_eq!(sources.borrow().paints.len(), 1);
+    }
+
+    #[test]
+    fn surface_glass_hidden_by_an_opaque_layer_needs_no_recording_traversal() {
+        let _guard = plx_base::testlock::serial();
+        let sources = Rc::new(RefCell::new(Sources::default()));
+        sources.borrow_mut().begin(vec![Layer { z: Z::surface(1), rect: canvas(),
+            blocks: true, revision: 1, composite_alpha: None }]);
+        let mut walks = 0;
+        discover_with(sources.clone(), || {
+            walks += 1;
+            let _surface = layer(Z::surface(0), false);
+            let glass = surface(rect(0.0)).unwrap();
+            assert!(!glass.draw);
+        });
+        assert_eq!(walks, 1, "covered glass must retain the ordinary modal fast path");
+    }
+
+    #[test]
     fn a_blur_source_never_contains_its_own_layer_or_above() {
         let _guard = plx_base::testlock::serial();
         let layers = [0, 2, 3].map(|z| Layer {
@@ -1646,6 +1777,47 @@ mod tests {
             below(&layers, Z(4)).map(|l| l.z).collect::<Vec<_>>(),
             vec![Z(0), Z(2)]
         );
+    }
+
+    /// **A glass finds ITS band's current image by its rect, and no other.** Two bands whose
+    /// images both cover the canvas: the answer for each rect is its own band's (a band above would
+    /// hold the glass in its image), nothing answers for a rect no band draws, a stale image
+    /// (`valid` false) answers nothing, and neither a discovery nor a source walk answers at all.
+    #[test]
+    fn a_glass_finds_its_own_bands_current_image_by_rect_and_no_other() {
+        let _guard = plx_base::testlock::serial();
+        let sources = Rc::new(RefCell::new(Sources::default()));
+        sources.borrow_mut().begin(vec![]);
+        let (a, b) = (Rect::new(100.0, 40.0, 300.0, 76.0), Rect::new(900.0, 40.0, 300.0, 76.0));
+        let (za, zb);
+        {
+            let _walk = discover(sources.clone());
+            assert!(member_image(a).is_none(), "a discovery walk has no final image");
+            za = surface(a).unwrap().z;
+            zb = surface(b).unwrap().z;
+        }
+        assert_ne!(za, zb, "an unshared layer gives each glass its own band");
+        sources.borrow_mut().resolve();
+        let whole = [0.0, 0.0, 1920.0, 1080.0];
+        for (z, e) in sources.borrow_mut().entries.iter_mut() {
+            let mw = if *z == za { 10 } else { 20 };
+            e.image = Some(Rc::new(crate::gfx::BackdropImage::for_test(whole, mw, 8)));
+            e.valid = true;
+        }
+        {
+            let _walk = enter(sources.clone(), Z::ALL);
+            let (z, image) = member_image(a).expect("a's band has a current image");
+            assert_eq!((z, image.bytes()), (za, 10 * 8 * 4));
+            let (z, image) = member_image(b).expect("b's band has a current image");
+            assert_eq!((z, image.bytes()), (zb, 20 * 8 * 4));
+            assert!(member_image(Rect::new(500.0, 40.0, 300.0, 76.0)).is_none(), "no band draws this rect");
+        }
+        sources.borrow_mut().entries.get_mut(&za).unwrap().valid = false;
+        let _walk = enter(sources.clone(), Z::ALL);
+        assert!(member_image(a).is_none(), "an image a refused job left behind is not the ground");
+        assert!(member_image(b).is_some());
+        let _source = enter(sources.clone(), Z(5));
+        assert!(member_image(b).is_none(), "a source walk is drawing the image, not reading it");
     }
 
     #[test]

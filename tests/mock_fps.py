@@ -27,6 +27,11 @@ Scene fields (tests/manifest.json, `fps_scenes`):
   "mock": {"rk": 50002}         a scene that names a library `item` on a real server opens THIS
                                 ratingKey of the synthetic library instead (`$rk` in its triggers);
                                 an `item` scene with no `mock.rk` is not runnable under --mock
+  "mock": {"cw_art_fixture": true}
+                                ... `--cw-art-fixture`: five dedicated Continue Watching items (one per
+                                art path a stills card can take: Plex cover, background + clearLogo
+                                composite, title in type) head the row, whose art the mock draws at
+                                request time, so the card art is a cold read on a fresh install
   "mock": {"link": ["remote-wan"]}
                                 ... `--link remote-wan` (tests/link_conditioner.py): the mock answers
                                 like a slow remote server; a spec is `[class=]profile[:k=v,...]`, and
@@ -107,6 +112,12 @@ REPO_ROOT = os.path.dirname(TESTS_DIR)
 # (`pms: server <slot> version=<v> ...`). The same literal `tools/mock-guest.py` checks before boot.
 MOCK_SERVER_VERSION = "1.41.0.0000-synthetic"
 
+# The URI product route's carrier: the ONE `--extra-media` clip its mock serves, so the mock numbers it
+# from the start of its fixed id block (`mock_pms.EXTRA_MEDIA_RK_BASE` / `EXTRA_MEDIA_PART_ID_BASE`,
+# pinned against the mock by tests/test_harness.py).
+CARRIER_RK = 990001
+CARRIER_PART_ID = 991001
+
 # The only keys a walk may press. Never `ok`/`enter` (a Home card press resumes playback and writes
 # a household's viewing record) and never `back` (on a root screen it leaves the app).
 WALK_KEYS = ("down", "up")
@@ -150,6 +161,8 @@ def mock_server_args(scene):
             args += ["--section-hubs-linked", str(linked)]
     elif block.get("section_hubs_linked"):
         raise ValueError(f"{scene.get('name')}: mock.section_hubs_linked needs mock.section_hubs")
+    if block.get("cw_art_fixture"):
+        args += ["--cw-art-fixture"]
     for spec in block.get("link") or []:
         args += ["--link", str(spec)]  # tests/link_conditioner.py; mock_pms validates it at start
     for key in ("shows", "seasons", "episodes"):
@@ -258,6 +271,29 @@ def configured_endpoint(config_path):
         raise SystemExit(f"--mock needs an explicit PMS_HOST and PMS_PORT in {config_path} "
                          f"(the address the deployed binary was built against)")
     return host[1], int(port[1])
+
+
+def carrier_server_args(path, audio=None, subtitle=None, transcode=None):
+    """The `tests/mock_pms.py` arguments of a mock-carried pipeline case: the carrier clip as its ONE
+    `--extra-media` movie (ratingKey `CARRIER_RK`, part `CARRIER_PART_ID`). `path` is absolute, resolved
+    by the runner against the pack it is serving, not against `fixtures_base()`.
+
+    `audio` (a case's `carrier_audio`) is the 1-based audio stream of the carrier the mock reports as the
+    server-selected one (`--extra-media-audio`): the app's own startup pick, with track memory cleared.
+    `subtitle` (`carrier_subtitle`) is the same for the 1-based subtitle stream (`--extra-media-subtitle`).
+    `transcode` is the absolute path the mock serves for every `/video/:/transcode/universal/start`
+    (`--transcode-fixture`: the enhanced remux of a `pms_route: "mock"` case). None leaves each as it was."""
+    args = ["--extra-media", str(path)]
+    for flag, key, value in (("--extra-media-audio", "carrier_audio", audio),
+                             ("--extra-media-subtitle", "carrier_subtitle", subtitle)):
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{key} {value!r} must be a positive integer (the 1-based stream)")
+        args += [flag, str(value)]
+    if transcode is not None:
+        args += ["--transcode-fixture", str(transcode)]
+    return args
 
 
 def _mock_guest_module():

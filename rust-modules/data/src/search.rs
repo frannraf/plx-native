@@ -47,8 +47,9 @@
 //! ## Favourites RANK here; they never filter
 //!
 //! The **Favorite libraries** switch governs every other browsing surface — Home's shelves, which
-//! type pills the top strip draws, the Library's Sources picker — and this screen is the deliberate
-//! exception. It stays **grant-scoped**: every library the account may reach is searched, and the
+//! type pills the top strip draws, the Library's Sources picker — and this screen is a deliberate
+//! exception (the Library's Sort & Filter menu is the other: it lists every library of the type
+//! that is a favourite or on a server the Sources list can open). It stays **grant-scoped**: every library the account may reach is searched, and the
 //! favourites only decide the ORDER ([`merge`], favourites first, each pass stable so the server's
 //! own ranking survives inside it).
 //!
@@ -64,7 +65,7 @@
 //! visible cap must not truncate the FOLD (the cap bounds what is DRAWN, not what is COUNTED), and
 //! a tag straddling a favourite and a non-favourite library ranks favourite with its whole count.
 //!
-//! The favourite table is a SNAPSHOT taken at the spawn site and watched by a second generation
+//! The favourite table is a SNAPSHOT taken when the request is made and watched by a second generation
 //! ([`SearchState::fav_gen`]) beside the roster's — see that field for why a change re-arms the
 //! query rather than re-sorting what is on screen.
 //!
@@ -74,9 +75,23 @@
 //! per-fetch in-flight flag and retry backoff, pumped once a frame. As-you-type guarantees
 //! overlapping workers, and a monotone mailbox is what stops a slow answer for `wal` repopulating
 //! the results for `wallace`. Debounce is `ui/detail.rs`'s `season_settle` accumulator. Two rules
-//! that are easy to miss and both wedge the screen forever if missed: release the in-flight flag
-//! when `spawn_small` REFUSES, and call [`plx_machine::idle::invalidate`] on every landing including
-//! the failure branch.
+//! that are easy to miss and both wedge the screen forever if missed: the in-flight flag must come
+//! back when the runner REFUSES the request ([`SearchPort`]'s `refused`, which the next pump reads
+//! to back the source off), and every changed landing must reach the caller's owned presentation effect,
+//! including the failure branch.
+//!
+//! ## A fetch is a store job
+//!
+//! The pump starts no worker. For each source that is due it claims the source's [`Fetch`] and
+//! pushes a [`StoreJob::Search`](crate::stores::StoreJob::Search) on [`SearchState::jobs`]: a
+//! [`SearchReq`] naming the server, the CLIENT the step decided to ask through (from the
+//! [`ClientKeys`] it was handed, not a read of the registry), the query, the favourite snapshot and
+//! the work (the source's first answer, or one window of a lane), with the query's generation as the
+//! job's address. The `Bridge` takes the jobs in the same call and the application's runner
+//! launches each on a worker ([`finish_search_job`]) if the registry still holds that client, or
+//! refuses it. The worker's body is IO only; its one answer comes back through the [`SearchPort`]
+//! into the mailbox the request was made from. A source that holds no client has nothing to ask and
+//! lands as a failed fetch, as a read of the missing client always did.
 //!
 //! ## Ownership (`docs/stores-as-machines.md`)
 //!
@@ -86,12 +101,17 @@
 //! `Bridge` owns exactly one of each pair through `stores::search::SearchStore`, which is what
 //! makes two `Bridge`s share neither a query, a landing nor a notice.
 //! `SearchStore::run_with_directory` rotates `adapter` to a fresh `Arc` on `SearchCmd::Reset`, so
-//! a worker spawned before the reset can only ever complete into the retired mailbox it captured.
+//! a request made before the reset can only ever complete into the retired mailbox its port
+//! captured. A slot re-pointed at another server while a request is out is caught by the roster
+//! generation (a changed roster supersedes every answer) and by the runner's check of the client.
 #![allow(dead_code)]
 
-use plx_plex::plex::ServerId;
+use plx_machine::job::{Job, Port};
+use plx_machine::machine::{Addr, MachineId, RequestId};
+use plx_plex::plex::{Client, ClientKey, ClientKeys, ServerId};
 use crate::pms::{parse_item, PmsMovie};
-use std::panic::catch_unwind;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod view;
@@ -498,10 +518,6 @@ struct Pending {
     stalls: Vec<(usize, u32)>,
 }
 
-/// Test seam: a fake server for every worker, run on the calling thread.
-#[cfg(test)]
-static TEST_IO: Mutex<Option<Arc<Mutex<dyn tail::Io + Send>>>> = Mutex::new(None);
-
 /// What one source's finished fetch delivers. `None` means the fetch FAILED (transport, parse, or
 /// a panicking worker) and must be retried — kept distinguishable from a successful answer that
 /// happens to be empty, which is the "one wifi hiccup blanked a populated grid" bug `browse.rs`
@@ -529,25 +545,22 @@ type Projection = [Vec<Item>; NKIND];
 type Fetch = crate::stores::Fetch<Mail>;
 
 /// The `Arc`'d worker half of one Search owner: every in-flight claim and landing mailbox, one per
-/// registry slot ([`SearchAdapter::mailbox`], indexed by [`ServerId::raw`]). A worker captures a
-/// clone of the owning `Bridge`'s `Arc<SearchAdapter>` before it spawns; rotating the store's live
-/// `Arc` (on `SearchCmd::Reset`) orphans that clone harmlessly — the old worker can still land, but
-/// only into a mailbox nothing reads any more.
+/// registry slot ([`SearchAdapter::mailbox`], indexed by [`ServerId::raw`]). A request's
+/// [`SearchPort`] holds a clone of the owning store's `Arc<SearchAdapter>` from the moment the
+/// request is made; rotating the store's live `Arc` (on `SearchCmd::Reset`) orphans that clone
+/// harmlessly — the old worker can still land, but only into a mailbox nothing reads any more.
+#[derive(Default)]
 pub struct SearchAdapter {
     /// Grown on demand by [`SearchAdapter::mailbox`]. Behind a lock because the table is shared with
     /// the workers, and a slot's mailbox has to exist before its first landing can reach it.
     fetch: Mutex<Vec<Arc<Fetch>>>,
-}
-
-impl Default for SearchAdapter {
-    fn default() -> Self {
-        Self { fetch: Mutex::new(Vec::new()) }
-    }
+    /// A recents write the runner refused ([`recents::SaveRecentsPort`]), not yet seen by an edit.
+    recents_refused: AtomicBool,
 }
 
 impl SearchAdapter {
     /// The mailbox for registry slot `i`, created on first use. Handed out as an `Arc` so the lock
-    /// is not held across a claim, a take or a spawn.
+    /// is not held across a claim, a take or a request.
     fn mailbox(&self, i: usize) -> Arc<Fetch> {
         let mut table = self.fetch.lock().unwrap_or_else(|e| e.into_inner());
         if table.len() <= i {
@@ -556,12 +569,148 @@ impl SearchAdapter {
         Arc::clone(&table[i])
     }
 
+    /// Is slot `i`'s claim held? A runner test's view of a request that is out.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn busy_for_test(&self, i: usize) -> bool { self.mailbox(i).busy() }
+
+    /// Is an answer waiting in slot `i`'s mailbox? A runner test's view of a request that ran.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_mail_for_test(&self, i: usize) -> bool { self.mailbox(i).has_mail() }
+
+    /// Was a recents write refused since the last call? Reads and clears the memory, so a refusal
+    /// asks for ONE more drain ([`owe_recents_save`]).
+    fn take_recents_refused(&self) -> bool {
+        self.recents_refused.swap(false, Ordering::SeqCst)
+    }
+
     /// Drop every mailbox's contents and claim — [`supersede`]'s half of the reset.
     fn clear_all(&self) {
         for mailbox in self.fetch.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             mailbox.clear();
         }
     }
+}
+
+/// The one request a [`StoreJob::Search`](crate::stores::StoreJob::Search) carries: everything the
+/// worker needs, captured by the step on the main thread. `sid` names the slot, `key` the client the
+/// step decided on (a runner starts the request only if the registry still holds that client at the
+/// launch), `q` and `favs` the query and the favourite table of the generation it was made for.
+/// The generation itself is the job's [`Addr::req`]; the slot travels in the [`SearchPort`], because
+/// a refusal is told only the address.
+///
+/// Fields are private: [`SearchWork`] names the lane types of `search/tail.rs`, which are not
+/// public.
+#[derive(Clone)]
+pub struct SearchReq {
+    sid: ServerId,
+    key: ClientKey,
+    q: String,
+    favs: Vec<(ServerId, i64, bool)>,
+    work: SearchWork,
+}
+
+/// What a search request reads.
+#[derive(Clone)]
+enum SearchWork {
+    /// The source's first answer: `/hubs/search`, projected.
+    First,
+    /// A read of depths `range` of the lane of kind `k`, on a COPY of the source's lane and `tv`
+    /// map: a failed or superseded read leaves the lane as it was.
+    Tail { k: usize, range: std::ops::Range<usize>, lane: tail::Lane, tv: tail::TvMap },
+}
+
+impl SearchReq {
+    /// The server to ask and the client the step decided to ask it through.
+    pub fn server(&self) -> (ServerId, ClientKey) {
+        (self.sid, self.key)
+    }
+}
+
+impl PartialEq for SearchReq {
+    /// Two requests are equal when they ask the same server, through the same client, for the same
+    /// thing. A lane read is identified by its kind and depths: the lane it carries is a copy of
+    /// state the store already holds, not part of what is asked.
+    fn eq(&self, other: &Self) -> bool {
+        self.sid == other.sid && self.key == other.key && self.q == other.q && self.favs == other.favs
+            && match (&self.work, &other.work) {
+                (SearchWork::First, SearchWork::First) => true,
+                (SearchWork::Tail { k, range, .. }, SearchWork::Tail { k: k2, range: r2, .. }) => k == k2 && range == r2,
+                _ => false,
+            }
+    }
+}
+
+impl std::fmt::Debug for SearchReq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SearchReq({:?} {:?} q[{}ch] ", self.sid, self.key, self.q.chars().count())?;
+        match &self.work {
+            SearchWork::First => write!(f, "first)"),
+            SearchWork::Tail { k, range, .. } => write!(f, "lane {k} depths {}..{})", range.start, range.end),
+        }
+    }
+}
+
+/// A request's answer, opaque to the runner: what the worker came back with, for [`land`] or
+/// [`land_tail`]. `None` inside is a FAILED fetch, never "this server has nothing".
+pub struct SearchAnswer(Answer);
+
+enum Answer {
+    First(Option<Projection>),
+    Tail { kind: usize, read: Option<(tail::Lane, tail::TvMap)> },
+}
+
+/// Where a search request's ONE answer goes: slot `slot`'s mailbox in the adapter the request was
+/// made from. Captured with the job when it was emitted, so a store that has since been `Reset` (a
+/// new adapter) never receives it: the port still lands into the retired adapter nobody pumps. The
+/// generation it answers for is the job's [`Addr::req`]. Two ports are equal when they reach the same
+/// slot of the same adapter.
+#[derive(Clone)]
+pub struct SearchPort {
+    adapter: Arc<SearchAdapter>,
+    slot: usize,
+}
+
+impl SearchPort {
+    fn to(adapter: &Arc<SearchAdapter>, slot: usize) -> Self {
+        Self { adapter: Arc::clone(adapter), slot }
+    }
+}
+
+impl PartialEq for SearchPort {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.adapter, &other.adapter) && self.slot == other.slot
+    }
+}
+
+impl std::fmt::Debug for SearchPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SearchPort({:p}, slot {})", Arc::as_ptr(&self.adapter), self.slot)
+    }
+}
+
+impl Port<SearchAnswer> for SearchPort {
+    /// The request's answer, stamped with the generation it was made for: the pump discards an
+    /// answer for a query it has since superseded.
+    fn done(&self, addr: Addr, out: SearchAnswer) {
+        match out.0 {
+            Answer::First(what) => land(&self.adapter, self.slot, addr.req.0, what),
+            Answer::Tail { kind, read } => land_tail(&self.adapter, self.slot, addr.req.0, kind, read),
+        }
+    }
+
+    /// The request was never started, so nothing will land and nothing will release its claim:
+    /// hand it back and let the pump see it ([`Fetch::refuse_for`](crate::stores::Fetch::refuse_for)),
+    /// which backs the source off before it asks again. A refusal that comes after a newer request
+    /// has claimed the slot leaves that claim alone.
+    fn refused(&self, addr: Addr) {
+        self.adapter.mailbox(self.slot).refuse_for(addr.req.0);
+    }
+}
+
+/// An address in this store: a search request's `req` is the generation of the query it was made
+/// for, a recents write's the sequence of its own.
+fn search_addr(req: u32) -> Addr {
+    Addr { to: MachineId::Store(crate::stores::StoreId::Search.ord()), req: RequestId(req) }
 }
 
 /// ~2 s at 60 fps — the same backoff `person.rs`/`browse.rs` use for a failed fetch. Counted down in
@@ -636,17 +785,51 @@ impl Source {
 /// A profile switch can additionally deactivate only the middle slot, so even that post-sign-out
 /// window is not necessarily contiguous. One index per live server is the honest shape, whatever
 /// the slot numbers have reached.
-fn slots() -> Vec<usize> {
-    plx_plex::plex::server_ids().map(|id| id.raw() as usize).collect()
-}
+fn slots(state: &SearchState) -> Arc<Vec<usize>> { state.live.clone() }
 
 /// How many sources this store fans out over — the width of [`slots`].
-fn nsrc() -> usize {
-    slots().len()
+fn nsrc(state: &SearchState) -> usize {
+    state.clients.slots().count()
 }
 
 /// One Search owner's main-thread-only logical state (`docs/stores-as-machines.md`). Production
 /// gains one through `stores::search::SearchStore`; the worker-touched half is [`SearchAdapter`].
+/// All synchronous Search facts, captured by the host before commands as well as pumps.
+#[derive(Clone, Copy)]
+pub struct SearchInput<'a> {
+    pub keys: &'a ClientKeys,
+    pub recents: recents::Input<'a>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct FixtureInput {
+    pub keys: ClientKeys,
+    pub session: Arc<plx_plex::plex::session::Session>,
+    pub settled: bool,
+    pub profile_generation: u32,
+    pub session_generation: u64,
+    pub tenure: u64,
+    pub profile_key: String,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl FixtureInput {
+    pub fn input(&self) -> SearchInput<'_> {
+        SearchInput { keys: &self.keys, recents: recents::Input {
+            session: &self.session, settled: self.settled, profile_generation: self.profile_generation,
+            session_generation: self.session_generation, tenure: self.tenure, profile_key: &self.profile_key } }
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+pub fn fixture_input() -> FixtureInput {
+    let settled = plx_plex::plex::session::peek_settled();
+    FixtureInput { keys: crate::pms::registry_keys_for_test(), settled: settled.is_some(),
+        session: settled.unwrap_or_else(plx_plex::plex::session::peek),
+        profile_generation: plx_plex::plex::session::current_gen(),
+        session_generation: plx_plex::plex::session::visible_generation(),
+        tenure: plx_plex::plex::session::tenure(),
+        profile_key: plx_plex::plex::session::current_profile_key() }
+}
+
 pub struct SearchState {
     /// The publish order of view-state edits, shared by `stores::Stores`.
     pub(crate) ledger: crate::viewledger::ViewLedger,
@@ -668,9 +851,14 @@ pub struct SearchState {
     /// changes and same-slot re-points alike; both supersede cached answers and workers aimed at
     /// the previous origin/profile.
     visible: u32,
+    clients: ClientKeys,
+    live: Arc<Vec<usize>>,
+    profile_generation: u32,
+    profile_key: Option<String>,
+    profile_tenure: u64,
 
-    /// **The favourite table this result set was projected under**, taken once per query at the
-    /// spawn site (`plex/CLAUDE.md` rule 5) and read by [`rebuild`]'s merge. It ranks; it never
+    /// **The favourite table this result set was projected under**, taken once per query when
+    /// the request is made (`plex/CLAUDE.md` rule 5) and read by [`rebuild`]'s merge. It ranks; it never
     /// filters.
     favs: Vec<(ServerId, i64, bool)>,
 
@@ -708,6 +896,12 @@ pub struct SearchState {
     scope_cache: scope::ScopeCache,
     /// Which servers may have a request out this pump ([`crate::stores::fanout`]).
     fanout: crate::stores::fanout::Fanout,
+    /// The outbox: the requests the last step emitted, each a [`StoreJob`](crate::stores::StoreJob)
+    /// the owner takes (`SearchStore::take_jobs`) and owes to a runner in the same turn. The step
+    /// starts no worker.
+    pub(crate) jobs: Vec<crate::stores::StoreJob>,
+    /// The address of the last recents write this step emitted ([`owe_recents_save`]).
+    recents_seq: u32,
 }
 
 impl Default for SearchState {
@@ -719,6 +913,11 @@ impl Default for SearchState {
             state: State::Idle,
             gen: 0,
             visible: 0,
+            clients: ClientKeys::default(),
+            live: Arc::new(Vec::new()),
+            profile_generation: 0,
+            profile_key: None,
+            profile_tenure: 0,
             favs: Vec::new(),
             fav_gen: 0,
             settle_us: 0,
@@ -727,6 +926,8 @@ impl Default for SearchState {
             wins: Default::default(),
             scope_cache: scope::ScopeCache::default(),
             fanout: Default::default(),
+            jobs: Vec::new(),
+            recents_seq: 0,
         }
     }
 }
@@ -735,6 +936,16 @@ impl SearchState {
     /// The query as typed, verbatim — trailing space and all, because the FIELD draws this.
     pub fn query(&self) -> &str {
         self.query.as_deref().unwrap_or("")
+    }
+
+    pub(crate) fn run_local(&mut self, adapter: &Arc<SearchAdapter>, cmd: crate::stores::search::SearchCmd) -> bool {
+        use crate::stores::search::SearchCmd;
+        match cmd {
+            SearchCmd::ApplyView { at, edit } => apply_view(self, &at, edit),
+            SearchCmd::Reset => { reset(self, adapter); true },
+            _ => { plx_base::eventlog::log("search: command without captured input refused");
+                debug_assert!(false, "Search command requires captured input"); false }
+        }
     }
 
     pub fn state(&self) -> State {
@@ -751,72 +962,85 @@ impl SearchState {
         self.gen
     }
 
+    /// Standalone fixture snapshot: no retained directory and, by construction, no household
+    /// (production reaches the scope through [`SearchState::snapshot_with_directory`], which is
+    /// handed the household).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn snapshot(&self) -> view::SearchSnapshot {
-        self.snapshot_with_scope(self.scope_cache.snapshot())
+        let captured = fixture_input();
+        let input = captured.input();
+        self.snapshot_with_scope(self.scope_cache.snapshot_with_input(&input, &[]), &input)
     }
 
-    pub fn snapshot_with_directory(
-        &self,
-        directory: crate::stores::browse::DirectoryView<'_>,
-    ) -> view::SearchSnapshot {
-        self.snapshot_with_scope(self.scope_cache.snapshot_with_directory(directory))
+    /// `household`: the signed-in profile's household member ids, read by the application's
+    /// `Bridge` (`Session::household_ids`) and handed in, so the source scope this publishes
+    /// reads no session global.
+    pub fn snapshot_with_directory_and_input(&self, directory: crate::stores::browse::DirectoryView<'_>,
+        input: &SearchInput<'_>, household: &[i64]) -> view::SearchSnapshot {
+        self.snapshot_with_scope(self.scope_cache.snapshot_with_directory_and_input(directory, input, household), input)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn snapshot_with_directory(&self, directory: crate::stores::browse::DirectoryView<'_>, household: &[i64]) -> view::SearchSnapshot {
+        self.snapshot_with_directory_and_input(directory, &fixture_input().input(), household)
     }
 
-    fn snapshot_with_scope(&self, scope: scope::SourceScopeSnapshot) -> view::SearchSnapshot {
+    fn snapshot_with_scope(&self, scope: scope::SourceScopeSnapshot, input: &SearchInput<'_>) -> view::SearchSnapshot {
         view::SearchSnapshot::from_parts(
             self.query.clone(),
             self.shelves.clone(),
             self.state,
             self.gen,
-            recents::snapshot(),
+            recents::snapshot_with_input(&input.recents),
             scope,
         )
     }
 
     /// Synchronous command path. `stores::search::SearchStore::run_with_directory` is the
     /// production caller and is what rotates `adapter` on `SearchCmd::Reset`.
-    pub fn run(
-        &mut self,
-        adapter: &Arc<SearchAdapter>,
-        cmd: crate::stores::search::SearchCmd,
-    ) -> bool {
-        run_with_optional_directory(self, adapter, cmd, None)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn run(&mut self, adapter: &Arc<SearchAdapter>, cmd: crate::stores::search::SearchCmd) -> bool {
+        run_with_optional_directory(self, adapter, cmd, None, &fixture_input().input())
     }
 
-    pub fn run_with_directory(
-        &mut self,
-        adapter: &Arc<SearchAdapter>,
-        cmd: crate::stores::search::SearchCmd,
-        directory: crate::stores::browse::DirectoryView<'_>,
-    ) -> bool {
-        self.scope_cache.snapshot_with_directory(directory);
-        run_with_optional_directory(self, adapter, cmd, Some(directory))
+    pub fn run_with_directory_and_input(&mut self, adapter: &Arc<SearchAdapter>, cmd: crate::stores::search::SearchCmd,
+        directory: crate::stores::browse::DirectoryView<'_>, input: &SearchInput<'_>) -> bool {
+        run_with_optional_directory(self, adapter, cmd, Some(directory), input)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn run_with_directory(&mut self, adapter: &Arc<SearchAdapter>, cmd: crate::stores::search::SearchCmd,
+        directory: crate::stores::browse::DirectoryView<'_>) -> bool {
+        self.run_with_directory_and_input(adapter, cmd, directory, &fixture_input().input())
     }
 
-    /// Test-only compatibility pump for fixtures without a retained directory.
+    /// Test-only compatibility pump for fixtures without a retained directory. The requests it
+    /// emits wait on [`SearchState::jobs`] for the fixture to run.
     #[cfg(any(test, feature = "test-support"))]
     pub fn pump(&mut self, adapter: &Arc<SearchAdapter>, dt: f32) -> bool {
         pump_with_optional_directory(self, adapter, dt, None,
-            plx_machine::landgate::fixture_gate())
+            plx_machine::landgate::fixture_gate(), &fixture_input().input())
     }
 
-    /// Advance the debounce and land whatever arrived under this frame's retained directory policy.
-    /// Returns whether anything changed, so the caller can re-clamp focus.
-    pub fn pump_with_directory_and_gate(
-        &mut self,
-        adapter: &Arc<SearchAdapter>,
-        dt: f32,
-        directory: crate::stores::browse::DirectoryView<'_>,
-        gate: &plx_machine::landgate::Gate,
-    ) -> bool {
-        pump_with_optional_directory(self, adapter, dt, Some(directory), gate)
+    /// Advance the debounce, land whatever arrived under this frame's retained directory policy and
+    /// emit the requests that are due. `keys` is the registry's answer as of this call. Returns
+    /// whether anything changed, so the caller can re-clamp focus. It does NOT start the requests it
+    /// emitted: the owner takes them from [`SearchState::jobs`] and owes them to a runner.
+    pub fn pump_with_directory_and_input_and_gate(&mut self, adapter: &Arc<SearchAdapter>, dt: f32,
+        directory: crate::stores::browse::DirectoryView<'_>, gate: &plx_machine::landgate::Gate, input: &SearchInput<'_>) -> bool {
+        pump_with_optional_directory(self, adapter, dt, Some(directory), gate, input)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pump_with_directory_and_gate(&mut self, adapter: &Arc<SearchAdapter>, dt: f32,
+        directory: crate::stores::browse::DirectoryView<'_>, gate: &plx_machine::landgate::Gate, keys: &ClientKeys) -> bool {
+        let captured = fixture_input();
+        let input = SearchInput { keys, ..captured.input() };
+        self.pump_with_directory_and_input_and_gate(adapter, dt, directory, gate, &input)
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn pump_with_directory(&mut self, adapter: &Arc<SearchAdapter>, dt: f32,
         directory: crate::stores::browse::DirectoryView<'_>) -> bool {
-        self.pump_with_directory_and_gate(adapter, dt, directory,
-            plx_machine::landgate::fixture_gate())
+        self.pump_with_directory_and_input_and_gate(adapter, dt, directory,
+            plx_machine::landgate::fixture_gate(), &fixture_input().input())
     }
 
     /// Publish a bounded catalog through the real retained-view boundary, without network work.
@@ -839,9 +1063,11 @@ impl SearchState {
         plx_base::testlock::assert_held("the search store (publish_shelves_for_test)");
         // A published catalog represents completed source answers, not merely painted rows over
         // still-pending requests. Keep it valid when a real owned-screen Tick pumps the store.
-        self.visible = plx_plex::plex::server_roster_gen();
+        self.clients = crate::pms::registry_keys_for_test();
+        self.visible = self.clients.roster_gen();
+        self.live = Arc::new(self.clients.slots().map(|sid| sid.raw() as usize).collect());
         snapshot(self);
-        for i in slots() {
+        for i in slots(self).iter().copied() {
             let items = std::array::from_fn(|k| {
                 shelves
                     .iter()
@@ -919,7 +1145,7 @@ fn set_query_with_directory(
         state.settle_us = 0;
         state.armed = real_query;
     }
-    plx_machine::idle::invalidate();
+
 }
 
 /// Apply a view-state change to every result row it covers — the optimistic half of a view-state
@@ -974,7 +1200,7 @@ fn land(adapter: &SearchAdapter, i: usize, gen: u32, what: Option<Projection>) {
     adapter.mailbox(i).post(Mail { gen, what, tail: None }, |old| match old {
         // A newer generation always wins — the monotone rule this mailbox exists for.
         m if m.gen != gen => m.gen < gen,
-        // …but at the SAME generation an ANSWER beats a failure. The in-flight claim bounds spawns
+        // …but at the SAME generation an ANSWER beats a failure. The in-flight claim bounds requests
         // and is not a hard interlock, so two workers can be out for one source at one generation;
         // with the loser's `None` arriving first, the real response was dropped and the source then
         // sat out a ~2 s backoff holding a good answer. `record` already encodes this preference on
@@ -1043,7 +1269,7 @@ fn snapshot_favs_from_directory(
     state.favs = directory.favorite_sections().to_vec();
 }
 
-/// The snapshot, for the merge and for a worker about to be spawned.
+/// The snapshot, for the merge and for a request about to be emitted.
 fn favs(state: &SearchState) -> Vec<(ServerId, i64, bool)> {
     state.favs.clone()
 }
@@ -1059,7 +1285,7 @@ fn favs_match_directory(
 #[cfg(any(test, feature = "test-support"))]
 fn pump(state: &mut SearchState, adapter: &Arc<SearchAdapter>, dt: f32) -> bool {
     pump_with_optional_directory(state, adapter, dt, None,
-        plx_machine::landgate::fixture_gate())
+        plx_machine::landgate::fixture_gate(), &fixture_input().input())
 }
 
 fn pump_with_optional_directory(
@@ -1068,18 +1294,11 @@ fn pump_with_optional_directory(
     dt: f32,
     directory: Option<crate::stores::browse::DirectoryView<'_>>,
     gate: &plx_machine::landgate::Gate,
+    input: &SearchInput<'_>,
 ) -> bool {
-    let live = slots();
-    let visible = plx_plex::plex::server_roster_gen();
-    let roster_changed = state.visible != visible;
-    state.visible = visible;
-    if roster_changed {
-        // This is an identity boundary, not merely a changed source count. Clear every answer and
-        // generation so a slot reactivated for another profile cannot surface rows fetched with
-        // the credential it held before it was hidden.
-        supersede(state, adapter);
-        state.shelves = None;
-    }
+    let roster_changed = observe_inputs(state, adapter, input);
+    let keys = input.keys;
+    let live = slots(state);
     // **The second Browse identity, and it moves without the first.** Discovery appending a library
     // and a favourites edit both bump `SECTIONS_GEN`; an independent owner can instead carry a
     // different exact table at the SAME local generation. This screen runs discovery immediately
@@ -1122,7 +1341,7 @@ fn pump_with_optional_directory(
                 plx_base::eventlog::log(&format!(
                     "search: q[{}ch] settled, asking {} source(s)",
                     q.chars().count(),
-                    nsrc()
+                    nsrc(state)
                 ));
             }
         }
@@ -1143,8 +1362,9 @@ fn pump_with_optional_directory(
         // the take releases the single-flight claim with the mail that answers the CLAIMED
         // generation; a superseded query's late answer is dropped inside it and leaves the new
         // query's claim alone (`Fetch::take_current`)
+        let mailbox = adapter.mailbox(i);
         let taken = crate::stores::take_landing_owed(gate, crate::stores::StoreId::Search,
-            || adapter.mailbox(i).busy(), || adapter.mailbox(i).take_current(|m| m.gen));
+            || mailbox.busy(), || mailbox.take_current(|m| m.gen));
         if let Some(m) = taken {
             turn.finished();
             if m.gen == state.gen {
@@ -1160,7 +1380,17 @@ fn pump_with_optional_directory(
             // arm is skipped with it on purpose — a stale failure that armed the backoff would
             // delay the current query's first answer by ~2 s for an error that was never about it.
         }
-        maybe_spawn(state, adapter, i, &mut turn);
+        // A launch the runner refused freed its claim in the call that refused it, and said so:
+        // back off here, or the free claim would have the next request go out at once, every pump.
+        // Read after the take (a refusal and an answer cannot both belong to one request) and
+        // before the request, so the REQUEST is judged as backed off in the very pump that sees
+        // it. The fan-out turn above was planned before the sweep and does not know: a refused
+        // slot still counted `Wanting` there, so another wanting source can wait one extra pump
+        // (never more than `WIDTH` requests are out either way).
+        if mailbox.take_refused(state.gen) {
+            source_mut(state, i).retry_cd = RETRY_FRAMES;
+        }
+        maybe_spawn(state, adapter, i, &mut turn, keys);
     }
     // The SHELVES are rebuilt only when something landed, but the STATE is recomputed every frame:
     // it is a scan of one status per live slot, and making it conditional on a landing left the one
@@ -1187,7 +1417,7 @@ fn pump_with_optional_directory(
     }
     // every landing repaints, the failure branch included: without this the screen sits on a
     // spinner that has already been answered until the next keypress happens to invalidate it
-    plx_machine::idle::invalidate();
+
     true
 }
 
@@ -1267,7 +1497,7 @@ fn live_sources<'a>(state: &'a SearchState, live: &[usize]) -> Vec<&'a Source> {
 /// Recompute the merged shelves from every source's last answer. The [`State`] is NOT set here —
 /// `pump` recomputes that every frame, landing or no landing (see the note there).
 fn rebuild(state: &mut SearchState) {
-    let live = slots();
+    let live = slots(state);
     let sources = live_sources(state, &live);
     let los: [usize; NKIND] = std::array::from_fn(|k| state.wins[k].lo);
     let epochs: [u32; NKIND] = std::array::from_fn(|k| state.wins[k].committed);
@@ -1427,10 +1657,6 @@ fn state_from_refs(sources: &[&Source], asking: bool) -> State {
     State::Failed
 }
 
-/// One fetch per source at a time, and only once the query has settled. Re-entered every frame by
-/// `pump`, which is what makes the failure path self-healing: a refused `spawn_small` (the
-/// device's thread ceiling) or a transient network error simply retries after the backoff instead
-/// of latching the screen on a spinner forever.
 /// Would a request for source `i` leave now, given its countdown `retry_cd`? The one statement of
 /// the preconditions, read both when the pump opens ([`fanout_standing`]) and at the spawn.
 fn wants_spawn(state: &SearchState, adapter: &SearchAdapter, i: usize, retry_cd: u32) -> bool {
@@ -1453,7 +1679,7 @@ fn owed_read(state: &SearchState, i: usize) -> Option<(usize, std::ops::Range<us
     // any slide
     waited_on.or_else(|| {
         let k = (0..NKIND).find(|&k| source(state, i).skipped[k])?;
-        let (depths, _) = window_of(&live_sources(state, &slots()), k, state.wins[k].lo);
+        let (depths, _) = window_of(&live_sources(state, &slots(state)), k, state.wins[k].lo);
         Some((k, depths))
     })
 }
@@ -1466,106 +1692,108 @@ fn fanout_standing(state: &SearchState, adapter: &SearchAdapter, i: usize) -> cr
     else { Standing::Idle }
 }
 
+/// One fetch per source at a time, and only once the query has settled. Re-entered every frame by
+/// `pump`, which is what makes the failure path self-healing: a launch the runner refuses (the
+/// device's thread ceiling) or a transient network error simply retries after the backoff instead
+/// of latching the screen on a spinner forever.
+///
+/// Emit the request source `i` is owed, if any: claim the fetch and push the request on the outbox
+/// as a [`StoreJob::Search`](crate::stores::StoreJob::Search). Nothing is started here: the owner
+/// takes the job and its runner launches it, or refuses it, and a refusal is what the pump reads
+/// (`take_refused`) to back off.
+///
+/// `keys` is the registry's answer as of this pump. The client is chosen HERE, on the main thread,
+/// as the key of the client `sid` holds: the runner starts the request through that client or not at
+/// all, so the answer is filed under the slot it was asked of. A worker that read `client()` would
+/// search whichever server the user had wandered off to by the time it was scheduled. A slot a
+/// roster change re-points between this step and the launch is caught by the roster-generation
+/// supersede (the next pump drops the answer) and, before that, by the runner's key check.
 fn maybe_spawn(state: &mut SearchState, adapter: &Arc<SearchAdapter>, i: usize,
-    turn: &mut crate::stores::fanout::FanoutTurn) {
+    turn: &mut crate::stores::fanout::FanoutTurn, keys: &ClientKeys) {
     if !wants_spawn(state, adapter, i, source(state, i).retry_cd) || !turn.admit(i) {
         return; // not due, or ungranted: it stays wanted and the next pump asks again
     }
     let mailbox = adapter.mailbox(i);
     let Some(q) = terms(state.query()) else { return };
     let q = q.to_string();
-    // `sid` is captured HERE, on the main thread, and resolved through `client_for` on the worker.
-    // A worker that read `client()` would search whichever server the user had wandered off to by
-    // the time it was scheduled, and file the answers under this slot's id.
     let sid = ServerId::from_raw(i as u16);
     let gen = state.gen;
     // …and so is the favourite table, for the same reason and by the same rule: a worker that asked
     // `browse` what was current would answer with a table from a different moment than the query it
     // was given. `pump` rejects a landing taken under a snapshot that has since moved.
     let favs = favs(state);
-    let worker_adapter = Arc::clone(adapter);
     mailbox.claim(gen);
     source_mut(state, i).stamp = state.ledger.stamp();
-    // an answered source is here for a read of one lane: the worker takes a copy, so a failed or
+    // an answered source is here for a read of one lane: the job carries a copy, so a failed or
     // superseded read leaves the lane as it was
-    let spawned = if source(state, i).status == Status::Answered {
+    let work = if source(state, i).status == Status::Answered {
         let Some((k, range)) = owed_read(state, i) else { mailbox.release(); return };
-        let (mut lane, mut tv) = (source(state, i).tails[k].clone(), source(state, i).tv);
+        let (lane, tv) = (source(state, i).tails[k].clone(), source(state, i).tv);
         plx_base::eventlog::log(&format!("search: q[{}ch] sid={i} reading {} depths {}..{}",
             q.chars().count(), KINDS[k].hubs()[0], range.start, range.end));
-        spawn_job(move || {
-            let read = catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut io = open_io(sid, &q, &favs);
-                lane.read(KINDS[k], &mut tv, range, &mut *io, sid)?;
-                Some((lane, tv))
-            }))
-            .unwrap_or(None);
-            land_tail(&worker_adapter, i, gen, k, read);
-        })
+        SearchWork::Tail { k, range, lane, tv }
     } else {
         plx_base::eventlog::log(&format!("search: q[{}ch] sid={i} asking limit={LIMIT}", q.chars().count()));
-        spawn_job(move || {
-            // the mailbox is filled OUTSIDE the guard so a panicking fetch still lands — as a FAILURE
-            // (None), not as an answer of "this server has nothing"
-            //
+        SearchWork::First
+    };
+    let Some(key) = keys.key(sid) else {
+        // No client for this slot: nothing can be asked. It lands as the FAILED fetch a read of the
+        // missing client was, through the same mailbox, so the status, the backoff and `Failed`
+        // behave as they did. The claim is held, so the pump's take of this mail releases it.
+        match work {
+            SearchWork::First => land(adapter, i, gen, None),
+            SearchWork::Tail { k, .. } => land_tail(adapter, i, gen, k, None),
+        }
+        return;
+    };
+    state.jobs.push(crate::stores::StoreJob::Search(
+        Job { addr: search_addr(gen), req: SearchReq { sid, key, q, favs, work } },
+        SearchPort::to(adapter, i),
+    ));
+}
+
+/// The request's IO body and its completion: read the server through `client` and post the answer
+/// to `port`. The answer is posted OUTSIDE the guard, so a fetch that panics lands as a FAILURE
+/// (`None`), not as an answer of "this server has nothing", and the take of it releases the claim.
+///
+/// WORKER THREAD.
+pub fn finish_search_job(port: &SearchPort, addr: Addr, client: &'static Client, req: SearchReq) {
+    let SearchReq { sid, q, favs, work, .. } = req;
+    finish_work(port, addr, &mut LiveIo { client, sid, q, favs }, sid, work);
+}
+
+/// [`finish_search_job`] over any [`tail::Io`]: what a data test with a fake server runs a job
+/// with, in place of a client.
+#[cfg(test)]
+fn finish_with_io(port: &SearchPort, addr: Addr, io: &mut dyn tail::Io, req: SearchReq) {
+    io.serving(req.sid);
+    finish_work(port, addr, io, req.sid, req.work);
+}
+
+fn finish_work(port: &SearchPort, addr: Addr, io: &mut dyn tail::Io, sid: ServerId, work: SearchWork) {
+    let out = match work {
+        SearchWork::First => {
             // sectionId 0 = every section, which `opt_int` sends by omitting it. The Search screen
             // is deliberately account-wide: `sectionId` only RANKS (measured — every other
             // section's rows still come back), so it could not scope this even if we wanted it to.
-            let what = catch_unwind(std::panic::AssertUnwindSafe(|| {
-                open_io(sid, &q, &favs).hubs(LIMIT as usize)
+            let what = catch_unwind(AssertUnwindSafe(|| io.hubs(LIMIT as usize))).unwrap_or(None);
+            Answer::First(what)
+        }
+        SearchWork::Tail { k, range, mut lane, mut tv } => {
+            let read = catch_unwind(AssertUnwindSafe(|| {
+                lane.read(KINDS[k], &mut tv, range, io, sid)?;
+                Some((lane, tv))
             }))
             .unwrap_or(None);
-            land(&worker_adapter, i, gen, what);
-        })
+            Answer::Tail { kind: k, read }
+        }
     };
-    if !spawned {
-        // nothing will ever fill the mailbox, and the claim is cleared only by a take — release it
-        // here or this source never searches again. `maybe_spawn` runs every frame, so this retries
-        // by itself.
-        mailbox.release();
-    }
+    port.done(addr, SearchAnswer(out));
 }
 
-/// Run a worker job on a small thread. A test with a fake server runs it right here instead, so a
-/// pump is deterministic.
-fn spawn_job(job: impl FnOnce() + Send + 'static) -> bool {
-    #[cfg(test)]
-    if TEST_IO.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-        job();
-        return true;
-    }
-    plx_base::task::spawn_small("search", job)
-}
-
-/// WORKER THREAD: what a worker asks a server with.
-fn open_io(sid: ServerId, q: &str, favs: &[(ServerId, i64, bool)]) -> Box<dyn tail::Io> {
-    #[cfg(test)]
-    if let Some(io) = TEST_IO.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        io.lock().unwrap_or_else(|e| e.into_inner()).serving(sid);
-        return Box::new(SharedIo(io));
-    }
-    Box::new(LiveIo { sid, q: q.to_string(), favs: favs.to_vec() })
-}
-
-#[cfg(test)]
-struct SharedIo(Arc<Mutex<dyn tail::Io + Send>>);
-
-#[cfg(test)]
-impl tail::Io for SharedIo {
-    fn listing(&mut self, kind: plx_plex::plex::SearchKind, req: plx_plex::plex::PageReq)
-        -> Option<plx_plex::plex::MediaContainer> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).listing(kind, req)
-    }
-    fn hubs(&mut self, limit: usize) -> Option<Projection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).hubs(limit)
-    }
-    fn serving(&mut self, sid: ServerId) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).serving(sid);
-    }
-}
-
-/// One server, resolved through `client_for` at the moment of the request.
+/// One server, through the client the runner resolved for the launch.
 struct LiveIo {
+    client: &'static Client,
     sid: ServerId,
     q: String,
     favs: Vec<(ServerId, i64, bool)>,
@@ -1574,10 +1802,10 @@ struct LiveIo {
 impl tail::Io for LiveIo {
     fn listing(&mut self, kind: plx_plex::plex::SearchKind, req: plx_plex::plex::PageReq)
         -> Option<plx_plex::plex::MediaContainer> {
-        plx_plex::plex::client_for(self.sid)?.search_typed(&self.q, kind, req)
+        self.client.search_typed(&self.q, kind, req)
     }
     fn hubs(&mut self, limit: usize) -> Option<Projection> {
-        let mc = plx_plex::plex::client_for(self.sid)?.search(&self.q, limit as i64, 0)?;
+        let mc = self.client.search(&self.q, limit as i64, 0)?;
         Some(project(&mc, self.sid, &self.favs))
     }
 }
@@ -1606,7 +1834,7 @@ fn land_read(state: &mut SearchState, i: usize, t: TailMail) -> bool {
     let Some(range) = waited_on else {
         // a source the window was committed without, reading the window on screen
         if !source(state, i).skipped[k] { return false }
-        let (depths, _) = window_of(&live_sources(state, &slots()), k, state.wins[k].lo);
+        let (depths, _) = window_of(&live_sources(state, &slots(state)), k, state.wins[k].lo);
         if source(state, i).tails[k].needs(&depths) {
             if !progressed { source_mut(state, i).retry_cd = RETRY_FRAMES; }
             return false;
@@ -1664,9 +1892,9 @@ fn prune_pending(state: &mut SearchState, live: &[usize]) -> bool {
 /// Move kind `k`'s window to start at `lo`: every lane lets go of the depths outside it, and
 /// [`rebuild`] (the caller's) draws the new cards.
 fn commit_window(state: &mut SearchState, k: usize, lo: usize) {
-    let live = slots();
+    let live = slots(state);
     let (depths, _) = window_of(&live_sources(state, &live), k, lo);
-    for i in live {
+    for i in live.iter().copied() {
         let s = source_mut(state, i);
         s.tails[k].trim(depths.clone());
         // whoever still lacks a depth of the new window was left out of it: owed, and asked outside
@@ -1700,7 +1928,7 @@ fn page(state: &mut SearchState, kind: Kind, before: bool, seen: (usize, usize))
         if !before { return false }
         state.wins[k].pending = None;
     }
-    let live = slots();
+    let live = slots(state);
     let sources = live_sources(state, &live);
     let lo = state.wins[k].lo;
     let (depths, answered) = window_of(&sources, k, lo);
@@ -1862,9 +2090,30 @@ fn tag_hit(t: &plx_plex::plex::Tag, sid: ServerId, favs: &[(ServerId, i64, bool)
 
 /// Drop everything — the account changed, so both the query and the results belong to someone
 /// else. Called beside the Browse `BrowseCmd::Reset` command.
+fn observe_inputs(state: &mut SearchState, adapter: &Arc<SearchAdapter>, input: &SearchInput<'_>) -> bool {
+    let profile_changed = state.profile_key.as_ref().is_some_and(|key|
+        state.profile_generation != input.recents.profile_generation || key != input.recents.profile_key
+            || state.profile_tenure != input.recents.tenure);
+    if state.profile_key.as_deref() != Some(input.recents.profile_key) {
+        state.profile_key = Some(input.recents.profile_key.to_owned());
+    }
+    state.profile_generation = input.recents.profile_generation;
+    state.profile_tenure = input.recents.tenure;
+    let roster_changed = state.visible != input.keys.roster_gen()
+        || !state.clients.slots().eq(input.keys.slots()) || !state.clients.iter().eq(input.keys.iter());
+    if !state.clients.slots().eq(input.keys.slots()) {
+        state.live = Arc::new(input.keys.slots().map(|sid| sid.raw() as usize).collect());
+    }
+    state.visible = input.keys.roster_gen();
+    if state.clients != *input.keys { state.clients.clone_from(input.keys); }
+    if profile_changed { reset(state, adapter); }
+    else if roster_changed { supersede(state, adapter); state.shelves = None; }
+    roster_changed || profile_changed
+}
+
 fn reset(state: &mut SearchState, adapter: &Arc<SearchAdapter>) {
     supersede(state, adapter);
-    state.visible = plx_plex::plex::server_roster_gen();
+    state.visible = state.clients.roster_gen();
     state.query = None;
     state.shelves = None;
     state.state = State::Idle;
@@ -1872,13 +2121,30 @@ fn reset(state: &mut SearchState, adapter: &Arc<SearchAdapter>) {
     state.armed = false;
 }
 
+/// Emit the recents write an edit owes: a [`StoreJob::SaveRecents`](crate::stores::StoreJob::SaveRecents)
+/// on the outbox, which the owner takes and runs in the same turn. A write the runner REFUSED since
+/// the last edit is owed too, whatever this edit did: its queue is still waiting, and an edit is the
+/// only moment the store gets to ask again. Addressed by a sequence of its own, since a recents
+/// write belongs to no query.
+fn owe_recents_save(state: &mut SearchState, adapter: &Arc<SearchAdapter>, owed: bool) {
+    let retried = adapter.take_recents_refused();
+    if !(owed || retried) { return; }
+    state.recents_seq = state.recents_seq.wrapping_add(1);
+    state.jobs.push(crate::stores::StoreJob::SaveRecents(
+        Job { addr: search_addr(state.recents_seq), req: recents::SaveRecentsReq },
+        recents::SaveRecentsPort::to(adapter),
+    ));
+}
+
 fn run_with_optional_directory(
     state: &mut SearchState,
     adapter: &Arc<SearchAdapter>,
     cmd: crate::stores::search::SearchCmd,
     directory: Option<crate::stores::browse::DirectoryView<'_>>,
+    input: &SearchInput<'_>,
 ) -> bool {
     use crate::stores::search::SearchCmd;
+    observe_inputs(state, adapter, input);
     match cmd {
         SearchCmd::SetQuery(q) => {
             match directory {
@@ -1888,7 +2154,7 @@ fn run_with_optional_directory(
             true
         }
         SearchCmd::SetQueryScoped { profile_generation, query } => {
-            if profile_generation != plx_plex::plex::session::current_gen() { return false; }
+            if profile_generation != input.recents.profile_generation { return false; }
             match directory {
                 Some(directory) => set_query_from_directory(state, adapter, &query, directory),
                 None => set_query(state, adapter, &query),
@@ -1896,10 +2162,14 @@ fn run_with_optional_directory(
             true
         }
         SearchCmd::RememberRecent { profile_generation, term } => {
-            crate::search::recents::remember(profile_generation, &term)
+            let edit = crate::search::recents::remember_with_input(&input.recents, profile_generation, &term);
+            owe_recents_save(state, adapter, edit.save);
+            edit.changed
         }
         SearchCmd::ClearRecents { profile_generation } => {
-            crate::search::recents::clear(profile_generation)
+            let edit = crate::search::recents::clear_with_input(&input.recents, profile_generation);
+            owe_recents_save(state, adapter, edit.save);
+            edit.changed
         }
         SearchCmd::Reset => {
             reset(state, adapter);
@@ -1986,3 +2256,11 @@ mod paging_tests;
 #[cfg(test)]
 #[path = "search_dump_tests.rs"]
 mod dump_tests;
+
+#[cfg(test)]
+#[path = "search_job_tests.rs"]
+mod job_tests;
+
+#[cfg(test)]
+#[path = "search/captured_inputs_tests.rs"]
+mod captured_inputs_tests;

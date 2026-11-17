@@ -42,6 +42,7 @@
   "browse.detail.mark_show_unwatched": "Marquer la série comme non vue",
   "browse.detail.play_start": "Lire depuis le début",
   "browse.detail.trailer": "Bande-annonce",
+  "browse.detail.play_version": "Lire une version",
   "browse.detail.resume": "Reprendre",
   "browse.detail.play": "Lire",
   "browse.detail.created_by": "Créé par",
@@ -76,6 +77,8 @@
   "browse.menu.go_season": "Aller à la saison",
   "browse.menu.go_movie": "Aller au film",
   "browse.menu.remove_deck": "Retirer de la liste",
+  "browse.menu.play_version": "Lire une version…",
+  "browse.menu.play_version_title": "Lire une version",
   "browse.login.deleted": "Données locales supprimées",
   "browse.login.deleted_detail": "Les identifiants, préférences, données de télémétrie et diagnostics locaux ont été supprimés.",
   "browse.login.partial": "Déconnecté ; la plupart des données locales supprimées",
@@ -278,5 +281,8 @@
   "browse.clock.notice_year": "L’horloge de la TV semble incorrecte ({year}). Connecté grâce à la clé mémorisée.",
   "browse.clock.notice": "L’horloge de la TV semble incorrecte. Connecté grâce à la clé mémorisée.",
   "browse.clock.no_key": "L’horloge de cette TV semble incorrecte. Connectez la TV à internet une fois, puis réessayez.",
-  "browse.clock.key_changed": "La clé de votre serveur a changé. Connectez la TV à internet une fois pour que l’application puisse la vérifier de nouveau."
+  "browse.clock.key_changed": "La clé de votre serveur a changé. Connectez la TV à internet une fois pour que l’application puisse la vérifier de nouveau.",
+  "browse.detail.mark_episode_watched": "Marquer l’épisode comme vu",
+  "browse.detail.mark_episode_unwatched": "Marquer l’épisode comme non vu",
+  "browse.detail.minutes_left": "{minutes} min restantes"
 }

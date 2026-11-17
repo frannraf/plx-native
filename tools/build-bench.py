@@ -59,7 +59,7 @@ Scenarios (each a named row; `--only ID,ID` selects, `--quick` is `noop,leaf,siz
   leaf-inc  `leaf` with CARGO_INCREMENTAL=1 in rust-modules/target-fast (the `make test-fast` tree).
   hub-inc   `hub`, incremental. The two -inc rows are skipped with a note when target-fast is
             absent, unless `--cold` (which builds it, untimed, first).
-  tests     the default-feature unit suite (`cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens`, run through
+  tests     the default-feature unit suite (`cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens`, run through
             tools/cargo-test-parallel.py exactly as the Makefile's recipes do) on a warm tree;
             the `test result:` counts of every crate are summed.
   arm       the ARM staticlib line (`cargo rustc ... --crate-type staticlib`) after touching lib.rs,
@@ -161,7 +161,7 @@ SCREENS_PACKAGE = "plx_screens"
 # The cargo subcommand skeletons the Makefile's recipes use. Everything else (toolchain, dirs,
 # feature flags, RUSTFLAGS) comes from `make -s print-bench-config`. ci/test_build_bench.py compares
 # these to the recipes in the Makefile.
-HOST_TEST_ARGS = ("test", "--lib", "-p", "plxnative-modules", "-p", "plx_base", "-p", "plx_machine", "-p", "plx_platform", "-p", "plx_gfx", "-p", "plx_net", "-p", "plx_ui", "-p", "plx_plex", "-p", "plx_telemetry", "-p", "plx_data", "-p", "plx_session", "-p", "plx_media", "-p", "plx_appkit", "-p", "plx_screens")
+HOST_TEST_ARGS = ("test", "--lib", "-p", "plxnative-modules", "-p", "plx_base", "-p", "plx_machine", "-p", "plx_platform", "-p", "plx_gfx", "-p", "plx_net", "-p", "plx_ui", "-p", "plx_plex", "-p", "plx_telemetry", "-p", "plx_data", "-p", "plx_session", "-p", "plx_media", "-p", "plx_playback_contract", "-p", "plx_play_uri", "-p", "plx_play_feed", "-p", "plx_media_codecs", "-p", "plx_appkit", "-p", "plx_screens")
 HOST_TEST_BUILD_ARGS = HOST_TEST_ARGS + ("--no-run", "--message-format=json")
 ARM_ARGS_HEAD = ("rustc",)  # then the Makefile's ARM_PROFILE_FLAG (`--release` / `--profile tvdev`)
 ARM_ARGS_TARGET = ("--target",)  # then the target triple
@@ -603,12 +603,16 @@ class Bench:
         elif sid == "tests":
             self.ensure_warm(False)
             secs, proc = self.cargo.run_unit_suite()
-            result = parse_test_result(proc.stdout + proc.stderr)
+            output = proc.stdout + proc.stderr
+            result = parse_test_result(output)
             if result is None:
                 raise BenchError(f"unit suite: no `test result:` line (cargo exited "
                                  f"{proc.returncode}): {proc.stderr.strip()[-400:]}")
-            output = proc.stdout + proc.stderr
-            names = failed_tests(output) if result["failed"] or result["status"] != "ok" else []
+            tests_failed = result["failed"] or result["status"] != "ok"
+            if proc.returncode and not tests_failed:
+                raise BenchError(f"unit suite: test runner exited {proc.returncode} despite passing test summaries:\n"
+                                 f"{output.strip()[-600:]}")
+            names = failed_tests(output) if tests_failed else []
             if names:
                 log(f"unit suite: {len(names)} test(s) FAILED: " + ", ".join(names[:FAILURE_NAMES_SHOWN]))
             sample.update(seconds=secs, failed_tests=names[:FAILURE_NAMES_SHOWN], **result)

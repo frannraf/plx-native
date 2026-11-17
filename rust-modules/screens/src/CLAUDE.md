@@ -10,6 +10,13 @@ policy. Read that one first — its four rules bind here too.
 they are the authority on the module list and the application bundle. This guide holds only what
 they do not: the rules that span screens.
 
+## Sans-IO
+
+A screen is a machine: it starts no worker, reads no process-global registry and carries no
+`cfg(test)` fork. It asks for work by pushing an `AppFx` and reads what the stores publish.
+
+@../../../docs/sans-io-guide.md
+
 ## The layer rule is the thing that will bite you
 
 A screen may name `ui/`, `appkit/` (the widgets several screens share — `player_hud`,
@@ -200,28 +207,108 @@ Captures are the check — see the `ui-sim` and `which-tier` skills, and `../../
 ## Under posters settings page (library redesign)
 
 `SettingsPage::UnderPosters` (ScreenId 113, `settings_under_posters.rs`) is pushed from Settings >
-Libraries, which now has two rows (Favorite libraries, Under posters). The page has three rows (Title switch, Details › with the current line on the right, Reset to default) and a framed preview (a still row of three posters from the library the Library last showed, `cards::SampleRow`, the middle one lifted and captioned, a blank face carrying no word); Details pushes `SettingsPage::UnderPostersDetails` (ScreenId 114, `DetailsPage` in the same file), the picker of the one details line (Nothing first, a sample on each row), which pops on a durable write. `settings::caption_policy_of`
+Libraries, which now has two rows (Favorite libraries, Under posters). The page has five rows (Title, Movie details ›, TV show details ›, Sort value, Reset), with Reset disabled when all values are at their defaults. Each details row carries its ticked parts on the right (their names joined with " · " in the line's fixed order, "Nothing", or a count such as "4 details" once the joined names pass `NAMES_BUDGET_CHARS`). The page draws the shared picture slot (`RootPicture`, also drawn on the Settings root and on both pickers): one movie poster on the left and one show poster on the right (250 x 375 tiles, 410 apart), each demonstrating the stored selections and each the first poster of its kind (with a poster path) in the WIDEST cache the Browse store holds (`DirectoryView::kind_poster`: the current library's listing and shelves, then every other library's retained rows and shelves), so a last-opened Movies library still shows a real show (a kind the cache has none of is asked for as its library's hubs by `PosterAsk`, from this page and from the Settings root while its Under posters row has focus, until the poster is there or `DirectoryView::kind_shelves_published`); a kind with no art anywhere draws `widgets::absent_card` (the never-sentinel absence ground, uncounted), never `Art::Poster(None)`, which is a skeleton the frame-dump harness refuses; each tile wears its KIND over it ("MOVIE", "TV SHOW": the catalog's `browse.kind.movie` / `browse.kind.tv_show` drawn by `plx_ui::table::draw_caps_label_aligned`, the section header's caps, centred over the tile in `TEXT_READING`), a bold title line above the details line when Title is On, and details in the 380 px preview column, wrapping to two lines if needed. The picker and the picture both use an example for a selected fact the poster lacks. A focused library poster still uses the focused-title marquee (`card_row.rs`); **the column of the kind that is not being chosen is dimmed to the design's `dim`** (`plx_ui::follow_copy::DIM`, 0.45, from `Sv2s-P2-Details`: on the page the kind of the OTHER details row, in a picker the other kind, both at 1 on the root and on Title / Sort value / Reset), caption, tile and lines together as one group on the shared appear spring (`ColumnDims`); it is not the disabled control state. No frame, no clipping and no caption such as "Sorted by Year" or "The library you last opened" (those locale keys were deleted). Each details row pushes `SettingsPage::UnderPostersDetails(PosterKind)` (ScreenId 114, `DetailsPage` in the same file, shared by both kinds), the picker of that kind's details parts: one section, "Show under posters", with a row per part (a movie: Year, Length, Genre, Video quality, Age rating, Score; a show: Year, Seasons, Genre, Age rating, Score), a check mark on the ticked ones and a sample of the part on the right. OK ticks or unticks the row and STAYS on the page (the write goes through `PreferenceCmd::Choose`); at most four are ticked (`DetailParts::MAX`) and with four ticked the unticked rows are DISABLED through the shared `FormSection::disabled` (focusable, inert to OK), their sentence beside the table saying why. The parts are `plx_base::detail_parts::{DetailPart, DetailParts}` (fixed line order, kept to what a kind offers by `for_movies` / `for_shows`); the stored setting keeps the retired single-choice ladder only as the migration source and as the downgrade key (`UnderPostersLadder`). The caption band stays shut only when Title is Off and BOTH part sets are empty (`CaptionPolicy::show_details` is the show's own set). `settings::caption_policy_of`
 maps the stored `UnderPosters` to the ui `CaptionPolicy`. **EVERY poster tile reads that one policy through
-`registry::captions`** (`policy()` with the one `TEST_UNDER_POSTERS` test override, `label()` the one builder of a focused
+`registry::captions`** (`policy_for(&ScreenInputs)` from the host's effective frame capture; `TEST_UNDER_POSTERS` is a fixture input only, `label()` the one builder of a focused
 poster's `[title, details]`, `shelf_label()` for Home's and Recommended's shelves): the Library grid, the Collections page, the Watchlist,
 Home's shelves, Recommended's poster shelves, **Search's poster rows** (Movies, Shows, Collections; a result from a server that is not the
 household's own is credited after its details line, `CaptionFacts::source`), **the person page's filmography**, **Detail's Related and
-collection shelves** and **the Collection screen's members** (an episode member's poster already prints its "S3 · E4" mark, so its caption names the show instead: `CaptionFacts::address_on_art`). A grid page hands its grid the policy through `StackPage::caption_policy`
+collection shelves** and **the Collection screen's members** (an episode member's poster already prints its "S3 · E4" mark, so its caption names the show instead: `CaptionFacts::address_on_art`). The Library's movie, TV show, season and episode grids are the exception while they show their sort value (Sort value On, sorted by something that has a value for that kind of row): it draws the one value line described below instead. A grid page otherwise hands its grid the policy through `StackPage::caption_policy`
 (Stack hands it to a `Body::Shelf` as well as a `Body::Grid`); Detail owns its shelves and sets the policy on Related and the
 collection each step. **Landscape tiles and headshots are not posters and do not read it**: the Library's Episodes listing, Search's Episode stills and Person
-headshots, Detail's Extras and Cast, and Recommended's landscape rows keep the legacy block under every setting (the Episodes listing's grid is handed
-`None` for its policy, so its band is the legacy 114 px one the two-line label needs; every landscape block is made by `captions::still_block`: `still_label` words an episode's, Extras hand theirs in). A shelf is
+headshots, Detail's Extras and Cast, and Recommended's landscape EPISODE rows (not its Continue Watching deck, below) keep the legacy block under every setting (the Episodes listing's grid is handed
+`None` for its policy, so its band is the legacy 114 px one the two-line label needs; the one thing that replaces that block is the Episodes view's
+sort value line while it shows one, below; every landscape block is made by `captions::still_block`: `still_label` words an episode's, Extras hand theirs in). A shelf is
 handed the policy (`Shelf::set_caption_policy`) and reserves,
-opens and reveals its band from `caption_policy::band_h`; a tile that carries a state keeps it (the Continue Watching deck's
-time left is its details line, a filmography poster's character is its details line, the amber play mark leads the first line drawn while OK plays, a Watchlist title's release date or
-"Server offline"), and with Title Off and Details set to Nothing no band opens (a state line is dropped with the details line), **except the Continue Watching deck** (the owner's 2026-10-22 call): its progress line is the tile's state and is always shown, Nothing included, so the deck shelf is handed `captions::deck_policy(policy)` (Home's and Recommended's alike; `shelf_label` words its tiles by the same value) and keeps a one-line band (two with the Title On), per shelf so it never changes as focus walks the row.
+opens and reveals its band from `caption_policy::band_h`; a tile that carries a state keeps it (a Recommended poster deck's
+time left is its details line, a filmography poster's character is its details line, a Watchlist title's release date or
+"Server offline"), and with Title Off and both details lines (movie and show) set to Nothing no band opens (a shelf that mixes kinds, Home's, Search's, Watchlist's, holds the room for either kind's line; a Library grid lists ONE kind, so `Library::grid_policy` narrows the policy to that kind's own line with `CaptionPolicy::only` before `band_h`: a Movies grid with Movie details Nothing opens no band whatever the show line says) (a state line is dropped with the details line, a started movie's time left and a collection's size included), **except the Watchlist's own status words** ("Coming 12 Mar", "Not on your servers", "Server offline": `captions::label_with_states` shows them with no part ticked and `captions::status_policy` opens the band for them) **and Recommended's Continue Watching poster deck** (the owner's 2026-10-22 call): its progress line is the tile's state and is always shown, Nothing included, so that shelf is handed `captions::deck_policy(policy)` (`shelf_label` words its tiles by the same value) and keeps a one-line band (two with the Title On), per shelf so it never changes as focus walks the row. **The landscape Continue Watching deck is not that, on Home and on Recommended alike** (one object, one look: `RowStyle::STILL`, `Row::still_deck` / `hub_style` / `shelf_pitch` on Recommended): it is landscape stills handed `captions::NOTHING_UNDER_STILLS` (no band under them, `shelf_label` returns no label for them), and the tile's status (`S2 E4 · 38m left`) and bar are drawn BELOW the still as its one footer line (`ui::still_footer`). **Both landscape Continue Watching decks (Home's, Recommended's) draw their footer with `tile_facts::deck_overlay` (the cue from `deck_press()`) and draw SHOW art, never the episode's still**: a card opts in with `tile_facts::for_deck(item, &DeckKeys)` (`DeckKeys` = the cover and composite store keys, built once per row with the row: Home's `HubProjection::deck`, Recommended's `Basis::deck`; a library grid or any other shelf never builds them), so `ui::card_art::pick` walks Plex's cover, our composite, then the show's background in type, then the still, then the poster, and the footer carries the `S2 E4` tag and the status only: the title is drawn ONCE, in the art (in type at the logo slot when neither cover nor composite exists, by `still_overlay`). The detail page's episode strip does not opt in and keeps the still.
 **One rule for every kind of tile: a line the setting turns on is never drawn empty** (`caption_policy::caption_lines`): the title line is the name a reader
 knows the tile by (`tile_facts::caption_facts`: a season by its SHOW, an episode by its own title, a show or movie by its title), and a
-details kind the tile has no facts for (a season has no length, often no genre or rating) says the tile's identity instead: a season "Season 6" (its own title,
+tile that has none of the ticked parts' facts (a season has no length, often no genre or rating) says the tile's identity instead: a season "Season 6" (its own title,
 else "Season N", else "Specials" for the season numbered 0), an episode "S1 · E8" (the app's ONE address spelling, `fmt::episode_address`), a show or movie its year, a collection its size, and for an episode, movie, show or collection
 with not even that the KIND word ("Episode", "Movie", "Show", "Collection") as the last fallback, so no band opens over nothing and no per-tile band is needed (a per-tile band
 would move the rows below it as focus walks a row). Home's season tiles ("Recently Added TV") and the Library grid's seasons read it the same way; the
 Library grid's episodes keep their own wording (title and release date). **A collection follows one rule on every surface**: its details line is its
-size under every details kind but Nothing, the Title switch governs its title line, and a name its face cuts (`registry::tile_facts::face_cuts_name`) rides the details line
+size under every set of parts but the empty one, the Title switch governs its title line, and a name its face cuts (`registry::tile_facts::face_cuts_name`) rides the details line
 ("Name · 7 films") when the title line is off; the Collections page has no caption transform of its own. The Library page is the full grid under one
-header row (`library/header.rs`); the hub shelves live on the Recommended page (`library/recommended.rs`), which the header's Recommended control pushes.
+header row (`library/header.rs`); the hub shelves live on the Recommended page (`library/recommended.rs`), which the header's Recommended control pushes. The header's right cluster is the board's: Collections › and Recommended › are places (a chevron), a divider (no stop) separates them from the sort control, which is the sort icon, the chosen criterion and a down chevron; "Sort & Filter" is the control's name, the identity the row's swap matches it by, drawn nowhere: not on the control and not as a heading (the menu's own headings are Show, Sort and Filter; library navigation and management live in the separate ellipsis menu; "Sort & Filter" itself is never one). The criterion has no reserved slot (the control ends at the row's right edge and the places slide as its width changes while the control keeps its right edge and its chevron, the old criterion fading out at its own place and the new one in at its own; only the library names' budget is sized from the widest criterion), and the Collections page's Sort and the Watchlist's control are the same `HeaderItem::sort_control` (`plx_ui::page_header`; the Watchlist's criterion is its sort alone, a Type or Show filter shows as its "N of M" read-out, and its row begins the same `HeaderSwap` from `SharedRow::get_replacing`). Once the page is scrolled the shared capsule carries the sort too ("Films 1,284 · Date viewed": `LibraryScreen::sort_value`, the string the control shows, queued edit included, handed to `scroll_chrome::capsule_parts` as its criterion; library and criterion in the primary ink, the count and the dot at 50% white (`theme::COUNT_FILTERED_INK`), the capsule as wide as its pieces).
+
+The **Sort value** switch is also in `UnderPosters` (`sort_value`, saved per profile, On by default and
+stored as its Off state, so everyone starts On). While it is On and a movie or TV show library's movies, shows, seasons or episodes (never its Collections) are
+sorted by something that has a value FOR THAT KIND OF ROW (`registry::sort_info::shows_value(kind, key)`: not Title, Random,
+the compound Show order Seasons and Episodes default to, or a sort the table does not word for the kind), every card shows
+the value it is sorted by on ONE line under it
+(`registry::sort_info::label`, drawn by `plx_ui::card_row::draw_sort_value`) and no title or details
+line: CAPTION 24 regular at 80% white centred on the card's axis at rest (a poster's or an episode still's), bold white under the lifted
+card when focused (a two-texture crossfade on the lift's own pop factor, so it snaps when the lift
+does), rows 60 px apart (40 otherwise) with the focused row opening 26 px. The Library reads the
+switch and the sort in `sync` (`LibraryScreen::values`, from `shows_sort_values(kind, listed, ..)`: the section kind and the
+listing map to the row kind the listing holds, `value_row_kind`) and gives the layout and the grid the same
+answer (`Layout::with_value_line`, `Grid::set_value_line`); with the switch Off, or a Title/Random
+sort, the grid draws as it did before (an Episodes view keeps its legacy two-line caption and 114 px band). The Title switch does not change a value's band: the
+value replaces the title and the details line, and the focused row opens 26 px whatever the Title switch says. Other poster surfaces keep the Title/Details policy
+above. The values are Plex's own facts from the listing (no request is added): ratings as a
+percentage beside the provider's mark (the shared `captions::rating_mark`, hung left of the number so
+the number stays on the axis), `2h 14m`, `4K` with `+1` for a second version, `62.0 Mbps`, plays with their noun ("14 plays", "1 play": the
+catalogue's plural message), the content rating, the year, for a show the episodes left to play ("9 episodes", the
+catalogue's `browse.detail.episodes`; a show with none left draws NO line, while its slot keeps the 60 px pitch; a season is worded for the same count, its dates added and viewed and its plays), and dates as Today, Yesterday, `27 Oct` this year or `Oct 2024` otherwise,
+in the interface language's month names (an English TV numeric-format locale does not override
+Russian month names). Every space in a value is a no-break space; an empty value says what it means at 50% white and never bold:
+"Never" under Date viewed and Plays for something nobody played, the en dash only for data the server did not send
+(a show's Last episode added, `episode.addedAt`, is such a gap: the listing carries no date of its latest episode, so that sort is not worded and
+the grid keeps its captions). **A sort the listing carries no fact for, for that kind of row, is not worded and shows NO line at all** (its rows stay 40 px
+apart, its captions stay): never a column of dashes. The dash is for the one item of a worded sort whose fact the server did not send. An
+episode is worded for every term a movie is, from its own row (its air date, never the show's; the two scores; length; plays; dates; media), a season for
+Date added, Date viewed, Plays and Unplayed, a collection for none. A real PMS lists for Episodes the Show order, Release date, Critic and Audience rating,
+Date added, Date viewed and Random (all but the Show order and Random read), and for Seasons the Show order and Random alone (`docs/pms-api.md`, "Sort[]"). The
+episode view's cards are 4 columns wide, wider than a poster, so no value gains a truncation risk there; the fit test runs both widths in every shipped language. A line that does not fit drops its `+1`, then its mark, and is never cut. **Today is an
+input, not a read:** a screen reads no clock and fetches no date; the application's loop publishes the
+calendar date once per frame (`Bridge::publish_today`, read from the platform at most once a minute through
+`app::clock::today`, the loop its one caller) and `LibraryLike::today` hands it in from the frame's views,
+and `CaptionCache` keys its labels on it so "Today" rebuilds at midnight. The Under posters page's picture
+illustrates the mode as a library sorted by Year while the Sort value row has focus: each sample's own year
+(through `registry::sort_info::year_value`, the Year sort's own wording) replaces its caption lines (`RootPicture::sorted`; the details pickers never preview it). The picture never adds sort choices.
+
+## The Library's rail: letters for a title sort, bands for a value sort
+
+`library/rail.rs` (`RailPart`) is ONE rail with one logic: an element is a place in the listing (`starts`, the index
+of its first item), an element no item starts is dimmed and skipped by focus, moving focus inside the rail scrolls the
+grid to the element's first card at once (`LibraryScreen::follow`, no OK), the grid has no focus while the rail has it,
+and Left returns to the grid. A title sort (ascending) has the A-Z letters (`ListingView::rail_available`); a sort with
+a value ladder has its BANDS (`ListingView::bands_available`: rating `95% 90% 85% 80% 75% <75%`, duration `3h+ 2½h 2h
+1½h 1h <1h`, unplayed `12+ 10 8 6 4 2 1`, plays `10+ 5 3 2 1`, and the CALENDAR sorts: date added, date viewed and
+last episode added (newest first only) read `Today Oct Sep ... Jan 2025 2024 ...`, release date reads `2026 2020s
+2010s ...`), never both. A calendar rail needs the day, which the Library's ask hands the data layer
+(`LibraryLike::today`), and its bands follow it: a day turn re-plans them, and the previous day's bands stay on screen
+until the new day's are read (`SecState::shown_bands`), so a focus seated in the rail is not lost to a gap; a key the new
+plan no longer holds is seated on the first band with films (`RailPart::reconcile`), never on an empty one. What differs:
+
+- **Labels** are `library/rail_bands.rs`, built from the data layer's `Mark` tokens with `fmt::percent`, the locale's
+  numbers and the catalog's `library_rail.hours` and `library_rail.hours_or_more` (the language's own short hour unit,
+  spaced as `core.duration_hours` spaces it, `½` for a half hour). `<` is written by the code, and so is the `+` of the
+  count ladders (`12+`, `10+`); the Duration ladder's `3h+` is `library_rail.hours_or_more`, a catalog string, so a
+  language can put the `+` after its own unit. A calendar band is `library_rail.today` (the word under a poster, or
+  its abbreviation where that is too wide for the column: French `Auj.`), a month is `LocaleContext::month_short`
+  (the stand-alone abbreviation), a year is its plain digits (never the grouped `locale.number`) and a decade is
+  `library_rail.decade` over the digits of its first year and the last two of its last (`{decade}` and `{end}`; the
+  English entry lists `end` under `"optional"`, so a language reads the ones it needs): `2020s`, `2020er`, `años 2020`,
+  `lata 2020.`, `2020-е`, and `2020–29` for a language whose phrase does not fit (French `années 2020` is 137 px;
+  Hungarian's suffix alternates by vowel harmony, `2020-as` but `2010-es`). The widest label the column holds is
+  the track limit less the least pill air each side (116 px at `MICRO`), so a new language's Today and decade
+  strings are checked against it by `rail_bands`' fit test, which loops every family of every shipped language
+  through the real measure. Focus identity is the token, not the text.
+- **Geometry** is `layout::BandRows`: centre x 1834 (the letters keep 1844), rows 40 px apart (the letters' pitch is
+  `layout::rail_pitch`: 32 at most, squeezed toward 26 for a long alphabet), the first
+  at the grid's top (244), `BAND_STEP_GAP` extra before the rows a scale change names (`rail_bands::steps`, from the
+  marks: between a month and a year, a year and a decade, in either direction of the sort; `Today` is on no scale, so
+  `Today 2025` on the first of January has none), the
+  track as wide as the widest label plus the pill's 12 px each side (never under the letters' 44, never into the
+  posters: a label wider than the limit allows 12 each side gives air back, `layout::band_pill_pad`, down to 4).
+  A calendar rail can hold some 35 rows (twelve months and every year back), more than the column's
+  window: it scrolls in whole rows, the driving band one row clear of both fades, like a long alphabet. The grid
+  does not move for it.
+- **Ink**: a band that holds items is `TEXT_SECONDARY`, an empty one the same at 25%, the CURRENT band (the one the
+  grid's card is in, none when the card is among the items the sort leaves without a value, which lie before the first
+  band or after the last) `TEXT_PRIMARY`, and the focused band wears the white focus pill (38 high, built with
+  `widgets::focus_pill`, filled as the letters' disc is). There is no position bar or marker.

@@ -45,11 +45,27 @@ pub(super) const TEXT_TOP: f32 = plx_ui::page_header::TOP + plx_ui::page_header:
 const TEXT_AIR: f32 = 28.0;
 /// The line the text must end above: the first heading's rest, less the air.
 const ROOM_BOTTOM: f32 = TEXT_TOP + HERO_H - TEXT_AIR;
-/// Every logo draws this tall: the heroes' floor (`theme::logo::HERO_H_MIN`), as the ceiling too.
+/// The left hero wedge (upstream's `widgets::hero_scrim` before #1310 replaced it), with its knee
+/// LIFTED to `knee`: the copy on this page starts on the grid's content line, above where the
+/// billboards anchored theirs. Width, top and alpha are the old wedge's.
+fn hero_scrim_lifted(p: Painter, strength: f32, knee: f32) {
+    const W: f32 = 0.80 * SCR_W;
+    const FEATHER: f32 = (0.39 - 0.15) * SCR_H;
+    if strength <= 0.0 {
+        return;
+    }
+    let a = |x: f32| theme::SCRIM_TEXT_A * (1.0 - (x.max(0.0) / W).min(1.0)) * strength.clamp(0.0, plx_ui::landing_hero::PREVIEW_FIELD);
+    let (none, edge) = (theme::scrim(a(W)), theme::scrim(a(0.0)));
+    p.grad4(Rect::new(0.0, knee - FEATHER, W, FEATHER), [none, none, none, edge]);
+    p.grad4(Rect::new(0.0, knee, W, SCR_H - knee), [edge, none, none, edge]);
+}
+
+/// Every logo draws this tall: the heroes' old floor (`theme::logo::HERO_H_MIN` was 120 before
+/// upstream moved the heroes to an area rule), as the ceiling too.
 /// A hero-rung logo grows past its band UPWARD as paint, up to `HERO_H_MAX` on Home, whose band
 /// stands low under open sky; here the crumb row is right above the block, so the band is the
 /// drawn height, anchored at its top, and nothing overflows.
-const LOGO_H: f32 = theme::logo::HERO_H_MIN;
+const LOGO_H: f32 = 120.0;
 /// The text title's rung: the one-line headline a step under the billboards' (`size::DISPLAY`;
 /// the official app's hero title is about this size, and a 72 px line elides a long title to a
 /// few words). Its band is one em, its baseline on the band's bottom.
@@ -69,7 +85,8 @@ const REPEAT_GRACE_MS: u32 = 300;
 /// The hero's logo rung: the heroes' area and floor, the height fixed at [`LOGO_H`], the text
 /// fallback at [`TITLE_TEXT_SZ`].
 fn logo_rung() -> LogoRung {
-    LogoRung::Custom { area: theme::logo::HERO_AREA, h_min: LOGO_H, h_max: LOGO_H, fallback_sz: TITLE_TEXT_SZ }
+    LogoRung::Custom { area: theme::logo::HERO_AREA, band_h: LOGO_H, w_max: theme::logo::HERO_W_MAX, h_max: LOGO_H,
+        fallback_sz: TITLE_TEXT_SZ, descent_share: 1.0 }
 }
 
 /// One art layer: a texture by `(server, path)`, with the dimensions the resolve reported.
@@ -193,20 +210,21 @@ impl FocusHero {
 
     /// Advance the reveals; let the held picture go once the new one is up, or once the held one
     /// is no longer resident and there is nothing left to hold.
-    pub(super) fn step(&mut self, dt: f32) {
-        // decorative: the dissolve must not count as the page being busy
-        plx_machine::idle::decorative(|| {
-            if self.tex.0 != 0 {
-                self.art.step(1.0, AmbientWash::K, dt);
-            }
-            if self.outgoing_tex.0 != 0 {
-                self.outgoing_art.step(1.0, AmbientWash::K, dt);
-            }
-        });
+    /// Answers whether a dissolve is still under way (the page then reports Motion).
+    pub(super) fn step(&mut self, dt: f32) -> bool {
+        if self.tex.0 != 0 {
+            self.art.step(1.0, AmbientWash::K, dt);
+        }
+        if self.outgoing_tex.0 != 0 {
+            self.outgoing_art.step(1.0, AmbientWash::K, dt);
+        }
+        let moving = (self.tex.0 != 0 && plx_machine::motion::moving(self.art.pos, 1.0, self.art.vel, dt))
+            || (self.outgoing_tex.0 != 0 && plx_machine::motion::moving(self.outgoing_art.pos, 1.0, self.outgoing_art.vel, dt));
         if self.held.is_some() && (reveal(self.tex, &self.art) > 0.999 || self.outgoing_tex.0 == 0) {
             self.held = None;
             self.outgoing_tex = NO_TEX;
         }
+        moving
     }
 
     /// How much picture is on screen: the more visible of the two layers, 0..1.
@@ -232,7 +250,7 @@ impl FocusHero {
         p.rect(Rect::new(0.0, knee, SCR_W, SCR_H - knee), 0.0, theme::scrim(mid), theme::scrim(foot), 0.0);
         // The wedge under the copy, its knee lifted to the block's top: the shared one feathers in
         // down to where the billboards anchor their text, which is under this block's synopsis.
-        plx_ui::widgets::hero_scrim_lifted(p, shown, TEXT_TOP);
+        hero_scrim_lifted(p, shown, TEXT_TOP);
     }
 
     /// The text block: the title (its logo when the server has one), an episode's own line, the

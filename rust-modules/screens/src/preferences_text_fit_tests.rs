@@ -18,19 +18,20 @@ fn frame_w() -> f32 {
 }
 
 fn playback(quality: Quality, direct_play: DirectPlayMode) -> FieldListInputs<'static> {
-    FieldListInputs { kind: Kind::Playback, quality, direct_play, prefs: None, busy: false, show_retry: false, read_only: false }
+    FieldListInputs { local: crate::registry::empty_fixture(), kind: Kind::Playback, quality, direct_play, prefs: None, busy: false, show_retry: false, marker_prefs: marker_grants(), read_only: false }
 }
 
 fn audio(prefs: Option<&AudioPreferences>) -> FieldListInputs<'_> {
     FieldListInputs {
-        kind: Kind::AudioSubtitles, quality: Quality::Original, direct_play: DirectPlayMode::Auto,
-        prefs, busy: false, show_retry: false, read_only: false,
+        local: crate::registry::empty_fixture(), kind: Kind::AudioSubtitles, quality: Quality::Original, direct_play: DirectPlayMode::Auto,
+        prefs, busy: false, show_retry: false, marker_prefs: Default::default(), read_only: false,
     }
 }
 
 fn table_of(section: Section) -> TableView {
     let mut table = TableView::new();
     table.compact = false;
+    table.board_metrics(true); // the Settings pages' table, as `preferences.rs` draws it
     table.set_sections(vec![section], 0, false);
     table
 }
@@ -41,6 +42,7 @@ fn table_of(section: Section) -> TableView {
 fn check_field_section(tag: &str, inputs: &FieldListInputs<'_>, out: &mut Vec<String>) {
     let mut form: FormTable<RowId, Action, SettingsPage> = FormTable::new(BAND);
     form.table.compact = false;
+    form.table.board_metrics(true); // as `preferences.rs` draws it
     form.set(field_form(inputs), None);
     let ui_language = tag.split_whitespace().next().unwrap_or(tag);
     for e in form.table.app_fit_failures(frame_w(), tag) {
@@ -54,7 +56,7 @@ fn check_field_section(tag: &str, inputs: &FieldListInputs<'_>, out: &mut Vec<St
 /// Every value readout and detail line each field can show, through [`field_form`] directly.
 #[test]
 fn every_field_readout_and_detail_fits_its_column_in_every_language() {
-    let _serial = plx_base::testlock::serial(); // Subtitle Size/Position read the route globals below
+    let _serial = plx_base::testlock::serial(); // Shared language fixture; preferences below are explicit.
     let mut out = Vec::new();
     for language in SHIPPED {
         let _guard = language_on_this_thread_for_test(language);
@@ -63,41 +65,48 @@ fn every_field_readout_and_detail_fits_its_column_in_every_language() {
         for &quality in available_quality_ladder() {
             check_field_section(&format!("{tag} quality={quality:?}"), &playback(quality, DirectPlayMode::Auto), &mut out);
         }
-        // Forced adds the "overridden" detail line to the Quality row.
+        // Forced reads the Quality row's value as "Overridden".
         check_field_section(&format!("{tag} quality overridden detail"), &playback(Quality::Original, DirectPlayMode::Forced), &mut out);
         for direct_play in [DirectPlayMode::Auto, DirectPlayMode::Forced, DirectPlayMode::Disabled] {
             check_field_section(&format!("{tag} direct_play={direct_play:?}"), &playback(Quality::Original, direct_play), &mut out);
         }
+        use plx_plex::plex::session::ProfilePrefs;
+        let captured = |preferences| crate::registry::ScreenInputs { preferences: Some(preferences), ..Default::default() };
         for size in plx_media::route::SubtitleSize::LADDER {
-            plx_media::route::restore_subtitle_size(size);
-            check_field_section(&format!("{tag} subtitle_size={size:?}"), &playback(Quality::Original, DirectPlayMode::Auto), &mut out);
+            let local = captured(ProfilePrefs { subtitle_size: Some(size), ..Default::default() });
+            check_field_section(&format!("{tag} subtitle_size={size:?}"), &FieldListInputs { local: &local, ..audio(Some(&AudioPreferences::default())) }, &mut out);
         }
-        plx_media::route::restore_subtitle_size(plx_media::route::SubtitleSize::Medium);
         for position in plx_media::route::SubtitlePosition::LADDER {
-            plx_media::route::restore_subtitle_position(position);
-            check_field_section(&format!("{tag} subtitle_position={position:?}"), &playback(Quality::Original, DirectPlayMode::Auto), &mut out);
+            let local = captured(ProfilePrefs { subtitle_position: Some(position), ..Default::default() });
+            check_field_section(&format!("{tag} subtitle_position={position:?}"), &FieldListInputs { local: &local, ..audio(Some(&AudioPreferences::default())) }, &mut out);
         }
-        plx_media::route::restore_subtitle_position(plx_media::route::SubtitlePosition::Low);
         for mode in plx_media::route::NextEpisodeMode::LADDER {
-            plx_media::route::restore_next_episode_mode(mode);
-            check_field_section(&format!("{tag} next_episode={mode:?}"), &playback(Quality::Original, DirectPlayMode::Auto), &mut out);
+            let local = captured(ProfilePrefs { next_episode_mode: Some(mode), ..Default::default() });
+            check_field_section(&format!("{tag} next_episode={mode:?}"), &FieldListInputs { local: &local, ..playback(Quality::Original, DirectPlayMode::Auto) }, &mut out);
         }
-        plx_media::route::restore_next_episode_mode(plx_media::route::NextEpisodeMode::Countdown);
         for mode in plx_media::route::DeckPress::LADDER {
-            plx_media::route::restore_deck_press(mode);
-            check_field_section(&format!("{tag} deck_press={mode:?}"), &playback(Quality::Original, DirectPlayMode::Auto), &mut out);
+            let local = captured(ProfilePrefs { deck_press: Some(mode), ..Default::default() });
+            check_field_section(&format!("{tag} deck_press={mode:?}"), &FieldListInputs { local: &local, ..playback(Quality::Original, DirectPlayMode::Auto) }, &mut out);
         }
-        plx_media::route::restore_deck_press(plx_media::route::DeckPress::Details);
         for interval in plx_media::route::SkipInterval::LADDER {
-            plx_media::route::restore_skip_interval(interval);
-            check_field_section(&format!("{tag} skip_interval={interval:?}"), &playback(Quality::Original, DirectPlayMode::Auto), &mut out);
+            let local = captured(ProfilePrefs { skip_interval: Some(interval), ..Default::default() });
+            check_field_section(&format!("{tag} skip_interval={interval:?}"), &FieldListInputs { local: &local, ..playback(Quality::Original, DirectPlayMode::Auto) }, &mut out);
         }
-        plx_media::route::restore_skip_interval(plx_media::route::SkipInterval::Seconds10);
+        for mode in plx_plex::plex::session::DolbyVisionMode::LADDER {
+            let local = captured(ProfilePrefs { dolby_vision_mode: Some(mode), ..Default::default() });
+            check_field_section(&format!("{tag} dolby_vision={mode:?}"), &FieldListInputs { local: &local, ..playback(Quality::Original, DirectPlayMode::Auto) }, &mut out);
+        }
 
+        for mode in MarkerSkipMode::LADDER {
+            let mut inputs = playback(Quality::Original, DirectPlayMode::Auto);
+            inputs.marker_prefs.intro = mode; inputs.marker_prefs.credits = mode;
+            check_field_section(&format!("{tag} marker={mode:?}"), &inputs, &mut out);
+        }
         // Nobody seated: the same rows, read-only (dimmed).
         check_field_section(&format!("{tag} read-only"), &FieldListInputs { read_only: true, ..playback(Quality::Original, DirectPlayMode::Auto) }, &mut out);
         check_field_section(&format!("{tag} read-only forced"), &FieldListInputs { read_only: true, ..playback(Quality::Original, DirectPlayMode::Forced) }, &mut out);
 
+        check_field_section(&format!("{tag} read-only look"), &FieldListInputs { read_only: true, ..audio(Some(&AudioPreferences::default())) }, &mut out);
         check_field_section(&format!("{tag} retry row"), &FieldListInputs { show_retry: true, ..audio(None) }, &mut out);
 
         // Every catalog language as the Audio/Subtitle Language read-out (app data, so judged).
@@ -137,15 +146,15 @@ fn every_picker_level_fits_its_column_in_every_language() {
         for kind in [Kind::Playback, Kind::AudioSubtitles] {
             let prefs = AudioPreferences::default();
             let fields: &[PickerKind] = match kind {
-                Kind::Playback => &[PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition, PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval],
+                Kind::Playback => &[PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition, PickerKind::SubtitleColor, PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval, PickerKind::InstantDpadSeeking, PickerKind::UriEngine, PickerKind::DolbyVision, PickerKind::IntroSkip, PickerKind::CreditsSkip],
                 Kind::AudioSubtitles => &[PickerKind::AudioLanguage, PickerKind::SubtitleMode, PickerKind::SubtitleLanguage, PickerKind::ForcedSubtitles],
             };
             // The Interface resolution picker is opened from the Settings root, not a field list.
             let fields: Vec<PickerKind> = fields.iter().copied()
                 .chain((kind == Kind::Playback).then_some(PickerKind::UiResolution)).collect();
             for field in fields {
-                let current = resolve_value(field, Quality::Original, DirectPlayMode::Auto, Some(&prefs));
-                let section = field_options(field, Quality::Original, DirectPlayMode::Auto, Some(&prefs)).into_iter()
+                let current = resolve_with_marker(field, Quality::Original, DirectPlayMode::Auto, Some(&prefs), marker_grants(), UiResolution::default(), crate::registry::empty_fixture());
+                let section = options_with_marker(field, Quality::Original, DirectPlayMode::Auto, Some(&prefs), marker_grants()).into_iter()
                     .fold(Section::new(""), |section, (label, value)| section.row(Row::new(&label).checked(value == current)));
                 out.extend(table_of(section).app_fit_failures(frame_w(), &format!("{tag} {field:?} picker")));
             }
@@ -201,8 +210,12 @@ fn the_subtitle_mode_readouts_are_pinned_in_every_language() {
         ("it", "Se audio e sottotitoli hanno lingue diverse"),
         ("pt", "Áudio fora do idioma das legendas"),
         ("de", "Ton nicht in Untertitelsprache"),
+        ("pl", "Gdy język dźwięku jest inny"),
         ("hu", "Ha a hang nem a felirat nyelvén szól"),
         ("be", "Калі гук не на мове субцітраў"),
+        ("ru", "Если аудио не на языке субтитров"),
+        ("nl", "Audio niet in ondertiteltaal"),
+        ("ca", "Àudio en un altre idioma"),
     ];
     for (tag, _) in WANT {
         assert!(SHIPPED.iter().any(|p| p.tag() == *tag), "{tag} is pinned but no longer shipped");
@@ -212,7 +225,7 @@ fn the_subtitle_mode_readouts_are_pinned_in_every_language() {
         let mut prefs = AudioPreferences::default();
         let readouts: Vec<String> = (0..3).map(|mode| {
             prefs.subtitle_mode = mode;
-            field_readout(PickerKind::SubtitleMode, Quality::Original, DirectPlayMode::Auto, Some(&prefs))
+            field_readout(PickerKind::SubtitleMode, Quality::Original, DirectPlayMode::Auto, Some(&prefs), crate::registry::empty_fixture())
         }).collect();
         assert_eq!(readouts[0], plx_platform::i18n::msg::settings_audio_manual(), "{}", language.tag());
         assert_eq!(readouts[1], plx_platform::i18n::msg::settings_audio_foreign_short(), "{}", language.tag());
@@ -245,9 +258,9 @@ fn long_profile() -> Whose {
 fn every_explanation_under_a_title_fits_the_column_in_every_language() {
     const MAX_COPY_LINES: usize = 5;
     let _serial = plx_base::testlock::serial();
-    let layout = RouteLayout::screen();
-    let all_fields = [PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition,
-        PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval, PickerKind::UiResolution, PickerKind::AudioLanguage, PickerKind::SubtitleMode,
+    let layout = RouteLayout::settings_page();
+    let all_fields = [PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition, PickerKind::SubtitleColor,
+        PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval, PickerKind::InstantDpadSeeking, PickerKind::UriEngine, PickerKind::DolbyVision, PickerKind::IntroSkip, PickerKind::CreditsSkip, PickerKind::UiResolution, PickerKind::AudioLanguage, PickerKind::SubtitleMode,
         PickerKind::SubtitleLanguage, PickerKind::ForcedSubtitles];
     let mut out = Vec::new();
     for language in SHIPPED {
@@ -316,8 +329,8 @@ fn the_playback_page_names_its_profile_or_asks_for_one_in_every_language() {
 #[test]
 fn each_local_picker_has_its_own_explanation_in_every_language() {
     let _serial = plx_base::testlock::serial();
-    let fields = [PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition,
-        PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval];
+    let fields = [PickerKind::Quality, PickerKind::DirectPlay, PickerKind::SubtitleSize, PickerKind::SubtitlePosition, PickerKind::SubtitleColor,
+        PickerKind::NextEpisode, PickerKind::DeckPress, PickerKind::SkipInterval, PickerKind::InstantDpadSeeking, PickerKind::UriEngine, PickerKind::DolbyVision, PickerKind::IntroSkip, PickerKind::CreditsSkip];
     for language in SHIPPED {
         let _guard = language_on_this_thread_for_test(language);
         let tag = language.tag();
@@ -351,4 +364,8 @@ fn each_local_picker_has_its_own_explanation_in_every_language() {
             format!("{status}\n\n{}", plx_platform::i18n::msg::settings_playback_force_note()), "{tag}");
         assert_eq!(copy_text(Subject::Picker(PickerKind::DirectPlay), status, DirectPlayMode::Auto, &Whose::Nobody), status, "{tag}");
     }
+}
+
+fn marker_grants() -> MarkerPrefsView {
+    MarkerPrefsView { scope: 1, intro_granted: true, credits_granted: true, ..Default::default() }
 }

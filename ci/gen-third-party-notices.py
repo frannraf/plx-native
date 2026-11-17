@@ -30,8 +30,10 @@ the failure message asks for, and `--verify-graph` re-derives it from cargo. `no
 and holds common crates (once_cell, thiserror, base64, ...) that dev and build dependencies pull in, so
 only the graph proves that no shipping crate has come to depend on one: `ci.yml`'s host-lint job runs
 `--check --verify-graph` on every pull request (`cargo tree --locked` resolves; it runs no build
-script), and the same pass rejects a version cell that only a build or dev dependency uses. The licence
-and copyright columns come from the data file, not from any lock: nothing here notices that a crate's
+script), and the same pass rejects a version cell that only a build or dev dependency uses. Exact dev-only
+versions of a crate that also ships are recorded in `not_shipped_versions`; the offline check rejects
+stale entries and the graph check rejects any excluded version that reaches the ARM runtime graph.
+The licence and copyright columns come from the data file, not from any lock: nothing here notices that a crate's
 licence changed in a new release, so a major bump needs them re-read by a person.
 
 THE STD HALF. The standard library is the pinned stable toolchain's PREBUILT armv7 std, so its
@@ -66,7 +68,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'ci'))
-from rust_toolchain import pinned  # noqa: E402
+from rust_toolchain import pinned, shipping_featflags  # noqa: E402
 DATA = ROOT / 'ci' / 'third-party-crates.json'
 NOTICES = ROOT / 'THIRD-PARTY-NOTICES.md'
 LOCK = ROOT / 'rust-modules' / 'Cargo.lock'
@@ -98,7 +100,7 @@ def version_key(v):
 
 
 def crate_versions(name, project, data):
-    versions = set(project.get(name, ()))
+    versions = set(project.get(name, ())) - set(data.get('not_shipped_versions', {}).get(name, ()))
     if name in data['std_lock']:
         versions.add(data['std_lock'][name])
     return sorted(versions, key=version_key, reverse=True)
@@ -184,6 +186,15 @@ def problems_in(data, project, pins):
         problems.append(f'"not_shipped" lists {name}, which rust-modules/Cargo.lock no longer has: drop it.')
     for name in sorted(not_shipped & rows):
         problems.append(f'{name} is both a row and in "not_shipped".')
+    for name, versions in data.get('not_shipped_versions', {}).items():
+        if (name not in rows or not isinstance(versions, list) or not versions
+                or any(not isinstance(version, str) for version in versions)):
+            problems.append(f'not_shipped_versions.{name} needs a shipping row and a nonempty list of exact versions.')
+            continue
+        if len(set(versions)) != len(versions) or not set(versions) <= set(project.get(name, ())):
+            problems.append(f'not_shipped_versions.{name} contains duplicate or stale lock versions.')
+        if data['std_lock'].get(name) in versions or not crate_versions(name, project, data):
+            problems.append(f'not_shipped_versions.{name} hides a std version or every version of its shipping row.')
     for name in sorted(rows - set(project) - set(data['std_lock'])):
         problems.append(f'row {name} is in no lock: rust-modules/Cargo.lock dropped it (remove the row, or it is a std crate '
                         f'and belongs in "std_lock").')
@@ -330,7 +341,11 @@ def graph_problems(tree, data, project):
     for name in sorted(rows - set(tree) - shipped_by_std):
         problems.append(f'row {name} is not in the ARM runtime graph (and is not a std crate): is it still linked?')
     for name in sorted(rows & set(tree)):
-        extra = set(project.get(name, ())) - tree[name]
+        excluded = set(data.get('not_shipped_versions', {}).get(name, ()))
+        hidden = tree[name] & excluded
+        if hidden:
+            problems.append(f'{name} {sorted(hidden)} is marked not_shipped_versions but reaches the ARM runtime graph')
+        extra = set(project.get(name, ())) - tree[name] - excluded
         if extra:
             problems.append(f'{name} {sorted(extra)} is in rust-modules/Cargo.lock but not in the ARM runtime graph (only a build or '
                             f'dev dependency uses it), yet the notices table would list it')
@@ -338,7 +353,14 @@ def graph_problems(tree, data, project):
 
 
 def verify_graph(data, project):
-    cmd = ['cargo', '+' + pinned(ROOT), 'tree', '--locked', '--manifest-path', str(ROOT / 'rust-modules' / 'Cargo.toml'), '--no-default-features',
+    """The graph is the SHIPPING build's, so its features are the Makefile's (`make RELEASE=1`), never a list of
+    this script's own: a bare `--no-default-features` drops both playback backends and with them play-feed's
+    third-party tree (dolby_vision and its dependencies), which the release links."""
+    try:
+        featflags = shipping_featflags(ROOT)
+    except ValueError as exc:
+        return [str(exc)]
+    cmd = ['cargo', '+' + pinned(ROOT), 'tree', '--locked', '--manifest-path', str(ROOT / 'rust-modules' / 'Cargo.toml'), *featflags,
            '--target', 'armv7-unknown-linux-gnueabi', '--edges', 'normal,no-proc-macro', '--prefix', 'none', '--format', '{p}']
     out = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, 'CARGO_INCREMENTAL': '0'})
     if out.returncode != 0:

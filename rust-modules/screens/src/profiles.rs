@@ -687,6 +687,10 @@ impl PendingSelection {
 
 pub struct ProfilesScreen {
     entry: EntryId,
+    /// The seated user's uuid, which the roster opens on ([`Self::seated_tile`]).
+    seated: Arc<str>,
+    /// Focus has been put on that tile once since mounting, so the person's own moves stand.
+    roster_seated: bool,
     /// The avatar row's animation cache — focus-scale + scroll springs. A render cache, not
     /// logical state, exactly as `RootPage::table`'s `TableView` is: the engine owns WHICH avatar
     /// is focused, this owns how it gets there on screen.
@@ -736,6 +740,8 @@ impl ProfilesScreen {
         let snapshot = auth.0;
         let mut s = Self {
             entry,
+            seated: Arc::clone(&snapshot.seated),
+            roster_seated: false,
             row: AvatarRow::new(),
             footer_pop: CtlPop::new(),
             spin_ms: 0.0,
@@ -785,9 +791,14 @@ impl ProfilesScreen {
         self.row.focusable(n, ROW_Y, ROSTER_GROUP, self.entry, extent)
     }
 
-    fn avatar_art(u: &auth::UserTile) -> Art<'_> {
+    /// The roster's tile for the seated user.
+    fn seated_tile(&self) -> Option<usize> {
+        self.users.iter().position(|u| !self.seated.is_empty() && *u.uuid == *self.seated)
+    }
+
+    fn avatar_art(u: &auth::UserTile, sid: plx_plex::plex::ServerId) -> Art<'_> {
         Art::Thumb {
-            sid: plx_plex::plex::current_server().raw(),
+            sid: sid.raw(),
             key: &u.thumb,
             res: (300, 300),
         }
@@ -831,7 +842,7 @@ impl ProfilesScreen {
     /// Advance the wrong-PIN flash by one frame, and invalidate on the phase FLIPS alone — the two
     /// halves `ui/CLAUDE.md` demands of anything that animates from a CLOCK rather than a spring
     /// (`Xfade::tick`/`Spinner::draw`'s own standing hazard). Ported from `ui/profiles.rs`'s
-    /// `step_pin_flash`, `plx_machine::idle::invalidate()` replaced by `Effects::invalidate` — this screen
+    /// `step_pin_flash`, `plx_machine::motion::report::invalidate()` replaced by `Effects::invalidate` — this screen
     /// has no `plx_machine::idle` gate to report to; the dispatcher's own `Present` is fed exclusively
     /// through `Effects`/`fx.note`.
     fn step_pin_flash<H: AppLike>(pad: &mut Pad, dt: f32, fx: &mut Effects<'_, H>) {
@@ -848,6 +859,7 @@ impl ProfilesScreen {
     fn resync(&mut self, auth: auth::SessionRead<'_>) {
         let snapshot = auth.0;
         self.users = Arc::clone(&snapshot.users);
+        self.seated = Arc::clone(&snapshot.seated);
         self.phase = snapshot.phase;
         self.error = Arc::clone(&snapshot.error);
         self.back_resumes = snapshot.readout_back_resumes;
@@ -921,6 +933,20 @@ impl ProfilesScreen {
             ));
         }
         self.readout_seated = readout;
+
+        // The roster opens on the user who is watching; the mount's own seat is the first tile.
+        if !self.roster_seated && !self.pad.open && !readout && n > 0 {
+            self.roster_seated = true;
+            if let Some(i) = self.seated_tile().filter(|&i| i != 0) {
+                let me = fx.from();
+                fx.push(Fx::Deliver(
+                    me,
+                    Delivery::Screen(ScreenEvent::Enter(Enter::Fresh {
+                        focus: FocusTarget::Elem(plx_machine::machine::FocusKey { entry: self.entry, elem: i as u32 }),
+                    })),
+                ));
+            }
+        }
 
         if self.pad.open {
             Self::step_pin_flash(&mut self.pad, dt, fx);
@@ -1039,8 +1065,10 @@ impl ProfilesScreen {
         let target = self.pad.target as u32;
         self.pad = Pad::new();
         self.pending_selection = None;
-        self.sync_pin_state();
+        // Clear the verdict BEFORE publishing: a closed pad must never be published beside a
+        // standing `pin_denied`.
         self.pin_denied = false;
+        self.sync_pin_state();
         if dismiss_pin_error {
             fx.push(Fx::App(AppFx::Session(auth::SessionCmd::DismissPinError)));
         }
@@ -1745,7 +1773,7 @@ impl<H: AuthLike> Screen<H> for ProfilesScreen {
                 focused_i = Some(i);
                 continue; // draw the focused tile last (ring over neighbours)
             }
-            let rect = self.row.draw(p, i, base, Self::avatar_art(u), false, f.measure);
+            let rect = self.row.draw(p, i, base, Self::avatar_art(u, H::screen_inputs(f.cx).current_server), false, f.measure, &f.press, &plx_machine::machine::FocusKey { entry: self.entry, elem: i as u32 });
             Self::draw_name(p, u, cx_, false, f.measure);
             f.stop(
                 p,
@@ -1773,7 +1801,7 @@ impl<H: AuthLike> Screen<H> for ProfilesScreen {
             );
             Self::draw_name(p, u, cx_, true, f.measure);
             // the click dip folds into the focused avatar's pop (1.0 when idle)
-            let rect = self.row.draw(p, i, base, Self::avatar_art(u), true, f.measure);
+            let rect = self.row.draw(p, i, base, Self::avatar_art(u, H::screen_inputs(f.cx).current_server), true, f.measure, &f.press, &plx_machine::machine::FocusKey { entry: self.entry, elem: i as u32 });
             f.stop(
                 p,
                 Stop {
@@ -1812,7 +1840,7 @@ impl<H: AuthLike> Screen<H> for ProfilesScreen {
             // controls on its own row: *Back* (what the BACK key does, focused) and *Sign out*
             // beside it, or *Sign out* alone when BACK would leave the app (`readout_back`).
             let reason = CString::new(self.error.as_ref()).unwrap_or_default();
-            let press = f.press.scale;
+            let press = f.press;
             let overlay = readout_overlay(&reason, self.back_resumes)
                 .focus(cur.and_then(|e| self.readout_slot(e)))
                 .scales([0, 1].map(|i| self.footer_pop.scale_with(i, press)));
@@ -1829,7 +1857,7 @@ impl<H: AuthLike> Screen<H> for ProfilesScreen {
             let footer_r = footer_rect(f.measure);
             Button::new(plx_platform::i18n::msg::settings_account_sign_out_c().as_ptr(), theme::size::BODY, footer_r)
                 .focused(footer_focused)
-                .scale(self.footer_pop.scale(0))
+                .scale(self.footer_pop.scale(0, f.press))
                 .palette(self.ground.palette())
                 .draw(&Env::inert(), p);
             stop(f, FOOTER, footer_r);
@@ -1911,3 +1939,21 @@ mod pin_tests;
 #[cfg(test)]
 #[path = "profiles_pad_geometry_tests.rs"]
 mod pad_geometry_tests;
+
+#[cfg(test)]
+mod retained_input_tests {
+    use super::*;
+    #[test]
+    fn avatars_use_the_supplied_server_even_without_a_client() {
+        let user = auth::UserTile { thumb: "avatar".into(), ..Default::default() };
+        let server = plx_plex::plex::ServerId::from_raw(71);
+        match ProfilesScreen::avatar_art(&user, server) {
+            Art::Thumb { sid, key, res } => {
+                assert_eq!(sid, server.raw());
+                assert_eq!(key, "avatar");
+                assert_eq!(res, (300, 300));
+            }
+            _ => panic!("a profile avatar uses its retained server"),
+        }
+    }
+}

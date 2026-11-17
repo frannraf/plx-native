@@ -6,7 +6,7 @@
 //! row (the partition by `SCOPE`): a live setting that stayed `Install` would be restored from
 //! nobody's seat.
 use super::*;
-use plx_plex::plex::session::{self as session, prefs::DESCRIPTORS, stored_effective, UnderPostersDetails};
+use plx_plex::plex::session::{self as session, prefs::DESCRIPTORS, stored_effective, UnderPostersLadder};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn declared_by_plex() -> BTreeMap<&'static str, bool> {
@@ -392,7 +392,7 @@ fn every_live_setting_is_picked_into_the_seated_profiles_record() {
     assert!(confirm::<NextEpisodeModePref>(NextEpisodeMode::Off));
     assert!(confirm::<SkipIntervalPref>(SkipInterval::Seconds60));
     assert!(confirm::<DeckPressPref>(DeckPress::Details));
-    assert!(confirm::<SubtitleTonePref>(SubtitleTone::Grey));
+    assert!(confirm::<SubtitleTonePref>(SubtitleTone::Yellow));
     assert!(confirm::<AudioEnhancementsPref>(AudioEnhancements::NONE));
     assert!(confirm::<TrailerAutoplayPref>(true), "over the TV's off: an own value, on");
 
@@ -405,7 +405,7 @@ fn every_live_setting_is_picked_into_the_seated_profiles_record() {
     assert_eq!(
         cells(),
         Cells(Quality::P480, DirectPlayMode::Disabled, SubtitleSize::ExtraLarge, SubtitlePosition::Middle,
-            NextEpisodeMode::Off, SkipInterval::Seconds60, DeckPress::Details, SubtitleTone::Grey,
+            NextEpisodeMode::Off, SkipInterval::Seconds60, DeckPress::Details, SubtitleTone::Yellow,
             AudioEnhancements::NONE, HdrOverlayBrightness::ThreeQuarters, true)
     );
 }
@@ -541,8 +541,52 @@ fn how_settings_follows_the_rows_declared_policy() {
     assert!(matches!(How::settings::<DeckPressPref>(tx.clone()), How::Confirm(_)));
     assert!(matches!(How::settings::<QualityPref>(tx.clone()), How::Confirm(_)));
     assert!(matches!(How::settings::<SubtitleSizePref>(tx.clone()), How::Optimistic(Some(_))));
-    assert!(matches!(How::settings::<SubtitlePositionPref>(tx), How::Optimistic(Some(_))));
+    assert!(matches!(How::settings::<SubtitlePositionPref>(tx.clone()), How::Optimistic(Some(_))));
+    assert!(matches!(How::settings::<SubtitleTonePref>(tx), How::Optimistic(Some(_))));
 }
+
+/// **The Subtitle colour has a Settings row**, so a `Choice` saves it: the player's Color section
+/// was its only writer until it joined Size and Position under Settings > Audio & subtitles.
+#[test]
+fn the_subtitle_colour_is_a_settings_choice() {
+    assert!(Choice::KEYS.contains(&"subtitle_tone"), "{:?}", Choice::KEYS);
+    assert!(settings_rows().contains("subtitle_tone"));
+}
+
+/// **The Subtitle colour is a per-profile pick.** A profile that never chose reads the install's
+/// older value (white when the install has none either, which is the look every build before the
+/// colour drew); a pick made through the Settings door is the seated profile's own, shows live at
+/// once and is the one the seat restores, while another profile keeps reading its fallback.
+#[test]
+fn the_subtitle_colour_is_a_per_profile_pick_that_defaults_to_the_install_value() {
+    let _g = plx_base::testlock::serial();
+    let session = session::TempSession::new("colour-per-profile");
+    let _restore = Put::back(cells());
+    assert_eq!(session.seated("u1", TOKEN), stamp());
+    let install = Preferences { subtitle_tone: SubtitleTone::Silver, ..Preferences::default() };
+    session::save(&record(install, vec![]));
+    seed_profile_prefs_for_test(&session::peek());
+    let stored = |who: &str| stored_effective::<SubtitleTonePref>(&session::load(), &seat(who));
+    assert_eq!(stored("u1"), SubtitleTone::Silver, "u1 has picked nothing: the install's older value");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    choose::<SubtitleTonePref>(SubtitleTone::Yellow, How::settings::<SubtitleTonePref>(tx));
+    assert_eq!(crate::player::subtitle_tone(), SubtitleTone::Yellow, "live at once");
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), "and saved");
+    assert_eq!(stored("u1"), SubtitleTone::Yellow);
+    assert_eq!(stored("u2"), SubtitleTone::Silver, "u2 keeps reading the fallback, not u1's pick");
+    assert_eq!(session::load().prefs.subtitle_tone, SubtitleTone::Silver, "and the install's key is untouched");
+
+    let after = session::load();
+    restore(&after, &seat("u2"), Overrides::default());
+    assert_eq!(crate::player::subtitle_tone(), SubtitleTone::Silver, "u2 is seated: the fallback");
+    restore(&after, &seat("u1"), Overrides::default());
+    assert_eq!(crate::player::subtitle_tone(), SubtitleTone::Yellow, "u1 is back: its own pick");
+
+    restore(&record(Preferences::default(), vec![]), &seat("u3"), Overrides::default());
+    assert_eq!(crate::player::subtitle_tone(), SubtitleTone::White, "no profile and no install value: white");
+}
+
 
 /// The keys of the descriptors that have a Settings row, as plex declares them.
 fn settings_rows() -> BTreeSet<&'static str> {
@@ -577,7 +621,7 @@ fn t_settings_catches_a_row_or_choice_dropped() {
     rows.remove("playback_quality"); // the Quality row's SETTINGS fact dropped
     assert!(!agrees(&rows), "a Choice whose setting has no Settings row is caught");
     rows.insert("playback_quality");
-    rows.insert("subtitle_tone"); // a panel-only setting gains a row with no Choice
+    rows.insert("audio_enhancements"); // a panel-only setting gains a row with no Choice
     assert!(!agrees(&rows), "a Settings row with no Choice is caught");
 }
 
@@ -633,7 +677,7 @@ fn under_posters_is_picked_into_the_seated_profiles_record_and_follows_the_seat(
     restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
     assert_eq!(under_posters(), UnderPosters::DEFAULT, "nothing picked: the default");
 
-    let pick = UnderPosters { title: true, details: UnderPostersDetails::AgeRatingScore };
+    let pick = UnderPosters { title: true, details: UnderPostersLadder::AgeRatingScore.movie_parts(), show_details: UnderPostersLadder::AgeRatingScore.show_parts(), sort_value: false };
     assert!(confirm::<UnderPostersPref>(pick));
     assert_eq!(under_posters(), pick, "the cell holds the pick");
     let after = session::load();
@@ -649,4 +693,139 @@ fn under_posters_is_picked_into_the_seated_profiles_record_and_follows_the_seat(
     assert_eq!(under_posters(), pick, "and u1, seated again, finds its pick");
     assert!(Choice::KEYS.contains(&"under_posters"), "a Settings row saves it through the door");
     assert!(matches!(How::settings::<UnderPostersPref>(std::sync::mpsc::channel().0), How::Confirm(_)));
+}
+
+// ---- Dolby Vision override (Settings > Playback) -----------------------------------------------
+
+struct DolbyVisionBack;
+impl Drop for DolbyVisionBack {
+    fn drop(&mut self) {
+        restore_dolby_vision_mode(DolbyVisionMode::DEFAULT);
+    }
+}
+
+#[test]
+fn dolby_vision_mode_is_picked_into_the_seated_profiles_record_and_follows_the_seat() {
+    let _g = plx_base::testlock::serial();
+    let session = session::TempSession::new("dolby-vision-mode");
+    let _restore = Put::back(cells());
+    let _back = DolbyVisionBack;
+    session.seated("u1", TOKEN);
+    let mut legacy = record(Preferences::default(), vec![]);
+    legacy.client_id = "cid-test".into();
+    session::save(&legacy);
+    seed_profile_prefs_for_test(&session::peek());
+    restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
+    assert_eq!(dolby_vision_mode(), DolbyVisionMode::Auto);
+
+    assert!(confirm::<DolbyVisionModePref>(DolbyVisionMode::Off));
+    assert_eq!(dolby_vision_mode(), DolbyVisionMode::Off);
+    let after = session::load();
+    assert_eq!(after.prefs.dolby_vision_mode, DolbyVisionMode::Auto, "the TV's key is untouched");
+    assert_eq!(own_of::<DolbyVisionModePref>(&after.prefs.profile_prefs, "u1"), Some(DolbyVisionMode::Off));
+
+    session.seated("u2", TOKEN);
+    restore_profile_rows(&session::peek(), &seat("u2"), Overrides::default());
+    assert_eq!(dolby_vision_mode(), DolbyVisionMode::Auto, "another profile reads the default");
+
+    session.seated("u1", TOKEN);
+    restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
+    assert_eq!(dolby_vision_mode(), DolbyVisionMode::Off, "u1 seated again restores Off");
+}
+
+/// Puts the playback engine's cell and the mirrors back on drop; declared AFTER `serial()`.
+struct EngineBack(plx_plex::plex::session::UriEngine);
+impl Drop for EngineBack {
+    fn drop(&mut self) {
+        unseed_profile_prefs_for_test();
+        restore_uri_engine(self.0);
+    }
+}
+
+/// **The opt-in to the URI engine is the seated profile's own pick and nobody else's.** A profile
+/// that chose `On` reads it; a second profile, an unseated process and a record that chose nothing
+/// read the default `Off`, so the production qualifier answers Unknown for them.
+#[test]
+fn the_uri_engine_opt_in_follows_the_seated_profile_only() {
+    use plx_plex::plex::session::UriEngine;
+    let _g = plx_base::testlock::serial();
+    let _session = session::TempSession::new("restore-uri-engine");
+    let _back = EngineBack(uri_engine());
+    let own = vec![picked("u1", &stamp(), serde_json::json!({"uri_engine": "on"}))];
+    let rec = record(Preferences::default(), own);
+
+    restore(&rec, &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::On, "the profile that chose it");
+    restore(&rec, &seat("u2"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "another profile on the same account");
+    restore_uri_engine(UriEngine::On);
+    restore(&rec, &Seat::Unseated, Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "an unseated process reads the install key, which is the default");
+    restore_uri_engine(UriEngine::On);
+    restore(&record(Preferences::default(), vec![]), &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "a record that chose nothing");
+}
+
+/// **A Settings pick of the playback engine is durable first, then live, and the profile's own.**
+/// It is a Confirm row like its neighbours (`How::settings`), lands in the picking
+/// profile's record only, and a profile seated afterwards still reads the default.
+#[test]
+fn a_confirmed_opt_in_is_stored_as_the_picking_profiles_own_and_no_ones_else() {
+    use plx_plex::plex::session::UriEngine;
+    let _g = plx_base::testlock::serial();
+    let session = session::TempSession::new("pick-uri-engine");
+    let _back = EngineBack(uri_engine());
+    let mut legacy = record(Preferences::default(), vec![]);
+    legacy.client_id = "cid-test".into();
+    session.seated("u1", TOKEN);
+    session::save(&legacy);
+    seed_profile_prefs_for_test(&session::peek());
+    restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "setup: nobody has opted in");
+    assert!(matches!(How::settings::<UriEnginePref>(std::sync::mpsc::channel().0), How::Confirm(_)));
+
+    assert!(confirm::<UriEnginePref>(UriEngine::On), "the write was durable");
+    assert_eq!(uri_engine(), UriEngine::On, "and only then live");
+    let records = session::load().prefs.profile_prefs;
+    assert_eq!(own_of::<UriEnginePref>(&records, "u1"), Some(UriEngine::On));
+    assert_eq!(own_of::<UriEnginePref>(&records, "u2"), None);
+
+    session.seated("u2", TOKEN);
+    restore_profile_rows(&session::peek(), &seat("u2"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "u2 is not opted in by u1's pick");
+}
+
+
+/// The estimated-end-time cell follows the seated profile, falls back to the legacy key,
+/// and defaults ON when neither source has a value.
+#[test]
+fn restore_end_time_preference_is_profile_scoped_and_defaults_on() {
+    let _g = plx_base::testlock::serial();
+    let _session = session::TempSession::new("restore-end-time-preference");
+    struct RestoreEndTime(bool);
+    impl Drop for RestoreEndTime {
+        fn drop(&mut self) {
+            unseed_profile_prefs_for_test();
+            restore_hud_end_time(self.0);
+        }
+    }
+    let _restore = RestoreEndTime(hud_end_time());
+
+    let rec = record(
+        Preferences { hud_end_time: Some(false), ..Default::default() },
+        vec![
+            picked("u1", &stamp(), serde_json::json!({ "hud_end_time": true })),
+            picked("u2", &stamp(), serde_json::json!({ "hud_end_time": false })),
+        ],
+    );
+    restore(&rec, &seat("u1"), Overrides::default());
+    assert!(hud_end_time(), "u1's own ON overrides the legacy OFF");
+    restore(&rec, &seat("u2"), Overrides::default());
+    assert!(!hud_end_time(), "u2's own OFF is independent");
+    restore(&rec, &seat("u3"), Overrides::default());
+    assert!(!hud_end_time(), "a profile without a pick reads the legacy OFF");
+
+    let fresh = record(Preferences::default(), vec![]);
+    restore(&fresh, &seat("u1"), Overrides::default());
+    assert!(hud_end_time(), "a fresh profile defaults to ON");
 }

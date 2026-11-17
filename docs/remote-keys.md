@@ -98,7 +98,7 @@ before `SDL_Init` (§5).
 
 | Code | Field | `Key` | What it does | Provenance |
 | --- | --- | --- | --- | --- |
-| `450` | `wcode` only | `Play` | resume, or start playback off a card | evdev 207 `KEY_PLAYCD` |
+| `450` | `wcode` only | `Play` | resume, or start playback off a card; on the Player HUD settings page, on the row of a HUD installed from a development address (`tools/hud-dev`), fetch that address again | evdev 207 `KEY_PLAYCD` |
 | `72` | `wcode` only | `Pause` | pause | evdev 119 `KEY_PAUSE` |
 | `261` | either | `PlayPause` | toggles — its own variant, since `key_play`/`key_pause` are each one direction | evdev 164 `KEY_PLAYPAUSE` |
 | `451` | either | `Right { alt: true }` | fast-forward: scrubs in the player, does nothing elsewhere | evdev 208 `KEY_FASTFORWARD` |
@@ -127,7 +127,7 @@ before `SDL_Init` (§5).
 
 | Code | Field | `Key` | What it does |
 | --- | --- | --- | --- |
-| `484` (`0x1e4`) | `wcode` | `PointerHidden` | the Magic Remote reporting its pointer auto-hid. The ladder's arm has an empty body — the press is consumed there rather than reaching the arms below. evdev 614, an LG-private code and not a key. |
+| `484` (`0x1e4`) | `wcode` | `PointerHidden` | LG's pointer-hidden notification. It stops edge scrolling and is consumed before fresh-press bookkeeping. Evdev 614 is an LG-private code. |
 
 ### Reachable but deliberately unbound
 
@@ -150,8 +150,8 @@ from two different namespaces (§1, §4), so "make them consistent" is not the t
 **`Left`/`Right` carry an `alt` flag, and the two horizontal tests accept different sets.** `alt`
 is `false` for a press that arrived as the plain `SDLK_LEFT`/`SDLK_RIGHT` sym and `true` for one
 that arrived only as `WCODE_REWIND`/`WCODE_FASTFORWARD`. The non-player four-way nav dispatch
-matches `alt: false` alone, so a transport key does nothing on Home; the player's scrub arm and the
-Chapters strip match both. A press carrying BOTH stays plain — `classify` asks `sym` first — which
+matches `alt: false` alone, so a transport key does nothing on Home; the player's scrub arm matches
+both (an open MODAL section page swallows them: the bar they drive is not on screen). A press carrying BOTH stays plain — `classify` asks `sym` first — which
 is what keeps Home's navigation answering an ordinary arrow that happens to ride beside a transport
 code.
 
@@ -278,7 +278,9 @@ build anyone can install; `docs/lab-diagnostics.md`). The guarded half lives in
 `app/input.rs::note_global_press`, split
 out so `make check` can grade it — `begin_fresh_press` itself calls `hide_cursor`, which acts on
 whatever pointer calls the process's SDL exports, so a host test that reached it would be grading the
-host's SDL rather than the press.
+host's SDL rather than the press. The bare player samples the HUD for bound keys in ordered screen
+delivery. A second Back in the same SDL batch sees the first one's dismissal, and an intervening
+bound press spends any exit arming. The LG pointer-hidden notification only stops edge scrolling.
 
 **The digit term reads `sym` and not `wcode`, diverging from `screens::profiles::digit_of`, on purpose.**
 48–57 in the scancode field are `]` `\` `#` `;` `'` `` ` `` `,` `.` `/` and CapsLock (the digits'
@@ -307,6 +309,13 @@ alone: travel is summed since the last arrow press, so a hand holding the remote
 gate (159–600 px measured between arrowing to a disc and pressing OK), and over full-screen video
 the player never leaves D-pad mode. A click that lands on a control after real travel is still
 that control's, so pointing at a button and clicking it keeps working.
+
+When Back dismisses the player transport, the last delivered pointer position becomes the anchor.
+If there is no position yet, the next motion sets the anchor. The HUD stays down until the sum of
+the horizontal and vertical distances from the anchor reaches four logical pixels. The motion that
+reaches the threshold raises the HUD and restores a transparent cursor installed by Back. While
+that cursor is held, its OK click takes the same paired key path. On firmware with the LG visibility
+API, webOS handles the pointer's return.
 
 **The one place it deliberately over-approximates.** The digits count as bound *everywhere*, because
 the who's-watching PIN keypad types from them, so a number press on Home or during playback still

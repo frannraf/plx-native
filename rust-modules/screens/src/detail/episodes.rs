@@ -9,6 +9,7 @@ use std::ffi::CString;
 use plx_data::metadata::{Detail, Episode};
 use plx_machine::machine::GroupId;
 use plx_ui::hstack::{Align, HStack, Item};
+use plx_ui::still_footer::{self, Footer, Right};
 use plx_ui::text_lift::{TextLift, TOP_CENTRE};
 use plx_ui::text_view::TextView;
 use plx_ui::vstack::{Anchor, VStack};
@@ -269,7 +270,7 @@ fn state(ep: &Episode) -> State {
     if in_progress {
         return State {
             glyph: Glyph::None,
-            label: plx_ui::fmt::time_left(ep.dur_ms - ep.resume_ms),
+            label: plx_ui::fmt::footer_left(ep.dur_ms - ep.resume_ms),
             progress: Some((ep.resume_ms as f32 / ep.dur_ms as f32).clamp(0.0, 1.0)),
         };
     }
@@ -313,6 +314,12 @@ fn cell_rect(x: f32) -> Rect {
     Rect::new(x, 0.0, W, H)
 }
 
+/// The strip, as the PAGE pass draws it. `scale` is each cell's pop spring and `dip` the press
+/// machine's factor for its still (`PressRead::dip_of`; `1.0` for every cell but the pressed one),
+/// so a press dips the page's own copy as it dips a card. `left_out` names the cell a surface lifts
+/// out of the dim (`DrawFrame::leaves_out`): the page draws NOTHING of it, still or label plate,
+/// because the opener lift ([`draw_focused`]) is its only copy.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     p: Painter,
     d: &Detail,
@@ -320,6 +327,8 @@ pub fn draw(
     scroll: f32,
     focused: Option<(usize, Row)>,
     scale: impl Fn(usize) -> f32,
+    dip: impl Fn(usize) -> f32,
+    left_out: impl Fn(usize) -> bool,
     lift: impl Fn(usize) -> TextLift,
     measure: &dyn plx_machine::machine::Measure,
     meta: plx_data::metadata::MetadataView<'_>,
@@ -344,7 +353,10 @@ pub fn draw(
             plx_ui::placeholder::skeleton(p, plx_ui::placeholder::Reason::CardSkeleton, "", cell_rect(x), CARD_RADIUS);
             continue;
         };
-        draw_cell(p, d, i, ep, focused, scale(i), &lift(i), cap_top, measure);
+        if left_out(i) {
+            continue;
+        }
+        draw_cell(p, d, i, ep, focused, scale(i), dip(i), &lift(i), cap_top, measure);
         if reloading {
             plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::StaleEpisodes, &ep.rk);
             plx_ui::placeholder::stale_cover(p, cell_rect(x), CARD_RADIUS);
@@ -361,6 +373,7 @@ pub fn draw_focused(
     top: f32,
     scroll: f32,
     scale: f32,
+    dip: f32,
     lift: &TextLift,
     measure: &dyn plx_machine::machine::Measure,
     meta: plx_data::metadata::MetadataView<'_>,
@@ -382,6 +395,7 @@ pub fn draw_focused(
         episode,
         Some((index, row)),
         scale,
+        dip,
         lift,
         kicker_cap_top(),
         measure,
@@ -392,9 +406,11 @@ pub fn draw_focused(
     }
 }
 
-/// One filmstrip cell. `scale` is the still's pop spring; `lift` is the label block's own focus
-/// state (earned by the TEXT stop alone). The block's plate shows for either stop, at whichever of
-/// the two is further along.
+/// One filmstrip cell. `scale` is the still's pop spring and `dip` the press's factor on top of it
+/// (the still is drawn at `scale * dip`; the pop that earns the label plate follows the spring
+/// alone, as a card's does, so a press does not blink the plate out); `lift` is the label block's
+/// own focus state (earned by the TEXT stop alone). The block's plate shows for either stop, at
+/// whichever of the two is further along.
 #[allow(clippy::too_many_arguments)]
 fn draw_cell(
     p: Painter,
@@ -403,6 +419,7 @@ fn draw_cell(
     ep: &Episode,
     focused: Option<(usize, Row)>,
     scale: f32,
+    dip: f32,
     lift: &TextLift,
     kicker_cap_top: f32,
     measure: &dyn plx_machine::machine::Measure,
@@ -413,7 +430,8 @@ fn draw_cell(
     // A cell is drawn at its spring's scale for as long as the spring is off rest: the pop factor is
     // exactly 0.0 only at rest (a released cell lands there, `Cells::step`), so no threshold of its own.
     let focused_here = still_focused || pop > 0.0;
-    let card = Rect::new(x, -theme::EP_CARD_FOCUS_LIFT * pop, W, H);
+    let drawn_scale = scale * dip;
+    let card = Rect::new(x, -theme::EP_CARD_FOCUS_LIFT * widgets::pop_factor(drawn_scale, theme::EP_CARD_FOCUS_SCALE), W, H);
     #[cfg(feature = "devtriggers")]
     plx_ui::card_probe::begin_card();
     widgets::draw_card_peaked(
@@ -424,11 +442,11 @@ fn draw_cell(
         (640, 360),
         CARD_RADIUS,
         focused_here,
-        scale,
+        drawn_scale,
         theme::EP_CARD_FOCUS_SCALE,
     );
     let drawn = if focused_here {
-        card.scaled(scale)
+        card.scaled(drawn_scale)
     } else {
         card
     };
@@ -446,19 +464,27 @@ fn draw_cell(
         widgets::STILL_SCRIM_H_1,
         widgets::STILL_SCRIM_A,
     );
-    widgets::still_line(
+    // The strip's footer: no show name (the page is inside one season of one show), no episode tag,
+    // and no focus cue (every cell plays, and the focus pop is the cue). Watched = the length and a
+    // muted tick; in progress = "Nm left" and the amber bar; not started = the length alone.
+    still_footer::draw_footer(
         p,
         drawn,
-        watch_state(ep),
         "",
-        &st.label,
-        true,
-        st.progress.is_some(),
+        &Footer {
+            tag: "",
+            status: &st.label,
+            right: match (st.progress, st.glyph) {
+                (Some(frac), _) => Right::Bar(frac),
+                (None, Glyph::Watched) => Right::Tick,
+                (None, _) => Right::None,
+            },
+            cue: None,
+            focus: 0.0,
+            place: still_footer::Place::InArt,
+        },
         measure,
     );
-    if let Some(frac) = st.progress {
-        widgets::progress_bar(p, drawn, CARD_RADIUS, 5.0, frac);
-    }
 
     // Every episode's label block draws in the same ink; focus is marked by the shared
     // `ui::text_lift` treatment. The plate shows while the still pops or the text is lifted; the
@@ -626,22 +652,37 @@ mod tests {
         }
     }
 
+    /// **The strip's footer is one 24 px line 12 px above the card's bottom, inside the one-line
+    /// scrim, at every pop phase**, and the old full-bleed bar is gone from it (the bar is the
+    /// footer's own 4 px mark on the right).
     #[test]
-    fn the_state_line_clears_the_full_bleed_bar_at_every_pop_phase() {
-        const BAR_H: f32 = 5.0;
-        assert!(plx_ui::widgets::STILL_LINE_BOT > BAR_H);
-        assert!(
-            plx_ui::widgets::STILL_SCRIM_H_1
-                > plx_ui::widgets::STILL_LINE_BOT + plx_ui::widgets::STILL_GLYPH_D
-        );
+    fn the_strip_footer_stands_inside_the_one_line_scrim_at_every_pop_phase() {
         let card = Rect::new(0.0, 0.0, W, H);
         for scale in [1.0, 1.045, theme::EP_CARD_FOCUS_SCALE, plx_ui::widgets::CARD_FOCUS_SCALE] {
             let drawn = card.scaled(scale);
-            let bar = Rect::new(drawn.x, drawn.y + drawn.h - BAR_H, drawn.w, BAR_H);
-            assert_eq!((bar.x, bar.w), (drawn.x, drawn.w), "the bar is full bleed");
-            assert!((bar.y + bar.h - (drawn.y + drawn.h)).abs() < 0.01);
-            assert!(plx_ui::widgets::STILL_SCRIM_H_1 < drawn.h);
+            let line_top = drawn.y + drawn.h - still_footer::FOOTER_RISE - still_footer::FOOTER_LINE_H;
+            assert!(line_top > drawn.y + drawn.h - plx_ui::widgets::STILL_SCRIM_H_1, "scale {scale}: the line is on the scrim");
         }
+    }
+
+    /// **What the strip's footer says in each state**: the length alone for a fresh episode and a
+    /// watched one, `Nm left` for one in progress, and no season/episode tag on any (the page is
+    /// inside one season). The mark on the right (the bar, the tick) is drawn by the footer and is
+    /// graded in `ui::still_footer`.
+    #[test]
+    fn the_strip_footer_says_the_length_or_the_time_left_and_never_a_tag() {
+        let _g = plx_base::testlock::serial();
+        let min = 60_000;
+        let fresh = Episode { dur_ms: 48 * min, index: 4, ..Default::default() };
+        let watched = Episode { dur_ms: 48 * min, index: 4, watched: true, ..Default::default() };
+        let partial = Episode { dur_ms: 48 * min, resume_ms: 10 * min, index: 4, ..Default::default() };
+        let footer_of = |ep: &Episode| -> Vec<String> {
+            card_words(ep).into_iter().filter(|w| w.contains("48m") || w.contains("left")).collect()
+        };
+        assert_eq!(footer_of(&fresh), ["48m"]);
+        assert_eq!(footer_of(&watched), ["48m"]);
+        assert_eq!(footer_of(&partial), ["38m left"]);
+        assert!(!card_words(&partial).iter().any(|w| w.contains('\u{b7}') && w.starts_with('S')), "no season/episode tag on the strip");
     }
 
     fn cell_census(scale: f32, lift: &TextLift) -> Vec<(u64, Rect)> {
@@ -649,7 +690,7 @@ mod tests {
         let d = Detail::default();
         let ep = Episode { dur_ms: 100, ..Default::default() };
         plx_ui::draw_census::capture(|| {
-            draw_cell(Painter::recording(), &d, 0, &ep, None, scale, lift, kicker_cap_top(), &measure)
+            draw_cell(Painter::recording(), &d, 0, &ep, None, scale, 1.0, lift, kicker_cap_top(), &measure)
         })
     }
 
@@ -658,7 +699,7 @@ mod tests {
         let measure = plx_ui::fixture::FixtureMeasure;
         let d = Detail::default();
         plx_ui::draw_census::capture_text(|| {
-            draw_cell(Painter::recording(), &d, 0, ep, None, 1.0, &TextLift::new(), kicker_cap_top(), &measure)
+            draw_cell(Painter::recording(), &d, 0, ep, None, 1.0, 1.0, &TextLift::new(), kicker_cap_top(), &measure)
         })
         .into_iter()
         .map(|(text, _)| text)
@@ -840,7 +881,7 @@ mod tests {
         let platter_bottom = text_top + (bottom - META_BOTTOM_PAD) + PLATTER_PAD;
         let d = Detail::default();
         let runs = plx_ui::draw_census::capture_runs(|| {
-            draw_cell(Painter::recording(), &d, 0, &ep, None, 1.0, &TextLift::new(), kicker_cap_top(), &measure)
+            draw_cell(Painter::recording(), &d, 0, &ep, None, 1.0, 1.0, &TextLift::new(), kicker_cap_top(), &measure)
         });
         let chip = runs.iter().find(|r| r.text == "TV-14").expect("the rating chip is drawn");
         assert!(chip.at.y + theme::size::MICRO as f32 <= platter_bottom + 0.5, "chip run at {} + MICRO past platter bottom {platter_bottom}", chip.at.y);

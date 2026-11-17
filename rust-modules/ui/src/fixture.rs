@@ -95,8 +95,26 @@ impl LogicalState for FixtureArg {
 pub enum FixtureFx {
     StoreAdd(u32),
     Net(Addr),
+    /// Explicit yielded request; ordinary Net remains synchronous for existing fixtures.
+    ExternalNet(Addr),
     Poster(PosterKey),
 }
+
+impl plx_machine::machine::AppEffect for FixtureFx {
+    type Inline = Self;
+    type ExternalFx = Self;
+    fn route(self) -> plx_machine::machine::EffectDisposition<Self, Self> {
+        match self {
+            effect @ Self::ExternalNet(_) => plx_machine::machine::EffectDisposition::External(effect),
+            effect @ (Self::StoreAdd(_) | Self::Net(_) | Self::Poster(_)) =>
+                plx_machine::machine::EffectDisposition::Inline(effect),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "extension_screen_tests.rs"]
+mod extension_screen_tests;
 
 /// The app's messages.
 pub enum FixtureMsg {
@@ -426,10 +444,12 @@ impl Machine<FixtureHost> for FixtureScreen {
             ScreenEvent::Input(_) => Handled::No,
             ScreenEvent::Mount => {
                 // a request emitted from mount is addressable: the id arrived first
-                fx.push(Fx::App(FixtureFx::Net(Addr {
-                    to: fx.from(),
-                    req: RequestId(1),
-                })));
+                let address = Addr { to: fx.from(), req: RequestId(1) };
+                // Page 974 explicitly exercises a yielded POST-mount request. Ordinary pages
+                // keep their synchronous Net effect; no rig may override its routing authority.
+                fx.push(Fx::App(if self.arg == FixtureArg::Page(974) {
+                    FixtureFx::ExternalNet(address)
+                } else { FixtureFx::Net(address) }));
                 fx.push(Fx::Log(LogLine(format!("fixture: mounted {:?}", self.arg))));
                 Handled::Yes
             }
@@ -533,6 +553,9 @@ impl Screen<FixtureHost> for FixtureScreen {
             self.lifted = f.lifted;
         }
         composed_draw(self, f);
+        if self.arg == FixtureArg::Page(975) {
+            f.report_presentation(FixtureMsg::Store(StoreOrd(0), 1));
+        }
         if matches!(self.arg, FixtureArg::Page(_)) {
             // a page that always shows a placeholder, for the held-image debt test
             crate::placeholder::note(f.painter, crate::placeholder::Reason::DetailSpinner, "fixture");
@@ -603,6 +626,8 @@ pub struct FixtureModal {
     /// One entry per [`Screen::draw_held`] call: whether the painter it was handed was LIVE (not
     /// the text recorder a held surface's `draw` is walked through).
     pub held_faces: Vec<bool>,
+    /// One entry per [`Screen::draw_warm`] call: whether the painter it was handed records.
+    pub warm_walks: Vec<bool>,
 }
 
 thread_local! {
@@ -612,6 +637,17 @@ thread_local! {
 /// Make every [`FixtureModal`] drawn on this thread paint one line of text ("modal surface text").
 pub fn modal_draws_text(on: bool) {
     MODAL_TEXT.with(|t| t.set(on));
+}
+
+thread_local! {
+    static MODAL_WARMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make every [`FixtureModal`] on this thread hold one string back ("held back text"): it answers
+/// [`Screen::warms_text`] and walks that string in [`Screen::draw_warm`], as a Settings push does for
+/// the page it is about to show.
+pub fn modal_warms_text(on: bool) {
+    MODAL_WARMS.with(|t| t.set(on));
 }
 
 /// A monotonic tick the fixture screens stamp their draw-order observations with.
@@ -646,6 +682,7 @@ impl FixtureModal {
             opener: None,
             tick_dts: Vec::new(),
             held_faces: Vec::new(),
+            warm_walks: Vec::new(),
         }
     }
 
@@ -790,6 +827,10 @@ impl Machine<FixtureHost> for FixtureModal {
             }
             ScreenEvent::Tick(t) => {
                 self.tick_dts.push(t.dt_us);
+                // a surface waiting for its text asks for the next frame, as a push's pre-roll does
+                if MODAL_WARMS.with(|w| w.get()) {
+                    fx.note(plx_machine::present::PresentEvent::Motion);
+                }
                 // the surface's own foreground spring: reports motion while it settles
                 if self.pop < 1.0 {
                     self.pop = (self.pop + 0.25).min(1.0);
@@ -841,6 +882,13 @@ impl Screen<FixtureHost> for FixtureModal {
     }
     fn draw_held(&mut self, f: &mut DrawFrame<'_, '_, FixtureHost>) {
         self.held_faces.push(!f.painter.records());
+    }
+    fn warms_text(&self) -> bool {
+        MODAL_WARMS.with(|t| t.get())
+    }
+    fn draw_warm(&mut self, f: &mut DrawFrame<'_, '_, FixtureHost>) {
+        self.warm_walks.push(f.painter.records());
+        f.painter.text(c"held back text".as_ptr(), 640.0, 300.0, 24, [1.0; 4], 0, 0);
     }
     fn scrim(&self) -> super::screen::Scrim {
         self.scrim_at.set(draw_order());
@@ -1085,8 +1133,7 @@ impl FixtureRig {
 }
 
 impl Rig<FixtureHost> for FixtureRig {
-    fn page_alpha(&self) -> f32 { self.page_alpha }
-    fn navigation_presentation(&self) -> super::screen::NavPresentation {
+    fn navigation_presentation(&self, _nav: &super::containers::Navigation<FixtureHost>) -> super::screen::NavPresentation {
         self.navigation_reads.set(self.navigation_reads.get() + 1);
         super::screen::NavPresentation {
             page_alpha: self.page_alpha, chrome_alpha: self.chrome_alpha,
@@ -1227,7 +1274,7 @@ impl super::adapters::Adapters<FixtureHost> for FixtureRig {
                     Delivery::Machine(FixtureMsg::Store(StoreOrd(0), v)),
                 ));
             }
-            FixtureFx::Net(addr) => self.net_requests.push(addr),
+            FixtureFx::Net(addr) | FixtureFx::ExternalNet(addr) => self.net_requests.push(addr),
             FixtureFx::Poster(key) => self.cache.accept(PosterReady {
                 key,
                 result: Ok(Decoded {
@@ -1288,6 +1335,23 @@ pub fn key_up(k: Key, at: Tick) -> InputEvent<u32> {
     event
 }
 
+/// Headless runner with explicit admission and a virtual swap after drawing.
+pub fn frame_and_swap(
+    d: &mut Dispatcher<FixtureHost>, rig: &mut FixtureRig, at: Tick,
+    inputs: Vec<InputEvent<u32>>, results: Vec<(Addr, FixtureMsg)>,
+    tap: &mut dyn super::dispatch::Tap<FixtureHost>,
+) -> super::dispatch::FrameReport {
+    let mut report = d.frame_with(rig, at, inputs, results, tap, false);
+    if report.presented {
+        d.present.take(at.ms);
+        d.prepare(rig);
+        let drawn = d.draw(rig, true);
+        report.drawn = drawn.drawn;
+        d.present.acknowledge(at.ms);
+    }
+    report
+}
+
 #[test]
 fn the_spike_composes_boot_a_key_a_landing_and_a_poster_over_four_frames() {
     let _g = plx_base::testlock::serial();
@@ -1296,7 +1360,7 @@ fn the_spike_composes_boot_a_key_a_landing_and_a_poster_over_four_frames() {
 
     // frame 1: boot — Root(Home) parked, committed, mounted, entered; presented (first frame)
     d.request(MachineId::Nav, NavOp::Root(FixtureArg::Home));
-    let r1 = d.frame(&mut rig, tick(0), vec![], vec![], &mut NoTap);
+    let r1 = frame_and_swap(&mut d, &mut rig, tick(0), vec![], vec![], &mut NoTap);
     assert!(r1.presented);
     assert_eq!(r1.mounted.len(), 1, "Home mounted at NAV COMMIT");
     assert_eq!(rig.ls2_pumps, 1);
@@ -1312,7 +1376,7 @@ fn the_spike_composes_boot_a_key_a_landing_and_a_poster_over_four_frames() {
         to: MachineId::Instance(home),
         req: RequestId(1),
     };
-    let r2 = d.frame(
+    let r2 = frame_and_swap(&mut d,
         &mut rig,
         tick(16),
         vec![],
@@ -1337,7 +1401,7 @@ fn the_spike_composes_boot_a_key_a_landing_and_a_poster_over_four_frames() {
         FixtureMsg::Store(StoreOrd(0), 1),
     );
     d.track_inflight(home, RequestId(0));
-    let r3 = d.frame(&mut rig, tick(32), vec![key(Key::Ok, tick(32))], vec![notice], &mut NoTap);
+    let r3 = frame_and_swap(&mut d, &mut rig, tick(32), vec![key(Key::Ok, tick(32))], vec![notice], &mut NoTap);
     assert_eq!(r3.mounted.len(), 1, "the page mounted in the same frame as the key");
     assert!(r3.presented, "the key invalidated");
     assert_eq!(d.nav.tabs.stack.depth(), 2);
@@ -1360,14 +1424,14 @@ fn the_spike_composes_boot_a_key_a_landing_and_a_poster_over_four_frames() {
         }),
     });
     d.budget.note_queued(rig.cache.has_pending());
-    let r4 = d.frame(&mut rig, tick(48), vec![], vec![], &mut NoTap);
+    let r4 = frame_and_swap(&mut d, &mut rig, tick(48), vec![], vec![], &mut NoTap);
     assert!(r4.presented, "queued prepare work forces a present");
     assert!(rig.cache.resolve(PosterKey(9)).is_some(), "uploaded in prepare");
     assert!(!rig.cache.has_pending());
     d.budget.note_queued(false);
 
     // frame 5: BACK pops the page: WillLeave → Unmount → Uncover → Enter(Restored) on Home
-    let r5 = d.frame(&mut rig, tick(64), vec![key(Key::Back, tick(64))], vec![], &mut NoTap);
+    let r5 = frame_and_swap(&mut d, &mut rig, tick(64), vec![key(Key::Back, tick(64))], vec![], &mut NoTap);
     assert_eq!(r5.unmounted.len(), 1);
     d.prune(&r5.unmounted);
     assert_eq!(d.nav.tabs.stack.depth(), 1);
@@ -1445,6 +1509,7 @@ impl Tap<FixtureHost> for RecTap {
             Fx::Timer { .. } => "timer",
             Fx::CancelTimer(_) => "cancel_timer",
             Fx::Press(_) => "press",
+            Fx::HoldHint(_) => "hold_hint",
             Fx::Remember { .. } => "remember",
             Fx::Log(_) => "log",
             Fx::App(_) => "app",
@@ -1519,7 +1584,7 @@ impl Codec<FixtureHost> for FixtureCodec {
 /// The scenario every recorder test drives: boot, an HTTP landing, a store notice + OK, BACK.
 fn drive(d: &mut Dispatcher<FixtureHost>, rig: &mut FixtureRig, tap: &mut dyn Tap<FixtureHost>) {
     d.request(MachineId::Nav, NavOp::Root(FixtureArg::Home));
-    d.frame(rig, tick(0), vec![], vec![], tap);
+    frame_and_swap(d, rig, tick(0), vec![], vec![], tap);
     let home = d.nav.top_page().and_then(|e| e.inst.as_ref()).unwrap().id;
     d.track_inflight(home, RequestId(1));
     d.track_inflight(home, RequestId(0));
@@ -1527,22 +1592,22 @@ fn drive(d: &mut Dispatcher<FixtureHost>, rig: &mut FixtureRig, tap: &mut dyn Ta
         to: MachineId::Instance(home),
         req: RequestId(req),
     };
-    d.frame(
+    frame_and_swap(d,
         rig,
         tick(16),
         vec![],
         vec![(addr(1), FixtureMsg::Http { status: 200, blob: vec![] })],
         tap,
     );
-    d.frame(
+    frame_and_swap(d,
         rig,
         tick(32),
         vec![key(Key::Ok, tick(32))],
         vec![(addr(0), FixtureMsg::Store(StoreOrd(0), 1))],
         tap,
     );
-    d.frame(rig, tick(48), vec![], vec![], tap);
-    let r = d.frame(rig, tick(64), vec![key(Key::Back, tick(64))], vec![], tap);
+    frame_and_swap(d, rig, tick(48), vec![], vec![], tap);
+    let r = frame_and_swap(d, rig, tick(64), vec![key(Key::Back, tick(64))], vec![], tap);
     d.prune(&r.unmounted);
 }
 
@@ -1788,14 +1853,16 @@ fn the_present_bit_is_recorded_and_replayed() {
 fn the_fixture_bundles_state_shape_is_pinned() {
     // Re-pin only with a named reason: a shape change invalidates every fixture of this bundle.
     // The fixture bundle now versions the input machine and queued whole-input payloads too.
-    assert_eq!(fixture_state_fp(), 0x23c4_4e83_a90a_8644);
+    // Owned HoldHintRead and gesture/key/page-instance LiftReceipt join Input Canon (V12).
+    // This pins the current producer only; no historical recording is rewritten or admitted.
+    assert_eq!(fixture_state_fp(), 0xb00b_44a5_806d_d3b4);
 }
 
 pub fn booted() -> (Dispatcher<FixtureHost>, FixtureRig, plx_machine::machine::InstanceId) {
     let mut d: Dispatcher<FixtureHost> = Dispatcher::new();
     let mut rig = FixtureRig::new();
     d.request(MachineId::Nav, NavOp::Root(FixtureArg::Home));
-    d.frame(&mut rig, tick(0), vec![], vec![], &mut NoTap);
+    frame_and_swap(&mut d, &mut rig, tick(0), vec![], vec![], &mut NoTap);
     let home = d.nav.top_page().and_then(|e| e.inst.as_ref()).unwrap().id;
     (d, rig, home)
 }
@@ -2114,7 +2181,9 @@ fn below_drawn(d: &Dispatcher<FixtureHost>) -> u32 {
 #[test]
 fn a_video_plane_screen_replaces_its_host_and_takes_no_snapshot() {
     let _g = plx_base::testlock::serial();
-    // A transition that DRAWS BELOW while it is in flight (`RoutePush`, the Settings family's).
+    // A transition that DRAWS BELOW while it is in flight (`transition::RoutePush`, the stack
+    // transition that draws both levels; the Settings family's own push is `route_screen::RoutePush`,
+    // a different type).
     // The default `Immediate` never draws the level under the top one, so on it this test's first
     // half would be vacuous — it would pass whether or not the rule exists.
     let mut d: Dispatcher<FixtureHost> = Dispatcher::with_transition(Box::new(

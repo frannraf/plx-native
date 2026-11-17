@@ -8,10 +8,15 @@
 //! `["playback-error", kind]`, except for origin `preview` (a failed detail-page trailer), which
 //! groups apart as `["playback-error", "preview", kind]`. There is no
 //! title, URL, rating key, playhead, duration, measured bitrate or free-text error slot. Sparse transitions are retained in memory only while error reporting is
-//! enabled, and nothing is queued unless the viewer actually reaches `PlaybackState::Error`.
+//! enabled, and no error event is queued unless the viewer actually reaches `PlaybackState::Error`.
+//!
+//! The one other handled event, and the one that is NOT a failure, is `refusal_recovered`
+//! ([`refusal_recovered_body`]): a play the television refused and the app then recovered, with four
+//! closed fields and no trace, under the same consent.
 
 use super::classes::{
-    AttemptOrigin, FailureClass, PlaybackErrorContext, TraceEvent, TraceOutcome, TraceStep,
+    AttemptOrigin, FailureClass, PlaybackErrorContext, RefusalRecoveredContext, TraceEvent,
+    TraceOutcome, TraceStep,
 };
 use serde_json::{Map, Value};
 
@@ -160,6 +165,8 @@ pub fn event_body(
         }]},
         "tags": {
             "playback.kind": code,
+            "playback.backend": context.backend.code(),
+            "playback.terminal_stage": context.terminal_stage.code(),
             "playback.delivery": context.delivery.code(),
             "playback.selected_quality": context.selected.code(),
             "playback.requested_quality": context.requested.code(),
@@ -172,10 +179,13 @@ pub fn event_body(
             "playback.http_status": context.http_status.to_string(),
             "playback.transport": context.transport.code(),
             "playback.transfer_age": context.transfer_age.code(),
+            "playback.demux_exit": context.demux_exit.code(),
             "playback.pipeline_error": context.pipeline_error.to_string(),
         },
         "contexts": {"playback": {
             "type": "playback",
+            "backend": context.backend.code(),
+            "terminal_stage": context.terminal_stage.code(),
             "delivery": context.delivery.code(),
             "selected_quality": context.selected.code(),
             "requested_quality": context.requested.code(),
@@ -192,11 +202,18 @@ pub fn event_body(
             "buffer": context.buffer.code(),
             "transport": context.transport.code(),
             "transfer_age": context.transfer_age.code(),
+            "demux_exit": context.demux_exit.code(),
             "pipeline_error": context.pipeline_error,
             "started": context.started,
         }},
         "breadcrumbs": {"values": breadcrumbs},
     });
+    // Which condition refused a trailer preview: one closed tag, and only on the kind it explains
+    // (the failtest and jail shapes outrank the preview verdict in the kind, and must not carry a
+    // reason that is no longer the cause). The fingerprint above is untouched: one issue.
+    if let (FailureClass::PreviewNotDirect, Some(reason)) = (kind, context.preview_refusal) {
+        body["tags"]["playback.preview_refusal"] = Value::String(reason.code().to_string());
+    }
     if let Some(r) = context.refusal {
         // Tags so an issue can be searched and grouped on them, a context so one event reads in
         // one place. Every value is the `code()` of a closed enum; the server's own sentence has
@@ -258,6 +275,122 @@ pub fn report_error(kind: FailureClass, context: PlaybackErrorContext, trace: &[
         context,
         trace,
     );
+    queue_handled(event_id, body, "playback error");
+}
+
+/// The `refusal_recovered` class code: the wire value of the event's `playback.class` tag, its
+/// exception value and its fingerprint's first segment.
+pub const REFUSAL_RECOVERED: &str = "refusal_recovered";
+
+/// **Pure body builder of the `refusal_recovered` event**: a refusal the television gave a Load
+/// before its first picture and the open-recovery ladder then recovered from. Everything it
+/// carries is a field of [`RefusalRecoveredContext`] (the refused stream's codec class, a channel
+/// bucket, the pipeline's error number or `timeout`/`stall`, the rung that played) plus what every
+/// Sentry-bound report carries (release, environment, the crash-report id as `user.id`, the
+/// webOS/hardware contexts with the firmware build). No trace and no breadcrumb: the ladder's own
+/// log lines stay on the television, so there is no raster, delivery, timing or anything else of
+/// the playback here. It groups by rung and codec class (`["refusal_recovered", rung, codec]`);
+/// the error number and channel bucket are tags, so one refused codec is one issue however many
+/// firmware numbers it arrives with. Level `info`: a recovered play is not an error.
+pub fn refusal_recovered_body(
+    event_id: &str,
+    dist: &str,
+    errors_id: Option<&str>,
+    context: RefusalRecoveredContext,
+) -> Vec<u8> {
+    let codec = context.stream.codec();
+    let error = context.error.code();
+    let mut body = serde_json::json!({
+        "event_id": event_id,
+        "platform": "native",
+        "level": "info",
+        "release": super::release(),
+        "environment": super::sender::ENVIRONMENT,
+        "sdk": {"name": "plxnative-handled", "version": super::app_version()},
+        "logger": "playback",
+        "transaction": "playback",
+        "culprit": format!("playback::{REFUSAL_RECOVERED}"),
+        "fingerprint": [REFUSAL_RECOVERED, context.rung.code(), codec],
+        "exception": {"values": [{
+            "type": "RefusalRecovered",
+            "value": REFUSAL_RECOVERED,
+            "mechanism": {"type": "playback", "handled": true},
+        }]},
+        "tags": {
+            "playback.class": REFUSAL_RECOVERED,
+            "playback.refused_stream": context.stream.kind(),
+            "playback.refused_codec": codec,
+            "playback.refused_channels": context.channels.code(),
+            "playback.pipeline_error": error,
+            "playback.recovery_rung": context.rung.code(),
+        },
+        "contexts": {"refusal_recovered": {
+            "type": "refusal_recovered",
+            "refused_stream": context.stream.kind(),
+            "refused_codec": codec,
+            "refused_channels": context.channels.code(),
+            "pipeline_error": error,
+            "recovery_rung": context.rung.code(),
+        }},
+    });
+    if !dist.is_empty() {
+        body["dist"] = Value::String(dist.to_string());
+    }
+    super::sentry::attach_user(&mut body, errors_id);
+    super::sentry::attach_hardware_context(&mut body);
+    serde_json::to_vec(&body).unwrap_or_default()
+}
+
+/// The `refusal_recovered` bodies [`report_refusal_recovered`] accepted past the consent gate, in
+/// order. Test seam: "one event per rescued play, none without consent" is a count of these (a test
+/// build has no Sentry destination, so nothing reaches the spool).
+#[cfg(any(test, feature = "test-support"))]
+static RECOVERED_FOR_TEST: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// See [`RECOVERED_FOR_TEST`]: take (and forget) the bodies accepted so far.
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_recovered_for_test() -> Vec<serde_json::Value> {
+    std::mem::take(&mut *RECOVERED_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()))
+        .iter()
+        .map(|body| serde_json::from_slice(body).expect("refusal_recovered JSON"))
+        .collect()
+}
+
+/// Queue one `refusal_recovered` handled event through the same spool and sender as
+/// [`report_error`], under the same error-report consent and nothing else: no consent, no event,
+/// and no new channel or question for the viewer. No network work is performed on the render thread.
+pub fn report_refusal_recovered(context: RefusalRecoveredContext) {
+    if !super::consent::allows_errors() {
+        return;
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    RECOVERED_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(refusal_recovered_body(
+            &"0".repeat(32),
+            "",
+            super::consent::errors_id().as_deref(),
+            context,
+        ));
+    if !super::sender::has_sentry() {
+        return;
+    }
+    let Some(event_id) = crate::diag::random_hex_id() else {
+        plx_base::eventlog::log("telemetry: no /dev/urandom — recovered refusal was not queued");
+        return;
+    };
+    let body = refusal_recovered_body(
+        &event_id,
+        super::sentry::build_id(),
+        super::consent::errors_id().as_deref(),
+        context,
+    );
+    queue_handled(event_id, body, "recovered refusal");
+}
+
+/// Spool one handled Sentry event and ask the sender to flush it; the one tail of both reports.
+fn queue_handled(event_id: String, body: Vec<u8>, what: &str) {
     let record = super::queue::Record {
         category: super::queue::Category::Errors,
         dest: super::queue::Dest::Sentry,
@@ -269,10 +402,10 @@ pub fn report_error(kind: FailureClass, context: PlaybackErrorContext, trace: &[
         // `Some(false)` is a failed write, not a size verdict: no spool path is writable (the app
         // directory is read-only on that install), or the write itself failed. An oversized
         // record logs its own cap line, so this wording must not claim "did not fit".
-        Some(false) => plx_base::eventlog::log(
-            "telemetry: handled playback error was not written to the durable spool \
-             (no writable spool path, or the write failed)",
-        ),
+        Some(false) => plx_base::eventlog::log(&format!(
+            "telemetry: handled {what} was not written to the durable spool \
+             (no writable spool path, or the write failed)"
+        )),
         None => {} // consent changed while the event was being shaped
     }
 }
@@ -283,8 +416,10 @@ pub fn report_error(kind: FailureClass, context: PlaybackErrorContext, trace: &[
 pub fn preview_event() -> Vec<u8> {
     use crate::telemetry::classes::{
         AttemptOrdinal, AttemptOrigin, AudioCodecClass, BufferClass, DecisionCodeClass, DeliveryClass,
+        ErrorBackendClass, TerminalStageClass,
         DeliveryReason, HttpClass, OriginalProbePhase, PipelineClass, QualityClass, RasterClass, RateClass, RefusalContext,
         TraceAge, TraceDirection, TraceOutcome, TransferAgeClass, TransportClass, VideoCodecClass,
+        DemuxExitClass,
     };
     let trace = [
         TraceStep {
@@ -347,6 +482,8 @@ pub fn preview_event() -> Vec<u8> {
         Some(super::native::PREVIEW_USER_ID),
         FailureClass::PlaybackInterrupted,
         PlaybackErrorContext {
+            backend: ErrorBackendClass::Feed,
+            terminal_stage: TerminalStageClass::Decode,
             delivery: DeliveryClass::Hls,
             selected: QualityClass::Auto,
             requested: QualityClass::M22,
@@ -358,6 +495,7 @@ pub fn preview_event() -> Vec<u8> {
             buffer: BufferClass::S3To10,
             transport: TransportClass::RecvError,
             transfer_age: TransferAgeClass::S30To90,
+            demux_exit: DemuxExitClass::HttpsOpenFailed,
             started: true,
             attempted_delivery: DeliveryClass::Direct,
             attempt_started: false,
@@ -366,8 +504,10 @@ pub fn preview_event() -> Vec<u8> {
             http_status: 404,
             pipeline_error: 601,
             // Representative of a `decision_refused` report's extra block, shown here so the
-            // consent screen's sample carries every key a report can; a real report has it only
-            // when the server refused the plan.
+            // consent screen's sample carries every key a report can, bar one: the
+            // `playback.preview_refusal` tag belongs to a `preview_not_direct` report and is
+            // listed by `preview_domains` instead. A real report has this block only when the
+            // server refused the plan.
             refusal: Some(RefusalContext {
                 general: DecisionCodeClass::C2000,
                 transcode: DecisionCodeClass::C4007,
@@ -375,9 +515,62 @@ pub fn preview_event() -> Vec<u8> {
                 source_video: VideoCodecClass::Vp9,
                 source_audio: AudioCodecClass::Eac3,
             }),
+            // Only a `preview_not_direct` report carries one, and this sample is not that kind.
+            preview_refusal: None,
         },
         &trace,
     )
+}
+
+/// Representative `refusal_recovered` payload through the real serializer, for the consent screen
+/// beside [`preview_event`]: the same visible placeholders for the per-report values.
+pub fn preview_refusal_recovered() -> Vec<u8> {
+    use crate::telemetry::classes::{
+        AudioCodecClass, ChannelBucket, RecoveryRung, RefusalError, RefusedStream,
+    };
+    refusal_recovered_body(
+        "<random per-error event id>",
+        "<running ELF build id>",
+        Some(super::native::PREVIEW_USER_ID),
+        RefusalRecoveredContext {
+            stream: RefusedStream::Audio(AudioCodecClass::Dts),
+            channels: ChannelBucket::Surround,
+            error: RefusalError::Number(601),
+            rung: RecoveryRung::Facet,
+        },
+    )
+}
+
+/// The closed domain of each `refusal_recovered` field, from the same enums as the serializer, as
+/// [`preview_domains`] does for the playback error.
+pub fn preview_recovered_domains() -> String {
+    use crate::telemetry::classes::{
+        AudioCodecClass as A, ChannelBucket as C, RecoveryRung as R, VideoCodecClass as V,
+    };
+    use plx_platform::i18n::msg;
+    let domains: [(&str, String); 5] = [
+        (msg::core_preview_domain_recovered_rung(), codes(&R::ALL, R::code)),
+        (msg::core_preview_domain_recovered_stream(), "none / video / audio".to_owned()),
+        (
+            msg::core_preview_domain_recovered_codec(),
+            format!("{} / {}", codes(&V::ALL, V::code), codes(&A::ALL, A::code)),
+        ),
+        (msg::core_preview_domain_recovered_channels(), codes(&C::ALL, C::code)),
+        // The one NUMERIC field, so its domain is its range, then the two words that stand for no
+        // number: the firmware's own error number, a Load budget that ran out, the audio stall.
+        (
+            msg::core_preview_domain_recovered_error(),
+            format!("{} to {} / timeout / stall", i32::MIN, i32::MAX),
+        ),
+    ];
+    let mut out = String::new();
+    for (label, values) in domains {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&msg::core_preview_domain_line(label, &values));
+    }
+    out
 }
 
 fn codes<T: Copy>(values: &[T], code: fn(T) -> &'static str) -> String {
@@ -391,34 +584,27 @@ fn codes<T: Copy>(values: &[T], code: fn(T) -> &'static str) -> String {
 
 /// Closed value domains for the representative handled-error payload above. Generated from the
 /// same enum `code()` methods as the serializer, so the consent screen does not imply that its one
-/// sample value is the only possible one.
+/// sample value is the only possible one. It also names the one key the sample cannot carry, the
+/// `playback.preview_refusal` tag of a `preview_not_direct` report.
 pub fn preview_domains() -> String {
     use crate::telemetry::classes::{
-        BufferClass as B, DeliveryClass as D, DeliveryReason as W, HttpClass as H,
+        BufferClass as B, DeliveryClass as D, DeliveryReason as W, ErrorBackendClass as U,
+        TerminalStageClass as S, HttpClass as H,
         OriginalProbePhase as P, PipelineClass as L, QualityClass as Q, RasterClass as X,
         RateClass as R, TraceAge as A, TraceDirection as I, TraceOutcome as O,
-        TransferAgeClass as T, TransportClass as K,
+        DemuxExitClass as E, TransferAgeClass as T, TransportClass as K,
     };
     use crate::telemetry::classes::{AudioCodecClass as Z, DecisionCodeClass as N, VideoCodecClass as V};
-    use crate::telemetry::classes::{AttemptOrdinal, AttemptOrigin};
+    use crate::telemetry::classes::{AttemptOrdinal, AttemptOrigin, PreviewRefusal};
     use FailureClass as F;
     use plx_platform::i18n::msg;
     // The labels are the reader's words; the codes after them are the wire values themselves.
-    let domains: [(&str, String); 24] = [
-        (msg::core_preview_domain_failure_kind(), codes(
-            &[
-                F::DecisionRefused,
-                F::PlaybackPolicy,
-                F::NoVideoTranscodeTarget,
-                F::NoVideoTrack,
-                F::MediaSource,
-                F::PlaybackInterrupted,
-                F::TvPipeline,
-                F::OriginalRollback,
-                F::Unspecified,
-            ],
-            F::code,
-        )),
+    let domains: [(&str, String); 28] = [
+        // Every class reaches the handled report (`FailureKind::class`), so the row is the whole
+        // enum: a class added to `FailureClass` appears here without anyone remembering to.
+        (msg::core_preview_domain_failure_kind(), codes(&F::ALL, F::code)),
+        (msg::core_preview_domain_backend(), codes(&U::ALL, U::code)),
+        (msg::core_preview_domain_terminal_stage(), codes(&S::ALL, S::code)),
         (msg::core_preview_domain_delivery(), codes(&[D::Unknown, D::Direct, D::Remux, D::Hls, D::Transcode], D::code)),
         // The route the failed attempt was opening rides every report (a refusal's own block names
         // the same value), so its row is the whole delivery domain.
@@ -431,6 +617,10 @@ pub fn preview_domains() -> String {
         (msg::core_preview_domain_refusal_codes(), codes(&N::ALL, N::code)),
         (msg::core_preview_domain_source_video(), codes(&V::ALL, V::code)),
         (msg::core_preview_domain_source_audio(), codes(&Z::ALL, Z::code)),
+        // The `playback.preview_refusal` tag rides a `preview_not_direct` report only, so the
+        // sample above (a `playback_interrupted` one) cannot show it; the label says which
+        // reports carry it, and the list is the enum's own `ALL`.
+        (msg::core_preview_domain_preview_refusal(), codes(&PreviewRefusal::ALL, PreviewRefusal::code)),
         (msg::core_preview_domain_quality(), codes(
             &[
                 Q::Unknown,
@@ -494,6 +684,7 @@ pub fn preview_domains() -> String {
         )),
         (msg::core_preview_domain_transport(), codes(&K::ALL, K::code)),
         (msg::core_preview_domain_transfer_age(), codes(&T::ALL, T::code)),
+        (msg::core_preview_domain_demux_exit(), codes(&E::ALL, E::code)),
         (msg::core_preview_domain_elapsed(), codes(
             &[
                 A::Under1s,
@@ -545,12 +736,15 @@ mod tests {
     use super::*;
     use crate::telemetry::classes::{
         AttemptOrdinal, AttemptOrigin, AudioCodecClass, BufferClass, DecisionCodeClass,
+        ErrorBackendClass, TerminalStageClass,
         DeliveryClass, HttpClass, OriginalProbePhase, PipelineClass, QualityClass, RasterClass, RateClass, RefusalContext,
-        TraceAge, TraceOutcome, TransferAgeClass, TransportClass, VideoCodecClass,
+        TraceAge, TraceOutcome, TransferAgeClass, TransportClass, VideoCodecClass, DemuxExitClass,
     };
 
     fn context() -> PlaybackErrorContext {
         PlaybackErrorContext {
+            backend: ErrorBackendClass::Unknown,
+            terminal_stage: TerminalStageClass::Unknown,
             delivery: DeliveryClass::Hls,
             selected: QualityClass::Auto,
             requested: QualityClass::M22,
@@ -562,6 +756,7 @@ mod tests {
             buffer: BufferClass::S3To10,
             transport: TransportClass::None,
             transfer_age: TransferAgeClass::Unknown,
+            demux_exit: DemuxExitClass::None,
             started: true,
             attempted_delivery: DeliveryClass::Hls,
             attempt_started: true,
@@ -570,7 +765,37 @@ mod tests {
             http_status: 0,
             pipeline_error: 0,
             refusal: None,
+            preview_refusal: None,
         }
+    }
+
+    #[test]
+    fn handled_error_names_backend_and_terminal_stage_even_when_unobserved() {
+        let body = event_body(&"a".repeat(32), "", None,
+            FailureClass::MediaSource, context(), &[]);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["tags"]["playback.backend"], "unknown");
+        assert_eq!(value["tags"]["playback.terminal_stage"], "unknown");
+        assert_eq!(value["contexts"]["playback"]["backend"], "unknown");
+        assert_eq!(value["contexts"]["playback"]["terminal_stage"], "unknown");
+        assert!(value.get("request_id").is_none());
+        assert!(value.get("attempt_id").is_none());
+    }
+
+    #[test]
+    fn handled_error_carries_only_closed_current_backend_and_stage_codes() {
+        let mut context = context();
+        context.backend = ErrorBackendClass::Uri;
+        context.terminal_stage = TerminalStageClass::Decode;
+        let body = event_body(&"a".repeat(32), "", None,
+            FailureClass::TvPipeline, context, &[]);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["tags"]["playback.backend"], "uri");
+        assert_eq!(value["tags"]["playback.terminal_stage"], "decode");
+        assert_eq!(value["contexts"]["playback"]["backend"], "uri");
+        assert_eq!(value["contexts"]["playback"]["terminal_stage"], "decode");
+        assert_eq!(value["fingerprint"], serde_json::json!(["playback-error", "tv_pipeline"]),
+            "backend and stage refine context without splitting the established issue group");
     }
 
     #[test]
@@ -802,7 +1027,7 @@ mod tests {
         assert_eq!(keys(&v["contexts"]), ["hardware", "playback", "webos"]);
         assert_eq!(
             keys(&v["contexts"]["webos"]),
-            ["api", "codename", "name", "release", "type"]
+            ["api", "build", "codename", "name", "release", "type"]
         );
         assert_eq!(
             keys(&v["contexts"]["hardware"]),
@@ -815,9 +1040,11 @@ mod tests {
                 "attempt_origin",
                 "attempt_started",
                 "attempted_delivery",
+                "backend",
                 "buffer",
                 "declared_rate",
                 "delivery",
+                "demux_exit",
                 "http",
                 "http_status",
                 "media_rate",
@@ -827,6 +1054,7 @@ mod tests {
                 "requested_quality",
                 "selected_quality",
                 "started",
+                "terminal_stage",
                 "transfer_age",
                 "transport",
                 "type",
@@ -839,14 +1067,17 @@ mod tests {
                 "playback.attempt_origin",
                 "playback.attempt_started",
                 "playback.attempted_delivery",
+                "playback.backend",
                 "playback.declared_rate",
                 "playback.delivery",
+                "playback.demux_exit",
                 "playback.http_status",
                 "playback.kind",
                 "playback.pipeline_error",
                 "playback.requested_quality",
                 "playback.selected_quality",
                 "playback.started",
+                "playback.terminal_stage",
                 "playback.transfer_age",
                 "playback.transport",
             ]
@@ -938,8 +1169,10 @@ mod tests {
                 "playback.attempt_origin",
                 "playback.attempt_started",
                 "playback.attempted_delivery",
+                "playback.backend",
                 "playback.declared_rate",
                 "playback.delivery",
+                "playback.demux_exit",
                 "playback.http_status",
                 "playback.kind",
                 "playback.pipeline_error",
@@ -950,6 +1183,7 @@ mod tests {
                 "playback.source_audio",
                 "playback.source_video",
                 "playback.started",
+                "playback.terminal_stage",
                 "playback.transfer_age",
                 "playback.transport",
             ]
@@ -960,6 +1194,50 @@ mod tests {
         assert_eq!(v["tags"]["playback.source_video"], "hevc");
         // Grouping is unchanged: the fingerprint is the failure kind, as before.
         assert_eq!(v["fingerprint"], serde_json::json!(["playback-error", "decision_refused"]));
+    }
+
+    /// **Sentry PLX-NATIVE-23.** A refused trailer preview says WHICH condition refused it, as one
+    /// closed tag, and only on the `preview_not_direct` kind (a failtest or jail shape can outrank
+    /// the verdict in the kind, and must not carry a stale reason). The issue stays one group.
+    #[test]
+    fn a_preview_refusal_is_tagged_only_on_the_preview_not_direct_kind() {
+        use crate::telemetry::classes::PreviewRefusal;
+        let body = |kind: FailureClass, reason: Option<PreviewRefusal>| -> Value {
+            let mut ctx = context();
+            ctx.attempt_origin = AttemptOrigin::Preview;
+            ctx.preview_refusal = reason;
+            serde_json::from_slice(&event_body(&"a".repeat(32), "", None, kind, ctx, &[])).expect("handled event JSON")
+        };
+        for reason in PreviewRefusal::ALL {
+            let v = body(FailureClass::PreviewNotDirect, Some(reason));
+            assert_eq!(v["tags"]["playback.preview_refusal"], reason.code(), "{reason:?}");
+            assert_eq!(
+                v["fingerprint"],
+                serde_json::json!(["playback-error", "preview", "preview_not_direct"]),
+                "the reason refines the issue, it never splits its group"
+            );
+            assert!(v["contexts"]["playback"].get("preview_refusal").is_none());
+            assert!(
+                body(FailureClass::TvPipeline, Some(reason))["tags"].get("playback.preview_refusal").is_none(),
+                "another kind carries no refusal reason: {reason:?}"
+            );
+        }
+        assert!(
+            body(FailureClass::PreviewNotDirect, None)["tags"].get("playback.preview_refusal").is_none(),
+            "no verdict, no tag"
+        );
+    }
+
+    #[test]
+    fn privacy_names_the_preview_refusal_tag_and_every_value() {
+        use crate::telemetry::classes::PreviewRefusal;
+        let privacy = include_str!("../../../../PRIVACY.md");
+        assert!(privacy.contains("`preview_refusal`"), "PRIVACY.md omitted the tag");
+        let codes: Vec<_> = PreviewRefusal::ALL.iter().map(|r| r.code()).collect();
+        assert_eq!(codes, ["not_direct", "no_part", "adaptive"]);
+        for code in codes {
+            assert!(privacy.contains(&format!("`{code}`")), "PRIVACY.md omitted {code}");
+        }
     }
 
     #[test]
@@ -995,6 +1273,59 @@ mod tests {
         // not list would be a payload the person was never shown.
         assert!(preview_domains()
             .contains("unknown / original_direct / original_remux / hls / progressive_transcode"));
+    }
+
+    #[test]
+    fn delivery_reason_codes_are_closed_and_listed() {
+        use crate::telemetry::classes::DeliveryReason;
+        let legend = preview_domains();
+        let privacy = include_str!("../../../../PRIVACY.md");
+        assert_eq!(DeliveryReason::ALL.len(), 5);
+        assert_eq!(DeliveryReason::RefusalRecovery.code(), "refusal_recovery");
+        for reason in DeliveryReason::ALL {
+            assert!(legend.contains(reason.code()), "the legend omitted {}", reason.code());
+        }
+        assert!(privacy.contains("`refusal_recovery`"), "PRIVACY.md omitted the facet rung's reason");
+    }
+
+    /// The values of the legend row headed `label`, read from the one line the legend wrote for it.
+    /// A code can be a substring of another (`not_direct` of `preview_not_direct`), so a test of a
+    /// row's domain reads the row it means and never searches the whole legend.
+    fn legend_row_values(label: &str) -> String {
+        let prefix = plx_platform::i18n::msg::core_preview_domain_line(label, "");
+        let legend = preview_domains();
+        let mut rows = legend.lines().filter_map(|line| line.strip_prefix(prefix.as_str()));
+        let values = rows.next().unwrap_or_else(|| panic!("the legend has no row {label:?}"));
+        assert!(rows.next().is_none(), "the legend has two rows {label:?}");
+        values.to_owned()
+    }
+
+    /// **Sentry PLX-NATIVE-23.** The consent screen shows every field a report can carry, and
+    /// `playback.preview_refusal` rides a `preview_not_direct` report, so its closed domain has a
+    /// row of its own and the failure-kind row names the kind that carries it. The sample event
+    /// cannot show the key (it is a `playback_interrupted` report), which is why the row's label
+    /// says which reports have it.
+    #[test]
+    fn consent_legend_lists_the_preview_refusal_domain_on_its_own_row() {
+        use crate::telemetry::classes::PreviewRefusal;
+        use plx_platform::i18n::msg;
+        let want: Vec<&str> = PreviewRefusal::ALL.iter().map(|r| r.code()).collect();
+        assert_eq!(want, ["not_direct", "no_part", "adaptive"], "the domain is closed at three");
+        let row = legend_row_values(msg::core_preview_domain_preview_refusal());
+        assert_eq!(row.split(" / ").collect::<Vec<_>>(), want, "the whole domain, in the enum's order");
+    }
+
+    /// The failure-kind row is the whole `FailureClass` domain, in declaration order: every kind
+    /// reaches the handled report through `FailureKind::class`, so a kind the row leaves out is a
+    /// value the person was never shown (`preview_not_direct`, `jail_missing_rtkmem` and the rest
+    /// were once missing).
+    #[test]
+    fn consent_legend_failure_kind_row_lists_every_failure_class() {
+        use plx_platform::i18n::msg;
+        let row = legend_row_values(msg::core_preview_domain_failure_kind());
+        let want: Vec<&str> = FailureClass::ALL.iter().map(|k| k.code()).collect();
+        assert_eq!(row.split(" / ").collect::<Vec<_>>(), want);
+        assert!(want.contains(&"preview_not_direct"));
     }
 
     #[test]
@@ -1052,6 +1383,76 @@ mod tests {
         .expect("handled event JSON");
         assert_eq!(v["tags"]["playback.transport"], "none");
         assert_eq!(v["tags"]["playback.transfer_age"], "unknown");
+    }
+
+    /// The demuxer exit that failed the session rides on every report as a closed code, as a
+    /// searchable tag AND in the playback context, and a report with none recorded says `none`.
+    /// The fingerprint is untouched: the field explains a group, it does not split it.
+    #[test]
+    fn a_demux_exit_is_tagged_and_in_the_context() {
+        let mut ctx = context();
+        ctx.demux_exit = DemuxExitClass::NoFraming;
+        let v: Value = serde_json::from_slice(&event_body(
+            &"a".repeat(32),
+            "0123456789abcdef",
+            Some(&"e".repeat(32)),
+            FailureClass::MediaSource,
+            ctx,
+            &[],
+        ))
+        .expect("handled event JSON");
+        assert_eq!(v["tags"]["playback.demux_exit"], "no_framing");
+        assert_eq!(v["contexts"]["playback"]["demux_exit"], "no_framing");
+        assert_eq!(v["fingerprint"], serde_json::json!(["playback-error", "media_source"]));
+        let v: Value = serde_json::from_slice(&event_body(
+            &"a".repeat(32),
+            "0123456789abcdef",
+            None,
+            FailureClass::MediaSource,
+            context(),
+            &[],
+        ))
+        .expect("handled event JSON");
+        assert_eq!(v["tags"]["playback.demux_exit"], "none");
+        assert_eq!(v["contexts"]["playback"]["demux_exit"], "none");
+    }
+
+    /// The demux-exit domain is closed and its wire strings and latch numbers are STABLE: a code
+    /// is never renamed or renumbered (production dashboards group on them), only appended.
+    #[test]
+    fn demux_exit_codes_are_unique_and_the_latch_mapping_is_pinned() {
+        let pinned: [(u8, DemuxExitClass, &str); 18] = [
+            (0, DemuxExitClass::None, "none"),
+            (1, DemuxExitClass::HttpsReserveFailed, "https_reserve_failed"),
+            (2, DemuxExitClass::HttpsOpenFailed, "https_open_failed"),
+            (3, DemuxExitClass::HttpOpenFailed, "http_open_failed"),
+            (4, DemuxExitClass::OpenInputFailed, "open_input_failed"),
+            (5, DemuxExitClass::FindStreamInfoFailed, "find_stream_info_failed"),
+            (6, DemuxExitClass::NoVideoStream, "no_video_stream"),
+            (7, DemuxExitClass::NoFraming, "no_framing"),
+            (8, DemuxExitClass::LoadMismatch, "load_mismatch"),
+            (9, DemuxExitClass::NoAudioAu, "no_audio_au"),
+            (10, DemuxExitClass::NoUsableVideo, "no_usable_video"),
+            (11, DemuxExitClass::DtsCoreMissing, "dts_core_missing"),
+            (12, DemuxExitClass::HlsFailed, "hls_failed"),
+            (13, DemuxExitClass::HlsNotReady, "hls_not_ready"),
+            (14, DemuxExitClass::DemuxPanicked, "demux_panicked"),
+            (15, DemuxExitClass::NoAccessUnits, "no_access_units"),
+            (16, DemuxExitClass::LoadRefused, "load_refused"),
+            (17, DemuxExitClass::Other, "other"),
+        ];
+        for (n, class, code) in pinned {
+            assert_eq!(class.latch(), n, "{code}");
+            assert_eq!(DemuxExitClass::from_latch(n), class, "{code}");
+            assert_eq!(class.code(), code);
+        }
+        assert_eq!(DemuxExitClass::from_latch(200), DemuxExitClass::Other, "an unowned byte is `other`");
+        let listed: Vec<DemuxExitClass> = pinned.iter().map(|p| p.1).collect();
+        assert_eq!(DemuxExitClass::ALL.to_vec(), listed, "ALL lists every variant, in latch order");
+        let mut codes: Vec<&str> = DemuxExitClass::ALL.iter().map(|c| c.code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), DemuxExitClass::ALL.len(), "every code is distinct");
     }
 
     /// The mapping from the code libcurl returned: every code a mid-body death produces has its
@@ -1208,7 +1609,7 @@ mod tests {
         let codes: Vec<_> = AttemptOrigin::ALL.iter().map(|o| o.code()).collect();
         assert_eq!(
             codes,
-            ["fresh", "user_retry", "quality_change", "auto_handoff", "recovery", "resume", "preview"],
+            ["fresh", "user_retry", "quality_change", "viewer_reconfigure", "auto_handoff", "recovery", "resume", "preview"],
         );
         assert_eq!(AttemptOrdinal::all().count(), 10, "1..=9 and the saturated value");
     }
@@ -1251,6 +1652,8 @@ mod tests {
         use plx_platform::i18n::msg;
         let v: Value = serde_json::from_slice(&preview_event()).expect("preview JSON");
         for key in [
+            "backend",
+            "terminal_stage",
             "attempted_delivery",
             "attempt_started",
             "attempt_origin",
@@ -1263,6 +1666,8 @@ mod tests {
         assert!(v["contexts"]["playback"]["http_status"].is_u64());
         let legend = preview_domains();
         for label in [
+            msg::core_preview_domain_backend(),
+            msg::core_preview_domain_terminal_stage(),
             msg::core_preview_domain_attempted_delivery(),
             msg::core_preview_domain_attempt_started(),
             msg::core_preview_domain_attempt_origin(),
@@ -1272,22 +1677,28 @@ mod tests {
             assert!(legend.contains(label), "legend omitted the row {label:?}");
         }
         assert!(legend.contains("yes / no"), "the attempt_started domain");
+        assert!(legend.contains("unknown / feed / uri"), "the backend domain");
+        assert!(legend.contains("unknown / planning / open / decode / presentation / release"),
+            "the terminal-stage domain");
         assert!(legend.contains("100 to 599"), "the http_status domain");
         // Every origin and every ordinal the producer can send is listed, in the enum's own order.
         assert!(
             legend.contains(
-                "fresh / user_retry / quality_change / auto_handoff / recovery / resume / preview"
+                "fresh / user_retry / quality_change / viewer_reconfigure / auto_handoff / recovery / resume / preview"
             ),
             "the attempt_origin domain",
         );
         assert!(legend.contains("1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / 9 / 9+"), "the attempt_ordinal domain");
         assert!(legend.contains("quality_pick"), "the delivery reason the fixed-rung pick notes");
+        assert!(legend.contains("refusal_recovery"), "the delivery reason the facet rung's conversion notes");
         // The attempted route rides EVERY report now, so its row lists the whole delivery domain
         // (including `unknown`), not only the three a refusal can name.
         let all = "unknown / original_direct / original_remux / hls / progressive_transcode";
         assert_eq!(legend.matches(all).count(), 2, "delivery and attempted delivery both list it");
         let privacy = include_str!("../../../../PRIVACY.md");
         for key in [
+            "backend",
+            "terminal_stage",
             "attempted_delivery",
             "attempt_started",
             "attempt_origin",
@@ -1303,6 +1714,7 @@ mod tests {
             assert!(privacy.contains(&quoted), "PRIVACY.md omitted the origin {}", origin.code());
         }
         assert!(privacy.contains("9+") && privacy.contains("quality_pick"));
+        assert!(privacy.contains("refusal_recovery"));
     }
 
     /// **The firmware's error number.** A `tv_pipeline` report used to say only that the pipeline
@@ -1364,5 +1776,171 @@ mod tests {
         assert!(v["contexts"]["playback"]["transfer_age"].is_string());
         assert!(v["tags"]["playback.transport"].is_string());
         assert!(v["tags"]["playback.transfer_age"].is_string());
+        assert!(v["contexts"]["playback"]["demux_exit"].is_string());
+        assert!(v["tags"]["playback.demux_exit"].is_string());
+    }
+
+    // ---- the `refusal_recovered` event (S6, #1075) ------------------------------------------
+
+    fn recovered_context() -> RefusalRecoveredContext {
+        use crate::telemetry::classes::{ChannelBucket, RecoveryRung, RefusalError, RefusedStream};
+        RefusalRecoveredContext {
+            stream: RefusedStream::Audio(AudioCodecClass::Dts),
+            channels: ChannelBucket::Surround,
+            error: RefusalError::Number(601),
+            rung: RecoveryRung::Facet,
+        }
+    }
+
+    fn sorted_keys(v: &Value) -> Vec<&str> {
+        let mut out: Vec<_> = v.as_object().expect("object").keys().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **The event's whole content, key by key.** A key that is not in this list is a field nobody
+    /// agreed to send: no breadcrumbs, no playback context (no raster, delivery or timing), no
+    /// refusal block (no source codecs beyond the one refused stream), only `user.id` of the user.
+    #[test]
+    fn refusal_recovered_carries_exactly_its_closed_fields() {
+        let v: Value = serde_json::from_slice(&refusal_recovered_body(
+            &"a".repeat(32),
+            "0123456789abcdef",
+            Some(&"e".repeat(32)),
+            recovered_context(),
+        ))
+        .expect("event JSON");
+        assert_eq!(v["level"], "info", "a recovered play is not an error");
+        assert_eq!(v["fingerprint"], serde_json::json!(["refusal_recovered", "facet", "dts"]));
+        assert_eq!(v["exception"]["values"][0]["mechanism"]["handled"], true);
+        assert_eq!(
+            sorted_keys(&v["tags"]),
+            [
+                "playback.class",
+                "playback.pipeline_error",
+                "playback.recovery_rung",
+                "playback.refused_channels",
+                "playback.refused_codec",
+                "playback.refused_stream",
+            ]
+        );
+        assert_eq!(v["tags"]["playback.class"], "refusal_recovered");
+        assert_eq!(v["tags"]["playback.refused_stream"], "audio");
+        assert_eq!(v["tags"]["playback.refused_codec"], "dts");
+        assert_eq!(v["tags"]["playback.refused_channels"], "3-6");
+        assert_eq!(v["tags"]["playback.pipeline_error"], "601");
+        assert_eq!(v["tags"]["playback.recovery_rung"], "facet");
+        assert_eq!(
+            sorted_keys(&v["contexts"]),
+            ["hardware", "refusal_recovered", "webos"],
+            "no playback context rides this event"
+        );
+        assert_eq!(
+            sorted_keys(&v["contexts"]["refusal_recovered"]),
+            ["pipeline_error", "recovery_rung", "refused_channels", "refused_codec", "refused_stream", "type"]
+        );
+        assert!(v.get("breadcrumbs").is_none(), "no trace of the playback is sent");
+        assert_eq!(sorted_keys(&v["user"]), ["id"]);
+        assert!(v["contexts"]["webos"]["build"].is_string(), "the firmware build rides every report");
+    }
+
+    /// The pipeline's answer is a number, `timeout` or `stall`; a video stream and an unnamed one
+    /// carry no channel count, and the grouping never includes the firmware's number.
+    #[test]
+    fn refusal_recovered_spells_every_closed_value_and_groups_without_the_number() {
+        use crate::telemetry::classes::{ChannelBucket, RecoveryRung, RefusalError, RefusedStream};
+        let body = |stream, channels, error, rung| -> Value {
+            serde_json::from_slice(&refusal_recovered_body(
+                &"a".repeat(32),
+                "",
+                None,
+                RefusalRecoveredContext { stream, channels, error, rung },
+            ))
+            .expect("event JSON")
+        };
+        let v = body(
+            RefusedStream::Video(VideoCodecClass::Hevc),
+            ChannelBucket::Unknown,
+            RefusalError::Timeout,
+            RecoveryRung::Hls,
+        );
+        assert_eq!(v["tags"]["playback.pipeline_error"], "timeout");
+        assert_eq!(v["tags"]["playback.refused_stream"], "video");
+        assert_eq!(v["fingerprint"], serde_json::json!(["refusal_recovered", "hls", "hevc"]));
+        assert!(v.get("user").is_none(), "no id, no user key at all");
+        assert!(v.get("dist").is_none());
+        let v = body(RefusedStream::Video(VideoCodecClass::H264), ChannelBucket::Unknown, RefusalError::Number(100), RecoveryRung::Encode);
+        assert_eq!(v["fingerprint"], serde_json::json!(["refusal_recovered", "encode", "h264"]));
+        let v = body(RefusedStream::None, ChannelBucket::Unknown, RefusalError::Stall, RecoveryRung::Rollback);
+        assert_eq!(v["tags"]["playback.pipeline_error"], "stall");
+        assert_eq!(v["tags"]["playback.refused_stream"], "none");
+        assert_eq!(v["tags"]["playback.refused_codec"], "unknown");
+        let a = body(RefusedStream::Audio(AudioCodecClass::Opus), ChannelBucket::Surround, RefusalError::Number(200), RecoveryRung::Facet);
+        let b = body(RefusedStream::Audio(AudioCodecClass::Opus), ChannelBucket::UpToStereo, RefusalError::Number(601), RecoveryRung::Facet);
+        assert_eq!(a["fingerprint"], b["fingerprint"], "one refused codec, one issue");
+    }
+
+    /// The channel buckets, at their edges.
+    #[test]
+    fn channel_buckets_have_their_edges_where_the_layouts_are() {
+        use crate::telemetry::classes::ChannelBucket as B;
+        assert_eq!(
+            [0, 1, 2, 3, 6, 7, 8, 32].map(|n| B::from_channels(n).code()),
+            ["unknown", "1-2", "1-2", "3-6", "3-6", "7+", "7+", "7+"]
+        );
+    }
+
+    /// **Consent is the existing error-report switch and nothing else.** On: exactly one event per
+    /// report call. Off (never asked, or declined): nothing is accepted, and a withdrawal stops
+    /// it at once.
+    #[test]
+    fn refusal_recovered_is_sent_only_under_the_error_report_consent() {
+        use crate::telemetry::consent::{self, Consent};
+        let _g = plx_base::testlock::serial();
+        let previous = consent::current();
+        let _ = take_recovered_for_test();
+
+        consent::install(Consent::default());
+        report_refusal_recovered(recovered_context());
+        assert!(take_recovered_for_test().is_empty(), "never asked: nothing");
+
+        let mut usage_only = Consent::default();
+        usage_only.usage = true;
+        usage_only.asked_version = consent::POLICY_VERSION;
+        consent::install(usage_only);
+        report_refusal_recovered(recovered_context());
+        assert!(take_recovered_for_test().is_empty(), "analytics consent is not error-report consent");
+
+        let mut enabled = Consent::default();
+        enabled.errors = true;
+        enabled.asked_version = consent::POLICY_VERSION;
+        consent::install(enabled);
+        report_refusal_recovered(recovered_context());
+        let sent = take_recovered_for_test();
+        assert_eq!(sent.len(), 1, "one call, one event");
+        assert_eq!(sent[0]["tags"]["playback.class"], "refusal_recovered");
+
+        let mut declined = Consent::default();
+        declined.asked_version = consent::POLICY_VERSION;
+        consent::install(declined);
+        report_refusal_recovered(recovered_context());
+        assert!(take_recovered_for_test().is_empty(), "declined: nothing");
+
+        consent::install(previous.unwrap_or_default());
+    }
+
+    /// The consent screen shows a sample of the event and the domain of each of its fields, and
+    /// `PRIVACY.md` names the class: an event neither mentions is an event nobody was shown.
+    #[test]
+    fn consent_preview_and_privacy_name_the_recovered_refusal() {
+        let sample: Value = serde_json::from_slice(&preview_refusal_recovered()).expect("preview JSON");
+        assert_eq!(sample["tags"]["playback.class"], "refusal_recovered");
+        let legend = preview_recovered_domains();
+        for code in ["facet", "hls", "rollback", "encode", "timeout", "stall", "1-2", "3-6", "7+", "dts", "h264", "video", "audio", "none"] {
+            assert!(legend.contains(code), "the legend omits {code}: {legend}");
+        }
+        assert!(legend.contains(&format!("{} to {}", i32::MIN, i32::MAX)), "{legend}");
+        let privacy = include_str!("../../../../PRIVACY.md");
+        assert!(privacy.contains("refusal_recovered"), "PRIVACY.md omitted refusal_recovered");
     }
 }

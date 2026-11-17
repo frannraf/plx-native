@@ -67,9 +67,9 @@ GFX_CRATE = "plx_gfx"
 NIGHTLY = pinned()  # the repo's one toolchain (historic name)
 
 
-# The invocation `make check`'s lab line runs (Makefile, "cargo check --lib --tests -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens --features
+# The invocation `make check`'s lab line runs (Makefile, "cargo check --lib --tests -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --features
 # lab-diagnostics"); identical arguments and CARGO_INCREMENTAL make the first run here a reuse.
-LIB_ARGS = ["check", "--lib", "--tests", "-p", "plxnative-modules", "-p", "plx_base", "-p", "plx_machine", "-p", "plx_platform", "-p", "plx_gfx", "-p", "plx_net", "-p", "plx_ui", "-p", "plx_plex", "-p", "plx_telemetry", "-p", "plx_data", "-p", "plx_session", "-p", "plx_media", "-p", "plx_appkit", "-p", "plx_screens", "--features", "lab-diagnostics"]
+LIB_ARGS = ["check", "--lib", "--tests", "-p", "plxnative-modules", "-p", "plx_base", "-p", "plx_machine", "-p", "plx_platform", "-p", "plx_gfx", "-p", "plx_net", "-p", "plx_ui", "-p", "plx_plex", "-p", "plx_telemetry", "-p", "plx_data", "-p", "plx_session", "-p", "plx_media", "-p", "plx_playback_contract", "-p", "plx_play_uri", "-p", "plx_play_feed", "-p", "plx_media_codecs", "-p", "plx_appkit", "-p", "plx_screens", "--features", "lab-diagnostics"]
 
 
 def cargo_env():
@@ -193,7 +193,9 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(script_stamp(freeze_stamps(json_records(other))), {})
             # A later rewrite of the file shows up in the NEXT build's stamp, not the earlier one.
             records = freeze_stamps(json_records(ours))
+            stamp = (build / "output").stat()
             (build / "output").write_text("cargo:rustc-env=X=2\n")
+            os.utime(build / "output", ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
             self.assertEqual(script_stamp(records), first)
             self.assertNotEqual(script_stamp(freeze_stamps(json_records(ours))), first)
 

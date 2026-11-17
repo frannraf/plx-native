@@ -104,19 +104,27 @@ mod tests {
         // Exhaustive on purpose: adding a row field owes a codec/shape review, not an implicit
         // default in the only test claiming complete row preservation.
         let m = PmsMovie {
+            edition: String::new(),
             sid: plx_plex::plex::ServerId::from_raw(3), sec: 8, title: "Episode".into(), year: 2026,
             rating: "TV-14".into(), dur_ns: i64::MAX, part: "/part".into(), thumb: "/poster".into(),
             still: "/still".into(), art: "/art".into(), summary: "Summary".into(), rk: "17".into(),
+            logo: Some("/library/metadata/10/clearLogo/1700000000".into()),
             vcodec: "hevc".into(), acodec: "aac".into(),
             blur: [[-0.0, f32::from_bits(0x7fc01234), f32::INFINITY]; 4], has_blur: true,
             kind: 3, resume_ms: 12345, show_rk: "10".into(), season_index: 2,
             show_title: "Show".into(), ep_index: 4, unwatched: false, watched: true,
             aired: "2026-09-08".into(), child_count: i64::MAX,
             guid: Some([1; 12]), show_guid: Some([2; 12]),
-            subtype: Some("movie".into()), smart: true, genre: Some("Drama".into()),
+            subtype: Some("movie".into()), smart: true, genre: Some("Drama".into()), secondary_genre: Some("Crime".into()),
             genres: vec!["Drama".into(), "Crime".into()], cast: vec!["A Lead".into(), "B Lead".into()],
             video_resolution: Some("4k".into()), hdr: true, audience_rating: Some(7.5),
             leaf_count: Some(10), viewed_leaf_count: Some(4), added_at: Some(i64::MAX),
+            sort_info: Some(crate::pms::SortInfo { rating: Some(9.1), user_rating: Some(8.0),
+                view_count: Some(7), bitrate_kbps: Some(8000), media_count: 2, ..Default::default() }),
+            versions: vec![crate::pms::MediaVersion {
+                id: plx_plex::plex::MediaId(3082), kbps: 25_200, resolution: "4k".into(),
+                vcodec: "hevc".into(), size: i64::MAX, hdr: true, ..Default::default()
+            }],
         };
         Landing { gen: 7, seq: 19, sid: m.sid, client: None, token_gen: 5,
             build: Some(SourceBuild {
@@ -136,6 +144,28 @@ mod tests {
         let m = &decoded.build.as_ref().unwrap().shelves[0].items[0];
         assert_eq!(m.blur[0].map(f32::to_bits), [0x80000000, 0x7fc01234, 0x7f800000]);
         assert_eq!(m.dur_ns, i64::MAX);
+        assert_eq!(m.logo.as_deref(), Some("/library/metadata/10/clearLogo/1700000000"));
+    }
+
+    #[test]
+    fn the_shared_row_codec_keeps_required_fields_and_rejects_unknown_and_duplicate_keys() {
+        let l = landing();
+        let row = &l.build.as_ref().unwrap().shelves[0].items[0];
+        let value = serde_json::to_value(row).unwrap();
+        let mut legacy = value.clone();
+        legacy.as_object_mut().unwrap().remove("logo");
+        let legacy = serde_json::from_value::<PmsMovie>(legacy).unwrap();
+        assert!(legacy.logo.is_none());
+        assert!(serde_json::to_value(&legacy).unwrap().get("logo").is_none());
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("title");
+        assert!(serde_json::from_value::<PmsMovie>(missing).is_err());
+        let mut unknown = value.clone();
+        unknown["unrecognised_row_field"] = json!(true);
+        assert!(serde_json::from_value::<PmsMovie>(unknown).is_err());
+        let wire = value.to_string();
+        let duplicate = format!("{{\"title\":\"duplicate\",{}", &wire[1..]);
+        assert!(serde_json::from_str::<PmsMovie>(&duplicate).is_err());
     }
 
     #[test]

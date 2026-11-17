@@ -136,13 +136,16 @@ THRESHOLDS = {
 # ------------------------------------------------------------------ the pinned tool ffmpeg -------
 Pin = collections.namedtuple("Pin", "key urls sha256 kind member version licence source")
 
-# Each build was DOWNLOADED and hashed by the author of this table on 2026-10-08, and the hash
-# agrees with the publisher's own (GitHub's asset digest; the build server's .sha256 file).
+# Each build was DOWNLOADED and hashed by the author of this table, and the hash agrees with the
+# publisher's own (GitHub's asset digest; the build server's .sha256 file): darwin-arm64 on
+# 2026-10-08, linux-x86_64 on 2026-11-12 (the 2026-10-07 and 2026-10-23 autobuilds pinned before
+# it were both pruned, and no copy of either survived to mirror).
 #  * linux-x86_64 is the canonical build (CI). BtbN/FFmpeg-Builds, GPLv3 (`--enable-gpl
 #    --enable-version3`), static libs, with libsvtav1, libx264, libaom and libvmaf; the build
 #    scripts are public at github.com/BtbN/FFmpeg-Builds. Its URL is a dated `autobuild-*` release,
-#    and BtbN prunes old autobuilds: when it 404s, mirror THIS exact tarball (same sha256) as a release
-#    asset of this repository, add that URL to `urls`, and nothing else changes.
+#    and BtbN prunes old autobuilds, so `urls` lists FIRST this repository's own copy of the same
+#    tarball (same sha256), a prerelease named `mirror/ffmpeg-btbn-<autobuild>` that is never
+#    `latest`. A re-pin mirrors the new tarball the same way before it changes this table.
 #  * darwin-arm64 is for local previews only (`adopt` refuses anything not rendered on linux-ci).
 #    Martin Riedl's build server, GPLv3, ffmpeg 9.0.2, with libsvtav1 4.2.0, libx264 and libvmaf;
 #    build script github.com/ffmpeg-build-tools. Permanent timestamped URL; I ran this binary.
@@ -150,11 +153,13 @@ Pin = collections.namedtuple("Pin", "key urls sha256 kind member version licence
 PINS = {
     "linux-x86_64": Pin(
         "linux-x86_64",
-        ("https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-07-13-07/"
-         "ffmpeg-n9.0.2-22-g46d8f462ee-linux64-gpl-9.0.tar.xz",),
-        "c03023a986dec781a5ab6bb8821d6544b40eb86e96f34283880a0fae8105da67",
-        "tar.xz", "/bin/ffmpeg", "n9.0.2-22-g46d8f462ee", "GPL-3.0-or-later (--enable-gpl --enable-version3)",
-        "BtbN/FFmpeg-Builds autobuild-2026-10-07-13-07"),
+        ("https://github.com/plxnative/plx-native/releases/download/"
+         "mirror/ffmpeg-btbn-autobuild-2026-11-12-15-40/ffmpeg-n9.0.2-57-gd838f9f9ae-linux64-gpl-9.0.tar.xz",
+         "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-12-15-40/"
+         "ffmpeg-n9.0.2-57-gd838f9f9ae-linux64-gpl-9.0.tar.xz"),
+        "ccedeabdb6c1bbfd44647225e3a4452a1983a770847c2d7de261fcbc407250df",
+        "tar.xz", "/bin/ffmpeg", "n9.0.2-57-gd838f9f9ae", "GPL-3.0-or-later (--enable-gpl --enable-version3)",
+        "BtbN/FFmpeg-Builds autobuild-2026-11-12-15-40"),
     "darwin-arm64": Pin(
         "darwin-arm64",
         ("https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip",),

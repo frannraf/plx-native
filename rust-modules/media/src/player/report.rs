@@ -10,6 +10,11 @@
 //! `Error`; ordinary low quality, buffering and rejected ABR candidates remain breadcrumbs at most,
 //! never errors of their own.
 //!
+//! A second, separate handled event is [`refusal_recovered`]: a refusal the television gave a Load
+//! that the open-recovery ladder then recovered from, raised by the recovery machine as an effect
+//! at the rescue's first picture, once per request, under the same error-report consent. It carries
+//! no trace; see `telemetry::playback::refusal_recovered_body`.
+//!
 //! # A failure says WHY the attempt it ended was made
 //!
 //! A report names the attempt that failed beside the playback it failed in: the route being opened
@@ -33,13 +38,13 @@
 //! The first design put `playback.started` on the engine's `load:` line. That line is the wrong
 //! seam and the name would have been a lie: it is emitted BEFORE the source is opened and before
 //! anything plays, so a television that never produced a frame would report a start. It is
-//! `requested` now, and `started` fires on the first transition into `Playing` — the same value the
-//! HUD renders, so the event says what the viewer saw.
+//! `requested` now, and `started` fires on the first transition into backend-reported `Playing` —
+//! the same value the HUD renders. A URI service's Playing report does not prove a panel picture.
 //!
 //! # Observed at the DERIVED state, not at `pump::set_state`
 //!
 //! `set_state` looks like the choke point and is not: [`super::state`] derives two of its answers
-//! outside `pb_state` entirely — `Resolving` while a plan is in flight, and `Error` for a
+//! outside the readout's state entirely — `Resolving` while a plan is in flight, and `Error` for a
 //! `/decision` refusal, which happens before an engine exists and so before the pump has ever run.
 //! Hooking the setter would have silently missed the earliest and most certain failure there is.
 //! So this observes the value the HUD reads, once a frame.
@@ -57,12 +62,17 @@ use plx_telemetry::diag::schema::DiagEvent;
 // classifies a live playback INTO it. Re-exported here so the player and the route layer keep
 // naming the closed domains where they report from.
 pub use plx_telemetry::telemetry::classes::{
-    AttemptOrdinal, AttemptOrigin, AudioCodecClass, BufferClass, DecisionCodeClass, DeliveryClass, DeliveryReason, HttpClass,
-    LoadElapsedClass, OriginalProbePhase, PipelineClass, PlaybackErrorContext, QualityClass,
-    RasterClass, RateClass, RefusalContext, TraceAge, TraceDirection, TraceEvent, TraceOutcome,
+    AttemptOrdinal, AttemptOrigin, AudioCodecClass, BufferClass, DecisionCodeClass, DeliveryClass, DemuxExitClass, DeliveryReason, HttpClass,
+    ChannelBucket, ErrorBackendClass, TerminalStageClass, LoadElapsedClass, OriginalProbePhase,
+    PipelineClass, PlaybackErrorContext, QualityClass,
+    RasterClass, RateClass, RecoveryRung, RefusalContext, RefusalError, RefusalRecoveredContext, RefusedStream, TraceAge, TraceDirection, TraceEvent, TraceOutcome,
     TraceStep, TransferAgeClass, TransportClass, VideoCodecClass,
 };
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering::Relaxed};
+
+/// Common request history spans physical backend reloads and survives their resource resets.
+/// The existing consent eraser and every append serialize on this same owner.
+static TRACE: std::sync::Mutex<PlaybackTrace> = std::sync::Mutex::new(PlaybackTrace::new());
 
 /// The current attempt's opaque id — random, per attempt, never stored. See `DiagEvent`'s playback
 /// block: it joins one attempt's lifecycle events and cannot link two playbacks, let alone two sets.
@@ -173,8 +183,8 @@ static LEDGER: std::sync::Mutex<AttemptLedger> = std::sync::Mutex::new(AttemptLe
     ordinal: AttemptOrdinal::FIRST,
 });
 
-/// The current play attempt's in-memory, privacy-bounded history. It lives in [`super::SHARED`]
-/// because both the demux worker (ABR/probe) and main thread (request/seek/error) append to it.
+/// The current play request's in-memory, privacy-bounded history, owned here by [`TRACE`].
+/// Both the common adaptive worker and main thread append addressed transitions to it.
 /// Engine reloads do not clear it; a new play attempt does.
 pub struct PlaybackTrace {
     generation: u32,
@@ -335,6 +345,48 @@ pub fn rung_quality_class(rung: crate::abr::Rung) -> QualityClass {
     QualityClass::from_kbps(i64::from(rung.kbps()))
 }
 
+/// **A refused play the ladder rescued, told as one `refusal_recovered` event** (issue #1075). The
+/// recovery machine (`recovery::OpenRecovery`) raises it once per request, at the first picture
+/// of a rescue, as `RecoveryEffect::ReportRecovered`; the pump hands it here and this is the whole
+/// of what leaves: the closed classes of [`RefusalRecoveredContext`]. The event goes through the
+/// same error-report switch as [`report_error`](plx_telemetry::telemetry::playback::report_error);
+/// with the consent off nothing is built, so this holds no consent check of its own.
+pub fn refusal_recovered(recovered: &super::recovery::Recovered) {
+    if let Some(context) = refusal_recovered_context(recovered) {
+        plx_telemetry::telemetry::playback::report_refusal_recovered(context);
+    }
+}
+
+/// The wire's closed classes of a rescue, or `None` for a refusal the report does not name (a
+/// source failure is the demuxer's, never the television's refusal).
+fn refusal_recovered_context(recovered: &super::recovery::Recovered) -> Option<RefusalRecoveredContext> {
+    use super::recovery::{LoadRefusal, Rung};
+    use plx_platform::devcaps::Facet;
+    let error = match recovered.refusal {
+        LoadRefusal::Refused { num } => RefusalError::Number(num),
+        LoadRefusal::TimedOut => RefusalError::Timeout,
+        LoadRefusal::Stalled => RefusalError::Stall,
+        LoadRefusal::SourceFailed => return None,
+    };
+    // The codec class and, for audio, the channel bucket: the facet's raster and exact layout stay
+    // in the machine.
+    let (stream, channels) = match &recovered.facet {
+        Some(Facet::Audio { codec, channels }) => (
+            RefusedStream::Audio(AudioCodecClass::from_name(codec)),
+            ChannelBucket::from_channels(*channels),
+        ),
+        Some(Facet::Video { codec, .. }) => (RefusedStream::Video(VideoCodecClass::from_name(codec)), ChannelBucket::Unknown),
+        None => (RefusedStream::None, ChannelBucket::Unknown),
+    };
+    let rung = match recovered.rung {
+        Rung::Facet => RecoveryRung::Facet,
+        Rung::Both => RecoveryRung::Hls,
+        Rung::Encode => RecoveryRung::Encode,
+        Rung::Rollback => RecoveryRung::Rollback,
+    };
+    Some(RefusalRecoveredContext { stream, channels, error, rung })
+}
+
 /// The delivery of the route this playback INSTALLED. A refused or unresolved plan installs none
 /// (`tsession` stays empty and `cur_contract` describes an attempt that never ran), so reading the
 /// route would label it `Direct` — the tag Sentry PLX-NATIVE-14 showed on every `decision_refused`
@@ -354,8 +406,7 @@ fn delivery_class(ps: &crate::route::PlaybackSession) -> DeliveryClass {
 }
 
 fn push_trace_for(generation: u32, event: TraceEvent) {
-    let mut trace = super::SHARED
-        .playback_trace
+    let mut trace = TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // Check consent while holding the same trace lock used by withdrawal's clear. Either this
@@ -370,8 +421,7 @@ fn push_trace_for(generation: u32, event: TraceEvent) {
 /// An engine open begins: the attempt that follows has shown nothing yet. Same consent and
 /// generation discipline as the breadcrumbs, but no step is added.
 fn note_engine_opening() {
-    let mut trace = super::SHARED
-        .playback_trace
+    let mut trace = TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if !plx_telemetry::telemetry::consent::allows_errors() || trace.generation == 0 || trace.sealed {
@@ -381,8 +431,7 @@ fn note_engine_opening() {
 }
 
 fn push_trace(event: TraceEvent) {
-    let mut trace = super::SHARED
-        .playback_trace
+    let mut trace = TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if !plx_telemetry::telemetry::consent::allows_errors() || trace.generation == 0 {
@@ -396,8 +445,7 @@ fn push_trace(event: TraceEvent) {
 /// snapshot under one lock. A split append/snapshot lets an ABR worker put an event *after*
 /// `playback failed`, producing a causal sequence that never happened.
 fn finish_trace(event: TraceEvent) -> Vec<TraceStep> {
-    let mut trace = super::SHARED
-        .playback_trace
+    let mut trace = TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if !plx_telemetry::telemetry::consent::allows_errors() {
@@ -411,8 +459,7 @@ fn finish_trace(event: TraceEvent) -> Vec<TraceStep> {
 /// reaches this through the hook [`install_trace_eraser`] registers
 /// (`telemetry::playback::clear_error_trace`); the app's own call sites name it directly.
 pub fn clear_error_trace() {
-    super::SHARED
-        .playback_trace
+    TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -440,6 +487,19 @@ pub fn note_quality_selected_for(generation: u32, q: crate::route::Quality) {
         TraceEvent::QualitySelected {
             selected: selected_quality_class(q),
         },
+    );
+}
+
+/// The facet rung's replacement route is the playback's delivery now: its class, the reason
+/// [`DeliveryReason::RefusalRecovery`], and the app's own recovery as the open's origin (which also
+/// notes the attempt, so a failure of the converted open does not read as the first fresh one).
+pub fn note_refusal_recovery_delivery(ps: &crate::route::PlaybackSession) {
+    note_delivery_requested_for(
+        crate::route::playback_trace_generation(),
+        delivery_class(ps),
+        QualityClass::Unknown,
+        DeliveryReason::RefusalRecovery,
+        AttemptOrigin::Recovery,
     );
 }
 
@@ -514,8 +574,8 @@ pub fn note_original_probe_for(
 }
 
 /// Record the native Load-returned gate opening, or issue #74 D.1.4's budget firing first — see
-/// [`LoadElapsedClass`]. Callable off the main thread (the load thread reports the ordinary gate
-/// transition), like every other `_for` breadcrumb here.
+/// [`LoadElapsedClass`]. The common adapter publishes the worker's captured timing only after
+/// validating the receipt's attempt and native epoch; the pump reports budget expiry.
 pub fn note_load_gate_for(generation: u32, elapsed: LoadElapsedClass) {
     push_trace_for(generation, TraceEvent::LoadGateOpened { elapsed });
 }
@@ -523,10 +583,10 @@ pub fn note_load_gate_for(generation: u32, elapsed: LoadElapsedClass) {
 /// The quality the installed route asked the server for. Original-quality routes ask for the
 /// original, a progressive transcode asks for the viewer's selection, and HLS is the controller's
 /// current rung. No route (`Unknown`) asked for nothing recorded, so it is not inferred.
-fn requested_quality(delivery: DeliveryClass, selected: QualityClass) -> QualityClass {
+fn requested_quality(delivery: DeliveryClass, selected: QualityClass, hls_kbps: Option<i64>) -> QualityClass {
     match delivery {
         DeliveryClass::Unknown => QualityClass::Unknown,
-        DeliveryClass::Hls => QualityClass::from_kbps(super::SHARED.dg_abr_kbps.load(Relaxed)),
+        DeliveryClass::Hls => hls_kbps.map_or(QualityClass::Unknown, QualityClass::from_kbps),
         DeliveryClass::Direct | DeliveryClass::Remux => QualityClass::Original,
         DeliveryClass::Transcode => selected,
     }
@@ -550,36 +610,60 @@ fn transport_classes(
 }
 
 fn error_context(ps: &crate::route::PlaybackSession) -> PlaybackErrorContext {
+    error_context_with_source(ps, None)
+}
+
+fn error_context_with_source(ps: &crate::route::PlaybackSession,
+    source: Option<super::backend::TerminalFailureSource>) -> PlaybackErrorContext {
+    use super::attempt_metrics::{Backend, Stage};
+    let backend = match source.map(|source| source.backend) {
+        Some(Backend::Uri) => ErrorBackendClass::Uri,
+        Some(Backend::Feed) => ErrorBackendClass::Feed,
+        _ => ErrorBackendClass::Unknown,
+    };
+    let terminal_stage = match source.map(|source| source.stage) {
+        Some(Stage::Planning) => TerminalStageClass::Planning,
+        Some(Stage::Open) => TerminalStageClass::Open,
+        Some(Stage::Decode) => TerminalStageClass::Decode,
+        Some(Stage::Presentation) => TerminalStageClass::Presentation,
+        Some(Stage::Release) => TerminalStageClass::Release,
+        _ if super::backend::handled_failure(super::error_now(ps).kind).stage
+            == Stage::Planning => TerminalStageClass::Planning,
+        _ => TerminalStageClass::Unknown,
+    };
+    let facts = ps.attempt_view().facts();
     let delivery = delivery_class(ps);
     let selected = selected_quality_class(crate::route::quality());
-    let requested = requested_quality(delivery, selected);
+    let requested = requested_quality(delivery, selected, facts.requested_kbps);
     let (transport, transfer_age) = transport_classes(
-        super::SHARED.dg_transport_rc.load(Relaxed),
-        super::SHARED.dg_transport_age_ms.load(Relaxed),
-        super::SHARED.dg_transport_reopen_failed.load(Relaxed),
+        facts.transport_rc.unwrap_or(0),
+        facts.transfer_age_ms.unwrap_or(0),
+        facts.transport_reopen_failed.unwrap_or(false),
     );
     let refusal = refusal_context(ps);
     let (noted, attempt_started) = {
-        let trace = super::SHARED
-            .playback_trace
+        let trace = TRACE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         (trace.attempted_delivery(), trace.attempt_started())
     };
-    let http_status = super::SHARED.dg_http_status.load(Relaxed);
+    let http_status = facts.http_status.unwrap_or(0);
     let (attempt_origin, attempt_ordinal) = attempt_snapshot();
     let context = PlaybackErrorContext {
+        backend,
+        terminal_stage,
         delivery,
         selected,
         requested,
-        declared_rate: RateClass::from_kbps(super::SHARED.dg_abr_declared_kbps.load(Relaxed)),
-        media_rate: RateClass::from_kbps(super::SHARED.dg_abr_media_kbps.load(Relaxed)),
-        raster: RasterClass::from_height(super::SHARED.video_raster().1),
-        pipeline: PipelineClass::from_stage(super::SHARED.dg_stage.load(Relaxed)),
+        declared_rate: RateClass::from_kbps(facts.declared_kbps.unwrap_or(0)),
+        media_rate: RateClass::from_kbps(facts.media_kbps.unwrap_or(0)),
+        raster: RasterClass::from_height(facts.raster.map_or(0, |(_, h)| h)),
+        pipeline: PipelineClass::from_stage(facts.pipeline_stage.unwrap_or(0)),
         http: HttpClass::from_status(http_status),
-        buffer: BufferClass::from_ms(super::SHARED.dg_abr_buffer_ms.load(Relaxed)),
+        buffer: BufferClass::from_ms(facts.abr_buffer_ms.unwrap_or(0)),
         transport,
         transfer_age,
+        demux_exit: DemuxExitClass::from_latch(facts.demux_exit.unwrap_or(0)),
         started: SAW_START.load(Relaxed),
         // A refusal names the route it asked the server for; else the route a noted switch is
         // opening; else the session's own, which is also the attempt's when nothing was switched.
@@ -588,8 +672,9 @@ fn error_context(ps: &crate::route::PlaybackSession) -> PlaybackErrorContext {
         attempt_origin,
         attempt_ordinal,
         http_status: HttpClass::exact_status(http_status),
-        pipeline_error: super::SHARED.dg_cb_err_num.load(Relaxed),
+        pipeline_error: facts.pipeline_error.unwrap_or(0),
         refusal,
+        preview_refusal: crate::route::preview_refusal(ps),
     };
     if crate::route::preview_request(ps) {
         as_preview(context)
@@ -649,12 +734,23 @@ pub fn note_presented_for_test(ps: &crate::route::PlaybackSession) {
     push_trace(presented_event(ps));
 }
 
+/// The reason and the route class of the newest `DeliveryRequested` step of the playback trace (the
+/// breadcrumb a noted route change leaves), `None` when there is none. The trace records only while
+/// error reporting is consented, so a test installs that consent first.
+#[cfg(any(test, feature = "test-support"))]
+pub fn last_delivery_requested_for_test() -> Option<(DeliveryReason, DeliveryClass)> {
+    let trace = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    trace.snapshot().iter().rev().find_map(|step| match step.event {
+        TraceEvent::DeliveryRequested { reason, delivery, .. } => Some((reason, delivery)),
+        _ => None,
+    })
+}
+
 /// Put the per-attempt latches back the way an idle player has them, after a route test that
 /// asked for a trace.
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_latches_for_test() {
-    super::SHARED.pb_state.store(super::shared::PlaybackState::Idle as u8, Relaxed);
-    LAST.store(super::shared::PlaybackState::Idle as u8, Relaxed);
+    LAST.store(super::attempt_view::PlaybackState::Idle as u8, Relaxed);
     SAW_START.store(false, Relaxed);
     SAW_FAIL.store(false, Relaxed);
     preview_requested();
@@ -687,13 +783,14 @@ fn refusal_context(ps: &crate::route::PlaybackSession) -> Option<RefusalContext>
 }
 
 fn presented_event(ps: &crate::route::PlaybackSession) -> TraceEvent {
+    let facts = ps.attempt_view().facts();
     let delivery = delivery_class(ps);
-    let requested = requested_quality(delivery, selected_quality_class(crate::route::quality()));
+    let requested = requested_quality(delivery, selected_quality_class(crate::route::quality()), facts.requested_kbps);
     TraceEvent::Presented {
         delivery,
         requested,
-        declared_rate: RateClass::from_kbps(super::SHARED.dg_abr_declared_kbps.load(Relaxed)),
-        raster: RasterClass::from_height(super::SHARED.video_raster().1),
+        declared_rate: RateClass::from_kbps(facts.declared_kbps.unwrap_or(0)),
+        raster: RasterClass::from_height(facts.raster.map_or(0, |(_, h)| h)),
     }
 }
 
@@ -750,9 +847,8 @@ pub fn requested(
     REBUFFER_AT_MS.store(0, Relaxed);
     REBUFFER_TOTAL_MS.store(0, Relaxed);
     REQUESTED_MS.store(at, Relaxed);
-    LAST.store(super::shared::PlaybackState::Resolving as u8, Relaxed);
-    let mut trace = super::SHARED
-        .playback_trace
+    LAST.store(super::attempt_view::PlaybackState::Resolving as u8, Relaxed);
+    let mut trace = TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if plx_telemetry::telemetry::consent::allows_errors() {
@@ -863,12 +959,12 @@ enum What {
 /// heavy scrubbers look like heavy watchers. Neither is observable without a test, so the decision
 /// is separated from the globals and graded on the host.
 fn transition(
-    prev: super::shared::PlaybackState,
-    now: super::shared::PlaybackState,
+    prev: super::attempt_view::PlaybackState,
+    now: super::attempt_view::PlaybackState,
     saw_start: bool,
     saw_fail: bool,
 ) -> Option<What> {
-    use super::shared::PlaybackState as S;
+    use super::attempt_view::PlaybackState as S;
     if prev == now {
         return None;
     }
@@ -885,7 +981,14 @@ fn transition(
 
 /// **Observe the state the HUD is rendering.** Called once a frame from the main loop.
 pub fn tick(ps: &crate::route::PlaybackSession) {
-    tick_with(ps, REPORT_PREVIEW_FAILURES);
+    tick_with(ps, REPORT_PREVIEW_FAILURES, None);
+}
+
+/// Production app observation supplies only a failure of this logical request's addressed
+/// physical attempt. No source means Unknown backend; known planning refusals retain that stage.
+pub fn tick_with_source(ps: &crate::route::PlaybackSession,
+    source: Option<super::backend::TerminalFailureSource>) {
+    tick_with(ps, REPORT_PREVIEW_FAILURES, source);
 }
 
 /// A detail-page preview is about to be requested: its failure may be reported again. The preview
@@ -894,34 +997,45 @@ pub fn preview_requested() {
     PREVIEW_SAW_FAIL.store(false, Relaxed);
 }
 
-/// [`tick`] with the preview-reporting switch passed in, so a test can flip it without a second
-/// production switch: [`tick`] is its only caller and always passes [`REPORT_PREVIEW_FAILURES`].
-fn tick_with(ps: &crate::route::PlaybackSession, report_preview_failures: bool) {
+/// The common observer with the preview-reporting switch passed in, so a test can flip it
+/// without a second production switch. Both production entry points pass
+/// [`REPORT_PREVIEW_FAILURES`].
+fn tick_with(ps: &crate::route::PlaybackSession, report_preview_failures: bool,
+    source: Option<super::backend::TerminalFailureSource>) {
     let now = super::state(ps);
-    let prev = super::shared::PlaybackState::from_u8(LAST.swap(now as u8, Relaxed));
+    let prev = super::attempt_view::PlaybackState::from_u8(LAST.swap(now as u8, Relaxed));
     if crate::route::preview_request(ps) {
         tick_preview(ps, prev, now, report_preview_failures);
         return;
     }
     // A claim's presentation hold answers Buffering on purpose (`state()`), so its
     // Playing -> Buffering edge is the viewer's own pick working, not a stall.
-    if !super::claim_hold::active() {
+    let claim_held = super::claim_hold::active();
+    if !claim_held {
         note_rebuffer(prev, now, SAW_START.load(Relaxed));
     }
-    // `Resolving` and `Connecting` are the states of an engine being opened, whether the first or
-    // a reload after a quality switch; a rebuffer or a seek is neither, so an open that never
-    // reaches a picture is told apart from a session that had one.
+    // `Resolving` and `Connecting` mark an open, whether the first or a reload after a quality
+    // switch; a rebuffer or seek is neither. A later Feed picture can then be attributed to
+    // this open. A URI service state alone cannot establish that picture.
     if prev != now
         && matches!(
             now,
-            super::shared::PlaybackState::Resolving | super::shared::PlaybackState::Connecting
+            super::attempt_view::PlaybackState::Resolving | super::attempt_view::PlaybackState::Connecting
         )
     {
         note_engine_opening();
     }
-    if prev != now && now == super::shared::PlaybackState::Playing {
-        // Unlike the usage funnel's once-per-attempt `Started`, every return to actual presented
-        // video is useful causal evidence after a seek or delivery reload.
+    if prev != now
+        && now == super::attempt_view::PlaybackState::Playing
+        && ps.attempt_view().backend() != Some(super::attempt_view::Backend::Uri)
+    {
+        // Feed's Playing transition follows its first reported position tick (`seen_frame` is
+        // set by the pipeline's type-0 `FRAMEREADY` callback, a ~5 Hz position report), so the
+        // trace step and `PlaybackStarted.startup` below measure the time to that first position
+        // tick, NOT to a first picture. The reducer's `Observation::Presented` (local metrics
+        // only, set from the displayed-frame counter) is a different and stricter fact; the two
+        // are not merged. A URI service Playing report, even with an advancing position, cannot
+        // establish panel presentation.
         push_trace(presented_event(ps));
     }
     match transition(prev, now, SAW_START.load(Relaxed), SAW_FAIL.load(Relaxed)) {
@@ -930,7 +1044,7 @@ fn tick_with(ps: &crate::route::PlaybackSession, report_preview_failures: bool) 
             emit(DiagEvent::PlaybackStarted {
                 playback_id: ATTEMPT.load(Relaxed),
                 mode: mode(ps),
-                raster: raster_class(super::SHARED.video_raster().1),
+                raster: raster_class(ps.attempt_view().facts().raster.map_or(0, |(_, h)| h)),
                 fps: fps_rung(crate::route::stream_fps(ps)),
                 video: video_codec_class(&crate::route::stream_vcodec(ps)),
                 audio: audio_codec_class(&crate::route::stream_acodec(ps)),
@@ -943,12 +1057,22 @@ fn tick_with(ps: &crate::route::PlaybackSession, report_preview_failures: bool) 
             let shape = super::error_now(ps);
             let kind = shape.kind.class();
             let trace = finish_trace(TraceEvent::Failed { kind });
-            let context = error_context(ps);
+            let context = match source {
+                Some(source) => error_context_with_source(ps, Some(source)),
+                None => error_context(ps),
+            };
             plx_telemetry::telemetry::playback::report_error(kind, context, &trace);
             emit(DiagEvent::PlaybackFailed {
                 playback_id: ATTEMPT.load(Relaxed),
                 mode: mode(ps),
                 kind: shape.kind.code(),
+                video: video_codec_class(&crate::route::stream_vcodec(ps)),
+                audio: audio_codec_class(&crate::route::stream_acodec(ps)),
+                pipeline_error: plx_telemetry::telemetry::classes::PipelineErrorClass::from_number(
+                    context.pipeline_error,
+                )
+                .code(),
+                refusal: ps.attempt_view().facts().refusal_path.unwrap_or(super::attempt_view::RefusalPath::None).code(),
             });
         }
         None => {}
@@ -963,8 +1087,8 @@ fn tick_with(ps: &crate::route::PlaybackSession, report_preview_failures: bool) 
 /// whether the handled error is queued.
 fn tick_preview(
     ps: &crate::route::PlaybackSession,
-    prev: super::shared::PlaybackState,
-    now: super::shared::PlaybackState,
+    prev: super::attempt_view::PlaybackState,
+    now: super::attempt_view::PlaybackState,
     report_failure: bool,
 ) {
     // `saw_start` is passed as true: a trailer reaching Playing is not `playback.started`.
@@ -1009,11 +1133,11 @@ pub fn ended(ps: &crate::route::PlaybackSession, position_ns: i64, duration_ns: 
 }
 
 fn note_rebuffer(
-    prev: super::shared::PlaybackState,
-    now: super::shared::PlaybackState,
+    prev: super::attempt_view::PlaybackState,
+    now: super::attempt_view::PlaybackState,
     saw_start: bool,
 ) {
-    use super::shared::PlaybackState as S;
+    use super::attempt_view::PlaybackState as S;
     if starts_rebuffer(prev, now, saw_start) {
         // A saturating increment, as a loop; see `requested` for why not `fetch_update`.
         let mut current = REBUFFER_COUNT.load(Relaxed);
@@ -1029,11 +1153,11 @@ fn note_rebuffer(
 }
 
 fn starts_rebuffer(
-    prev: super::shared::PlaybackState,
-    now: super::shared::PlaybackState,
+    prev: super::attempt_view::PlaybackState,
+    now: super::attempt_view::PlaybackState,
     saw_start: bool,
 ) -> bool {
-    use super::shared::PlaybackState as S;
+    use super::attempt_view::PlaybackState as S;
     saw_start && prev == S::Playing && now == S::Buffering
 }
 
@@ -1166,7 +1290,7 @@ pub fn fps_rung(fps: f64) -> &'static str {
         .unwrap_or("other")
 }
 
-/// How long the viewer waited for a picture. The boundaries are where the EXPERIENCE changes, not
+/// How long the viewer waited for backend-reported playback. The boundaries are where the EXPERIENCE changes, not
 /// round numbers: under a second reads as instant, three seconds is where a person starts to wonder,
 /// ten is where they press something.
 pub fn startup_class(ms: i64) -> &'static str {
@@ -1197,6 +1321,28 @@ pub fn watched_class(position_ns: i64, duration_ns: i64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plx_telemetry::telemetry::classes::PreviewRefusal;
+    use plx_play_feed::shared::FEED_SHARED;
+
+    #[test]
+    fn physical_feed_reset_preserves_common_request_trace() {
+        let _serial = plx_base::testlock::serial();
+        TRACE.lock().unwrap_or_else(|e| e.into_inner()).seed_for_reset_test();
+        crate::player::reset_session_for_test();
+        let steps = TRACE.lock().unwrap_or_else(|e| e.into_inner()).step_count_for_test();
+        clear_error_trace();
+        assert_eq!(steps, 1, "a physical reset cannot erase the request's causal history");
+    }
+
+    fn begin_view(ps: &mut crate::route::PlaybackSession) -> crate::route::RouteStartAttempt {
+        let attempt = crate::route::RouteStartAttempt::fixture();
+        ps.begin_attempt_view(attempt, crate::player::attempt_view::Backend::Feed);
+        attempt
+    }
+
+    fn observe_facts(ps: &mut crate::route::PlaybackSession, attempt: crate::route::RouteStartAttempt, facts: crate::player::attempt_view::AttemptFacts) {
+        assert!(ps.ingest_attempt_facts(attempt, crate::player::attempt_view::Backend::Feed, facts));
+    }
 
     /// PR #104 review: `ATTEMPT_CONNECTION` packs the server slot, link code and ip code into one
     /// `u32` so `requested`/`emit` publish/observe them with a single store/load. Every field must
@@ -1297,26 +1443,66 @@ mod tests {
         assert!(!starts_rebuffer(S::Playing, S::Buffering, false));
     }
 
+    #[test]
+    fn uri_playing_starts_lifecycle_without_claiming_panel_presentation() {
+        use plx_telemetry::telemetry::consent::{self, Consent};
+        let _g = plx_base::testlock::serial();
+        struct Restore(Option<Consent>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                reset_latches_for_test();
+                consent::install(self.0.take().unwrap_or_default());
+            }
+        }
+        let _restore = Restore(consent::current());
+        let mut enabled = Consent::default();
+        enabled.errors = true;
+        enabled.asked_version = consent::POLICY_VERSION;
+        consent::install(enabled);
+        let mut ps = crate::route::PlaybackSession::default();
+        let attempt = crate::route::RouteStartAttempt::fixture();
+        ps.begin_attempt_view(attempt, crate::player::attempt_view::Backend::Uri);
+        assert!(ps.ingest_attempt_facts(
+            attempt,
+            crate::player::attempt_view::Backend::Uri,
+            crate::player::attempt_view::AttemptFacts {
+                status: Some(S::Playing),
+                position_ns: Some(1_000_000),
+                ..Default::default()
+            },
+        ));
+        TRACE.lock().unwrap_or_else(|e| e.into_inner()).seed_for_reset_test();
+        SAW_START.store(false, Relaxed);
+        LAST.store(S::Connecting as u8, Relaxed);
+        assert_eq!(crate::player::state(&ps), S::Playing);
+        tick(&ps);
+        assert!(SAW_START.load(Relaxed), "service Playing starts the common lifecycle");
+        assert!(
+            !trace_steps().iter().any(|step| matches!(step.event, TraceEvent::Presented { .. })),
+            "service Playing and a position report are not independent panel evidence",
+        );
+    }
+
     /// A paused session with no picture yet (`PlaybackState::Paused`) is not playing: it reports no
     /// `PlaybackStarted`, no presented trace step, and a later `Buffering` is not a rebuffer of a
     /// playback that never presented.
     #[test]
     fn a_paused_session_with_no_picture_reports_no_playback_started() {
         let _g = plx_base::testlock::serial();
-        let ps = crate::route::PlaybackSession::IDLE;
+        let mut ps = crate::route::PlaybackSession::IDLE;
         SAW_START.store(false, Relaxed);
         REBUFFER_COUNT.store(0, Relaxed);
         LAST.store(S::Connecting as u8, Relaxed);
-        crate::player::SHARED.seeking.store(false, Relaxed);
-        crate::player::SHARED.pb_state.store(S::Paused as u8, Relaxed);
+        FEED_SHARED.seeking.store(false, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Paused));
         let steps_before = trace_steps().len();
         tick(&ps);
         let steps_after = trace_steps().len();
         let started = SAW_START.load(Relaxed);
-        crate::player::SHARED.pb_state.store(S::Buffering as u8, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Buffering));
         tick(&ps);
         let rebuffers = REBUFFER_COUNT.load(Relaxed);
-        crate::player::SHARED.pb_state.store(S::Idle as u8, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Idle));
         LAST.store(S::Idle as u8, Relaxed);
         SAW_START.store(false, Relaxed);
         REBUFFER_COUNT.store(0, Relaxed);
@@ -1332,13 +1518,13 @@ mod tests {
     #[test]
     fn a_claim_hold_is_not_a_rebuffer() {
         let _g = plx_base::testlock::serial();
-        let ps = crate::route::PlaybackSession::IDLE;
+        let mut ps = crate::route::PlaybackSession::IDLE;
         REBUFFER_COUNT.store(0, Relaxed);
         SAW_START.store(true, Relaxed);
         LAST.store(S::Playing as u8, Relaxed);
         // `state()` ranks a seek in flight above everything here; another test's leftover flag
         // would answer Seeking for both edges below.
-        crate::player::SHARED.seeking.store(false, Relaxed);
+        FEED_SHARED.seeking.store(false, Relaxed);
         crate::player::claim_hold::hold_for_test(7, true);
         crate::route::force_applying_for_test(7);
         assert_eq!(crate::player::state(&ps), S::Buffering, "the hold draws the spinner");
@@ -1350,11 +1536,11 @@ mod tests {
         crate::player::claim_hold::clear();
         crate::route::reset_player_control_for_test(&ps);
         LAST.store(S::Playing as u8, Relaxed);
-        crate::player::SHARED.pb_state.store(S::Buffering as u8, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Buffering));
         tick(&ps);
         let genuine = REBUFFER_COUNT.load(Relaxed);
 
-        crate::player::SHARED.pb_state.store(S::Idle as u8, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Idle));
         LAST.store(S::Idle as u8, Relaxed);
         SAW_START.store(false, Relaxed);
         REBUFFER_COUNT.store(0, Relaxed);
@@ -1375,15 +1561,33 @@ mod tests {
             crate::route::PlayVerdict::Server(String::new(), Default::default()),
             crate::route::PlayVerdict::DirectPlayDisabled,
             crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
+            crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason: PreviewRefusal::NotDirect },
         ] {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::refuse_for_test(&mut ps, verdict.clone());
             let ctx = error_context(&ps);
             assert_eq!(ctx.delivery.code(), "unknown", "{verdict:?}: delivery was inferred");
+            assert_eq!(ctx.backend, ErrorBackendClass::Unknown,
+                "a refused plan did not prove a current physical backend");
+            assert_eq!(ctx.terminal_stage, TerminalStageClass::Planning,
+                "the refusal itself proves the planning stage");
             assert_eq!(ctx.requested, QualityClass::Unknown, "{verdict:?}: requested was inferred");
             // The selected quality is the viewer's own setting, which is recorded and still true.
             assert_eq!(ctx.selected, selected_quality_class(crate::route::quality()));
         }
+    }
+
+    #[test]
+    fn addressed_uri_decode_failure_maps_to_closed_report_classes() {
+        let _g = plx_base::testlock::serial();
+        let ps = crate::route::PlaybackSession::default();
+        let context = error_context_with_source(&ps,
+            Some(super::super::backend::TerminalFailureSource {
+                backend: super::super::attempt_metrics::Backend::Uri,
+                stage: super::super::attempt_metrics::Stage::Decode,
+            }));
+        assert_eq!(context.backend, ErrorBackendClass::Uri);
+        assert_eq!(context.terminal_stage, TerminalStageClass::Decode);
     }
 
     /// Sentry PLX-NATIVE-14, the half `delivery: unknown` could not give: WHICH refusal. A server
@@ -1487,6 +1691,7 @@ mod tests {
         for verdict in [
             crate::route::PlayVerdict::DirectPlayDisabled,
             crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
+            crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason: PreviewRefusal::NotDirect },
         ] {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::refuse_for_test(&mut ps, verdict.clone());
@@ -1560,15 +1765,61 @@ mod tests {
     #[test]
     fn a_type_18_callback_number_reaches_the_error_context() {
         let _g = plx_base::testlock::serial();
-        let ps = crate::route::PlaybackSession::default();
-        super::super::SHARED.reset_session();
+        let mut ps = crate::route::PlaybackSession::default();
+        let attempt = begin_view(&mut ps);
+        crate::player::reset_session_for_test();
         assert_eq!(error_context(&ps).pipeline_error, 0, "no callback, nothing to report");
-        let epoch = super::super::SHARED.begin_native_session().expect("session");
-        super::super::sf_on_event(epoch, 18, 601, c"Resource Allocation Error".as_ptr());
+        let epoch = FEED_SHARED.begin_native_session().expect("session");
+        plx_play_feed::sf_event::sf_on_event(epoch, 18, 601, c"Resource Allocation Error".as_ptr());
+        observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+            pipeline_error: Some(FEED_SHARED.dg_cb_err_num.load(Relaxed)),
+                refusal_path: Some(FEED_SHARED.refusal_path()),
+            ..Default::default()
+        });
         assert_eq!(error_context(&ps).pipeline_error, 601);
-        super::super::SHARED.retire_native_session(epoch);
-        super::super::SHARED.reset_session();
+        FEED_SHARED.retire_native_session(epoch);
+        crate::player::reset_session_for_test();
+        ps.begin_attempt_view(attempt, crate::player::attempt_view::Backend::Feed);
         assert_eq!(error_context(&ps).pipeline_error, 0, "the latch does not outlive its session");
+    }
+
+    /// Which demuxer exit raised `media_source` rides on the report: the FIRST exit wins (a later
+    /// teardown cascade, or the shared "no access units" tail, must not overwrite the real cause),
+    /// `demux_failed` is still raised exactly as before, an exit that only `break`s to the tail is
+    /// recorded without raising it, and the next session starts with none.
+    #[test]
+    fn the_first_demux_exit_reaches_the_error_context_and_resets_per_session() {
+        let _g = plx_base::testlock::serial();
+        let mut ps = crate::route::PlaybackSession::default();
+        let attempt = begin_view(&mut ps);
+        let feed = &FEED_SHARED;
+        crate::player::reset_session_for_test();
+        assert_eq!(error_context(&ps).demux_exit, DemuxExitClass::None, "nothing recorded");
+
+        feed.fail_demux_latch(DemuxExitClass::HttpsOpenFailed.latch());
+        assert!(feed.demux_failed.load(Relaxed), "the helper still raises the flag");
+        observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+            demux_exit: Some(feed.dg_demux_exit.load(Relaxed)), ..Default::default()
+        });
+        assert_eq!(error_context(&ps).demux_exit, DemuxExitClass::HttpsOpenFailed);
+        feed.fail_demux_latch(DemuxExitClass::NoAccessUnits.latch());
+        feed.note_demux_exit_latch(DemuxExitClass::OpenInputFailed.latch());
+        assert_eq!(
+            error_context(&ps).demux_exit,
+            DemuxExitClass::HttpsOpenFailed,
+            "the first cause is the real one"
+        );
+
+        crate::player::reset_session_for_test();
+        ps.begin_attempt_view(attempt, crate::player::attempt_view::Backend::Feed);
+        assert_eq!(error_context(&ps).demux_exit, DemuxExitClass::None, "cleared per session");
+        feed.note_demux_exit_latch(DemuxExitClass::NoVideoStream.latch());
+        assert!(!feed.demux_failed.load(Relaxed), "a note alone does not fail the session");
+        observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+            demux_exit: Some(feed.dg_demux_exit.load(Relaxed)), ..Default::default()
+        });
+        assert_eq!(error_context(&ps).demux_exit, DemuxExitClass::NoVideoStream);
+        crate::player::reset_session_for_test();
     }
 
     /// **Sentry PLX-NATIVE-V.** A playback that was running, then switched quality to Original, and
@@ -1591,12 +1842,12 @@ mod tests {
         let mut ps = crate::route::PlaybackSession::default();
         crate::route::install_transcode_for_test(&mut ps, false, true);
         let generation = requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
-        let set = |state: S| {
-            crate::player::SHARED.pb_state.store(state as u8, Relaxed);
-            tick(&ps);
+        let set = |ps: &mut crate::route::PlaybackSession, state: S| {
+            ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(state));
+            tick(ps);
         };
-        set(S::Connecting);
-        set(S::Playing);
+        set(&mut ps, S::Connecting);
+        set(&mut ps, S::Playing);
         assert!(SAW_START.load(Relaxed), "the session played");
         let playing = error_context(&ps);
         assert!(playing.started && playing.attempt_started, "a picture is up on this attempt");
@@ -1614,8 +1865,8 @@ mod tests {
             DeliveryReason::OriginalRecovery,
             AttemptOrigin::QualityChange,
         );
-        set(S::Connecting);
-        set(S::Error);
+        set(&mut ps, S::Connecting);
+        set(&mut ps, S::Error);
 
         let ctx = error_context(&ps);
         assert_eq!(ctx.delivery.code(), "hls", "the session's route is still reported, for continuity");
@@ -1625,7 +1876,7 @@ mod tests {
         assert_eq!(ctx.attempt_origin.code(), "quality_change", "the viewer asked for Original");
         assert_eq!(ctx.attempt_ordinal.code(), "2", "the second open of this playback");
 
-        crate::player::SHARED.pb_state.store(S::Idle as u8, Relaxed);
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Idle));
         LAST.store(S::Idle as u8, Relaxed);
         SAW_START.store(false, Relaxed);
         SAW_FAIL.store(false, Relaxed);
@@ -1635,8 +1886,7 @@ mod tests {
 
     /// The sealed trace the shared slot now holds.
     fn trace_steps() -> Vec<TraceStep> {
-        super::super::SHARED
-            .playback_trace
+        TRACE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
@@ -1656,13 +1906,59 @@ mod tests {
         .expect("handled event JSON")
     }
 
-    /// A session as a hero preview leaves it when its landing is refused: resolved for a preview,
-    /// retired by the machine, no route installed.
+    /// A session as a hero preview leaves it when its landing is refused: a REAL preview resolve
+    /// (the route rig runs `build_stream` with the preview env on an item `accepts_direct_play`
+    /// rejects), so it carries exactly what `plan.rs` installs - `PreviewNeedsDirectPlay`, no
+    /// route - and not a state the production path never produces.
     fn refused_preview() -> crate::route::PlaybackSession {
         let mut ps = crate::route::PlaybackSession::default();
-        crate::route::resolve_as_preview_for_test(&mut ps);
-        crate::route::refuse_for_test(&mut ps, crate::route::PlayVerdict::DirectPlayDisabled);
+        crate::route::resolve_refused_preview_for_test(&mut ps);
         ps
+    }
+
+    /// **Sentry PLX-NATIVE-1G.** The same refusal, through the report path end to end: the event's
+    /// `playback.kind` tag is the typed verdict's `preview_not_direct`, not `unspecified`.
+    #[test]
+    fn a_preview_refused_for_not_being_a_direct_play_reports_kind_preview_not_direct() {
+        let _g = plx_base::testlock::serial();
+        consented(|| {
+            crate::player::preview::reset_for_test();
+            clear_error_trace();
+            let mut ps = refused_preview();
+            preview_requested();
+            observe(&mut ps, S::Error);
+            let v = event_for(&ps);
+            assert_eq!(v["tags"]["playback.kind"], "preview_not_direct");
+            assert_eq!(v["tags"]["playback.attempt_origin"], "preview");
+            assert_eq!(v["fingerprint"], serde_json::json!(["playback-error", "preview", "preview_not_direct"]));
+            // The rig's item has no Part, so the first failing condition is `no_part`.
+            assert_eq!(v["tags"]["playback.preview_refusal"], "no_part");
+        });
+    }
+
+    /// **Sentry PLX-NATIVE-23.** The refused preview's reason rides its report as one tag, whatever
+    /// the reason, and no other verdict carries one. The grouping is the kind's, as before.
+    #[test]
+    fn a_refused_previews_reason_rides_the_report_and_no_other_verdict_carries_one() {
+        let _g = plx_base::testlock::serial();
+        for reason in PreviewRefusal::ALL {
+            let mut ps = crate::route::PlaybackSession::default();
+            crate::route::refuse_for_test(&mut ps, crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason });
+            assert_eq!(error_context(&ps).preview_refusal, Some(reason));
+            let v = event_for(&ps);
+            assert_eq!(v["tags"]["playback.kind"], "preview_not_direct", "{reason:?}");
+            assert_eq!(v["tags"]["playback.preview_refusal"], reason.code(), "{reason:?}");
+        }
+        for verdict in [
+            crate::route::PlayVerdict::DirectPlayDisabled,
+            crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
+            crate::route::PlayVerdict::Server("Cannot convert this item.".into(), Default::default()),
+        ] {
+            let mut ps = crate::route::PlaybackSession::default();
+            crate::route::refuse_for_test(&mut ps, verdict.clone());
+            assert_eq!(error_context(&ps).preview_refusal, None, "{verdict:?}");
+            assert!(event_for(&ps)["tags"].get("playback.preview_refusal").is_none(), "{verdict:?}");
+        }
     }
 
     /// **Sentry PLX-NATIVE-15.** A detail-page preview never passes [`requested`], so its failure
@@ -1680,10 +1976,10 @@ mod tests {
             // the preview's.
             ledger().begin(7, AttemptOrigin::QualityChange);
             ledger().reopen(7, AttemptOrigin::UserRetry);
-            let ps = refused_preview();
+            let mut ps = refused_preview();
             let calls = plx_telemetry::telemetry::playback::report_calls_for_test();
             preview_requested();
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Error);
 
             let steps = trace_steps();
             assert!(
@@ -1757,8 +2053,8 @@ mod tests {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::refuse_for_test(&mut ps, crate::route::PlayVerdict::DirectPlayDisabled);
             requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
-            observe(&ps, S::Resolving);
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Resolving);
+            observe(&mut ps, S::Error);
             assert_eq!(error_context(&ps).attempt_origin, AttemptOrigin::Fresh);
             let v = event_for(&ps);
             let kind = v["tags"]["playback.kind"].as_str().expect("kind tag").to_owned();
@@ -1777,18 +2073,18 @@ mod tests {
         consented(|| {
             crate::player::preview::reset_for_test();
             clear_error_trace();
-            let ps = refused_preview();
-            let idle = crate::route::PlaybackSession::default();
+            let mut ps = refused_preview();
+            let mut idle = crate::route::PlaybackSession::default();
             let calls = plx_telemetry::telemetry::playback::report_calls_for_test();
 
             preview_requested();
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Error);
             assert_eq!(plx_telemetry::telemetry::playback::report_calls_for_test() - calls, 1);
 
             // The viewer browses on; the next trailer's resolve is in flight, then it fails too.
-            observe(&idle, S::Resolving);
+            observe(&mut idle, S::Resolving);
             preview_requested();
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Error);
             assert_eq!(
                 plx_telemetry::telemetry::playback::report_calls_for_test() - calls,
                 2,
@@ -1806,17 +2102,17 @@ mod tests {
         let _g = plx_base::testlock::serial();
         consented(|| {
             crate::player::preview::reset_for_test();
-            let film = crate::route::PlaybackSession::default();
+            let mut film = crate::route::PlaybackSession::default();
             requested(&film, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
             // The film played and ended; its latches stay up until the next film request.
             SAW_START.store(true, Relaxed);
             let attempt = ATTEMPT.load(Relaxed);
-            let ps = refused_preview();
+            let mut ps = refused_preview();
             let calls = plx_telemetry::telemetry::playback::report_calls_for_test();
 
             let (_, events) = plx_telemetry::diag::test_events::capture(|| {
                 preview_requested();
-                observe(&ps, S::Error);
+                observe(&mut ps, S::Error);
             });
             assert!(events.is_empty(), "a trailer is no attempt: {events:?}");
             assert!(!SAW_FAIL.load(Relaxed), "the film did not fail");
@@ -1830,10 +2126,93 @@ mod tests {
 
             // …and the film's own failure afterwards is still its own.
             SAW_START.store(false, Relaxed);
-            observe(&film, S::Resolving);
-            let (_, events) = plx_telemetry::diag::test_events::capture(|| observe(&film, S::Error));
+            observe(&mut film, S::Resolving);
+            let (_, events) = plx_telemetry::diag::test_events::capture(|| observe(&mut film, S::Error));
             assert!(matches!(events.as_slice(), [DiagEvent::PlaybackFailed { playback_id, .. }] if *playback_id == attempt));
             assert!(SAW_FAIL.load(Relaxed));
+        });
+    }
+
+    /// **`playback.failed` names the codecs and the pipeline's account of the refusal**, so a
+    /// failed DTS play is visible as one (0.9.0's `tv_pipeline` rise was tied to DTS direct play
+    /// by inference only). An asynchronous `type=18 num=601` before any picture is `async`.
+    #[test]
+    fn a_failed_play_reports_codecs_the_pipeline_error_class_and_an_async_refusal() {
+        let _g = plx_base::testlock::serial();
+        consented(|| {
+            let mut ps = crate::route::PlaybackSession::default();
+            assert!(crate::route::set_stream_declaration_for_test(
+                &mut ps,
+                "h264",
+                "dca",
+                24.0,
+                Default::default(),
+                false,
+                plx_platform::devcaps::dv::DvCapability::Supported,
+            ));
+            requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
+            crate::player::reset_session_for_test();
+            let epoch = FEED_SHARED.begin_native_session().expect("session");
+            plx_play_feed::sf_event::sf_on_event(epoch, 18, 601, c"Resource Allocation Error".as_ptr());
+            let attempt = begin_view(&mut ps);
+            observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+                pipeline_error: Some(FEED_SHARED.dg_cb_err_num.load(Relaxed)),
+                refusal_path: Some(FEED_SHARED.refusal_path()),
+                ..Default::default()
+            });
+            observe(&mut ps, S::Resolving);
+            let (_, events) = plx_telemetry::diag::test_events::capture(|| observe(&mut ps, S::Error));
+            FEED_SHARED.retire_native_session(epoch);
+            crate::player::reset_session_for_test();
+            match events.as_slice() {
+                [DiagEvent::PlaybackFailed { video, audio, pipeline_error, refusal, .. }] => {
+                    assert_eq!(*video, "h264");
+                    assert_eq!(*audio, "dts");
+                    assert_eq!(*pipeline_error, "601");
+                    assert_eq!(*refusal, "async");
+                }
+                other => panic!("one playback.failed expected: {other:?}"),
+            }
+        });
+    }
+
+    /// A Load call that itself returned 0 is `sync` and records no pipeline number.
+    #[test]
+    fn a_synchronous_load_refusal_reports_refusal_sync_and_no_pipeline_error() {
+        let _g = plx_base::testlock::serial();
+        consented(|| {
+            let mut ps = crate::route::PlaybackSession::default();
+            assert!(crate::route::set_stream_declaration_for_test(
+                &mut ps,
+                "hevc",
+                "ac3",
+                24.0,
+                Default::default(),
+                false,
+                plx_platform::devcaps::dv::DvCapability::Supported,
+            ));
+            requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
+            crate::player::reset_session_for_test();
+            let epoch = FEED_SHARED.begin_native_session().expect("session");
+            assert!(FEED_SHARED.publish_native_load_failure(epoch));
+            let attempt = begin_view(&mut ps);
+            observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+                refusal_path: Some(FEED_SHARED.refusal_path()),
+                ..Default::default()
+            });
+            observe(&mut ps, S::Resolving);
+            let (_, events) = plx_telemetry::diag::test_events::capture(|| observe(&mut ps, S::Error));
+            FEED_SHARED.retire_native_session(epoch);
+            crate::player::reset_session_for_test();
+            assert_eq!(FEED_SHARED.refusal_path(), plx_playback_contract::readout::RefusalPath::None, "reset_session clears it");
+            match events.as_slice() {
+                [DiagEvent::PlaybackFailed { video, audio, pipeline_error, refusal, .. }] => {
+                    assert_eq!((*video, *audio), ("hevc", "ac3"));
+                    assert_eq!(*pipeline_error, "0");
+                    assert_eq!(*refusal, "sync");
+                }
+                other => panic!("one playback.failed expected: {other:?}"),
+            }
         });
     }
 
@@ -1848,8 +2227,8 @@ mod tests {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::resolve_as_preview_for_test(&mut ps);
             let (_, events) = plx_telemetry::diag::test_events::capture(|| {
-                observe(&ps, S::Connecting);
-                observe(&ps, S::Playing);
+                observe(&mut ps, S::Connecting);
+                observe(&mut ps, S::Playing);
             });
             assert!(events.is_empty(), "a trailer's first picture is not playback.started: {events:?}");
             assert!(!SAW_START.load(Relaxed));
@@ -1867,13 +2246,13 @@ mod tests {
             let film = crate::route::PlaybackSession::default();
             requested(&film, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
             clear_error_trace();
-            let ps = refused_preview();
+            let mut ps = refused_preview();
             let calls = plx_telemetry::telemetry::playback::report_calls_for_test();
 
             let (_, events) = plx_telemetry::diag::test_events::capture(|| {
                 preview_requested();
-                crate::player::SHARED.pb_state.store(S::Error as u8, Relaxed);
-                tick_with(&ps, false);
+                ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(S::Error));
+                tick_with(&ps, false, None);
             });
             assert!(events.is_empty(), "no usage event: {events:?}");
             assert_eq!(
@@ -1898,7 +2277,6 @@ mod tests {
         enabled.asked_version = consent::POLICY_VERSION;
         consent::install(enabled);
         let out = body();
-        crate::player::SHARED.pb_state.store(S::Idle as u8, Relaxed);
         LAST.store(S::Idle as u8, Relaxed);
         SAW_START.store(false, Relaxed);
         SAW_FAIL.store(false, Relaxed);
@@ -1908,9 +2286,181 @@ mod tests {
         out
     }
 
+    // ---- the `refusal_recovered` event (S6, #1075) ------------------------------------------
+
+    use super::super::recovery::{
+        Lane, Lanes, LoadRefusal, OpenFacts, OpenRecovery, Recovered, RecoveryEffect, RecoveryEvent, Rung,
+        StreamAudio,
+    };
+    use plx_platform::devcaps::{Caps, Facet};
+
+    /// A set whose table lists DTS at six channels, so refusing it narrows the attempt.
+    fn dts_set() -> std::sync::Arc<Caps> {
+        std::sync::Arc::new(Caps {
+            audio: "aac,ac3,eac3,dts".into(),
+            audio_channels: [("dts".into(), 6)].into(),
+            ..Caps::assumed()
+        })
+    }
+
+    /// What the pump does with a machine's effects, reduced to the one that reports: every
+    /// `ReportRecovered` goes to [`refusal_recovered`], as `drive_open_recovery` does.
+    fn drive_machine(m: &mut OpenRecovery, events: impl IntoIterator<Item = RecoveryEvent>) {
+        for ev in events {
+            let mut fx = Vec::new();
+            m.step(&ev, &mut fx);
+            for effect in fx {
+                if let RecoveryEffect::ReportRecovered(r) = effect {
+                    refusal_recovered(&r);
+                }
+            }
+        }
+    }
+
+    fn dts_refusal() -> RecoveryEvent {
+        RecoveryEvent::Refused {
+            refusal: LoadRefusal::Refused { num: 601 },
+            facts: OpenFacts {
+                no_frames: true,
+                audio: Some(StreamAudio { codec: "dca".into(), channels: 6, app_decoded_lossy: false }),
+                ..OpenFacts::default()
+            },
+        }
+    }
+
+    fn landed() -> RecoveryEvent {
+        RecoveryEvent::FlightLanded { lanes: Some(Lanes { video: Lane::Copy, audio: Lane::Transcode }) }
+    }
+
+    /// **Consent on: exactly one event per rescued play, with the closed fields and nothing else.**
+    #[test]
+    fn a_rescued_play_sends_one_event_with_the_closed_fields_when_consented() {
+        let _g = plx_base::testlock::serial();
+        consented(|| {
+            let _ = plx_telemetry::telemetry::playback::take_recovered_for_test();
+            let mut m = OpenRecovery::new(dts_set());
+            drive_machine(
+                &mut m,
+                [
+                    dts_refusal(),
+                    landed(),
+                    RecoveryEvent::LoadStarted,
+                    RecoveryEvent::FirstPicture,
+                    // Frames after the first picture say the same thing again, as the pump does.
+                    RecoveryEvent::FirstPicture,
+                    RecoveryEvent::FirstPicture,
+                ],
+            );
+            let sent = plx_telemetry::telemetry::playback::take_recovered_for_test();
+            assert_eq!(sent.len(), 1, "one event for the play: {sent:?}");
+            let v = &sent[0];
+            assert_eq!(v["fingerprint"], serde_json::json!(["refusal_recovered", "facet", "dts"]));
+            assert_eq!(
+                v["contexts"]["refusal_recovered"],
+                serde_json::json!({
+                    "type": "refusal_recovered",
+                    "refused_stream": "audio",
+                    "refused_codec": "dts",
+                    "refused_channels": "3-6",
+                    "pipeline_error": "601",
+                    "recovery_rung": "facet",
+                })
+            );
+            assert!(v.get("breadcrumbs").is_none(), "no trace rides it");
+        });
+    }
+
+    /// **Consent off: nothing is sent**, and nothing is built.
+    #[test]
+    fn a_rescued_play_sends_nothing_without_the_error_report_consent() {
+        use plx_telemetry::telemetry::consent::{self, Consent};
+        let _g = plx_base::testlock::serial();
+        let previous = consent::current();
+        let _ = plx_telemetry::telemetry::playback::take_recovered_for_test();
+        for consent_state in [Consent::default(), {
+            let mut c = Consent::default();
+            c.usage = true;
+            c.asked_version = consent::POLICY_VERSION;
+            c
+        }] {
+            consent::install(consent_state);
+            let mut m = OpenRecovery::new(dts_set());
+            drive_machine(&mut m, [dts_refusal(), landed(), RecoveryEvent::LoadStarted, RecoveryEvent::FirstPicture]);
+            assert!(plx_telemetry::telemetry::playback::take_recovered_for_test().is_empty());
+        }
+        consent::install(previous.unwrap_or_default());
+    }
+
+    /// **A play with no refusal sends nothing** (consent on), and neither does a refusal the
+    /// ladder ended on the read-out.
+    #[test]
+    fn a_play_with_no_refusal_or_no_rescue_sends_nothing() {
+        let _g = plx_base::testlock::serial();
+        consented(|| {
+            let _ = plx_telemetry::telemetry::playback::take_recovered_for_test();
+            let mut m = OpenRecovery::new(dts_set());
+            drive_machine(&mut m, [RecoveryEvent::FirstPicture, RecoveryEvent::FirstPicture]);
+            let mut m = OpenRecovery::new(dts_set());
+            // Refused, converted, refused again: the read-out, and no picture follows.
+            drive_machine(&mut m, [dts_refusal(), landed(), RecoveryEvent::LoadStarted, dts_refusal()]);
+            assert!(plx_telemetry::telemetry::playback::take_recovered_for_test().is_empty());
+        });
+    }
+
+    /// The machine's vocabulary onto the wire's closed classes, at every rung and refusal.
+    #[test]
+    fn a_recovery_maps_onto_the_closed_classes() {
+        let map = |rung, refusal, facet| refusal_recovered_context(&Recovered { rung, refusal, facet });
+        let dts6 = || Some(Facet::Audio { codec: "dts".into(), channels: 6 });
+        let h264 = || Some(Facet::Video { codec: "h264".into(), width: 3840, height: 2160 });
+        let r601 = LoadRefusal::Refused { num: 601 };
+        assert_eq!(
+            map(Rung::Facet, r601, dts6()),
+            Some(RefusalRecoveredContext {
+                stream: RefusedStream::Audio(AudioCodecClass::Dts),
+                channels: ChannelBucket::Surround,
+                error: RefusalError::Number(601),
+                rung: RecoveryRung::Facet,
+            })
+        );
+        // A video carries no channel count, and its raster never leaves the machine.
+        assert_eq!(
+            map(Rung::Both, r601, h264()),
+            Some(RefusalRecoveredContext {
+                stream: RefusedStream::Video(VideoCodecClass::H264),
+                channels: ChannelBucket::Unknown,
+                error: RefusalError::Number(601),
+                rung: RecoveryRung::Hls,
+            })
+        );
+        // The manual both-facets encode is its own class: it is not the HLS contingency.
+        assert_eq!(
+            map(Rung::Encode, r601, h264()),
+            Some(RefusalRecoveredContext {
+                stream: RefusedStream::Video(VideoCodecClass::H264),
+                channels: ChannelBucket::Unknown,
+                error: RefusalError::Number(601),
+                rung: RecoveryRung::Encode,
+            })
+        );
+        assert_eq!(
+            map(Rung::Rollback, LoadRefusal::TimedOut, None),
+            Some(RefusalRecoveredContext {
+                stream: RefusedStream::None,
+                channels: ChannelBucket::Unknown,
+                error: RefusalError::Timeout,
+                rung: RecoveryRung::Rollback,
+            })
+        );
+        assert_eq!(map(Rung::Facet, LoadRefusal::Stalled, dts6()).map(|c| c.error), Some(RefusalError::Stall));
+        assert_eq!(map(Rung::Facet, LoadRefusal::SourceFailed, None), None, "the demuxer's failure is not named");
+        let unknown = Some(Facet::Audio { codec: "dts".into(), channels: 0 });
+        assert_eq!(map(Rung::Facet, r601, unknown).map(|c| c.channels), Some(ChannelBucket::Unknown));
+    }
+
     /// Present `state` to the per-frame observer, as the main loop does once a frame.
-    fn observe(ps: &crate::route::PlaybackSession, state: S) {
-        crate::player::SHARED.pb_state.store(state as u8, Relaxed);
+    fn observe(ps: &mut crate::route::PlaybackSession, state: S) {
+        ps.step_readout(crate::player::readout::ReadoutEvent::StateDerived(state));
         tick(ps);
     }
 
@@ -1921,19 +2471,19 @@ mod tests {
     fn a_retry_press_reports_user_retry_as_the_second_open_and_a_fresh_play_starts_over() {
         let _g = plx_base::testlock::serial();
         consented(|| {
-            let ps = crate::route::PlaybackSession::default();
+            let mut ps = crate::route::PlaybackSession::default();
             let sid = plx_plex::plex::ServerId::UNSET;
             requested(&ps, sid, AttemptOrigin::Fresh);
-            observe(&ps, S::Connecting);
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Connecting);
+            observe(&mut ps, S::Error);
             let first = error_context(&ps);
             assert_eq!((first.attempt_origin.code(), first.attempt_ordinal.code()), ("fresh", "1"));
 
             // The Retry: the failed playback is stopped (which clears the trace), then re-requested.
             clear_error_trace();
             requested(&ps, sid, AttemptOrigin::UserRetry);
-            observe(&ps, S::Resolving);
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Resolving);
+            observe(&mut ps, S::Error);
             let retried = error_context(&ps);
             assert_eq!(retried.attempt_origin.code(), "user_retry");
             assert_eq!(retried.attempt_ordinal.code(), "2");
@@ -1981,13 +2531,13 @@ mod tests {
     fn a_recovery_that_also_fails_emits_one_report_and_names_the_recovery() {
         let _g = plx_base::testlock::serial();
         consented(|| {
-            let ps = crate::route::PlaybackSession::default();
+            let mut ps = crate::route::PlaybackSession::default();
             let sid = plx_plex::plex::ServerId::UNSET;
             let before = plx_telemetry::telemetry::playback::report_calls_for_test();
             let generation = requested(&ps, sid, AttemptOrigin::Fresh);
-            observe(&ps, S::Connecting);
+            observe(&mut ps, S::Connecting);
             // The first open failed; the recovery flight flies (Resolving), lands, and reopens.
-            observe(&ps, S::Resolving);
+            observe(&mut ps, S::Resolving);
             note_delivery_requested_for(
                 generation,
                 DeliveryClass::Hls,
@@ -1995,10 +2545,10 @@ mod tests {
                 DeliveryReason::OriginalOpenRollback,
                 AttemptOrigin::Recovery,
             );
-            observe(&ps, S::Connecting);
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Connecting);
+            observe(&mut ps, S::Error);
             // The error read-out is republished on the frames that follow.
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Error);
             let ctx = error_context(&ps);
             assert_eq!((ctx.attempt_origin.code(), ctx.attempt_ordinal.code()), ("recovery", "2"));
             assert_eq!(
@@ -2010,8 +2560,8 @@ mod tests {
             // The flight refused: no second open was ever decided, so the first open is what failed.
             clear_error_trace();
             requested(&ps, sid, AttemptOrigin::Fresh);
-            observe(&ps, S::Connecting);
-            observe(&ps, S::Error);
+            observe(&mut ps, S::Connecting);
+            observe(&mut ps, S::Error);
             let refused = error_context(&ps);
             assert_eq!((refused.attempt_origin.code(), refused.attempt_ordinal.code()), ("fresh", "1"));
         });
@@ -2088,8 +2638,9 @@ mod tests {
     #[test]
     fn the_exact_http_status_rides_beside_the_class_and_only_when_it_is_one() {
         let _g = plx_base::testlock::serial();
-        let ps = crate::route::PlaybackSession::default();
-        let status = &crate::player::SHARED.dg_http_status;
+        let mut ps = crate::route::PlaybackSession::default();
+        let attempt = begin_view(&mut ps);
+        let status = &FEED_SHARED.dg_http_status;
         for (raw, want) in [
             (404, 404u16),
             (403, 403),
@@ -2104,11 +2655,17 @@ mod tests {
             (i32::MIN, 0),
         ] {
             status.store(raw, Relaxed);
+            observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+                http_status: Some(raw), ..Default::default()
+            });
             let ctx = error_context(&ps);
             assert_eq!(ctx.http_status, want, "raw {raw}");
             assert_eq!(ctx.http, HttpClass::from_status(raw), "the class is unchanged for raw {raw}");
         }
         status.store(404, Relaxed);
+        observe_facts(&mut ps, attempt, crate::player::attempt_view::AttemptFacts {
+            http_status: Some(404), ..Default::default()
+        });
         assert_eq!(error_context(&ps).http.code(), "4xx");
         status.store(0, Relaxed);
     }
@@ -2137,7 +2694,7 @@ mod tests {
         assert_eq!(error_context(&hls).delivery.code(), "hls");
     }
 
-    use super::super::shared::PlaybackState as S;
+    use super::super::attempt_view::PlaybackState as S;
 
     /// Drive a sequence of states through the rule the way a frame loop would, latches and all, and
     /// report what it emitted.
@@ -2281,8 +2838,7 @@ mod tests {
         });
         install_trace_eraser();
         plx_telemetry::telemetry::playback::clear_error_trace();
-        let left = super::super::SHARED
-            .playback_trace
+        let left = TRACE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .step_count_for_test();

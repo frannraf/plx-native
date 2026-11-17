@@ -10,7 +10,7 @@ use crate::screen::{At, By, Dir, DrawFrame, Placed, ScreenEvent, Step};
 use crate::widgets::Art;
 use crate::{Painter, Rect, Spring};
 use plx_machine::machine::{
-    Canon, Cx, Effects, EntryId, FocusKey, FocusRead, InputOwner, InstanceId, MachineId, PressId, PressRead, Tick,
+    Canon, Cx, Effects, Enter, EntryId, FocusKey, FocusRead, InputOwner, InstanceId, MachineId, PressId, PressRead, Tick,
 };
 use plx_machine::present::Present;
 
@@ -40,6 +40,7 @@ fn cx9_pressed(view: &FixtureView, ms: u32, press: f32, focus: Option<FocusKey<u
         press: PressRead { scale: press, owner: pressed, ..Default::default() },
         focus: FocusRead { current: focus, ..Default::default() },
         owner: InputOwner::Entry(ENTRY),
+        modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
     }
 }
 
@@ -65,6 +66,7 @@ struct Cards {
     first: usize,
     /// Every card carries a two-line caption (the Under posters setting's title over its details).
     captioned: bool,
+    sort_caption: bool,
     /// ...with the title alone (the 80 px Under posters band, no details line).
     title_only: bool,
     /// ...with the details line alone (the stored default: title off, Year · Length).
@@ -79,7 +81,7 @@ const TILE_PAINTED: u64 = 9999;
 
 impl Cards {
     fn new(elems: Vec<u32>, more: bool) -> Self {
-        Self { elems, more, epoch: 0, before: false, drawn: Default::default(), painted: Default::default(), focused: Default::default(), unindexed_from: usize::MAX, unloaded: 0..0, first: 0, captioned: false, title_only: false, details_only: false, elem_calls: Default::default() }
+        Self { elems, more, epoch: 0, before: false, drawn: Default::default(), painted: Default::default(), focused: Default::default(), unindexed_from: usize::MAX, unloaded: 0..0, first: 0, captioned: false, sort_caption: false, title_only: false, details_only: false, elem_calls: Default::default() }
     }
 }
 
@@ -101,14 +103,16 @@ impl CardSource<FixtureHost> for Cards {
         Art::Poster(None)
     }
     fn label(&self, i: usize) -> TileLabel {
-        if self.captioned {
+        let mut label = if self.captioned {
             TileLabel::from_lines([
                 (!self.details_only).then(|| format!("Title {}", self.elems[i])),
                 (!self.title_only).then(|| "2005 \u{b7} 1h 40m".into()),
             ])
         } else {
             TileLabel::default()
-        }
+        };
+        if self.sort_caption { label.value = Some(crate::card_row::SortValue { text: "100%".into(), ..Default::default() }); }
+        label
     }
     fn more(&self) -> bool {
         self.more
@@ -152,7 +156,7 @@ trait Section {
 
 impl Section for Shelf {
     fn new() -> Self {
-        Shelf::new(ENTRY, &RowStyle::HOME)
+        Shelf::new(ENTRY, RowStyle::HOME)
     }
     fn on(&mut self, ev: &ScreenEvent<FixtureHost>, cx: &Cx9<'_>, src: &Cards, fx: &mut Effects<'_, FixtureHost>)
         -> Option<CardEvent<u32>> {
@@ -315,6 +319,8 @@ struct Rig<S: Section> {
     /// The card the press dip belongs to when that is not the focused one (an abandoned press).
     pressed: Option<FocusKey<u32>>,
     ms: u32,
+    modal: plx_machine::machine::ModalRead,
+    page_image: plx_machine::machine::PageImageRead,
 }
 
 impl<S: Section> Rig<S> {
@@ -327,6 +333,8 @@ impl<S: Section> Rig<S> {
             press: 1.0,
             pressed: None,
             ms: 0,
+            modal: Default::default(),
+            page_image: Default::default(),
         }
     }
 
@@ -335,7 +343,10 @@ impl<S: Section> Rig<S> {
     }
 
     fn cx_with(&self, press: f32) -> Cx9<'_> {
-        cx9_pressed(&self.view, self.ms, press, self.focus, self.pressed.or(self.focus))
+        let mut cx = cx9_pressed(&self.view, self.ms, press, self.focus, self.pressed.or(self.focus));
+        cx.modal = self.modal;
+        cx.page_image = self.page_image;
+        cx
     }
 
     /// Step one event through the section: the event it reported and whether the step moved.
@@ -343,8 +354,10 @@ impl<S: Section> Rig<S> {
         let mut present = Present::new();
         let mut out = Vec::new();
         let mut reported = None;
-        let (_, moving) = plx_machine::idle::scoped_motion(|| {
-            let cx = cx9_pressed(&self.view, self.ms, self.press, self.focus, self.pressed.or(self.focus));
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
+            let mut cx = cx9_pressed(&self.view, self.ms, self.press, self.focus, self.pressed.or(self.focus));
+            cx.modal = self.modal;
+            cx.page_image = self.page_image;
             let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(9)), &mut present);
             reported = self.sect.on(&ev, &cx, &self.src, &mut fx);
         });
@@ -987,27 +1000,28 @@ fn the_lifted_card_is_left_out_of_the_page_pass_and_drawn_by_the_lift() {
         let cx = r.cx();
         let ids = |drawn: Vec<(u32, Rect)>| drawn.into_iter().map(|(e, _)| e).collect::<Vec<_>>();
 
-        crate::popover::set_lift_owns(false);
+        // Each draw reports only its own local omission.
         let mut page = DrawFrame::new(&cx, Painter::recording());
         page.lifted = Some(r.key(101));
+        page.lift_owner = Some(plx_machine::machine::InstanceId(1));
         let p = page.painter;
         r.src.drawn.borrow_mut().clear();
         r.sect.draw(&mut page, p, &r.src);
         let page_cards = ids(r.src.drawn.take());
         assert!(page_cards.len() >= 3 && !page_cards.contains(&101), "page pass left the lifted card out: {page_cards:?}");
-        assert!(crate::popover::lift_owns(), "…and said so");
+        assert_eq!(page.lift_receipt().unwrap().key, r.key(101), "…and said so locally");
 
         let mut lift = DrawFrame::new(&cx, Painter::recording());
         r.sect.redraw(&mut lift, &r.src, Some(r.key(101)));
         assert_eq!(ids(r.src.drawn.take()), vec![101], "the lift is the card's only copy");
 
         // A frame with nothing lifted (every other moment) draws it as ever, and claims nothing.
-        crate::popover::set_lift_owns(false);
+        assert!(lift.lift_receipt().is_none(), "the lift cannot publish page evidence");
         let mut plain = DrawFrame::new(&cx, Painter::recording());
         let p = plain.painter;
         r.sect.draw(&mut plain, p, &r.src);
         assert!(ids(r.src.drawn.take()).contains(&101));
-        assert!(!crate::popover::lift_owns());
+        assert!(plain.lift_receipt().is_none());
     }
     run::<Shelf>();
     run::<Grid>();
@@ -1068,7 +1082,7 @@ fn a_source_can_refuse_a_hold() {
     }
     let r = settled::<Shelf>(4);
     let src = NoHold(Cards::new(r.src.elems.clone(), false));
-    let mut shelf = Shelf::new(ENTRY, &RowStyle::HOME);
+    let mut shelf = Shelf::new(ENTRY, RowStyle::HOME);
     let mut r2 = r;
     r2.focus = Some(r2.key(100));
     let mut present = Present::new();
@@ -1740,6 +1754,200 @@ fn a_grid_restore_after_dormant_ticks_arrives_popped_and_a_deliberate_move_still
     assert!(first > 1.0 && first < full - 0.02, "a deliberate arrival grows from rest: {first}");
 }
 
+/// A captioned grid of four rows, card 100 (the first) focused and settled lifted, the way a page
+/// is left when a Detail is opened from it.
+fn left_lifted() -> Rig<Grid> {
+    let mut r = Rig::<Grid>::new(4 * poster_grid::COLS);
+    r.src.captioned = true;
+    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
+    r.run(2);
+    r.land_focus(100, By::Dir);
+    r.run(200);
+    assert!(r.scale(100).unwrap() > 1.05, "premise: the card is left lifted");
+    r
+}
+
+/// The caption alpha of card 100 on the frame the grid last drew.
+fn caption_of_100(r: &Rig<Grid>) -> f32 {
+    let cx = r.cx();
+    let f = DrawFrame::new(&cx, Painter::root());
+    r.sect.caption_probe(&f, f.painter, &r.src).iter().filter(|(i, _)| *i == 0).map(|(_, a)| *a).sum()
+}
+
+/// **A page that returns is not put to sleep.** BACK from a Detail runs under the dip's image, which
+/// the owner reports as dormant; a seat put at rest there and grown again moves the row under its
+/// caption band by the band's height and back. A grid fed `Enter(Restored)` draws the seat the
+/// engine restored lifted with its caption open from the first frame, through every dormant tick,
+/// and keeps it when the owner wakes it. Both a grid that slept while covered and a fresh one (the
+/// stack let the page go and rebuilt it) come back that way.
+#[test]
+fn a_grid_that_returns_under_a_held_image_keeps_its_seat_lifted_and_its_caption_open() {
+    let full = RowStyle::HOME.focus_scale;
+    for covered in [true, false] {
+        let mut r = if covered {
+            // the page slept under the image of the push that covered it, then went unticked
+            let mut r = left_lifted();
+            r.sect.dormant(true);
+            r.run(3);
+            assert_eq!(r.scale(100), Some(1.0), "premise: it slept");
+            r.focus = None;
+            r
+        } else {
+            Rig::<Grid>::new(4 * poster_grid::COLS)
+        };
+        if !covered {
+            r.src.captioned = true;
+            r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
+        }
+        r.sect.dormant(true);
+        r.feed(ScreenEvent::Enter(Enter::Restored));
+        r.land_focus(100, By::Restore);
+        assert_eq!(r.scale(100), Some(full), "covered={covered}: whole on the first frame, before any tick");
+        for frame in 0..30 {
+            r.run(1);
+            assert_eq!(r.scale(100), Some(full), "covered={covered}: lifted under the image, frame {frame}");
+        }
+        assert!((caption_of_100(&r) - 1.0).abs() < 0.01, "covered={covered}: its caption is open under the image: {}", caption_of_100(&r));
+        r.sect.dormant(false);
+        for frame in 0..30 {
+            r.run(1);
+            assert_eq!(r.scale(100), Some(full), "covered={covered}: still lifted once awake, frame {frame}");
+            assert!((caption_of_100(&r) - 1.0).abs() < 0.01, "covered={covered}: caption kept once awake, frame {frame}");
+        }
+    }
+}
+
+/// **A return leaves no mark.** `Enter(Restored)` reaches a live page too (a modal's dismissal), with
+/// no image after it: the first tick that reports awake ends the return, so a later dissolve puts
+/// the seat to rest and the lift grows on the awake tick, as on a page that never returned.
+#[test]
+fn a_grid_that_returned_with_no_image_sleeps_through_the_next_dissolve() {
+    let full = RowStyle::HOME.focus_scale;
+    let mut r = left_lifted();
+    r.focus = None;
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(100, By::Restore);
+    r.run(2);
+    assert!((r.scale(100).unwrap() - full).abs() < 1e-4, "premise: it came back lifted");
+    r.sect.dormant(true);
+    r.run(3);
+    assert_eq!(r.scale(100), Some(1.0), "a later dissolve puts the seat to rest");
+    assert_eq!(lifted(&r), 0);
+    r.sect.dormant(false);
+    r.run(1);
+    let first = r.scale(100).unwrap();
+    assert!(first > 1.0 && first < full - 0.02, "and the lift grows from rest once the page is in: {first}");
+}
+
+/// **The reader moving ends the return.** A key pressed while the image of the way back is still up
+/// is slept through like an entry's: nothing is lifted or opened under the image (the move would
+/// hold it), and the new seat grows from rest once the owner wakes the grid.
+#[test]
+fn a_deliberate_move_ends_a_grids_return_and_is_slept_through() {
+    let full = RowStyle::HOME.focus_scale;
+    let mut r = left_lifted();
+    r.focus = None;
+    r.sect.dormant(true);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(100, By::Restore);
+    r.run(3);
+    assert!((r.scale(100).unwrap() - full).abs() < 1e-4, "premise: it came back lifted");
+    r.land_focus(101, By::Dir);
+    for frame in 0..10 {
+        r.run(1);
+        assert_eq!(r.scale(100), Some(1.0), "the seat it left is at rest, frame {frame}");
+        assert_eq!(r.scale(101), Some(1.0), "the seat it moved to is at rest, frame {frame}");
+    }
+    assert!(!r.run(1), "nothing moves under the image");
+    r.sect.dormant(false);
+    r.run(1);
+    let first = r.scale(101).unwrap();
+    assert!(first > 1.0 && first < full - 0.02, "the new seat grows from rest once the page is in: {first}");
+}
+
+/// A grid that returned lifted under a held image, then had focus leave its cards: Up from the
+/// first row onto a header control (a deliberate move that names no card of the grid), or the
+/// BACK that walks there (a seat the page makes for itself, announced as a restore). Elem 7 is on
+/// the page and not a card of the grid.
+fn returned_then_focus_leaves(by: By) -> Rig<Grid> {
+    let mut r = left_lifted();
+    r.focus = None;
+    r.sect.dormant(true);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(100, By::Restore);
+    r.run(3);
+    assert!((r.scale(100).unwrap() - RowStyle::HOME.focus_scale).abs() < 1e-4, "premise: it came back lifted");
+    assert!((caption_of_100(&r) - 1.0).abs() < 0.01, "premise: its caption is open");
+    r.land_focus(7, by);
+    r
+}
+
+/// **Leaving the grid under the image of the way back waits for nothing.** The seat the page kept
+/// lifted lets go and its caption band shuts at once, like an entry's: a band left closing on its
+/// spring (and a pop letting go on its own) is layout motion, and the image waits for it.
+#[test]
+fn a_grid_that_returned_sleeps_through_focus_leaving_it() {
+    for by in [By::Dir, By::Pointer, By::Restore] {
+        let mut r = returned_then_focus_leaves(by);
+        for frame in 0..8 {
+            assert!(!r.run(1), "{by:?}: something moves under the image, frame {frame}");
+            assert_eq!(r.scale(100), Some(1.0), "{by:?}: the seat it left is at rest, frame {frame}");
+            assert_eq!(caption_of_100(&r), 0.0, "{by:?}: a caption is left closing under the image, frame {frame}");
+        }
+        assert_eq!(lifted(&r), 0, "{by:?}");
+    }
+}
+
+/// **A landing is adopted whole under the image, a returning grid included.** A card that left or
+/// arrived while the page was covered (the item watched, a refetch) must not play its ghost and its
+/// slides under the image that hides them: the animation would hold the image to its bound and
+/// then be cut.
+#[test]
+fn a_grid_that_returned_adopts_a_landing_whole_under_the_image() {
+    let mut r = animated_grid(40, 100, GRID);
+    r.focus = None;
+    r.sect.dormant(true);
+    r.run(2);
+    r.src.elems.remove(11);
+    r.src.elems.insert(13, 900);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(100, By::Restore);
+    for frame in 0..4 {
+        r.run(1);
+        assert!(r.sect.ghost_probe().0.is_empty(), "a ghost plays under the image, frame {frame}");
+    }
+    r.sect.dormant(false);
+    r.run(2);
+    let n = r.src.elems.len();
+    assert_eq!(r.sect.landing_probe(n, 13), ((0.0, 0.0), 1.0));
+    assert_eq!(r.sect.landing_probe(n, 10), ((0.0, 0.0), 1.0));
+    assert!(r.sect.ghost_probe().0.is_empty());
+}
+
+/// **A layout built before the first tick sizes the document from the returning seat's band.**
+/// `settle_band` is the owner's way to adopt a restored focus row's caption band at once (the
+/// Library's `relayout`, which runs on `Enter(Restored)` while the grid still reads the dormant
+/// flag of the dip that covered the page): a returning grid takes it, a sleeping one does not.
+#[test]
+fn settle_band_opens_a_returning_grids_band_but_not_a_sleeping_ones() {
+    let open = |r: &Rig<Grid>| r.sect.band_geometry().iter().any(|band| band.expansion > 0.99);
+    let mut sleeping = left_lifted();
+    sleeping.focus = None;
+    sleeping.sect.dormant(true);
+    sleeping.run(3);
+    sleeping.sect.settle_band(Some(0));
+    assert!(!open(&sleeping), "a sleeping grid's band stays shut");
+
+    let mut returning = left_lifted();
+    returning.focus = None;
+    returning.sect.dormant(true);
+    returning.run(3);
+    assert!(!open(&returning), "premise: the covered grid's band is shut");
+    returning.feed(ScreenEvent::Enter(Enter::Restored));
+    returning.sect.settle_band(Some(0));
+    assert!(open(&returning), "a returning grid's band opens before any tick");
+}
+
 /// A lifted grid card that goes dormant lets go and the grid keeps no lift while it sleeps.
 #[test]
 fn a_grid_that_goes_dormant_lets_its_lifted_card_go() {
@@ -1766,10 +1974,7 @@ fn a_dormant_seats_caption_opens_with_its_lift_and_never_before_it() {
     let full = RowStyle::HOME.focus_scale;
     let mut r = Rig::<Grid>::new(4 * cols);
     r.src.captioned = true;
-    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy {
-        title: true,
-        details: crate::caption_policy::DetailsKind::YearLength,
-    }));
+    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
     r.run(2);
     // the caption of card 0 on the frame the grid last drew
     let caption = |r: &Rig<Grid>| -> f32 {
@@ -1806,10 +2011,7 @@ fn a_dormant_seats_caption_opens_with_its_lift_and_never_before_it() {
 /// frame is painted before any tile.
 #[test]
 fn captions_are_painted_beneath_every_tile() {
-    let policy = crate::caption_policy::CaptionPolicy {
-        title: true,
-        details: crate::caption_policy::DetailsKind::YearLength,
-    };
+    let policy = crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT);
     let mut r = Rig::<Grid>::new(4 * poster_grid::COLS);
     r.src.captioned = true;
     r.sect.set_caption_policy(Some(policy));
@@ -1847,25 +2049,16 @@ fn a_shelf_that_goes_dormant_lets_its_lifted_card_go() {
     assert!(!r.run(1));
 }
 
-/// The page image a test sets must not outlive it (`PAGE_IMAGE_HELD` is a thread-local the
-/// dispatcher sets and a section reads on its next tick).
-struct ImageHeld;
-impl ImageHeld {
-    fn set() -> Self {
-        crate::containers::transition::set_page_image_held(true);
-        ImageHeld
-    }
-}
-impl Drop for ImageHeld {
-    fn drop(&mut self) {
-        crate::containers::transition::set_page_image_held(false);
-    }
+/// A standalone section fixture owns its immutable page-image input explicitly.
+fn held_image() -> plx_machine::machine::PageImageRead {
+    plx_machine::machine::PageImageRead::held(ENTRY, InstanceId(9))
 }
 
 /// **Nothing steps under an image that hides it.** A shelf that is dormant while the page is a held
 /// image (a route dip's Out and In halves, the hold after it) parks at exact rest on its FIRST
-/// tick, as a grid does: the card that was lifted, the caption band and the heading's lift are all
-/// closed at once, with no spring left moving to hold the image past the dissolve.
+/// tick, as a grid put to sleep does (a section that RETURNS is not put to sleep, below): the card that
+/// was lifted, the caption band and the heading's lift are all closed at once, with no spring left
+/// moving to hold the image past the dissolve.
 #[test]
 fn a_dormant_shelf_under_a_held_page_image_parks_on_its_first_tick() {
     let mut r = settled::<Shelf>(8);
@@ -1874,7 +2067,7 @@ fn a_dormant_shelf_under_a_held_page_image_parks_on_its_first_tick() {
     let full = RowStyle::HOME.focus_scale;
     assert!(r.scale(101).unwrap() > full - 0.002, "premise: the card is whole in its lift");
     assert!(r.sect.under_band() > crate::card_row::under_band(0.0) + 1.0, "premise: the focused card's caption band is open");
-    let _held = ImageHeld::set();
+    r.page_image = held_image();
     r.sect.dormant(true);
     r.run(1);
     assert_eq!(r.scale(101), Some(1.0), "the lifted card is at rest on the first tick under the image");
@@ -1898,7 +2091,7 @@ fn a_dormant_shelf_mid_ease_jumps_to_rest_when_the_page_image_goes_up() {
     r.run(3);
     let eased = r.scale(101).unwrap();
     assert!(eased > 1.0 + 1e-3 && eased < RowStyle::HOME.focus_scale - 1e-3, "premise: mid-ease on a visible page: {eased}");
-    let _held = ImageHeld::set();
+    r.page_image = held_image();
     r.run(1);
     assert_eq!(r.scale(101), Some(1.0), "the ease is finished under the image");
     assert!(r.sect.at_rest());
@@ -1924,12 +2117,268 @@ fn a_dormant_shelf_on_a_visible_page_still_eases_to_rest() {
     assert!(r.sect.at_rest());
 }
 
+/// A shelf of eight cards with card 101 focused and settled lifted, the way a page is left when a
+/// Detail is opened from it.
+fn shelf_left_lifted() -> Rig<Shelf> {
+    let mut r = settled::<Shelf>(8);
+    r.land_focus(101, By::Dir);
+    r.run(200);
+    assert!(r.scale(101).unwrap() > RowStyle::HOME.focus_scale - 0.002, "premise: the card is left lifted");
+    r
+}
+
+/// The shelf's caption band is open under its lifted card, and so is the lift it gives its heading.
+fn band_open(r: &Rig<Shelf>) -> bool {
+    r.sect.under_band() > crate::card_row::under_band(0.0) + 1.0 && r.sect.heading_lift() > 0.0
+}
+
+/// **A page that returns is not put to sleep, a shelf's too.** BACK from a Detail runs under the
+/// dip's image, which the owner reports as dormant; a seat put at rest there and grown again moves
+/// the shelf under its caption band by the band's height and back (the Recommended page's next
+/// shelf). A shelf fed `Enter(Restored)` draws the seat the engine restored lifted, its band open
+/// and its heading raised, from the first frame, through every dormant tick under the image, and
+/// keeps it when the owner wakes it. Both a shelf that slept while covered and a fresh one (the
+/// stack let the page go and rebuilt it) come back that way, the band and the heading with the seat
+/// on the restoring event itself: the page the dip captures that frame is laid out from them.
+#[test]
+fn a_shelf_that_returns_under_a_held_image_keeps_its_seat_lifted_and_its_band_open() {
+    let full = RowStyle::HOME.focus_scale;
+    for covered in [true, false] {
+        let mut r = if covered {
+            // the page slept under the image of the push that covered it, then went unticked
+            let mut r = shelf_left_lifted();
+            r.page_image = held_image();
+            r.sect.dormant(true);
+            r.run(3);
+            assert_eq!(r.scale(101), Some(1.0), "premise: it slept");
+            r.focus = None;
+            r
+        } else {
+            settled::<Shelf>(8)
+        };
+        r.page_image = held_image();
+        r.sect.dormant(true);
+        r.feed(ScreenEvent::Enter(Enter::Restored));
+        r.land_focus(101, By::Restore);
+        assert_eq!(r.scale(101), Some(full), "covered={covered}: whole on the first frame, before any tick");
+        assert!(band_open(&r), "covered={covered}: its band and heading are open on the first frame too, for the layout read before any tick");
+        for frame in 0..30 {
+            r.run(1);
+            assert_eq!(r.scale(101), Some(full), "covered={covered}: lifted under the image, frame {frame}");
+        }
+        assert!(band_open(&r), "covered={covered}: its caption band is open and its heading raised under the image");
+        assert!(!r.run(1), "covered={covered}: a seat already where it goes reports no motion to hold the image");
+        r.page_image = Default::default();
+        r.sect.dormant(false);
+        for frame in 0..30 {
+            r.run(1);
+            assert_eq!(r.scale(101), Some(full), "covered={covered}: still lifted once awake, frame {frame}");
+            assert!(band_open(&r), "covered={covered}: band kept once awake, frame {frame}");
+        }
+    }
+}
+
+/// **A scroll glide the push froze ends at once when the page returns.** A seat past the shelf's edge
+/// scrolls into view on the scroll spring, and an OK before it ends covers the page with the glide
+/// half played. The seat's shelf is stepped on the way back, so it would finish the glide under the
+/// BACK dip's image: layout motion, which holds the image past its dissolve and then jumps the row
+/// sideways. The scroll settles with the band and the heading on the restoring event, so the page
+/// the dip captures is the one that stays.
+#[test]
+fn a_shelf_that_returns_with_a_scroll_glide_unfinished_ends_the_glide_before_the_image_holds() {
+    let seat = 119;
+    let end = {
+        let mut left = settled::<Shelf>(20);
+        left.land_focus(seat, By::Dir);
+        left.run(300);
+        left.scroll().unwrap()
+    };
+    assert!(end > 100.0, "premise: the seat is past the edge, so the row scrolls: {end}");
+    let mut r = settled::<Shelf>(20);
+    r.land_focus(seat, By::Dir);
+    r.run(5);
+    let frozen = r.scroll().unwrap();
+    assert!(frozen > 1.0 && frozen < end - 20.0, "premise: the push froze the glide half played: {frozen} of {end}");
+    r.page_image = held_image();
+    r.sect.dormant(true);
+    r.run(3);
+    assert_eq!(r.scroll(), Some(frozen), "premise: the covered page keeps its scroll");
+    r.focus = None;
+    r.page_image = Default::default();
+
+    r.page_image = held_image();
+    r.sect.dormant(true);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(seat, By::Restore);
+    let landed = r.scroll().unwrap();
+    assert!((landed - end).abs() < 0.5, "the glide ends on the restoring event, before any tick: {landed} of {end}");
+    assert!(r.sect.under_band() > crate::card_row::under_band(0.0) + 1.0, "its caption band is open");
+    let raised = crate::card_row::heading_clearance(Some(19), &RowStyle::HOME, landed);
+    assert_eq!(r.sect.heading_lift(), raised, "and the heading is raised for the scroll it stands at");
+    for frame in 0..30 {
+        r.run(1);
+        assert_eq!(r.scroll(), Some(landed), "the row stands still under the image, frame {frame}");
+        assert_eq!(r.sect.heading_lift(), raised, "and so does its heading, frame {frame}");
+    }
+    assert!(!r.run(1), "a glide already ended reports no motion to hold the image");
+}
+
+/// **A return leaves no mark.** `Enter(Restored)` reaches a live page too (a modal's dismissal), with
+/// no image after it: the first tick that reports awake ends the return, so a later dissolve puts
+/// the seat to rest and the lift grows on the awake tick, as on a page that never returned.
+#[test]
+fn a_shelf_that_returned_with_no_image_sleeps_through_the_next_dissolve() {
+    let full = RowStyle::HOME.focus_scale;
+    let mut r = shelf_left_lifted();
+    r.focus = None;
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(101, By::Restore);
+    r.run(2);
+    assert!((r.scale(101).unwrap() - full).abs() < 1e-4, "premise: it came back lifted");
+    r.sect.dormant(true);
+    r.run(300);
+    assert_eq!(r.scale(101), Some(1.0), "a later dissolve puts the seat to rest");
+    assert_eq!(lifted(&r), 0);
+    r.sect.dormant(false);
+    r.run(1);
+    let first = r.scale(101).unwrap();
+    assert!(first > 1.0 && first < full - 0.02, "and the lift grows from rest once the page is in: {first}");
+}
+
+/// **The reader moving ends the return.** A key pressed while the image of the way back is still up
+/// is slept through like an entry's: nothing is lifted or opened under the image (the move would
+/// hold it), and the new seat grows from rest once the owner wakes the shelf.
+#[test]
+fn a_deliberate_move_ends_a_shelfs_return_and_is_slept_through() {
+    let full = RowStyle::HOME.focus_scale;
+    let mut r = shelf_left_lifted();
+    r.focus = None;
+    r.page_image = held_image();
+    r.sect.dormant(true);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(101, By::Restore);
+    r.run(3);
+    assert!((r.scale(101).unwrap() - full).abs() < 1e-4, "premise: it came back lifted");
+    r.land_focus(102, By::Dir);
+    r.run(1);
+    assert_eq!(r.scale(101), Some(1.0), "the seat it left is at rest at once");
+    assert_eq!(r.scale(102), Some(1.0), "the seat it moved to is at rest");
+    assert!(!band_open(&r) && r.sect.at_rest(), "nothing is left open or moving under the image");
+    assert!(!r.run(1), "nothing moves under the image");
+    r.page_image = Default::default();
+    r.sect.dormant(false);
+    r.run(1);
+    let first = r.scale(102).unwrap();
+    assert!(first > 1.0 && first < full - 0.02, "the new seat grows from rest once the page is in: {first}");
+}
+
+/// **Leaving the shelf under the image of the way back waits for nothing.** A shelf that returned
+/// lifted, then had focus leave its cards: Up onto a header control or another shelf (a deliberate
+/// move that names no card of this shelf), or the BACK that walks there (a seat the page makes for
+/// itself, announced as a restore). The seat lets go and its band shuts at once, like an entry's:
+/// a band left closing on its spring is layout motion, and the image waits for it. Elem 7 is on the
+/// page and not a card of the shelf. The return ends with the departure, whichever way focus left:
+/// a card of the shelf that focus lands on afterwards, with no fresh `Enter`, is slept through.
+#[test]
+fn a_shelf_that_returned_sleeps_through_focus_leaving_it() {
+    for by in [By::Dir, By::Pointer, By::Restore] {
+        let mut r = shelf_left_lifted();
+        r.focus = None;
+        r.page_image = held_image();
+        r.sect.dormant(true);
+        r.feed(ScreenEvent::Enter(Enter::Restored));
+        r.land_focus(101, By::Restore);
+        r.run(3);
+        assert!(band_open(&r), "{by:?}: premise: it came back with its band open");
+        r.land_focus(7, by);
+        r.run(1);
+        assert_eq!(r.scale(101), Some(1.0), "{by:?}: the seat it left is at rest at once");
+        assert!(!band_open(&r) && r.sect.at_rest(), "{by:?}: a band is left closing under the image");
+        assert!(!r.run(1), "{by:?}: something moves under the image");
+        assert_eq!(lifted(&r), 0, "{by:?}");
+        r.land_focus(102, By::Restore);
+        r.run(1);
+        assert_eq!(r.scale(102), Some(1.0), "{by:?}: the return ended when focus left, so a later seat is slept through");
+        assert!(!band_open(&r) && r.sect.at_rest(), "{by:?}: and its band stays shut");
+        assert!(!r.run(1), "{by:?}: and nothing moves under the image");
+    }
+}
+
+/// **A return no move announces wakes at its lift too.** The engine's focus can stay on the card
+/// while the page is covered, so the page comes back with `Enter(Restored)` and no `FocusMoved`. What
+/// the shelf slept through is stale then as well: the first tick adopts the seat at full pop as it
+/// does any focus no deliberate move announced, and does not grow it from rest (the wake of an
+/// entry's dissolve).
+#[test]
+fn a_shelf_that_returns_with_no_restoring_move_wakes_at_its_lift_and_not_from_rest() {
+    let full = RowStyle::HOME.focus_scale;
+    let mut r = shelf_left_lifted();
+    r.page_image = held_image();
+    r.sect.dormant(true);
+    r.run(3);
+    assert_eq!(r.scale(101), Some(1.0), "premise: it slept, with focus still on the card");
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    for frame in 0..5 {
+        r.run(1);
+        assert_eq!(r.scale(101), Some(full), "adopted whole, not grown from rest, frame {frame}");
+    }
+}
+
+/// **Only the shelf that holds the seat returns lifted.** The Recommended page feeds every shelf
+/// `Enter(Restored)`; a shelf the focus is not on (its lift was let go before the page was covered
+/// and its ease froze there) is still finished at once under the image, as any dormant shelf is:
+/// stepping it on would hold the image past the dissolve.
+#[test]
+fn a_returning_shelf_that_holds_no_seat_is_still_put_to_rest_under_the_image() {
+    let mut r = shelf_left_lifted();
+    r.sect.dormant(true);
+    r.run(3);
+    let eased = r.scale(101).unwrap();
+    assert!(eased > 1.0 + 1e-3 && eased < RowStyle::HOME.focus_scale - 1e-3, "premise: mid-ease on a visible page: {eased}");
+    r.focus = None;
+    r.page_image = held_image();
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.run(1);
+    assert_eq!(r.scale(101), Some(1.0), "the ease is finished under the image");
+    assert!(r.sect.at_rest());
+    assert!(!r.run(1), "and the shelf reports no motion to hold the image");
+}
+
+/// **A landing is adopted whole under the image, a returning shelf included.** A card that left or
+/// arrived while the page was covered (the item watched, a refetch) must not play its ghost and its
+/// slides under the image that hides them: the animation would hold the image to its bound and
+/// then be cut.
+#[test]
+fn a_shelf_that_returned_adopts_a_landing_whole_under_the_image() {
+    let mut r = landing_rig();
+    r.focus = None;
+    r.page_image = held_image();
+    r.sect.dormant(true);
+    r.run(2);
+    r.src.elems.remove(11);
+    r.src.elems.insert(13, 900);
+    r.feed(ScreenEvent::Enter(Enter::Restored));
+    r.land_focus(112, By::Restore);
+    for frame in 0..4 {
+        r.run(1);
+        assert!(r.sect.ghost_probe().0.is_empty(), "a ghost plays under the image, frame {frame}");
+        assert_eq!(r.scale(112), Some(RowStyle::HOME.focus_scale), "the seat stays lifted through the landing, frame {frame}");
+    }
+    r.page_image = Default::default();
+    r.sect.dormant(false);
+    r.run(2);
+    let n = r.src.elems.len();
+    assert_eq!(r.sect.landing_probe(n, 13), (0.0, 1.0));
+    assert_eq!(r.sect.landing_probe(n, 10), (0.0, 1.0));
+    assert!(r.sect.ghost_probe().0.is_empty());
+}
+
 /// `cull_margin` keeps painting and registering a card whose left edge is just past the screen's.
 #[test]
 fn a_cull_margin_keeps_a_card_just_off_the_left_edge() {
     let mut plain = settled::<Shelf>(60);
     let mut margined = settled::<Shelf>(60);
-    margined.sect = Shelf::new(ENTRY, &RowStyle::HOME).cull_margin(400.0);
+    margined.sect = Shelf::new(ENTRY, RowStyle::HOME).cull_margin(400.0);
     for r in [&mut plain, &mut margined] {
         r.land_focus(130, By::Restore);
         r.run(300);
@@ -2180,7 +2629,7 @@ mod stack {
             let mut present = Present::new();
             let mut out = Vec::new();
             let mut got = None;
-            let (_, moving) = plx_machine::idle::scoped_motion(|| {
+            let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
                 let cx = cx9(&self.view, self.ms, 1.0, self.focus);
                 let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(9)), &mut present);
                 got = self.stack.on(&self.page, &ev, &cx, &mut fx);
@@ -2437,6 +2886,63 @@ mod stack {
         r.go(HEAD_ELEM, By::Dir);
         r.run(240);
         assert!(r.stack.scroll().abs() < 0.5, "focus on the header brings the page home: {}", r.stack.scroll());
+    }
+
+    /// The pointer's sideways glide (`InputKind::Pan`) moves the stack's shelf under the pointer,
+    /// and only that shelf; a `Pan` over the grid below moves nothing.
+    #[test]
+    fn a_sideways_glide_moves_the_shelf_under_the_pointer() {
+        let pan = |y: f32| ScreenEvent::Input(plx_machine::machine::InputEvent {
+            at: Default::default(),
+            source: plx_machine::machine::Source::Script,
+            kind: plx_machine::machine::InputKind::Pan { dx: 30.0, x: 1900.0, y },
+        });
+        let mut r = rig(24, 60);
+        r.go(100, By::Restore);
+        r.run(2);
+        let before = r.place(100).unwrap().rect;
+        let grid_card = r.place(1000).unwrap().rect;
+        for _ in 0..10 { r.feed(pan(before.cy())); }
+        r.run(60);
+        let after = r.place(100).unwrap().rect;
+        assert!((before.x - after.x - 300.0).abs() < 0.5, "the shelf under the pointer glides 300 px: {before:?} -> {after:?}");
+        r.feed(pan(grid_card.cy()));
+        assert_eq!(r.place(1000).unwrap().rect.x, grid_card.x, "the grid does not move sideways");
+    }
+
+    /// The pointer's edge glide (a fractional wheel every frame) moves a stack page itself: the
+    /// page follows the wheel and stays where it put it instead of the tick pulling it back to the
+    /// focused row; a hover moves focus and not the page, and a key's move brings it back.
+    #[test]
+    fn a_wheel_glides_the_page_and_it_stays_until_focus_moves() {
+        let wheel = |dy: f32| ScreenEvent::Input(plx_machine::machine::InputEvent {
+            at: Default::default(),
+            source: plx_machine::machine::Source::Script,
+            kind: plx_machine::machine::InputKind::Wheel { dy },
+        });
+        let mut r = rig(6, 60);
+        r.go(1000, By::Restore);
+        r.run(2);
+        r.go(1042, By::Dir);
+        r.run(120);
+        let deep = r.stack.scroll();
+        assert!(deep > 400.0, "the page followed the focused row: {deep}");
+        let mut last = deep;
+        for _ in 0..30 {
+            r.feed(wheel(0.04));
+            r.run(1);
+            assert!(r.stack.scroll() < last, "every frame of the glide moves the page up");
+            last = r.stack.scroll();
+        }
+        r.run(120);
+        let glided = r.stack.scroll();
+        assert!((glided - (deep - 1.2 * crate::consts::ROW_PITCH)).abs() < 1.0, "1.2 rows up: {deep} -> {glided}");
+        r.go(1043, By::Pointer);
+        r.run(120);
+        assert!((r.stack.scroll() - glided).abs() < 0.5, "a hover moves focus, not the page: {}", r.stack.scroll());
+        r.go(1042, By::Dir);
+        r.run(120);
+        assert!((r.stack.scroll() - deep).abs() < 1.0, "a key's move reveals the focused row again: {}", r.stack.scroll());
     }
 
     #[test]
@@ -3441,12 +3947,12 @@ struct AbandonRow {
 /// dip stays with the card that was pressed while it springs back, so the pressed card is the
 /// press's owner after focus has left it. Real `Press`, real section, one 16 ms frame at a time.
 fn abandoned_press_trace<S: Section + 'static>() -> Vec<AbandonRow> {
-    crate::popover::set_lift_owns(false);
+    // No ambient lift policy is shared by card harnesses.
     let mut r = Rig::<S>::new(6);
     r.land_focus(100, By::Dir);
     r.run(120);
     let rest = r.drawn_rect(101, 1.0).unwrap().w;
-    let mut press = crate::press::Press::new();
+    let mut press = crate::dispatch::press::Press::new();
     let row = |r: &Rig<S>, ms: u32, what, dip, motion| {
         let width = |elem| r.drawn_rect(elem, dip).unwrap().w / rest;
         AbandonRow { ms, what, dip, pressed: width(100), neighbour: width(101), motion }
@@ -3463,7 +3969,7 @@ fn abandoned_press_trace<S: Section + 'static>() -> Vec<AbandonRow> {
             what = "RIGHT";
         }
         r.ms += MS;
-        let (_, motion) = plx_machine::idle::scoped_motion(|| press.tick(r.ms, MS as f32 / 1000.0));
+        let (_, motion) = plx_machine::motion::report::scoped_motion(|| press.tick(r.ms, MS as f32 / 1000.0));
         r.feed(ScreenEvent::Tick(Tick { ms: r.ms, dt_us: 16_667 }));
         let dip = if press.is_active() { press.scale() } else { 1.0 };
         rows.push(row(&r, r.ms - t0, what, dip, motion));
@@ -3534,6 +4040,27 @@ fn grid_header_press_dips_no_unindexed_member() {
     a_header_press_dips_no_unindexed_member::<Grid>();
 }
 
+/// **A held OK does not close what the pop opened.** `Tile::pop` is the card's pop spring as a
+/// 0..1 progress ([`super::pop_progress`]); the press dip multiplies the painted scale (1.09 x
+/// 0.918 is about 1.0, which `pop_factor` alone reads as "no pop") and must be taken back out for
+/// the pressed card, or the still footer's cue slot shuts at the moment of the press.
+#[test]
+fn a_pressed_cards_pop_progress_ignores_the_press_dip() {
+    let focus_scale = 1.09;
+    let view = FixtureView::default();
+    let src = Cards::new(vec![100, 101], false);
+    let key = FocusKey { entry: ENTRY, elem: 100 };
+    let popped = focus_scale;
+    for dip in [0.9, 0.918, 1.0] {
+        let cx = cx9_pressed(&view, 0, dip, Some(key), Some(key));
+        let s = super::press_scale(popped, 0, Some(0), &cx);
+        let p = super::pop_progress(s, 0, ENTRY, &src, &cx, focus_scale);
+        assert!((p - 1.0).abs() < 1e-4, "pressed at dip {dip}: the pop stays fully open, got {p}");
+        let other = super::pop_progress(1.0, 1, ENTRY, &src, &cx, focus_scale);
+        assert_eq!(other, 0.0, "a card the press does not own is untouched");
+    }
+}
+
 /// The focus read-out of a shelf that holds a slid window names the card by its place in the
 /// whole listing (`cdg`), not by its slot in the window (`cdi`): the two were the same number
 /// on every shelf once, and a reach graded on it could never pass the window length.
@@ -3560,9 +4087,9 @@ fn landing_rig() -> Rig<Shelf> {
 
 /// [`landing_rig`] with focus on `elem` instead.
 fn landing_rig_at(elem: u32) -> Rig<Shelf> {
-    crate::containers::transition::set_page_image_held(false);
+
     let mut r = Rig::<Shelf>::new(40);
-    r.sect = Shelf::new(ENTRY, &RowStyle::HOME).animate_landings(true);
+    r.sect = Shelf::new(ENTRY, RowStyle::HOME).animate_landings(true);
     r.run(2);
     r.land_focus(elem, By::Restore);
     r.run(240);
@@ -3691,9 +4218,9 @@ fn a_sliding_card_starts_where_it_stood_and_its_stop_follows() {
 /// becoming cards: nothing is there to change.
 #[test]
 fn nothing_animates_on_the_first_load() {
-    crate::containers::transition::set_page_image_held(false);
+
     let mut r = Rig::<Shelf>::new(0);
-    r.sect = Shelf::new(ENTRY, &RowStyle::HOME).animate_landings(true);
+    r.sect = Shelf::new(ENTRY, RowStyle::HOME).animate_landings(true);
     r.run(2);
     r.src.elems = (100..108).collect();
     r.run(1);
@@ -3703,7 +4230,7 @@ fn nothing_animates_on_the_first_load() {
     assert!(r.sect.ghost_probe().0.is_empty() && !r.sect.landing_pending());
 
     let mut p = Rig::<Shelf>::new(8);
-    p.sect = Shelf::new(ENTRY, &RowStyle::HOME).animate_landings(true);
+    p.sect = Shelf::new(ENTRY, RowStyle::HOME).animate_landings(true);
     p.src.unloaded = 0..8;
     p.run(2);
     p.src.elems = (200..208).collect();
@@ -3751,7 +4278,7 @@ fn a_dormant_shelf_snaps_a_landing() {
 #[test]
 fn a_landing_under_a_held_page_image_shows_its_start_state_on_release() {
     let mut r = landing_rig();
-    crate::containers::transition::set_page_image_held(true);
+    r.page_image = held_image();
     r.src.elems.remove(11);
     r.run(6);
     let n = r.src.elems.len();
@@ -3759,7 +4286,7 @@ fn a_landing_under_a_held_page_image_shows_its_start_state_on_release() {
     let slid = r.sect.landing_probe(n, 10).0;
     assert!((slid + pitch()).abs() < 0.5, "the card left of the gap still stands at its old slot: {slid}");
     // the frame painted between the release and the next tick
-    crate::containers::transition::set_page_image_held(false);
+    r.page_image = Default::default();
     assert_eq!(r.sect.ghost_probe(), (vec![11], 1.0));
     assert_eq!(r.sect.landing_probe(n, 10).0, slid);
     let ghost = ghost_paint(&r, &[111]);
@@ -3768,6 +4295,41 @@ fn a_landing_under_a_held_page_image_shows_its_start_state_on_release() {
     assert!(r.sect.ghost_probe().1 < 1.0 && r.sect.landing_probe(n, 10).0 > slid, "and it plays from the first live tick");
     r.run(600);
     assert!(!r.sect.landing_pending() && !r.run(1), "and the shelf is quiet");
+}
+
+/// Two real dispatcher draw plans on one thread must not share landing policy.
+#[test]
+fn another_dispatchers_live_draw_cannot_step_a_held_owners_landing() {
+    use crate::containers::transition::{PageDip, PageSnapshot};
+    let _serial = plx_base::testlock::serial();
+    #[derive(Default)]
+    struct Snapshot(bool);
+    impl PageSnapshot for Snapshot {
+        fn available(&self) -> bool { true }
+        fn valid(&self) -> bool { self.0 }
+        fn begin(&mut self) -> bool { true }
+        fn finish(&mut self) { self.0 = true; }
+        fn release(&mut self) { self.0 = false; }
+    }
+    let mut r = landing_rig();
+    let (mut a, mut ar, _) = crate::fixture::booted();
+    let (mut b, mut br, _) = crate::fixture::booted();
+    a.nav.tabs.stack.top_mut().unwrap().id = ENTRY; // the standalone landing belongs to A's page
+    a.page_snapshot = Box::<Snapshot>::default();
+    a.nav.tabs.stack.transition = Box::new(PageDip::new());
+    a.nav.tabs.stack.transition.request(true);
+    a.draw(&mut ar, true);
+    a.draw(&mut ar, true);
+    assert!(a.page_snapshot.valid(), "A actually captured its page");
+    r.page_image = a.page_image_read();
+    assert!(r.page_image.is_held());
+    r.src.elems.remove(11);
+    r.run(1);
+    assert_eq!(r.sect.ghost_probe(), (vec![11], 1.0));
+    b.draw(&mut br, true);
+    r.run(6);
+    assert_eq!(r.sect.ghost_probe(), (vec![11], 1.0),
+        "B's live draw must not advance A's landing hidden by A's held image");
 }
 
 /// When the focused card is the one removed its ghost starts at the scale it was drawn at (no
@@ -3928,7 +4490,7 @@ fn critical(x0: f32, k: f32, frames: u32) -> f32 {
 }
 
 fn animated_grid(n: usize, focus: u32, spec: GridSpec) -> Rig<Grid> {
-    crate::containers::transition::set_page_image_held(false);
+
     let mut r = Rig::<Grid>::new(n);
     r.sect = Grid::new(ENTRY, spec.animate_landings(true));
     r.run(2);
@@ -3998,10 +4560,10 @@ fn a_grid_ghost_fades_in_its_cell_on_k_scale() {
 /// stood, lifted and opaque.
 #[test]
 fn a_lifted_ghost_is_left_out_of_the_page_pass_and_drawn_by_the_lift() {
-    use crate::containers::modal::set_veil;
-    use crate::popover::{lift_owns, set_lift_owns};
+
+    use plx_machine::machine::InstanceId;
     let mut r = animated_grid(40, 108, GRID);
-    set_veil(1.0);
+    r.modal.veil = 1.0;
     let was = <Rig<Grid> as CardHarness>::place(&r, 108, At::Drawn).unwrap().rect;
     r.src.elems.remove(10);
     remove_focused_grid(&mut r, 8);
@@ -4012,13 +4574,14 @@ fn a_lifted_ghost_is_left_out_of_the_page_pass_and_drawn_by_the_lift() {
     assert!(!r.sect.departing::<FixtureHost>(r.key(109)), "a card on the page is not");
     let cx = r.cx();
     let ghosts = Cards::new(order, false);
-    set_lift_owns(false);
+    // The ghost omission belongs to this page walk alone.
     let mut page = DrawFrame::new(&cx, Painter::recording());
     page.lifted = Some(r.key(108));
+    page.lift_owner = Some(InstanceId(1));
     r.sect.paint_ghosts(&page, page.painter, &ghosts);
     let drawn: Vec<u32> = ghosts.drawn.take().into_iter().map(|(e, _)| e).collect();
     assert_eq!(drawn, vec![110], "the page pass leaves the lifted ghost out, and only it");
-    assert!(lift_owns(), "…and says the lift owns it");
+    assert_eq!(page.lift_receipt().unwrap().key, r.key(108), "…and says so locally");
     let mut lift = DrawFrame::new(&cx, Painter::recording());
     lift.lifting = Some(r.key(108));
     ghosts.painted.borrow_mut().clear();
@@ -4036,8 +4599,8 @@ fn a_lifted_ghost_is_left_out_of_the_page_pass_and_drawn_by_the_lift() {
     let mut marks = ghosts.focused.take();
     marks.sort();
     assert_eq!(marks, vec![(108, true), (110, false)], "each ghost keeps the focus it had");
-    set_veil(0.0);
-    set_lift_owns(false);
+    assert!(plain.lift_receipt().is_none());
+    r.modal.veil = 0.0;
     r.run(600);
     assert!(!r.sect.departing::<FixtureHost>(r.key(108)), "gone once faded");
 }
@@ -4164,10 +4727,10 @@ fn a_focused_card_that_changes_row_crossfades_on_top() {
 /// first frame after the menu has let go every spring starts on one frame: no beat.
 #[test]
 fn a_landing_waits_for_the_menu_to_leave_then_moves_at_once_on_the_first_frame_after() {
-    use crate::containers::modal::{set_veil, CLOSING_GONE};
+    use crate::containers::modal::CLOSING_GONE;
     let mut r = animated_grid(40, 108, GRID);
     let stood = settled_rect(&r, 109);
-    set_veil(1.0);
+    r.modal.veil = 1.0;
     remove_focused_grid(&mut r, 8);
     assert!(!r.run(1), "the landing's first frame under the menu reports no motion");
     let n = r.src.elems.len();
@@ -4178,7 +4741,7 @@ fn a_landing_waits_for_the_menu_to_leave_then_moves_at_once_on_the_first_frame_a
         // the menu's fade-out, down to just above the veil's edge
         if frame >= 10 {
             fade = (fade * 0.9).max(CLOSING_GONE + 1e-3);
-            set_veil(fade);
+            r.modal.veil = fade;
         }
         let moved = r.run(1);
         assert!(!moved, "frame {frame}: the waiting landing reported motion under the menu");
@@ -4188,14 +4751,14 @@ fn a_landing_waits_for_the_menu_to_leave_then_moves_at_once_on_the_first_frame_a
         let drawn = <Rig<Grid> as CardHarness>::place(&r, 109, At::Drawn).unwrap().rect;
         assert!(rect_close(drawn, stood), "frame {frame}: 109 is not where it stood: {drawn:?} {stood:?}");
     }
-    set_veil(CLOSING_GONE * 0.5);
+    r.modal.veil = CLOSING_GONE * 0.5;
     r.run(1);
     let ((x, _), _) = r.sect.landing_probe(n, 8);
     assert!(x < start.0 .0, "the slide starts on the first frame after the menu let go");
     assert!(r.sect.ghost_probe().1 < 1.0, "the ghost fades on the same frame");
     let s = r.scale(109).unwrap();
     assert!(s > 1.0, "and the takeover rises on it: {s}");
-    set_veil(0.0);
+    r.modal.veil = 0.0;
     r.run(600);
     assert!((r.scale(109).unwrap() - poster_grid::STYLE.focus_scale).abs() < 1e-4);
     assert!(!r.sect.landing_pending() && !r.run(1));
@@ -4206,9 +4769,9 @@ fn a_landing_waits_for_the_menu_to_leave_then_moves_at_once_on_the_first_frame_a
 /// to full the frame focus comes back (`--trigger watchlist=` Remove render, 2026-10-16).
 #[test]
 fn a_takeover_reconciled_a_frame_late_still_rises_from_rest_with_the_landing() {
-    use crate::containers::modal::set_veil;
+
     let mut r = animated_grid(40, 108, GRID);
-    set_veil(1.0);
+    r.modal.veil = 1.0;
     r.src.elems.remove(8);
     r.run(1);
     assert!(r.scale(109).unwrap() < 1.0 + 1e-4, "the frame before focus is reconciled: 109 is not lifted");
@@ -4220,7 +4783,7 @@ fn a_takeover_reconciled_a_frame_late_still_rises_from_rest_with_the_landing() {
         assert_eq!(r.scale(109), Some(1.0), "frame {frame}: the late-reconciled takeover is lifted under the menu");
         assert!(lifted(&r) <= 1, "frame {frame}: more than one tile lifted");
     }
-    set_veil(0.0);
+    r.modal.veil = 0.0;
     r.run(600);
     assert!((r.scale(109).unwrap() - poster_grid::STYLE.focus_scale).abs() < 1e-4, "and it ends lifted");
 }
@@ -4229,7 +4792,7 @@ fn a_takeover_reconciled_a_frame_late_still_rises_from_rest_with_the_landing() {
 /// next one moves, with no beat between.
 #[test]
 fn a_landing_with_no_menu_starts_at_once() {
-    crate::containers::modal::set_veil(0.0);
+
     let mut r = animated_grid(40, 108, GRID);
     let n0 = r.src.elems.len();
     let before = r.sect.landing_probe(n0, 9);
@@ -4349,13 +4912,13 @@ where
 }
 #[test]
 fn a_grid_ghost_stays_in_its_row_when_the_page_shifts() {
-    crate::containers::transition::set_page_image_held(false);
+
     let r = animated_grid(40, 112, GRID);
     a_ghost_holds_its_screen_place_when_the_landing_shifts_the_page(r, |r| &r.sect);
 }
 #[test]
 fn an_external_grid_ghost_stays_in_its_row_when_the_page_shifts() {
-    crate::containers::transition::set_page_image_held(false);
+
     let mut r = Rig::<ExtGrid>::new(40);
     r.sect = ExtGrid { grid: Grid::new(ENTRY, EXT.animate_landings(true)), page: 0.0 };
     r.run(2);
@@ -4366,7 +4929,7 @@ fn an_external_grid_ghost_stays_in_its_row_when_the_page_shifts() {
 
 fn mount_animated_shelf(n: usize) -> Box<dyn CardHarness> {
     let mut r = Rig::<Shelf>::new(n);
-    r.sect = Shelf::new(ENTRY, &RowStyle::HOME).animate_landings(true);
+    r.sect = Shelf::new(ENTRY, RowStyle::HOME).animate_landings(true);
     Box::new(r)
 }
 fn mount_animated_grid(n: usize) -> Box<dyn CardHarness> {
@@ -4414,15 +4977,15 @@ struct RowFrame {
 fn shape_captions(src: &mut Cards, policy: Option<crate::caption_policy::CaptionPolicy>) {
     src.captioned = true;
     if let Some(policy) = policy {
-        src.title_only = policy.details == crate::caption_policy::DetailsKind::None;
+        src.title_only = policy.details == crate::caption_policy::DetailParts::NONE;
         src.details_only = !policy.title;
     }
 }
 
 const BOTH_LINES: crate::caption_policy::CaptionPolicy =
-    crate::caption_policy::CaptionPolicy { title: true, details: crate::caption_policy::DetailsKind::YearLength };
+    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT);
 const TITLE_ONLY: crate::caption_policy::CaptionPolicy =
-    crate::caption_policy::CaptionPolicy { title: true, details: crate::caption_policy::DetailsKind::None };
+    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::NONE);
 
 /// A grid of `rows` rows of captioned cards under `policy`, focus seated on card 0 with its band open.
 fn captioned_grid(rows: usize, policy: Option<crate::caption_policy::CaptionPolicy>) -> Rig<Grid> {
@@ -4671,7 +5234,7 @@ fn a_shelf_told_nothing_about_the_heading_below_does_reach_it() {
 /// block: the room never holds a line's box, and a block folded over no lines is not a pass.
 #[test]
 fn a_shelf_with_a_band_of_zero_draws_no_caption_line() {
-    let none = crate::caption_policy::CaptionPolicy { title: false, details: crate::caption_policy::DetailsKind::None };
+    let none = crate::caption_policy::CaptionPolicy::same(false, crate::caption_policy::DetailParts::NONE);
     let mut a = Rig::<Shelf>::new(6);
     a.sect.set_caption_policy(Some(none));
     a.src.captioned = true;
@@ -4786,7 +5349,7 @@ fn a_down_hands_the_caption_over_from_the_key_frame_and_the_arrival_waits_for_it
 /// or a headshot row (Search's Episode and Person rows, Detail's Extras) reads it.
 #[test]
 fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
-    use crate::caption_policy::{band_h, CaptionPolicy, DetailsKind};
+    use crate::caption_policy::{band_h, CaptionPolicy, DetailPart, DetailParts};
     let settled_under_band = |policy: Option<CaptionPolicy>| {
         let mut r = Rig::<Shelf>::new(6);
         r.sect.set_caption_policy(policy);
@@ -4797,9 +5360,9 @@ fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
         let whole = r.src.label(0).revealed(r.sect.band_h(), r.sect.band_expand(), 0.0);
         (r.sect.under_band(), r.sect.band_h(), whole.lines().iter().flatten().map(|l| l.alpha).fold(1.0, f32::min))
     };
-    for (title, details, tall) in [(false, DetailsKind::None, 0.0), (false, DetailsKind::Genre, 80.0),
-        (true, DetailsKind::YearLength, 112.0), (true, DetailsKind::None, 80.0)] {
-        let policy = CaptionPolicy { title, details };
+    for (title, details, tall) in [(false, DetailParts::NONE, 0.0), (false, DetailParts::of(&[DetailPart::Genre]), 80.0),
+        (true, DetailParts::MOVIE_DEFAULT, 112.0), (true, DetailParts::NONE, 80.0)] {
+        let policy = CaptionPolicy::same(title, details);
         let (under, h, reveal) = settled_under_band(Some(policy));
         assert_eq!(h, tall, "title {title}, details {details:?}: the shelf's band is the policy's");
         assert_eq!(h, band_h(&policy));
@@ -4819,9 +5382,9 @@ fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
 /// reserves [`card_row::LEGACY_BAND_H`], not the stored setting's 80 / 40 px.
 #[test]
 fn a_grid_taken_off_the_policy_keeps_the_legacy_band() {
-    use crate::caption_policy::{band_h, CaptionPolicy, DetailsKind};
+    use crate::caption_policy::{band_h, CaptionPolicy, DetailParts};
     let mut r = Rig::<Grid>::new(2 * poster_grid::COLS);
-    let silent = CaptionPolicy { title: false, details: DetailsKind::None };
+    let silent = CaptionPolicy::same(false, DetailParts::NONE);
     r.sect.set_caption_policy(Some(silent));
     assert_eq!(r.sect.band_h(), band_h(&silent));
     r.sect.set_caption_policy(None);
@@ -4937,4 +5500,276 @@ fn the_rows_in_view_and_their_hold_reach_fit_the_rows_the_store_keeps() {
     // and the premise of ROWS_IN_VIEW_MAX: the fixed pitch of a row, whole rows that fit, plus two cut
     let pitch = crate::card_row::ROW_PITCH_FIXED;
     assert!(ROWS_IN_VIEW_MAX as f32 * pitch >= crate::consts::SCR_H + pitch, "{ROWS_IN_VIEW_MAX} rows of {pitch}px");
+}
+
+#[test]
+fn value_lines_draw_on_every_visible_card_and_space_the_rows_for_them() {
+    let _guard = plx_base::testlock::serial();
+    let mut r = Rig::<Grid>::new(30);
+    r.src.sort_caption = true;
+    r.sect.set_value_line(true);
+    // Focus in row 2: rows 0 and 1 are collapsed, so their pitch is the card and the 60 px row gap.
+    r.land_focus(112, By::Dir); r.run(120);
+    let cx = r.cx();
+    let y = |r: &Rig<Grid>, elem: u32| r.sect.place(&r.cx(), &r.src, &elem, At::SpringTarget).unwrap().rest_rect.y;
+    assert!((y(&r, 106) - y(&r, 100) - (GRID.style.h + crate::card_row::SORT_VALUE_ROW_GAP)).abs() < 0.5,
+        "collapsed rows are 60 px apart while values show");
+    // The focused row's band is open: the row below it sits SORT_VALUE_OPEN further down.
+    assert!((y(&r, 119) - y(&r, 113) - (GRID.style.h + crate::card_row::SORT_VALUE_ROW_GAP + crate::card_row::SORT_VALUE_OPEN)).abs() < 0.5,
+        "the focused row opens 26 px");
+    let runs = crate::draw_census::capture_runs(|| {
+        let mut frame = DrawFrame::new(&cx, Painter::recording());
+        let p = frame.painter;
+        r.sect.draw(&mut frame, p, &r.src);
+    });
+    let values: Vec<_> = runs.iter().filter(|run| run.text == "100%" && run.ink[3] > 0.5).collect();
+    assert!(values.iter().all(|run| run.size == crate::theme::size::CAPTION), "never smaller type");
+    assert_eq!(values.iter().filter(|run| run.bold).count(), 1, "exactly the lifted card's value is bold");
+    assert!(values.iter().filter(|run| !run.bold).count() >= 5, "every other visible card shows its value at rest");
+    assert!(runs.iter().all(|run| !run.text.starts_with("Title")), "no identity block while values show");
+    r.sect.set_value_line(false);
+    r.run(120);
+    let cx = r.cx(); let f = DrawFrame::new(&cx, Painter::recording());
+    assert!(r.sect.caption_probe(&f, f.painter, &r.src).iter().all(|(index, _)| *index == 12),
+        "turning values off restores the focused-only caption band");
+}
+
+/// The simulator measured the settled focused value at 217/255 where TEXT_PRIMARY is 247: the grid
+/// drew every value BEFORE every tile, and the lifted card's drop shadow (folded into its composite
+/// quad, 64 px past the poster) fell over the line. A value is painted over every tile.
+#[test]
+fn every_value_is_painted_after_every_tile_so_no_shadow_falls_on_it() {
+    let _guard = plx_base::testlock::serial();
+    let mut r = Rig::<Grid>::new(30);
+    r.src.sort_caption = true;
+    r.sect.set_value_line(true);
+    r.land_focus(112, By::Dir); r.run(120);
+    let cx = r.cx();
+    let draw = || {
+        let mut frame = DrawFrame::new(&cx, Painter::recording());
+        let p = frame.painter;
+        r.sect.draw(&mut frame, p, &r.src);
+    };
+    let census = crate::draw_census::capture(draw);
+    let last_tile = census.iter().rposition(|(tag, _)| *tag == TILE_PAINTED).expect("tiles are painted");
+    let first_value = census.iter().position(|(tag, _)| *tag == 100).expect("values are painted");
+    assert!(first_value > last_tile, "a value line goes over every tile (tile {last_tile}, value {first_value})");
+    // and the settled focused card's value is the whole of TEXT_PRIMARY, bold
+    let runs = crate::draw_census::capture_runs(draw);
+    let bold: Vec<_> = runs.iter().filter(|run| run.bold && run.ink[0] > 0.0).collect();
+    assert_eq!(bold.len(), 1, "exactly the lifted card's value is bold");
+    // (the pop spring settles within a millionth of its target: an alpha well inside one 8-bit step)
+    let ink = bold[0].ink;
+    assert_eq!(ink[..3], crate::theme::TEXT_PRIMARY[..3]);
+    assert!((ink[3] - 1.0).abs() < 0.5 / 255.0, "{ink:?}");
+    // the opener's redraw of the lifted card keeps the same order
+    let hold = crate::draw_census::capture(|| {
+        let mut frame = DrawFrame::new(&cx, Painter::recording());
+        r.sect.redraw(&mut frame, &r.src, Some(r.key(112)));
+    });
+    let tile = hold.iter().position(|(tag, _)| *tag == TILE_PAINTED).expect("the lifted tile");
+    assert!(hold.iter().position(|(tag, _)| *tag == 100).is_some_and(|value| value > tile), "{hold:?}");
+}
+
+#[test]
+fn a_value_line_drops_its_plus_then_its_mark_and_never_elides() {
+    let _guard = plx_base::testlock::serial();
+    let mark: &'static [crate::widgets::MarkLayer] = &[(crate::icons::Icon::Crowd, crate::theme::RATING_AUDIENCE)];
+    let rect = Rect::new(100.0, 100.0, 250.0, 375.0);
+    let drawn = |style: &crate::card_row::RowStyle, value: &crate::card_row::SortValue, focused: bool| {
+        crate::draw_census::capture_runs(|| crate::card_row::draw_sort_value(
+            Painter::recording(), rect, if focused { style.focus_scale } else { 1.0 }, style, value, &FixtureMeasure, focused))
+    };
+    let value = crate::card_row::SortValue { text: "4K".into(), plus: true, mark, missing: false };
+    let wide = crate::card_row::RowStyle { w: 250.0, ..GRID.style };
+    // FixtureMeasure is size/2 per byte: "4K" is 24 px, "4K" + NBSP + "+1" is 24 + 12 + 24 + ...
+    let full = format!("4K{}", crate::card_row::SORT_VALUE_PLUS);
+    assert!(drawn(&wide, &value, false).iter().any(|run| run.text == full), "fits whole when there is room");
+    let tight = crate::card_row::RowStyle { w: 100.0, ..GRID.style };
+    let runs = drawn(&tight, &value, false);
+    assert!(runs.iter().any(|run| run.text == "4K") && !runs.iter().any(|run| run.text.contains("+1")), "+1 goes first");
+    // The glyphs the same call hands the painter: a dropped mark is the absence of its icon, which the words alone cannot show.
+    let marks = |style: &crate::card_row::RowStyle, value: &crate::card_row::SortValue| {
+        crate::draw_census::capture_icons(|| crate::card_row::draw_sort_value(
+            Painter::recording(), rect, 1.0, style, value, &FixtureMeasure, false))
+    };
+    assert_eq!(marks(&wide, &value).len(), mark.len(), "with room for everything the mark is drawn");
+    assert_eq!(marks(&tight, &value).len(), mark.len(), "the mark outlasts the +1 (24 px of words and 52 of mark hang fit 100)");
+    let bare = crate::card_row::RowStyle { w: 60.0, ..GRID.style };
+    let marked = crate::card_row::SortValue { text: "4K".into(), mark, ..Default::default() };
+    let runs = drawn(&bare, &marked, false);
+    assert!(runs.iter().any(|run| run.text == "4K"), "the words are drawn whole at 60 px");
+    assert!(marks(&bare, &marked).is_empty(), "the mark goes before the words are cut: no icon is painted at 60 px (24 + 52 > 60)");
+    let long = crate::card_row::SortValue { text: "Yesterday".into(), ..Default::default() };
+    let runs = drawn(&wide, &long, false);
+    assert!(runs.iter().all(|run| !run.text.contains('\u{2026}')) && runs.iter().any(|run| run.text == "Yesterday"));
+    // The number stays on the poster axis whatever hangs beside it.
+    let axis = rect.cx();
+    let at = drawn(&wide, &crate::card_row::SortValue { text: "98%".into(), mark, ..Default::default() }, false);
+    assert!(at.iter().all(|run| run.align == 1 && (run.at.x - axis).abs() < 0.01), "centred on the axis: {at:?}");
+    // A missing value is an en dash at 50% white, regular even on the focused card.
+    let dash = crate::card_row::SortValue { text: "\u{2013}".into(), missing: true, ..Default::default() };
+    for focused in [false, true] {
+        let runs = drawn(&wide, &dash, focused);
+        assert!(runs.iter().all(|run| !run.bold) && runs.iter().any(|run| run.text == "\u{2013}"), "focused={focused}");
+    }
+}
+
+#[test]
+fn a_value_line_grid_borrows_labels_only_after_culling() {
+    struct CachedCards {
+        cards: Cards,
+        label: TileLabel,
+        reads: std::cell::RefCell<Vec<usize>>,
+    }
+    impl CardSource<FixtureHost> for CachedCards {
+        fn len(&self) -> usize { self.cards.len() }
+        fn elem(&self, i: usize) -> u32 { self.cards.elem(i) }
+        fn index_of(&self, e: &u32) -> Option<usize> { self.cards.index_of(e) }
+        fn art(&self, _: usize) -> Art<'_> { Art::Poster(None) }
+        fn label(&self, _: usize) -> TileLabel { panic!("persistent painting must borrow the cached label") }
+        fn with_label<R>(&self, i: usize, read: impl FnOnce(&TileLabel) -> R) -> R {
+            self.reads.borrow_mut().push(i);
+            read(&self.label)
+        }
+    }
+    let _guard = plx_base::testlock::serial();
+    let sources = std::rc::Rc::new(std::cell::RefCell::new(crate::frame::backdrop::Sources::default()));
+    sources.borrow_mut().begin(vec![]);
+    let _discovery = crate::frame::backdrop::discover(sources);
+    let view = FixtureView::default();
+    let cx = cx9(&view, 0, 1.0, None);
+    let painter = Painter::root();
+    let frame = DrawFrame::new(&cx, painter);
+    let mut grid = Grid::new(ENTRY, GRID.columns(GRID.cols, GRID.style, 5000.0));
+    grid.set_value_line(true);
+    let src = CachedCards { cards: Cards::new((100..130).collect(), false),
+        label: TileLabel { value: Some(crate::card_row::SortValue { text: "98%".into(), ..Default::default() }), ..TileLabel::titled("Cached", "1997") },
+        reads: Default::default() };
+    assert!(grid.caption_probe(&frame, painter, &src).is_empty());
+    assert!(src.reads.borrow().is_empty(), "culled tiles must not ask for words");
+    grid.set_columns(GRID.cols, GRID.style, crate::consts::MARGIN_X);
+    assert!(!grid.caption_probe(&frame, painter, &src).is_empty());
+    assert!(!src.reads.borrow().is_empty(), "visible captions use the borrowed path");
+}
+
+/// **A Shelf takes its style by value** (`docs/hud-plugins.md` D11): a style built at runtime, here a
+/// package's 288 x 162 chapter cards, lives in the Shelf and is read back unchanged, and the pitch every
+/// geometry reads is that style's, not a `'static` constant's.
+#[test]
+fn a_shelf_holds_a_style_built_at_runtime() {
+    let wide = RowStyle { w: 288.0, h: 162.0, gap: 24.0, ..RowStyle::HOME };
+    let shelf = Shelf::new(ENTRY, wide);
+    assert_eq!((shelf.style().w, shelf.style().h, shelf.style().gap), (288.0, 162.0, 24.0));
+    assert_eq!(Shelf::new(ENTRY, RowStyle::HOME).style().w, RowStyle::HOME.w, "a shipped style passes by value too");
+}
+
+#[test]
+fn default_shelf_composition_keeps_the_label_before_the_source_overlay() {
+    let src = Cards::new(vec![1], false);
+    let tile = super::Tile { rect: Rect::new(100.0, 200.0, 200.0, 100.0), scale: 1.0, radius: 10.0, focused: true, pop: 0.0 };
+    let label = TileLabel::default();
+    let draws = crate::draw_census::capture(|| src.compose(Painter::recording(), 0, &tile, &FixtureMeasure,
+        Some(&label), |_, given| {
+            assert!(std::ptr::eq(given, &label));
+            crate::draw_census::note(7777, tile.rect);
+        }));
+    assert_eq!(draws.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), [7777, TILE_PAINTED]);
+}
+
+/// The Continue Watching stills row's heading stands higher over its cards than a poster shelf's:
+/// [`theme::STILL_HEADING_RISE`] belongs to the shared row style. The strip's pitch determines
+/// the card tops.
+#[test]
+fn the_stills_heading_stands_a_fixed_rise_higher_over_its_cards_than_a_posters() {
+    use crate::consts::{CARD_DY, TITLE_DY};
+    // The heading draws at `row_y - TITLE_DY - lift`, the cards at `row_y + CARD_DY`.
+    let over_cards = |style: RowStyle| CARD_DY + TITLE_DY + Shelf::new(ENTRY, style).heading_lift();
+    assert_eq!(over_cards(RowStyle::HOME), CARD_DY + TITLE_DY, "a poster shelf's heading stands at rest where it always did");
+    assert_eq!(
+        over_cards(RowStyle::STILL) - over_cards(RowStyle::HOME),
+        crate::theme::STILL_HEADING_RISE,
+        "the stills row's heading stands one named rise higher, at rest, before any tile has focus"
+    );
+    assert_eq!(
+        RowStyle::STILL.pitch_fixed(),
+        RowStyle::EPISODE.pitch_fixed() + crate::still_footer::FOOTER_UNDER_TILE,
+        "the rise moves the heading, never the cards under it: the row's pitch is the strip's plus the footer line that stands under the tile"
+    );
+}
+
+/// **The Continue Watching row's geometry on the owner's CW-13 v2 board**: the tiles stand 40 px
+/// apart (a 460 px pitch for a 420 px tile) where the detail episode strip keeps its 28. The footer
+/// line stands below the art and the next heading leaves the shared footer gap.
+#[test]
+fn the_stills_row_is_spaced_40_apart_and_its_footer_stands_below_the_art() {
+    use crate::consts::{CARD_DY, PEEK_Y, TITLE_DY};
+    assert_eq!(RowStyle::STILL.gap, 40.0);
+    assert_eq!(RowStyle::EPISODE.gap, 28.0, "the detail episode strip keeps its own gap");
+    assert_eq!(RowStyle::STILL.w + RowStyle::STILL.gap, 460.0);
+    assert_eq!(RowStyle::STILL.w, RowStyle::EPISODE.w, "the same tile, only the air between them differs");
+    assert_eq!(RowStyle::EPISODE.under_tile, 0.0);
+    assert_eq!(RowStyle::HOME.under_tile, 0.0, "a poster shelf spends nothing under its tiles");
+    assert_eq!(RowStyle::STILL.under_tile, crate::still_footer::FOOTER_UNDER_TILE);
+    // the tile top on the board's Home at rest is 768; the footer's foot is the line's top + 24
+    assert_eq!(PEEK_Y + CARD_DY, 768.0);
+    let foot = PEEK_Y + CARD_DY + RowStyle::STILL.h;
+    let footer_foot = foot + crate::theme::STILL_FOOTER_DROP + crate::still_footer::FOOTER_LINE_H;
+    // the heading of the NEXT shelf: one pitch under this row's own, `TITLE_DY` over its tiles
+    let pitch = RowStyle::STILL.pitch_fixed() + crate::card_row::LABEL_BAND_COLLAPSED;
+    let next_heading_y = (PEEK_Y + pitch) - TITLE_DY;
+    assert_eq!(next_heading_y - footer_foot, crate::theme::STILL_FOOTER_AIR, "the next heading clears the footer by the shared gap");
+}
+
+/// The rise and the focus lift do not stack: a focused tile's glow spills up to `heading_lift_max`,
+/// and a heading already standing higher than that has cleared it.
+#[test]
+fn the_stills_heading_never_stands_lower_than_its_rise_whatever_the_focus_lift() {
+    use crate::card_row::{heading_lift_max, heading_lift_of};
+    let sty = RowStyle::STILL;
+    let rise = crate::theme::STILL_HEADING_RISE;
+    let focused = heading_lift_max(&sty);
+    assert!(focused > rise);
+    assert_eq!(heading_lift_of(&sty, 0.0), rise);
+    assert_eq!(heading_lift_of(&sty, focused), focused);
+    assert_eq!(heading_lift_of(&RowStyle::HOME, 4.0), 4.0, "a poster shelf has no rise: its live lift stands");
+}
+
+/// **Focusing a tile never changes the spacing between tiles** (owner, 2026-11, the Continue Watching
+/// stills): with focus on card `i`, every OTHER card stands at its rest rect at every point of the pop,
+/// for the stills style as for a poster shelf; only the focused card grows, and at 1.09 a 420 px tile's
+/// ~19 px a side stays inside the gap (40 px on the stills row, 28 on the strip), so it never overlaps a neighbour.
+#[test]
+fn focusing_a_tile_moves_no_other_tile_at_any_pop_progress() {
+    for style in [RowStyle::STILL, RowStyle::HOME, RowStyle::EPISODE] {
+        let mut r = Rig::<Shelf> {
+            sect: Shelf::new(ENTRY, style),
+            src: Cards::new((0..8u32).map(|i| 100 + i).collect(), false),
+            view: FixtureView::default(),
+            focus: None,
+            press: 1.0,
+            pressed: None,
+            ms: 0,
+            modal: Default::default(),
+            page_image: Default::default(),
+        };
+        r.run(2);
+        let rest: Vec<Rect> = (100..108u32).map(|e| Section::place(&r.sect, &r.cx(), &r.src, e, At::Drawn).expect("a card").rect).collect();
+        r.land_focus(102, By::Dir);
+        let (mut mid, mut frames) = (false, 0);
+        while frames < 120 {
+            r.run(1);
+            frames += 1;
+            let pop = r.scale(102).expect("the focused card");
+            mid |= pop > 1.02 && pop < style.focus_scale - 0.02;
+            for (k, e) in (100..108u32).enumerate().filter(|(_, e)| *e != 102) {
+                let now = Section::place(&r.sect, &r.cx(), &r.src, e, At::Drawn).expect("a card").rect;
+                assert_eq!((now.x, now.y, now.w, now.h), (rest[k].x, rest[k].y, rest[k].w, rest[k].h),
+                    "style w={} frame {frames} (pop {pop}): card {e} moved while 102 held focus", style.w);
+            }
+        }
+        assert!(mid, "the premise: the pop was sampled part-way (style w={})", style.w);
+        let popped = Section::place(&r.sect, &r.cx(), &r.src, 102, At::Drawn).expect("the focused card").rect;
+        assert!(popped.w > rest[2].w * 1.05, "the focused card did grow (style w={})", style.w);
+    }
 }

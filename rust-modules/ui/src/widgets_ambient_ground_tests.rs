@@ -196,7 +196,7 @@ fn an_eased_wash_lands_on_its_target_and_reports_rest_only_then() {
     assert!(w.at_rest(), "a wash mounted on a colour is at rest");
     let mut moving = 0;
     for _ in 0..200 {
-        plx_machine::idle::frame_begin(1.0 / 60.0);
+        plx_machine::motion::report::frame_begin(1.0 / 60.0);
         w.step(target, AmbientWash::K, 1.0 / 60.0);
         if w.at_rest() {
             break;
@@ -209,14 +209,14 @@ fn an_eased_wash_lands_on_its_target_and_reports_rest_only_then() {
     let wanted = target.map(|c| [c[0], c[1], c[2]]);
     assert_eq!(landed, wanted, "on its target exactly, not within a tolerance of it");
     for _ in 0..30 {
-        plx_machine::idle::frame_begin(1.0 / 60.0);
+        plx_machine::motion::report::frame_begin(1.0 / 60.0);
         w.step(target, AmbientWash::K, 1.0 / 60.0);
         assert!(w.at_rest(), "a wash at rest stays there");
         assert_eq!(w.corners.map(|c| c.map(|s| s.pos)), wanted, "and does not move");
     }
     let mut next = target;
     next[0][0] += 0.1;
-    plx_machine::idle::frame_begin(1.0 / 60.0);
+    plx_machine::motion::report::frame_begin(1.0 / 60.0);
     w.step(next, AmbientWash::K, 1.0 / 60.0);
     assert!(!w.at_rest(), "a new target takes it out of rest on the first step");
 }
@@ -290,8 +290,9 @@ fn an_item_with_no_envelope_holds_the_ground_instead_of_clearing_it() {
 }
 
 /// A ground that has resolved to the app's own clear colour must report itself flat, because
-/// `draw` skips it there and that skip IS this component's fill-rate story: a full-screen
-/// ambient pass is ~2M fragments for a gradient identical to the `frame_clear` under it.
+/// `draw` skips it there and that skip IS this component's fill-rate story: drawn, it would be a
+/// full-screen clear at rest and a ~2M-fragment ambient pass while the corners settle onto it,
+/// either way identical to the `frame_clear` under it.
 #[test]
 fn a_ground_keyed_to_nothing_is_a_pass_the_screen_can_skip() {
     let mut g = PageGround::new();

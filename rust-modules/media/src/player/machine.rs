@@ -42,8 +42,13 @@ pub struct Player {
     /// **Is the hardware video plane bound to our sink?** (spec §9, §4.4, §16 risk 10.)
     ///
     /// A DECISION of this machine, with defined transitions, not an expression the frame
-    /// re-derives: it is set when the ACB bind transaction has actually reached the sink and
-    /// cleared only when the sink is confirmed unbound. Read it; never recompute it. Through
+    /// re-derives: it is set when the ACB bind transaction has actually reached the sink (in a
+    /// `devtriggers` build also when a URI-mode probe session's service reports `playing`, which
+    /// binds no sink of ours; in any build with the product URI driver installed, also while that
+    /// driver owns the ACB plane) and cleared only when the sink is confirmed unbound or the probe's
+    /// registration release is acknowledged. The controlled URI ACB experiment retains plane
+    /// ownership through bus release until app exit. A logical probe stop retains the observation
+    /// while release remains unresolved. Read it; never recompute it. Through
     /// phase 8 the same question was asked as `matches!(app.route, Route::Player)` at three
     /// separate places in the loop, which is a claim about which SCREEN is up — true a second
     /// before the plane binds and a second after it unbinds, when the compositor has an ordinary
@@ -85,8 +90,8 @@ impl Player {
     /// formula term feeding it — exactly the risk the spec names, where the gate and the machine
     /// come to disagree about which frame the plane went away on and the false edge lands on a
     /// frame that was never presented.
-    /// `Some(bound)` when this was an EDGE — the loop forwards that, and only that, to the two
-    /// `plx_machine::present::Present` machines it owns beside the live gate.
+    /// `Some(bound)` when this was an EDGE — the loop forwards that, and only that, to the one runtime-owned
+    /// `plx_machine::present::Present` gate.
     pub fn set_video_plane_bound(&mut self, bound: bool) -> Option<bool> {
         if self.video_plane_bound == bound {
             return None;
@@ -100,14 +105,10 @@ impl Player {
         } else {
             "videoplane: unbound — ordinary idle rules from here"
         });
-        plx_machine::idle::note(plx_machine::present::PresentEvent::VideoPlane(bound));
-        // The FALSE edge has to reach the panel, and the frame it lands on is very often one the
-        // gate would otherwise skip — the picture is gone and nothing is animating (spec §3.3
-        // step 9). `invalidate` is what makes that frame present, so the opaque region is really
-        // cleared and the UI surface really goes back to being blended.
-        if !bound {
-            plx_machine::idle::invalidate();
-        }
+
+        // The runner forwards this explicit edge as PresentEvent::VideoPlane. Both edges owe
+        // a surface frame (including clearing the opaque region on false); no global damage.
+
         Some(bound)
     }
 

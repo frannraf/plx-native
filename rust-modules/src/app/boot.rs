@@ -4,55 +4,276 @@
 
 use super::*;
 
-/// The window size a DESKTOP should open at, in points: the authored 1920x1080 canvas divided by
-/// the smallest whole number that fits the usable display area.
+/// What a DESKTOP window is asked to be, before the display's pixel density is known.
+#[cfg(any(feature = "hostsim", test))]
+#[derive(Clone, Copy)]
+enum WindowAsk {
+    /// `PLXNATIVE_WIN=<w>x<h>`: a DRAWABLE of exactly this many pixels, on any display.
+    Drawable(c_int, c_int),
+    /// No override: the largest whole fraction of the canvas whose window fits this usable display
+    /// area (`SDL_GetDisplayUsableBounds`, in points).
+    Fit(c_int, c_int),
+}
+
+/// How many drawable pixels a window point is worth on this display, as the integer pair SDL
+/// reported for a window that exists: `window_w` points wide, `drawable_w` pixels wide.
 ///
-/// **An exact divisor, never a best fit.** `surface::scale` will letterbox any drawable it is
-/// given, so an arbitrary size would *work* — it would just be soft, because every glyph and icon
-/// mask in this app is rasterized for a 1:1 surface (`gfx::snap`, and the crispness contract in
-/// `theme.rs`) and a fractional scale resamples all of it. 1/1, 1/2 and 1/3 keep whole texels whole.
+/// Integers, never a float multiplied back: 960 points of a 2x window must come out as exactly
+/// 1920 pixels, and a ratio that is not a whole number (a 150% Windows display) must round the
+/// same way on the way out as on the way in.
+#[cfg(any(feature = "hostsim", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Density {
+    window_w: c_int,
+    drawable_w: c_int,
+}
+
+#[cfg(any(feature = "hostsim", test))]
+impl Density {
+    /// One pixel per point: every 1x display, and what is assumed until a window has been measured.
+    const UNIT: Density = Density { window_w: 1, drawable_w: 1 };
+
+    /// The measured pair. A drawable that is not larger than the window (a 1x display) is
+    /// [`Density::UNIT`]: a drawable never has fewer pixels than points, and a window is never
+    /// grown to make up for one that seems to.
+    fn measured(window_w: c_int, drawable_w: c_int) -> Density {
+        if window_w <= 0 || drawable_w <= window_w {
+            Density::UNIT
+        } else {
+            Density { window_w, drawable_w }
+        }
+    }
+
+    /// The window size, in points, whose drawable is `px` pixels: the nearest whole number of
+    /// points, and one fewer if rounding up would make the drawable LARGER than asked (never
+    /// larger than the canvas is the contract; a pixel short is a letterbox, a pixel over is not).
+    fn points(self, px: c_int) -> c_int {
+        let (w, d) = (i64::from(self.window_w), i64::from(self.drawable_w));
+        let pt = ((i64::from(px) * w + d / 2) / d).max(1) as c_int;
+        if pt > 1 && self.pixels(pt) > px {
+            pt - 1
+        } else {
+            pt
+        }
+    }
+
+    /// The drawable, in pixels, of a window `pt` points wide.
+    fn pixels(self, pt: c_int) -> c_int {
+        let (w, d) = (i64::from(self.window_w), i64::from(self.drawable_w));
+        ((i64::from(pt) * d + w / 2) / w) as c_int
+    }
+}
+
+/// `PLXNATIVE_WIN`'s value: `<w>x<h>`, both positive. Anything else is no override.
+#[cfg(any(feature = "hostsim", test))]
+fn parse_window_override(v: &str) -> Option<(c_int, c_int)> {
+    let (w, h) = v.split_once(['x', 'X'])?;
+    match (w.trim().parse::<c_int>(), h.trim().parse::<c_int>()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// The window a DESKTOP should open at, in points, for a display of this pixel `density`: the
+/// pure arithmetic of the size, so the Retina cases are testable without a Retina display.
+///
+/// **The drawable is what is sized; the window follows from it.** The UI is authored at a 1920x1080
+/// canvas and every glyph, icon mask and poster is rasterized for 1:1 texels against it
+/// (`gfx::snap`, the crispness contract in `theme.rs`), so a drawable LARGER than the canvas is
+/// not a sharper picture: it is the same atlas stretched, with every drawable-sized buffer (the
+/// page snapshot, the glass sources) four times the television's, which is how a 2x display once
+/// breached the render-set ceiling on every frame (`ui/src/frame/render_set.rs`).
+///
+/// * `Drawable` is that drawable, exactly. The fit below is chosen for a HUMAN looking at a
+///   window, and a screenshot is not that: on a 1x display its divisor lands on 2 and every shot
+///   comes back 960x540, half the canvas the UI is authored at, so a shot taken to JUDGE the
+///   interface asks for full size (`make sim-shot SIM_W=1920 SIM_H=1080`). Off-screen edges are
+///   fine for a headless grab: the drawable is the window's own framebuffer.
+/// * `Fit` is **an exact divisor, never a best fit**: the largest of 1/1, 1/2 and 1/3 of the canvas
+///   whose window, in points, fits the usable area. `surface::scale` will letterbox any drawable it
+///   is given, so an arbitrary size would *work*, but a fractional scale resamples all of the above.
+///   The bounds are in points, so the window is `canvas / div / density` of them.
 ///
 /// The television asks for the canvas itself (1:1) unless the owner picked a smaller Interface
 /// resolution in Settings on webOS 1-3 (`requested_drawable`), in which case the compositor fills the panel.
 /// A Mac is the case the `surface` doc was written against — 1920x1080 exceeds the usable area of
 /// every laptop display Apple ships, so asking for it flatly would put the title bar above the
 /// screen and the bottom of the interface under the Dock.
-///
-/// Falls back to the canvas size if SDL cannot answer, which is the behaviour this replaced.
+#[cfg(any(feature = "hostsim", test))]
+fn plan_desktop_window(ask: WindowAsk, density: Density) -> (c_int, c_int) {
+    let points = |(w, h): (c_int, c_int)| (density.points(w), density.points(h));
+    match ask {
+        WindowAsk::Drawable(w, h) => points((w, h)),
+        WindowAsk::Fit(uw, uh) => {
+            // A little headroom under the usable bounds: a window flush against them reads as a
+            // fullscreen that went wrong rather than as a deliberate size.
+            let (max_w, max_h) = ((uw as f32 * 0.95) as c_int, (uh as f32 * 0.95) as c_int);
+            let fits = |div| {
+                let (w, h) = points((SCR_W / div, SCR_H / div));
+                w <= max_w && h <= max_h
+            };
+            let div = (1..3).find(|&div| fits(div)).unwrap_or(3);
+            points((SCR_W / div, SCR_H / div))
+        }
+    }
+}
+
+/// `SDL_WINDOWPOS_CENTERED` on display 0.
 #[cfg(feature = "hostsim")]
-pub(crate) fn desktop_window_size() -> (c_int, c_int) {
-    // `PLXNATIVE_WIN=<w>x<h>` overrides the fit entirely — `make sim-shot SIM_W=1920 SIM_H=1080`.
-    // It exists because the fit below is chosen for a HUMAN looking at a window, and a screenshot
-    // is not that: on a 1x display the divisor lands on 2 and every shot comes back 960x540, which
-    // is half the canvas the UI is authored at. A hairline, a 1px edge-sheen and a snapped glyph
-    // are exactly the things that do not survive that, so a shot taken to JUDGE the interface has
-    // to be asked for at full size. Off-screen edges are fine for a headless grab: the drawable is
-    // the window's own framebuffer, not the part of it the compositor happens to show.
-    if let Some(v) = std::env::var_os("PLXNATIVE_WIN") {
-        let v = v.to_string_lossy().to_lowercase();
-        if let Some((w, h)) = v.split_once('x') {
-            if let (Ok(w), Ok(h)) = (w.trim().parse::<c_int>(), h.trim().parse::<c_int>()) {
-                if w > 0 && h > 0 {
-                    return (w, h);
-                }
+const WINDOWPOS_CENTERED: c_int = 0x2FFF_0000u32 as c_int;
+
+/// What this process is asked for: `PLXNATIVE_WIN` if it holds a size, else the fit to the display,
+/// or the canvas itself if SDL cannot say how big the display is.
+#[cfg(feature = "hostsim")]
+fn desktop_window_ask() -> WindowAsk {
+    if let Some((w, h)) = std::env::var_os("PLXNATIVE_WIN").and_then(|v| parse_window_override(&v.to_string_lossy())) {
+        return WindowAsk::Drawable(w, h);
+    }
+    let mut r = [0 as c_int; 4]; // SDL_Rect: x, y, w, h
+    let ok = unsafe { SDL_GetDisplayUsableBounds(0, r.as_mut_ptr()) } == 0 && r[2] > 0 && r[3] > 0;
+    if ok {
+        WindowAsk::Fit(r[2], r[3])
+    } else {
+        WindowAsk::Drawable(SCR_W, SCR_H)
+    }
+}
+
+/// Size the just-created desktop `win` for the pixel density of the display it opened on.
+///
+/// `SDL_GetDisplayDPI` is unreliable on macOS, so the density is MEASURED instead: the window was
+/// opened at the 1x answer of [`plan_desktop_window`], and `SDL_GL_GetDrawableSize` over
+/// `SDL_GetWindowSize` says how many pixels that bought per point. On a 1x display nothing happens.
+/// On a 2x display the window is resized (and put back in the middle of the display, since it was
+/// centred at the old size) to the points that give the drawable that was asked for:
+/// `PLXNATIVE_WIN=1920x1080` is a 960x540-point window, not a 1920x1080-point one with a 3840x2160
+/// drawable. Called before `surface::probe`, which reads the drawable once and for good.
+#[cfg(feature = "hostsim")]
+unsafe fn fit_window_to_density(win: *mut c_void, ask: WindowAsk) {
+    let ((ww, wh), (dw, dh)) = plx_base::surface::window_and_drawable_size(win);
+    let density = Density::measured(ww, dw);
+    if density == Density::UNIT {
+        return;
+    }
+    let (pw, ph) = plan_desktop_window(ask, density);
+    if (pw, ph) == (ww, wh) {
+        return;
+    }
+    SDL_SetWindowSize(win, pw, ph);
+    SDL_SetWindowPosition(win, WINDOWPOS_CENTERED, WINDOWPOS_CENTERED);
+    let ((nw, nh), (gw, gh)) = plx_base::surface::window_and_drawable_size(win);
+    log(&format!(
+        "surface: {:.3} pixels per point (a {ww}x{wh} point window read back a {dw}x{dh} drawable); \
+         resized to {pw}x{ph} points, which now reads {nw}x{nh} points / {gw}x{gh} drawable",
+        f64::from(dw) / f64::from(ww)
+    ));
+}
+
+#[cfg(test)]
+mod desktop_window_tests {
+    use super::WindowAsk::{Drawable, Fit};
+    use super::{parse_window_override, plan_desktop_window, Density, WindowAsk, SCR_H, SCR_W};
+
+    /// A window of 1920 points whose drawable reads back 3840 pixels: macOS Retina, the case this
+    /// module exists for. (macOS always reports a whole backing factor, even in a "scaled" mode.)
+    fn retina() -> Density {
+        Density::measured(1920, 3840)
+    }
+
+    /// The window the planner opens, in points, and the drawable that window gives.
+    fn plan(ask: WindowAsk, density: Density) -> ((i32, i32), (i32, i32)) {
+        let points = plan_desktop_window(ask, density);
+        (points, (density.pixels(points.0), density.pixels(points.1)))
+    }
+
+    /// `PLXNATIVE_WIN=1920x1080` on a 1x display is the 1920x1080 window it always was.
+    #[test]
+    fn a_1x_display_gives_the_override_as_asked() {
+        assert_eq!(plan(Drawable(1920, 1080), Density::UNIT), ((1920, 1080), (1920, 1080)));
+    }
+
+    /// THE BUG: `PLXNATIVE_WIN=1920x1080` on a 2x display was a 1920x1080-POINT window, whose
+    /// drawable is 3840x2160 (`scale=2.000`) and which breached the render-set ceiling on every
+    /// frame of a Library scroll. The override is the DRAWABLE, so the window is half of it.
+    #[test]
+    fn the_override_is_the_drawable_on_a_2x_display() {
+        assert_eq!(plan(Drawable(1920, 1080), retina()), ((960, 540), (1920, 1080)));
+    }
+
+    /// A 2x laptop (usable ~1512x945 points): 960x540 points, a 1:1 drawable. What it always got,
+    /// by the coincidence of div=2 meeting a 2x density; now by arithmetic.
+    #[test]
+    fn a_2x_laptop_fits_960x540_points_for_a_1_to_1_drawable() {
+        assert_eq!(plan(Fit(1512, 945), retina()), ((960, 540), (1920, 1080)));
+    }
+
+    /// THE SECOND HOLE: a 5K/4K display "looking like 2560x1440" has usable ~2560x1415 points, so
+    /// the fit in points took div=1 -- a 1920x1080-point window, a 3840x2160 drawable -- with no
+    /// override at all. The fit is of the DRAWABLE, measured in the points it occupies.
+    #[test]
+    fn a_large_2x_display_gives_the_same_1_to_1_drawable_without_any_override() {
+        assert_eq!(plan(Fit(2560, 1415), retina()), ((960, 540), (1920, 1080)));
+    }
+
+    /// Nothing changes on a 1x display: the divisor lands where it did, on every size.
+    #[test]
+    fn a_1x_display_fits_exactly_as_it_did() {
+        // a 1080p display's usable area under a menu bar and a Dock: div=2
+        assert_eq!(plan(Fit(1920, 1050), Density::UNIT), ((960, 540), (960, 540)));
+        // a display big enough for the canvas itself (div=1) needs 5% headroom: 1920 / 0.95 = 2021.05
+        assert_eq!(plan(Fit(2022, 1140), Density::UNIT), ((1920, 1080), (1920, 1080)));
+        assert_eq!(plan(Fit(2020, 1140), Density::UNIT), ((960, 540), (960, 540)));
+        // a small one: div=3
+        assert_eq!(plan(Fit(100, 100), Density::UNIT), ((640, 360), (640, 360)));
+    }
+
+    /// A density that is not a whole number (a 150% Windows display, a fractional Wayland scale):
+    /// the window is the drawable over the ratio, exactly where that is exact.
+    #[test]
+    fn a_fractional_density_is_divided_out_too() {
+        let d150 = Density::measured(1280, 1920);
+        assert_eq!(plan(Drawable(1920, 1080), d150), ((1280, 720), (1920, 1080)));
+        // 1280x720 points is over 95% of a 1280x800 display, so the half (960x540 px) wins
+        assert_eq!(plan(Fit(1280, 800), d150), ((640, 360), (960, 540)));
+    }
+
+    /// Whatever the ratio, the window never gives a drawable LARGER than the one asked for: a
+    /// pixel short is a letterbox, a pixel over is a texture that is not the canvas.
+    #[test]
+    fn the_drawable_is_never_larger_than_asked_on_any_density() {
+        for (window_w, drawable_w) in [(1000, 1100), (1000, 1250), (1000, 1333), (1000, 1750), (1000, 2000), (1000, 2500), (1000, 3000), (1920, 2880), (1366, 2049)] {
+            let d = Density::measured(window_w, drawable_w);
+            for (w, h) in [(1920, 1080), (960, 540), (640, 360), (1280, 720)] {
+                let (_, got) = plan(Drawable(w, h), d);
+                assert!(got.0 <= w && got.1 <= h, "{window_w}->{drawable_w} asked {w}x{h}: {got:?}");
+                // and no more than a point short of it, in either axis
+                let point = (drawable_w + window_w - 1) / window_w;
+                assert!(w - got.0 < point && h - got.1 < point, "{window_w}->{drawable_w} asked {w}x{h}: {got:?}");
+            }
+            for (uw, uh) in [(1280, 720), (1512, 945), (1920, 1050), (2560, 1415), (3840, 2100)] {
+                let (_, got) = plan(Fit(uw, uh), d);
+                assert!(got.0 <= SCR_W && got.1 <= SCR_H, "{window_w}->{drawable_w} usable {uw}x{uh}: {got:?}");
             }
         }
     }
-    let mut r = [0 as c_int; 4]; // SDL_Rect: x, y, w, h
-    let ok = unsafe { SDL_GetDisplayUsableBounds(0, r.as_mut_ptr()) } == 0;
-    let (uw, uh) = (r[2], r[3]);
-    if !ok || uw <= 0 || uh <= 0 {
-        return (SCR_W, SCR_H);
+
+    /// A drawable that is not larger than the window is no HiDPI at all, however it got that way:
+    /// a window is never grown to cover for a measurement that failed.
+    #[test]
+    fn a_drawable_no_larger_than_the_window_is_unit_density() {
+        assert_eq!(Density::measured(1920, 1920), Density::UNIT);
+        assert_eq!(Density::measured(0, 1920), Density::UNIT);
+        assert_eq!(Density::measured(1920, 960), Density::UNIT);
     }
-    // A little headroom under the usable bounds: a window flush against them reads as a fullscreen
-    // that went wrong rather than as a deliberate size.
-    for div in 1..=3 {
-        let (w, h) = (SCR_W / div, SCR_H / div);
-        if w <= (uw as f32 * 0.95) as c_int && h <= (uh as f32 * 0.95) as c_int {
-            return (w, h);
+
+    #[test]
+    fn the_override_parses_a_positive_size_and_nothing_else() {
+        assert_eq!(parse_window_override("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_window_override(" 640X360 "), Some((640, 360)));
+        assert_eq!(parse_window_override("1920 x 1080"), Some((1920, 1080)));
+        for bad in ["", "1920", "x", "0x1080", "1920x0", "-1x5", "axb", "1920x1080x2"] {
+            assert_eq!(parse_window_override(bad), None, "{bad:?}");
         }
     }
-    (SCR_W / 3, SCR_H / 3)
 }
 
 /// Log every Rust panic (message + source location + thread) to the event log AND the
@@ -221,6 +442,27 @@ pub(crate) fn install_plex_seams() {
 }
 
 #[cfg(test)]
+mod relaunch_tap_tests {
+    use super::slot_holds;
+
+    #[test]
+    fn relaunch_slot_must_hold_libhelpers() {
+        assert!(slot_holds(0x1000, Some(0x1000)), "the slot holds libhelpers' function");
+        assert!(!slot_holds(0x1000, Some(0x1001)), "a different value, even by the Thumb bit");
+        assert!(!slot_holds(0x1000, None), "libhelpers is not mapped or lacks the symbol");
+        assert!(!slot_holds(0, None));
+    }
+
+    #[test]
+    fn the_slot_must_be_word_aligned() {
+        use super::slot_aligned;
+        let word = core::mem::align_of::<usize>();
+        assert!(slot_aligned(0x1000) && slot_aligned(word));
+        assert!(!slot_aligned(0x1000 + 1) && !slot_aligned(word + word / 2));
+    }
+}
+
+#[cfg(test)]
 mod seam_order_tests {
     /// `plx_plex` reports the version it is handed (`plex::identity::set_version`) and, in a
     /// shipping build, panics when asked for it earlier, so the hand-in has to be the first thing
@@ -287,6 +529,73 @@ mod seam_order_tests {
             1,
             "enter_application has one caller, run_application"
         );
+    }
+
+    /// **No exit of the app process returns into libc's `exit`.** `exit` runs libcrypto's
+    /// `OPENSSL_cleanup`, which frees and NULLs its global locks while the detached curl workers
+    /// still run (#1115). The run-and-shutdown sequence and the entry point are typed `-> !` (a
+    /// path that returns does not compile): these consts are the compile-time proof, and the
+    /// source scan below finds any other `exit` call, which would sidestep
+    /// `plx_base::process::exit_now`.
+    const _: unsafe fn(&mut super::super::App) -> ! = super::super::run_and_shutdown;
+    const _: fn(*const std::os::raw::c_char, std::os::raw::c_int) -> ! =
+        super::super::run_application;
+
+    #[test]
+    fn no_production_code_calls_libc_exit_outside_the_shared_helper() {
+        // The app process links every crate under rust-modules except `storage` (the separate
+        // `plxstorage` helper binary, no OpenSSL workers) and platform's `storage_service/` (that
+        // helper's body). `base/src/process.rs` is the helper itself.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs(&root.join("src"), &mut files);
+        for entry in std::fs::read_dir(root).expect("rust-modules") {
+            let dir = entry.expect("entry").path();
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if matches!(name.as_str(), "storage" | "target" | "tests")
+                || name.starts_with("target-")
+                || !dir.join("src").is_dir()
+            {
+                continue;
+            }
+            collect_rs(&dir.join("src"), &mut files);
+        }
+        assert!(files.len() > 100, "the scan must see the whole tree");
+        let (a, b) = (concat!("process::", "exit("), concat!("libc::", "exit("));
+        let mut hits = Vec::new();
+        for f in files {
+            let path = f.to_string_lossy().replace('\\', "/");
+            if path.ends_with("base/src/process.rs")
+                || path.contains("/storage_service/")
+                || path.contains("/tests/")
+                || path.ends_with("_tests.rs")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).expect("read");
+            let prod = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (n, line) in prod.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains(a) || code.contains(b) {
+                    hits.push(format!("{path}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "exit through plx_base::process::exit_now, never libc exit (#1115): {hits:?}"
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                out.push(p);
+            }
+        }
     }
 
     /// `enter_application` installs the player's error-trace eraser before telemetry first loads a
@@ -453,6 +762,19 @@ mod seam_order_tests {
         assert_eq!(super::window_fallback((1600, 900)), Some((super::SCR_W, super::SCR_H)));
         assert_eq!(super::window_fallback((960, 540)), Some((super::SCR_W, super::SCR_H)));
         assert_eq!(super::window_fallback((super::SCR_W, super::SCR_H)), None, "the native canvas has no fallback");
+    }
+
+    /// `surface::probe` reads the drawable once, at boot, for good: the desktop window has to be
+    /// sized for the display's pixel density BEFORE it, or a 2x display keeps the 3840x2160
+    /// drawable the 1x size gave it. Reads the source for the reason the tests above give.
+    #[test]
+    fn the_desktop_window_is_fitted_to_the_density_before_the_drawable_is_probed() {
+        let source = include_str!("boot.rs");
+        let body = source.split_once(concat!("pub(crate) unsafe fn ", "construct(")).expect("construct").1;
+        let create = body.find(concat!("SDL_CreateWindow(", "title")).expect("creates the window");
+        let fit = body.find(concat!("fit_window_to_", "density(win")).expect("fits the window to the density");
+        let probe = body.find(concat!("surface::", "probe(win)")).expect("probes the drawable");
+        assert!(create < fit && fit < probe, "create the window, fit it to the density, then probe the drawable");
     }
 
     /// `construct` frees a half-made window before it retries (a leaked one would keep the display).
@@ -632,6 +954,102 @@ fn cursor_sleep_hint(has_lg_extension: bool) -> Option<&'static std::ffi::CStr> 
 #[cfg(not(feature = "hostsim"))]
 fn self_sym(name: &str) -> Option<*mut std::ffi::c_void> {
     plx_base::dynlib::Handle::self_handle().sym(name).filter(|p| !p.is_null())
+}
+
+/// **A warm launch's parameters, read where LG's SDL reads its `registerApp` replies.** SAM sends a
+/// relaunch's parameters only to the `registerApp` subscriber, which is LG's SDL; its handler
+/// (`callback_RegistNativeApp`) raises the window and never reads `parameters`. It fetches every
+/// reply's payload through `HELPER_HLunaServiceMessage`, an exported pointer slot that
+/// `LoadWEBOSBASELibrary` fills from `libhelpers.so.2` inside `SDL_Init` and that the handler
+/// reloads on every call. Wrapping that slot hands a relaunch payload to `tv::launch` and returns
+/// it unchanged, so SDL still raises the window. No new Luna registration: SAM refuses the app's
+/// own (`tv::launch`). The firmware inventories have the slot from webOS 7.4 on; where it is missing
+/// or empty (webOS 4.x to 6.x), nothing changes and callers keep closing the app first.
+/// The tap installs only when the slot holds the address `libhelpers.so.2` (already mapped,
+/// `RTLD_NOLOAD`) exports as `HLunaServiceMessage` ([`slot_holds`]); any other value is left alone.
+#[cfg(not(feature = "hostsim"))]
+unsafe fn tap_relaunch_payloads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Some(slot) = self_sym("HELPER_HLunaServiceMessage") else {
+        log("relaunch tap: no HELPER_HLunaServiceMessage in this SDL");
+        return;
+    };
+    // An atomic reference to a misaligned address is undefined behaviour: refuse a symbol that is
+    // not a word-aligned slot before forming it.
+    if !slot_aligned(slot as usize) {
+        log("relaunch tap: slot misaligned \u{2014} not installed");
+        return;
+    }
+    // SDL's Luna thread may read the slot while it is replaced: store it atomically, after the
+    // function it forwards to is published.
+    let slot = &*(slot as *const AtomicUsize);
+    let wrapped = wrapped_message as *const () as usize;
+    let current = slot.load(Ordering::Acquire);
+    if current == 0 || current == wrapped {
+        log(if current == 0 { "relaunch tap: HELPER_HLunaServiceMessage is empty" }
+            else { "relaunch tap: already installed" });
+        return;
+    }
+    // The slot is only ours to wrap while it holds libhelpers' own `HLunaServiceMessage`: another
+    // value (a different SDL build, a slot of some other type) would be called as a function
+    // pointer it is not.
+    let expected = plx_base::dynlib::Handle::open_loaded(&["libhelpers.so.2"])
+        .and_then(|(h, _)| h.sym("HLunaServiceMessage"))
+        .filter(|p| !p.is_null())
+        .map(|p| p as usize);
+    if !slot_holds(current, expected) {
+        log("relaunch tap: slot does not hold libhelpers' HLunaServiceMessage \u{2014} not installed");
+        return;
+    }
+    REAL_MESSAGE.store(current, Ordering::Release);
+    MAIN_THREAD.store(libc::pthread_self() as usize, Ordering::Relaxed);
+    slot.store(wrapped, Ordering::Release);
+    log("relaunch tap: installed");
+}
+#[cfg(feature = "hostsim")]
+unsafe fn tap_relaunch_payloads() {}
+
+/// Does the SDL slot hold exactly the function `libhelpers.so.2` exports as `HLunaServiceMessage`?
+/// The Thumb bit is compared as `dlsym` and the slot both carry it. `expected` is `None` when
+/// libhelpers is not mapped or lacks the symbol, and then nothing holds.
+#[cfg(any(test, not(feature = "hostsim")))]
+fn slot_holds(current: usize, expected: Option<usize>) -> bool {
+    expected == Some(current)
+}
+
+/// Is `addr` aligned for the `AtomicUsize` the slot is read and written as?
+#[cfg(any(test, not(feature = "hostsim")))]
+fn slot_aligned(addr: usize) -> bool {
+    addr % core::mem::align_of::<usize>() == 0
+}
+
+#[cfg(not(feature = "hostsim"))]
+type LunaMessageFn = unsafe extern "C" fn(*mut std::ffi::c_void) -> *const std::ffi::c_char;
+#[cfg(not(feature = "hostsim"))]
+static REAL_MESSAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(feature = "hostsim"))]
+static MAIN_THREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// SDL's payload read, passed through. Every Luna reply SDL subscribed to comes through here, so
+/// anything that is not a relaunch costs one substring scan and nothing else.
+#[cfg(not(feature = "hostsim"))]
+unsafe extern "C" fn wrapped_message(msg: *mut std::ffi::c_void) -> *const std::ffi::c_char {
+    let real = REAL_MESSAGE.load(std::sync::atomic::Ordering::Acquire);
+    if real == 0 {
+        return std::ptr::null();
+    }
+    let real: LunaMessageFn = std::mem::transmute(real);
+    let p = real(msg);
+    if !p.is_null() {
+        let payload = std::ffi::CStr::from_ptr(p).to_string_lossy();
+        if payload.contains("\"relaunch\"") {
+            let main = libc::pthread_self() as usize == MAIN_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+            log(&format!("relaunch tap: {} bytes on the {} thread, parameters={}",
+                payload.len(), if main { "main" } else { "other" }, payload.contains("\"parameters\"")));
+            plx_platform::tv::launch::offer(&payload);
+        }
+    }
+    p
 }
 
 /// The cursor [`hide_cursor`] replaced with the transparent one, for the motion that restores it.
@@ -989,9 +1407,9 @@ pub(super) fn activate_server_owned(
     bridge.collection_run(plx_data::stores::collection::CollectionCmd::Reset);
     // before the stores reset: a stop the previous identity left in flight must not land on this one
     plx_media::route::retire_pending_stops();
-    bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
+    let mut endpoints = bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset).endpoints;
     bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::Reset);
-    let mut endpoints = bridge.hubs_run(plx_data::stores::hubs::HubsCmd::RefetchHubs).endpoints;
+    endpoints.merge(bridge.hubs_run(plx_data::stores::hubs::HubsCmd::RefetchHubs).endpoints);
     endpoints.merge(bridge.browse_discover_pump().endpoints);
     log("pms: catalog activation queued");
     endpoints
@@ -1021,7 +1439,7 @@ pub(super) fn install_pms_owned(
 /// Everything before the loop: SDL and the window, GL, text, the poster workers, the boot gate
 /// (login / token / session / picker), every dev trigger read once, and the `App` literal —
 /// `plex_run`'s former body up to `while app.running`, moved verbatim in phase 1b-ii. An early
-/// exit is the process exit code `plex_run` returns.
+/// exit ends the process through `plx_base::process::exit_now` (the caller maps `Err(code)` to it).
 ///
 /// `mt`, THE main-thread token, is minted once by `plex_run` itself (`plx_base::task::MainThread::
 /// assume()` — that function IS the SDL main thread) and MOVES into `App.adapters.player` here,
@@ -1130,6 +1548,7 @@ pub(crate) unsafe fn construct(
         log("SDL_Init failed");
         return Err(1);
     }
+    tap_relaunch_payloads();
     {
         let d = SDL_GetCurrentVideoDriver();
         if !d.is_null() {
@@ -1177,8 +1596,8 @@ pub(crate) unsafe fn construct(
     // **The stored session is read HERE, before the window.** The window size is a setting
     // (Settings > System > Interface resolution, install-wide: `Session::ui_resolution`), and
     // `SDL_CreateWindow` below is the only moment it can be applied, so the record has to be read
-    // first. `peek_settled` would not do: its first call only schedules a background read and
-    // answers "not yet". The seams `load` consults (`install_plex_seams`) are installed by
+    // first. `peek_settled` would not do: it only reads the cache, which the session owner fills
+    // after boot, so its first call answers "not yet". The seams `load` consults (`install_plex_seams`) are installed by
     // `enter_application`, before `boot`. A replay or captured boot brings its own session.
     let session = match &initial {
         Some(initial) => initial.session.persisted.clone(),
@@ -1186,11 +1605,15 @@ pub(crate) unsafe fn construct(
     };
     // The television is placed at 0,0 at exactly canvas size (unless a webOS 1-3 owner picked a smaller
     // Interface resolution, `requested_drawable`) and takes the panel. A desktop
-    // window is centred (`SDL_WINDOWPOS_CENTERED`) at whatever fits — see `desktop_window_size`.
+    // window is centred (`SDL_WINDOWPOS_CENTERED`) at whatever fits — see `plan_desktop_window`.
+    // The density is not known until a window exists, so this is the 1x answer; `fit_window_to_density`
+    // below corrects it on a display where that was wrong.
+    #[cfg(feature = "hostsim")]
+    let desktop_ask = desktop_window_ask();
     #[cfg(feature = "hostsim")]
     let (wx, wy, ww_req, wh_req) = {
-        let (w, h) = desktop_window_size();
-        (0x2FFF_0000u32 as c_int, 0x2FFF_0000u32 as c_int, w, h)
+        let (w, h) = plan_desktop_window(desktop_ask, Density::UNIT);
+        (WINDOWPOS_CENTERED, WINDOWPOS_CENTERED, w, h)
     };
     #[cfg(not(feature = "hostsim"))]
     let (wx, wy, ww_req, wh_req) = {
@@ -1204,9 +1627,10 @@ pub(crate) unsafe fn construct(
     let title = c"PlxNative";
     #[cfg(not(feature = "hostsim"))]
     let title = c"plxnative";
-    // A frame dump's drawable is exactly the window's size in points: ALLOW_HIGHDPI (0x2000) would
-    // make a Retina display's drawable 3840x2160 for a 1920x1080 window, which the master cannot
-    // be, and which differs from the canonical Linux host. (Absent from every shipping build.)
+    // A frame dump's drawable is exactly the window's size in points: it is the one desktop window
+    // that does not ask for ALLOW_HIGHDPI (0x2000), so its window is the 1920x1080 points of the
+    // canonical Linux host on a Retina display too, and `fit_window_to_density` finds nothing to
+    // correct. (Absent from every shipping build.)
     #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
     let window_flags = if crate::dev::framedump::requested() { SDL_WINDOW_FLAGS & !0x2000 } else { SDL_WINDOW_FLAGS };
     #[cfg(not(all(feature = "hostsim", feature = "devtriggers")))]
@@ -1236,6 +1660,9 @@ pub(crate) unsafe fn construct(
         log(&format!("surface: retrying the window at the native {w}x{h}"));
         (ww_try, wh_try) = (w, h);
     };
+    // Correct the size for the display's density now: `surface::probe` below reads the drawable once.
+    #[cfg(feature = "hostsim")]
+    fit_window_to_density(win, desktop_ask);
     plx_base::surface::probe(win);
     // vsync on → the frame rate locks to the panel refresh. `/tmp/plxnative-novsync` uncaps it so
     // `fps=` reports the true GPU render rate. WSLg's X11/GLX swap accepts interval 1 without
@@ -1445,29 +1872,14 @@ pub(crate) unsafe fn construct(
     // once plain and once as the app, and logs each full outcome (`toast-probe …`).
     #[cfg(feature = "devtriggers")]
     crate::dev::scenarios::toast_probe::arm_at_boot();
+    #[cfg(feature = "devtriggers")]
+    crate::dev::scenarios::arm_hud_text_metrics();
     // dev: /tmp/plxnative-clockfact=nokey|keychanged|engaged[:<year>] — plants a wrong-clock fact
     // (`net::keypin`) so the Home/Library read-out and the toast can be looked at with no
     // television. Armed after the projection above, whose sign-out arm only clears bound hosts.
     #[cfg(feature = "devtriggers")]
     crate::dev::scenarios::clock_fact::arm_at_boot();
-    // dev: /tmp/plxnative-hintoff — the hold hint taught for this run, on every screen, read
-    // once here on the frame thread (the hint's latches are thread-local). The site demo film is
-    // shot with it: the capsule is a one-time teaching overlay, and a film has no viewer to teach.
-    #[cfg(feature = "devtriggers")]
-    if plx_base::devtrig::flag("hintoff") {
-        plx_ui::hold_hint::teach_all_for_dev();
-    }
-    // dev: /tmp/plxnative-hintfresh — this run starts with the hold hint untaught, though the install
-    // was taught: the seed below is skipped, so the hint can be looked at again. Nothing on disk is
-    // un-written; a read showing then writes taught again (an idempotent write).
-    // The hold hint offers itself once per INSTALL: seed what an earlier run taught, before frame one.
-    #[cfg(feature = "devtriggers")]
-    let hint_fresh = plx_base::devtrig::flag("hintfresh");
-    #[cfg(not(feature = "devtriggers"))]
-    let hint_fresh = false;
-    if !hint_fresh {
-        super::hint_taught::seed(session.hold_hint_taught());
-    }
+
     #[cfg(not(test))]
     plx_platform::i18n::initialize(session.language, controlled);
     let forced_login = !controlled && crate::dev::scenarios::login_forced();
@@ -1485,17 +1897,36 @@ pub(crate) unsafe fn construct(
         None => captured_session_for_boot(session.clone(), dev_primary,
             captured_dev_sources(&dev_servers.unwrap_or_default())),
     };
-    let mut bridge = if controlled {
-        super::bridge::Bridge::controlled_home(plx_base::diag::heartbeat::now_us,
+    let (mut runtime, mut retained) = if controlled {
+        super::bridge::BridgeRetained::controlled_home(plx_base::diag::heartbeat::now_us,
             initial.as_ref().expect("controlled initialization"), &mt, preflight.replay())
     } else {
-        super::bridge::Bridge::new(plx_base::diag::heartbeat::now_us, session_init,
+        super::bridge::BridgeRetained::new(plx_base::diag::heartbeat::now_us, session_init,
             plx_telemetry::telemetry::consent::current().unwrap_or_default(), &mt)
     };
+    let mut bridge = runtime.bridge(&mut retained);
     // Construct the one dispatcher before bootstrap commands; move this same queue into App.
     let mut pages = plx_ui::dispatch::Dispatcher::with_transition(Box::new(
         plx_ui::containers::transition::PageDip::new(),
     ));
+    // Controlled replay uses only its explicit captured install fact. The Session's frozen
+    // canonical projection does not bind this preference, and ambient cells are not authority.
+    pages.input.hold_hint = match &initial {
+        Some(initial) => initial.install_hold_hint.expect("preflight requires install hold-hint fact").input(),
+        None => {
+            let taught = session.hold_hint_taught();
+            plx_machine::machine::HoldHintRead { learned: false, card: taught.card, pill: taught.pill, context: 0 }
+        }
+    };
+    #[cfg(feature = "devtriggers")]
+    if !controlled {
+        if plx_base::devtrig::flag("hintfresh") {
+            pages.input.hold_hint = Default::default();
+        }
+        if plx_base::devtrig::flag("hintoff") {
+            pages.input.hold_hint.apply(plx_machine::machine::HoldHintEvent::Learned);
+        }
+    }
     restore_player_preferences(&session, controlled);
     // dev: /tmp/plxnative-audioenh=off|boost|loudness — force the enhancement preference right after
     // the restore. Nobody is seated yet, so this sets the live cell alone (the door refuses to save
@@ -1609,8 +2040,8 @@ pub(crate) unsafe fn construct(
         activate_session(&mut bridge, &mut pages, &mut super::recorder::Recplay::Off)
     };
     if !controlled {
-        plx_media::player::acb_init(&mt);
-        plx_media::ff::boot(); // Live playback resource boot; controlled Home cannot invoke ABI probes.
+        super::adapters::backends::acb_init(&mt); // every backend set: the plane owner's boot facts
+        plx_media_codecs::ffi::boot(); // Codec resource boot; controlled Home cannot invoke ABI probes.
     }
                        // dev: /tmp/plxnative-logintest validates the plex.tv account path end-to-end on the device — a
                        // real typed create_pin() through the libcurl transport + DTO deserialize. Logs only the
@@ -1635,7 +2066,7 @@ pub(crate) unsafe fn construct(
     let mut glass = plx_ui::frame::glass::GlassPlan::new();
     if !controlled {
         crate::dev::scenarios::arm_glassload(&mut glass);
-        crate::dev::scenarios::arm_navblur(&mut glass);
+        bridge.retained.blur_dissolve = crate::dev::scenarios::arm_navblur(&mut glass);
     }
     // dev: the two OVERDRAW surfaces (`ui::overdraw`, docs/backdrop-blur-profiling.md Part 5).
     // `plxnative-overdraw` arms the CPU-side per-draw-class ledger — how much screen-visible
@@ -1650,10 +2081,6 @@ pub(crate) unsafe fn construct(
         crate::dev::scenarios::arm_drawmask();
         crate::dev::scenarios::arm_cardsplit();
     }
-    // dev: /tmp/plxnative-heroground — draw the hero's photograph and BOTH of its scrim fields
-    // in one pass instead of the art plus four blended gradient quads over it. Absent, the
-    // shipped four-quad path draws, which is what makes this an A/B on one binary.
-    if !controlled { crate::dev::scenarios::arm_heroground(); }
     // dev: /tmp/plxnative-nobudget — the frame budget's A/B CONTROL leg (spec §8.1). Read here
     // with the other boot triggers; applied to the one `Budget` below, once the tree exists.
     let nobudget = !controlled && crate::dev::scenarios::nobudget_armed();
@@ -1672,8 +2099,8 @@ pub(crate) unsafe fn construct(
         plx_media::player::seed_dev_track_names();
     }
     if let Some(initial) = &initial {
-        plx_machine::idle::set_enabled(!plx_base::devtrig::listed(&initial.triggers, "noidle"));
-    } else { crate::dev::scenarios::arm_noidle(); }
+        pages.present.set_enabled(!plx_base::devtrig::listed(&initial.triggers, "noidle"));
+    } else { crate::dev::scenarios::arm_noidle(&mut pages.present); }
     // dev: /tmp/plxnative-detailosc (read once at boot, like the other triggers) makes the detail scroll
     // perpetually swing hero<->bottom so the FPS heartbeat samples the transition, not the ends.
     let detail_osc = !controlled && crate::dev::scenarios::detailosc_armed();
@@ -1863,6 +2290,8 @@ pub(crate) unsafe fn construct(
     // nothing is presenting, so the first beat of a playback reports no rate rather than a
     // fabricated one.
     let play_prev: Option<(i64, u32)> = None;
+    #[cfg(feature = "play-feed")]
+    let vpres_prev = plx_media::player::VplaneMark::default();
     let running = true;
     // Dev-only panel proof: advance a red/green counter phase only after SDL_GL_SwapWindow
     // returns. Hold each colour for 30 swaps: per-buffer alternation blends yellow at 60 Hz,
@@ -1886,11 +2315,16 @@ pub(crate) unsafe fn construct(
     let adapters = super::Adapters {
         player: plx_media::player::adapter::PlayerAdapter::new(mt),
     };
+    // The session's backend set is the one the installed drivers form (after the product URI driver
+    // is installed, and for every build, not only a URI one).
+    let (player, adapters) = {
+        let mut player = player;
+        let mut adapters = adapters;
+        super::adapters::backends::compose_backends(&mut adapters.player, &mut player.session, controlled);
+        (player, adapters)
+    };
     let repause_at = 0i64;
-    // ui::press click state: a grid-card OK is deferred (press-in on down, activate on the
-    // spring-back after key-up) so `ok_armed` marks "a press is in flight, commit it from the
-    // per-frame loop when press::take_commit fires". Only ever set on Home's grid.
-    let ok_armed = false;
+
     // Which route name was last REPORTED as an event. Not `route` itself: several `Route`
     // values share one name (every `Route::Player` is "player"), and an overlay
     // opening is not a screen change.
@@ -1922,7 +2356,9 @@ pub(crate) unsafe fn construct(
     bridge.refresh_browse_directory();
     let ask_first_run = || !controlled && (crate::dev::scenarios::firstrun_armed()
         || (!automated_boot()
-            && plx_data::stores::browse::onboard::asks(bridge.browse_directory())));
+            && plx_data::stores::browse::onboard::asks(
+                bridge.browse_directory(), &plx_plex::plex::session::peek(),
+                &plx_plex::plex::session::current_profile_key())));
     // The sign-in's telemetry question is PRESENTED on the container tree, and the tree lives on
     // the `App` this function is still assembling — so this boot arm records that it owes the
     // question and `maybe_ask_consent` is called once the struct exists, a few dozen lines down.
@@ -1981,7 +2417,7 @@ pub(crate) unsafe fn construct(
     // Why the app needs this at all: the synthetic tier boots with NO Plex session, so after a
     // stream ends there is no detail page, no Play control and no key path back into the
     // player. Everything else was already in place — `teardown` clears the URL and `ended` on a
-    // real stop, and `engine::start_bufferfeed` re-reads `player::playurl::playurl()` whenever
+    // real stop, and `engine::start_bufferfeed` re-reads `plx_play_feed::playurl::playurl()` whenever
     // `route::url()` is empty — so a replay is a second trip through the entry below.
     let replay_left: u32 = if controlled { 0 } else { replay_budget(crate::dev::scenarios::replay_trigger_value().as_deref()) };
     let grid_tried = false;
@@ -2030,6 +2466,11 @@ pub(crate) unsafe fn construct(
     // has been initialised and, unlike the earlier boot/discovery work, the SDL loop below is
     // ready to dispatch a delivered command within one frame. Compile-time no-op otherwise.
     if !controlled { crate::lab::start_control(); }
+    // **The HUD compiles here, at boot, outside any frame**, and the mounter is seeded with it (`run::boot_hud`;
+    // a controlled run defers it to the first player frame).
+    let hud = super::run::boot_hud(&mut bridge, controlled);
+    // End the bootstrap capability before moving its physical owners into App.
+    drop(bridge);
     let mut app = App {
         last_input,
         loop_t,
@@ -2038,6 +2479,10 @@ pub(crate) unsafe fn construct(
         #[cfg(feature = "devtools")]
         fps_shown,
         play_prev,
+        #[cfg(feature = "play-feed")]
+        vpres_prev,
+        hud,
+        dev_hud: Default::default(),
         running,
         window_activity: super::window_activity::WindowActivity::new(),
         #[cfg(feature = "devtools")]
@@ -2045,14 +2490,17 @@ pub(crate) unsafe fn construct(
         down_sym,
         modal_repeat,
         diagnostics: crate::app::diagnostics::Diagnostics::default(),
+        lab_toast: Default::default(),
         player,
         adapters,
         repause_at,
         decoder_parked: false,
-        ok_armed,
+        foreground_retry: None,
+
         last_route_reported,
         ptr,
         menu_play_await: None,
+        deeplink: Default::default(),
         prev,
         refresh_hubs,
         return_hold: Default::default(),
@@ -2066,18 +2514,19 @@ pub(crate) unsafe fn construct(
         t0,
         instr,
         measure_fault_logged: false,
-        input: plx_ui::input::Input::new(),
+
         rec: super::recorder::Recplay::Off,
         boot_initial: initial,
         telemetry_guard: None,
-        present: plx_machine::present::Present::new(),
+
         glass,
         // **The application's page stack runs the route DIP** (§6.2). It ran `Immediate` until
         // phase 12 while `ui::nav` held a second fader and the loop applied its own route change
         // at THAT floor; `PageDip` is the same schedule in the container that owns the op.
         pages,
         inputs: Vec::new(),
-        bridge,
+        runtime,
+        bridge: retained,
         // Every dev-trigger arm's own state (spec: `dev/scenarios.rs`'s module doc).
         scenarios: crate::dev::scenarios::Scenarios {
             #[cfg(feature = "devtriggers")]
@@ -2117,6 +2566,7 @@ pub(crate) unsafe fn construct(
             acct_rest: None,
             shots: Default::default(),
             auto_tried,
+            playurl_armed: None,
             replay_left,
             grid_tried,
             settings_tried,
@@ -2192,10 +2642,11 @@ pub(crate) unsafe fn construct(
         let replay = preflight.replay();
         app.rec = super::recorder::Recplay::controlled(preflight, &initial)
             .map_err(|reason| { log(&format!("rec: REFUSED — {reason}")); 1 })?;
-        app.rec.arm_landgate(app.bridge.landgate());
+        let mut bridge = app.runtime.bridge(&mut app.bridge);
+        app.rec.arm_landgate(bridge.landgate());
         log("bootstrap: captured pre-effect initial state");
         if let Some(deferred) = deferred {
-            apply_deferred_capture(&mut app.rec, app.bridge.landgate(), deferred)
+            apply_deferred_capture(&mut app.rec, bridge.landgate(), deferred)
                 .map_err(|reason| { log(&format!("rec: REFUSED — {reason}")); 1 })?;
             log("bootstrap: captured session persistence applied");
         }
@@ -2204,18 +2655,18 @@ pub(crate) unsafe fn construct(
         }
         if !replay { super::adapters::poster::init(); }
         app.rec.tick(initial.clock_start, 0.0);
-        app.rec.prepare_resources(&mut app.bridge);
-        if !matches!(activate_session(&mut app.bridge, &mut app.pages, &mut app.rec), BootTo::Home) {
+        app.rec.prepare_resources(&mut bridge);
+        if !matches!(activate_session(&mut bridge, &mut app.pages, &mut app.rec), BootTo::Home) {
             log("bootstrap: controlled Home activation refused");
             return Err(1);
         }
         let tree = app.pages.state_hash();
-        app.rec.resource_requests(app.bridge.take_resource_requests());
-        if let Some(reason) = app.rec.failure().or_else(|| app.bridge.controlled_failure()) {
+        app.rec.resource_requests(bridge.take_resource_requests());
+        if let Some(reason) = app.rec.failure().or_else(|| bridge.controlled_failure()) {
             log(&format!("bootstrap: REFUSED — {reason}"));
             return Err(1);
         }
-        super::run::recorder_end_frame(&mut app.rec, &app.bridge, &app.input.press,
+        super::run::recorder_end_frame(&mut app.rec, &bridge,
             "home", "", "bootstrap", tree);
         if let Some(ms) = app.rec.clock_start() {
             super::clock::set_replay(ms);

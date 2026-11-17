@@ -206,13 +206,19 @@ mod through_build_stream {
         requests.iter().filter(|r| r.starts_with("PUT ")).count()
     }
 
-    /// The request lines with their per-run noise (session ids, tokens, query values) taken off.
+    /// The request lines with their per-run noise (session ids, tokens, query values) taken off,
+    /// SORTED: the play queue is asked for beside the rest of the plan, so the order its request
+    /// arrives in relative to the others is not a property of the resolve. What two resolves are
+    /// compared on is the set of requests each made; the queue's overlap with the rest has its own
+    /// tests (`decision_queue_beside_tests`).
     pub(super) fn shape(requests: &[String]) -> Vec<String> {
-        requests
+        let mut shaped: Vec<String> = requests
             .iter()
             .map(|r| r.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
             .map(|r| r.split('?').next().unwrap_or("").to_string())
-            .collect()
+            .collect();
+        shaped.sort();
+        shaped
     }
 
     pub(super) fn decision(requests: &[String]) -> &String {
@@ -942,6 +948,8 @@ fn request(sid: ServerId, preview: bool) -> PlaybackRequest {
         title: "Episode".into(),
         ctx: String::new(),
         preview,
+        version: None,
+        show_rk: String::new(),
     }
 }
 
@@ -1041,7 +1049,7 @@ fn commit_audio_selection_is_false_only_for_the_forced_refusal() {
     forced.direct_play_mode = DirectPlayMode::Forced;
     restore_direct_play_mode(DirectPlayMode::Disabled);
     assert!(forced_direct_play(&forced));
-    let truehd = CarriedAudio { sid: 9, ordinal: 0, codec: "truehd".into(), channels: 8, can_normalize_loudness: false, immersive: false };
+    let truehd = CarriedAudio { sid: 9, ordinal: 0, codec: "truehd".into(), channels: 8, can_normalize_loudness: false, immersive: false, sample_rate: 0, bit_depth: 0 };
     assert!(!commit_audio_selection(&mut forced, truehd), "Force Direct Play refuses a track it cannot feed");
     assert_eq!(cur_audio_sid(&forced), 0, "and the selection is untouched");
     restore_direct_play_mode(DirectPlayMode::Auto);
@@ -1234,11 +1242,11 @@ fn a_pick_the_route_refuses_writes_nothing() {
     restore_direct_play_mode(DirectPlayMode::Disabled);
     assert!(forced_direct_play(&ps), "setup: Force Direct Play is on");
 
-    let truehd = CarriedAudio { sid: 9, ordinal: 0, codec: "truehd".into(), channels: 8, can_normalize_loudness: false, immersive: false };
+    let truehd = CarriedAudio { sid: 9, ordinal: 0, codec: "truehd".into(), channels: 8, can_normalize_loudness: false, immersive: false, sample_rate: 0, bit_depth: 0 };
     assert!(!commit_audio_pick(&mut ps, truehd, Some(japanese_eac3())), "the route refuses TrueHD it cannot feed");
     assert_eq!(remembered_anything(""), Vec::<TrackMemoryEntry>::new(), "and the refused pick wrote nothing");
 
-    let eac3 = CarriedAudio { sid: 10, ordinal: 1, codec: "eac3".into(), channels: 6, can_normalize_loudness: false, immersive: false };
+    let eac3 = CarriedAudio { sid: 10, ordinal: 1, codec: "eac3".into(), channels: 6, can_normalize_loudness: false, immersive: false, sample_rate: 0, bit_depth: 0 };
     assert!(commit_audio_pick(&mut ps, eac3, Some(japanese_eac3())), "control: a track the route can feed stands");
     assert_eq!(remembered(""), Some(TrackMemoryEntry::new(MACHINE, SHOW, Some(japanese_eac3()), None)));
     restore_direct_play_mode(DirectPlayMode::Auto);
@@ -1401,9 +1409,9 @@ fn a_pick_on_one_episode_is_what_the_next_episode_resolves_to() {
     let view = store.view();
     // A viewer's launch of `rk`, in the order `request_play_inner` does it: the outgoing item's live
     // selection is cleared, then the env is built (reading the memory off the mirror).
-    let resolve_episode = |ps: &PlaybackSession, rk: &str, part: &str, audio: Vec<plx_data::metadata::Stream>,
+    let resolve_episode = |ps: &mut PlaybackSession, rk: &str, part: &str, audio: Vec<plx_data::metadata::Stream>,
                            subs: Vec<plx_data::metadata::Stream>, mode: DirectPlayMode| {
-        reset_track_selection(sid, rk, None);
+        reset_track_selection(ps, sid, rk, None);
         let launch = PlaybackRequest { rk: rk.into(), part: part.into(), ..request(sid, false) };
         let mut env = request_env(ps, view, &launch, None);
         env.direct_play_mode = mode;
@@ -1417,7 +1425,7 @@ fn a_pick_on_one_episode_is_what_the_next_episode_resolves_to() {
 
     let e1_audio = audio_pair();
     let e1_subs = two_subs();
-    let e1 = resolve_episode(&ps, "rk-e1", "/library/parts/36013/1/file.mkv", e1_audio.clone(), e1_subs.clone(), DirectPlayMode::Auto);
+    let e1 = resolve_episode(&mut ps, "rk-e1", "/library/parts/36013/1/file.mkv", e1_audio.clone(), e1_subs.clone(), DirectPlayMode::Auto);
     assert_eq!((e1.audio.as_ref().map(|a| a.sid), e1.sub_sid), (Some(36014), 55002), "E1 starts on the server's own selection");
     apply_plan(&mut ps, e1, "rk-e1");
 
@@ -1433,7 +1441,7 @@ fn a_pick_on_one_episode_is_what_the_next_episode_resolves_to() {
         stream(46015, 2, "jpn", "eac3", 6),
     ];
     let e2_subs = vec![srt(65001, 3, "eng", false, false), srt(65002, 4, "spa", false, true)];
-    let e2 = resolve_episode(&ps, "rk-e2", "/library/parts/46013/1/file.mkv", e2_audio, e2_subs, DirectPlayMode::Disabled);
+    let e2 = resolve_episode(&mut ps, "rk-e2", "/library/parts/46013/1/file.mkv", e2_audio, e2_subs, DirectPlayMode::Disabled);
     let requests = rx.recv_timeout(std::time::Duration::from_secs(15)).expect("PMS never saw both resolves");
     server.join().unwrap();
 
@@ -1700,7 +1708,7 @@ fn a_forced_only_landing_holds_the_mode_and_a_retry_carries_it() {
 
     // The retry names the stream by id; the mode rides it through the same `RetryContext`.
     let retry = current_retry_context(&ps, 0);
-    assert_eq!((retry.selection.map(|s| s.1), retry.sub_mode), (Some(55003), SubMode::ForcedOnly));
+    assert_eq!((retry.selection.map(|s| s.sub_sid), retry.sub_mode), (Some(55003), SubMode::ForcedOnly));
     let sid = cur_sid(&ps);
     let env = env_of(&ps, &request(sid, false), Some(retry));
     assert_eq!((env.subtitle_override, env.sub_mode), (Some(55003), SubMode::ForcedOnly));
@@ -2013,7 +2021,7 @@ fn mp4_forced_found_after_names_arrive() {
     assert!(ps.track_ctx.as_ref().is_some_and(|c| c.rematch.is_none()), "(and it is spent: it asks once per landing)");
 
     land_mp4_forced_only(&mut ps);
-    publish_container_names(&["", "Forced"]);
+    publish_container_names(&mut ps, &["", "Forced"]);
     rematch_subtitle_with_names(&mut ps);
     assert_eq!(cur_sub_sid(&ps), 55003, "the track the name reveals is now the one shown");
     assert_eq!(cur_sub_mode(&ps), SubMode::ForcedOnly);
@@ -2024,7 +2032,6 @@ fn mp4_forced_found_after_names_arrive() {
     set_subtitle(&mut ps, 0);
     rematch_subtitle_with_names(&mut ps);
     assert_eq!(cur_sub_sid(&ps), 0, "the re-match does not run a second time");
-    publish_container_names(&[]);
     tidy_write(&mut ps);
 }
 
@@ -2043,7 +2050,7 @@ fn the_names_rematch_returns_what_it_committed() {
     assert_eq!(rematch_subtitle_with_names(&mut ps), None, "no names yet: nothing found, nothing committed");
 
     land_mp4_forced_only(&mut ps);
-    publish_container_names(&["", "Forced"]);
+    publish_container_names(&mut ps, &["", "Forced"]);
     assert_eq!(rematch_subtitle_with_names(&mut ps), Some(55003), "the track the name reveals");
     assert_eq!(rematch_subtitle_with_names(&mut ps), None, "once per landing: the next frame commits nothing");
 
@@ -2062,10 +2069,9 @@ fn the_names_rematch_returns_what_it_committed() {
     .0;
     plx_plex::plex::register_for_test(MACHINE, "127.0.0.1", 32401, "tok", "cid-tm");
     assert_eq!(shown, 55003, "setup: the flag drew the forced track");
-    publish_container_names(&["", "Director's Commentary"]);
+    publish_container_names(&mut ps, &["", "Director's Commentary"]);
     assert_eq!(rematch_subtitle_with_names(&mut ps), Some(0), "the names say it is a commentary: nothing is shown");
     assert_eq!((cur_sub_sid(&ps), cur_sub_mode(&ps)), (0, SubMode::ForcedOnly));
-    publish_container_names(&[]);
     tidy_write(&mut ps);
 }
 
@@ -2082,7 +2088,7 @@ fn a_pick_before_the_first_frame_ends_the_names_rematch() {
 
     land_mp4_forced_only(&mut ps);
     commit_subtitle_pick(&mut ps, -1, 0, false, Some(SubtitleMemo::Off));
-    publish_container_names(&["", "Forced"]);
+    publish_container_names(&mut ps, &["", "Forced"]);
     rematch_subtitle_with_names(&mut ps);
     assert_eq!((cur_sub_sid(&ps), cur_sub_mode(&ps)), (0, SubMode::Off), "the viewer's Off stands");
 
@@ -2090,7 +2096,6 @@ fn a_pick_before_the_first_frame_ends_the_names_rematch() {
     commit_subtitle_pick(&mut ps, 0, 55001, true, Some(english_track()));
     rematch_subtitle_with_names(&mut ps);
     assert_eq!((cur_sub_sid(&ps), cur_sub_mode(&ps)), (55001, SubMode::Track), "and so does a picked track");
-    publish_container_names(&[]);
     tidy_write(&mut ps);
 }
 
@@ -2172,12 +2177,11 @@ fn the_names_rematch_never_replaces_a_remembered_sidecar() {
     let session = session::TempSession::new("track-memory-names-sidecar");
     sign_in_and_seat(&session, "");
     land_with_remembered_sidecar(&mut ps);
-    publish_container_names(&["", ""]);
+    publish_container_names(&mut ps, &["", ""]);
     assert_eq!(rematch_subtitle_with_names(&mut ps), None, "nothing to re-match: the sidecar is the best match");
     assert_eq!(cur_sub_sid(&ps), 55009, "the remembered sidecar stays");
     assert!(ps.cur_sub_sidecar && ps.cur_sub_client_drawable, "and it is still the one the app draws itself");
     assert!(ps.track_ctx.as_ref().is_some_and(|c| c.rematch.is_none()), "(and the re-match is spent)");
-    publish_container_names(&[]);
     crate::player::sidecar::reset();
     tidy_write(&mut ps);
 }

@@ -65,6 +65,10 @@ const CAPTION_70: [f32; 4] = rgb8(0xb3, 0xb3, 0xb3);
 const CAPTION_55: [f32; 4] = rgb8(0x8c, 0x8c, 0x8c);
 const CAPTION_40: [f32; 4] = rgb8(0x66, 0x66, 0x66);
 const CAPTION_28: [f32; 4] = rgb8(0x47, 0x47, 0x47);
+// One chromatic stop, for the one subtitle colour a viewer can pick (`SubtitleTone::Yellow`); its
+// code is also `SubtitleTone::text_rgb8`, which media's synthesized header cannot read from here
+// (a test in `appkit::player_hud` pins the two together).
+const CAPTION_YELLOW: [f32; 4] = rgb8(0xff, 0xe6, 0x1a);
 
 // Sand — one warm off-white, and it has exactly one job: the ambient wash's resting cast.
 const SAND_100: [f32; 4] = rgb8(0xe9, 0xe6, 0xe0);
@@ -124,14 +128,28 @@ pub const TEXT_READING: [f32; 4] = COOL_200;
 /// Tertiary text: runtime, kickers, inactive tabs, About labels, dim/empty states.
 pub const TEXT_TERTIARY: [f32; 4] = COOL_400;
 /// A page-header control's label at rest (`PageHeader`): white at 65%. A value segment beside it
-/// stays full white, so "Sort & Filter · Title" reads as a label and a value.
+/// stays full white, so "Collections · 24" reads as a label and a value.
 pub const CONTROL_TEXT_REST: [f32; 4] = with_a(WHITE, 0.65);
 /// The "312 of 1,284" read-out beside the header controls while a filter is on: white at 50%,
 /// quieter than [`CONTROL_TEXT_REST`] because it is not a control and takes no focus.
 pub const COUNT_FILTERED_INK: [f32; 4] = with_a(WHITE, 0.50);
+/// The chevron a header PLACE wears ("Collections · 24 ›", "Recommended ›": the control opens a
+/// page): white at 45%, a step under [`CONTROL_TEXT_REST`] so the mark reads as the control's
+/// affordance and not as part of its name.
+pub const HEADER_PLACE_INK: [f32; 4] = with_a(WHITE, 0.45);
+/// The hairline between the header's places and its sort control (2 x 32 px): white at 16%.
+pub const HEADER_DIVIDER_INK: [f32; 4] = with_a(WHITE, 0.16);
 /// The details line under a focused poster (Under posters: "2019 · 2h 6m"): white at 82%, a step
 /// below the title above it and neutral where [`TEXT_SECONDARY`] read bluish over the ground.
 pub const CAPTION_DETAIL_INK: [f32; 4] = with_a(WHITE, 0.82);
+/// The sort value under every poster of a library grid sorted by something other than Title or
+/// Random (Settings > Libraries > Under posters > Sort value): white at 80% at rest. The focused
+/// poster's value is [`TEXT_PRIMARY`] in bold.
+pub const SORT_VALUE_INK: [f32; 4] = with_a(WHITE, 0.80);
+/// An empty sort value under a poster: the en dash for data the server does not have, the word
+/// "Never" under Date viewed and Plays for something nobody played. White at 50%, a step below
+/// [`SORT_VALUE_INK`] so the gap reads as absence.
+pub const SORT_VALUE_MISSING_INK: [f32; 4] = with_a(WHITE, 0.50);
 /// The `·` between fine-print facts, and **only** that — a step below the words it separates.
 /// Both mocks set every separator dot `opacity:.45` against the run around it, and the reason is
 /// worth keeping: a dot at the full ink of its neighbours joins the list instead of punctuating
@@ -155,12 +173,18 @@ pub const INK_DISABLED: [f32; 4] = with_a(WHITE, 0.22);
 /// two lengths together). The caption is media chrome over the video plane rather than app text,
 /// which is why it is `WHITE` and not [`TEXT_PRIMARY`] at the top; the greys under it exist
 /// because an HDR picture maps graphics white far brighter than an SDR one does, and the only
-/// cure for a searing caption is less light. Text subtitles are inked with the rung; image
-/// subtitles (PGS/VobSub) are TINTED by it, which scales their authored colours by the same
-/// amount. The dark outline is untouched — it is what keeps the darkest rung legible over a
+/// cure for a searing caption is less light. Client-drawn text is inked with the rung; every
+/// client-rendered bitmap (a libass frame, a PGS/VobSub picture) is TINTED by it, which scales
+/// its authored colours by the same amount. The dark outline is untouched — it is what keeps the darkest rung legible over a
 /// bright scene.
-pub const SUBTITLE_INKS: [[f32; 4]; 6] =
-    [WHITE, CAPTION_85, CAPTION_70, CAPTION_55, CAPTION_40, CAPTION_28];
+///
+/// A COLOUR rung (`SubtitleTone::Yellow`) holds its colour here, the ink of the client's own drawn
+/// caption text; as a TINT it is the identity (`appkit::player_hud::subtitle_tint`), because a
+/// multiplied yellow would recolour an authored ASS script, a picture subtitle or a cue's own inline
+/// colours. Its colour reaches a synthesized text track through the header's primary colour
+/// (`SubtitleTone::text_rgb8`, tied to this entry by a test).
+pub const SUBTITLE_INKS: [[f32; 4]; 7] =
+    [WHITE, CAPTION_YELLOW, CAPTION_85, CAPTION_70, CAPTION_55, CAPTION_40, CAPTION_28];
 
 // ── Type scale ───────────────────────────────────────────────────────────────
 // The ladder is DEFINED in `gfx::tokens` (module-layers step L5): `text` warms exactly these faces and
@@ -189,65 +213,150 @@ pub mod space {
 /// **Panel geometry tokens** — widths a whole class of popover shares, so no panel carries a width
 /// literal of its own.
 pub mod layout {
+    /// Reading column for Settings, consent and the shared route-page family.
+    /// Independent of the wider full-bleed hero column so adjacent tables retain their measure.
+    pub const ROUTE_COPY_W: f32 = 660.0;
     /// Narrowest an in-player popover (Tracks, More) is drawn, at 1080p. A small page (Style, a
     /// Size / Position / Color picker, the More menu) would otherwise shrink to its labels and wrap
     /// its note into a column too narrow to read; this floor keeps it a panel. A FLOOR only: wider
     /// content still grows the panel up to `ui::table::MENU_MAX_W`.
     pub const PLAYER_MENU_MIN_W: f32 = 440.0;
-    /// Bottom edge of an in-player popover: ~28px above the transport buttons, at 1080p.
-    pub const PLAYER_MENU_BOTTOM: f32 = crate::consts::SCR_H - 316.0;
+    /// Air between the control that opened an in-player popover (Tracks, More) and the panel, at
+    /// 1080p. Classic's opener row stands at y 792, so this puts the panel's bottom edge at 764.
+    pub const PLAYER_MENU_GAP: f32 = 28.0;
 }
 
-/// The **logo presence ladder** — how big a clearLogo is DRAWN. The third size axis of the design
-/// system, beside [`size`] (type) and [`space`] (gaps), and it exists for the same reason: a logo
-/// used to be sized by a per-screen literal (96 on the home hero, 120 on the detail hero, 54 on the
-/// scrolled compact title), so the SAME mark was three sizes in one app.
-///
-/// **The rule is constant AREA, not constant height** ([`crate::hero_logo::fit`]). A clearLogo's
-/// aspect runs from ~1:1 (an emblem) to ~10:1 (a long wordmark); under a height clamp the drawn area
-/// is LINEAR in aspect, so a 5:1 wordmark covered five times the ink of a 1:1 emblem — which is
-/// exactly why square logos read as an afterthought. Solving for a target AREA instead makes a
-/// square grow TALL and a wordmark grow WIDE, so both carry the same weight. The floor then stops a
-/// very wide mark thinning to a pinstripe, the ceiling stops a taller-than-wide asset swallowing the
-/// hero, and the caller's column contains the result last.
+/// Full-bleed hero treatment shared by Home and Detail (1920×1080 proposal).
+pub mod hero {
+    /// Both full-bleed heroes use the same reading column in the proposal.
+    pub const TEXT_W: f32 = 943.0;
+    /// Edition, kind, genres and content rating on the Detail hero: regular 24 px, as in the PDF.
+    /// Home's hero draws no identity line (board CW-13 v2).
+    pub const IDENTITY_SIZE: i32 = super::size::CAPTION;
+    /// Long titles without a clearLogo wrap over at most two DISPLAY lines.
+    pub const TITLE_LINES: usize = 2;
+    pub const TITLE_LEAD: f32 = super::size::DISPLAY as f32 * 1.06;
+    /// Facts are a CAPTION line box, including its optical air.
+    pub const FACTS_H: f32 = super::size::CAPTION as f32;
+
+    /// Minimum Play/Resume capsule; translated labels may grow beyond it.
+    pub const PLAY_MIN_W: f32 = 224.0;
+    /// Detail's lower shade reaches the credits at this knee.
+    pub const SCRIM_MID_Y: f32 = 650.0;
+    /// Opacity at the atmospheric midpoint. The shade ([`super::shade`]) supplies local contrast.
+    pub const SCRIM_MID_A: f32 = 0.66;
+    /// Opacity at the foot: retain the artwork's colour under the action row.
+    pub const SCRIM_FOOT_A: f32 = 0.86;
+
+    // ---- Home's hero (owner's board CW-13, v2). Detail's ladder and scrim are NOT these. ----
+
+    /// Top of Home's action row: Play, the Watchlist disc, Info (the pager follows Info on the row's
+    /// centre line). Everything above it on Home is one ladder that grows up from this
+    /// line (`landing_hero::home_rows`).
+    pub const HOME_ACTIONS_Y: f32 = 668.0;
+    /// The Home pager recedes as the Continue Watching shelf gains focus.
+    pub const HOME_PAGER_SHELF_ALPHA: f32 = 0.85;
+    /// The block above the action row (the hero's one line: an episode label, a resumed movie's
+    /// time left, or an introduced hero's premise) ends this far above [`HOME_ACTIONS_Y`]: 638, the
+    /// board's own number (it is not a rung of `space`).
+    pub const HOME_ACTIONS_GAP: f32 = 30.0;
+    /// The title's foot stands this far above the block under it.
+    pub const HOME_TITLE_GAP: f32 = super::space::SM;
+    /// Home's premise (the first sentence of a summary, `landing_hero::first_sentence`) wraps to this
+    /// column, narrower than the shared [`TEXT_W`] reading column.
+    pub const HOME_SYNOPSIS_W: f32 = 700.0;
+    /// ...and to at most this many lines (a third would climb into the title's band).
+    pub const HOME_SYNOPSIS_LINES: usize = 2;
+}
+
+/// Shared ink and geometry for the continuous Home and Detail edge fields and Catalog's
+/// feathered content blocks. Both field types use `gfx::scrim::GroundShade`.
+pub mod shade {
+    /// Detail needs legibility farther into the art for its wider title and synopsis.
+    pub const DETAIL_SIDE_X: [f32; 2] = [600.0, 1700.0];
+    /// Normal vertical entrance of the Detail shade.
+    pub const DETAIL_SIDE_Y: [f32; 2] = [120.0, 400.0];
+    /// Shift the fade upward as the preview logo travels into the corner.
+    pub const DETAIL_PREVIEW_RISE: f32 = 260.0;
+    /// Full-width top fade behind the compact preview title and the full-screen hint.
+    pub const DETAIL_PREVIEW_TOP_Y: [f32; 2] = [20.0, 245.0];
+    pub const DETAIL_PREVIEW_TOP_A: f32 = 0.45;
+    /// Top and knee of the preview's bottom ramp, below the gap and behind the first lines of copy.
+    pub const DETAIL_PREVIEW_FOOT_Y: [f32; 2] = [520.0, 630.0];
+    /// Detail's edge shade strength before the preview boost.
+    pub const DETAIL_SIDE_A: f32 = 0.65;
+    /// Inactive pagination dots still need contrast against the art.
+    pub const PAGER_IDLE_A: f32 = 0.50;
+
+    /// Home starts feathering inside the copy column and keeps its right edge legible.
+    pub const HOME_SIDE_X: [f32; 2] = [850.0, 1650.0];
+    /// Where the edge shade begins and reaches full strength down the screen.
+    pub const HOME_SIDE_Y: [f32; 2] = [110.0, 405.0];
+    /// Strength at the left under the logo, metadata and actions.
+    pub const HOME_SIDE_A: f32 = 0.59;
+    /// Opacity difference over which the side and shelf shades softly join.
+    pub const EDGE_JOIN: f32 = 0.10;
+
+    /// How far a block's darkness falls away beyond the edge of the content's rounded box, in px:
+    /// it holds its full alpha inside the box and reaches exactly nothing this far out (a smoothstep,
+    /// so neither end has a visible edge). Generous on purpose: the shade should read as a soft
+    /// weather behind the copy, never as a plate with an outline.
+    pub const FEATHER: f32 = 140.0;
+    /// The corner radius of the box the shade holds its full alpha inside, in px.
+    pub const RADIUS: f32 = 32.0;
+    /// How far that box stands out past the content's own rect on every side, in px, so a glyph at
+    /// the content's edge still sits inside the held alpha, never on the feather.
+    pub const PAD: f32 = 24.0;
+    /// The darkness held behind copy and a logo or typed title (text over an unknown photograph):
+    /// the value `widgets_hero_scrim_tests`' legibility contract is graded at, on every line.
+    pub const COPY_A: f32 = 0.60;
+    /// The darkness held behind the action row: its pills carry their own glass, so the shade only
+    /// settles the ground the discs and the pager stand on.
+    pub const CONTROLS_A: f32 = 0.45;
+    /// **The shelf fade's foot**: how dark the hero photograph is held at the Continue Watching
+    /// row's caption line (`landing_hero::shelf_fade`), as a fraction of [`SCRIM_INK`]. Near-black on
+    /// purpose, 0.93 (the board asks for 0.92 to 0.95): the captions are small secondary-ink type
+    /// standing straight on the backdrop with no plate behind them, and a bright rock behind a bar
+    /// or a "5m left" competes with them at any lower value.
+    pub const SHELF_FOOT_A: f32 = 0.93;
+    /// The shelf fade's darkness at the tiles' own mid-line, the knee of its two segments: the ease
+    /// in. Low on purpose, so the fade starts at the tiles' top without a visible edge and does its
+    /// work in the lower half of the tiles, where the captions are.
+    pub const SHELF_MID_A: f32 = 0.25;
+}
+
+/// Shared logo presence: target bounding-box area, with independent width/height limits.
+/// A wide mark may paint shorter than its layout band; a tall mark may paint above it.
+/// The band remains constant so artwork never moves the metadata or actions.
 pub mod logo {
-    /// HERO rung — the home hero's title band AND the detail hero's title band (one mark on two
-    /// screens, one value; the user directive is "mutual logic for logo size for all hero"). The
-    /// target ink in px², anchored on the shape this rule must NOT move: a 5:1 wordmark at the
-    /// height floor, i.e. 600×120 — the detail hero's on-device-tuned size today. Every other
-    /// aspect is solved from it, so the commonest logo shape is unchanged and only squarer ones grow.
-    pub const HERO_AREA: f32 = 72_000.0;
-    /// The shortest a hero logo is ever drawn, and the height everything ~5:1 and wider lands on.
-    /// The detail hero's tuned 120; home's old 96 is retired, because two heroes drawing the same
-    /// clearLogo must draw it the same size. Deliberately a step ABOVE one line of [`super::size::HERO`]
-    /// text (72 × 1.32 ≈ 95): the logo is the brand mark and outranks the text title it stands in
-    /// for. ALSO the LAYOUT height of the title band ([`crate::hero_logo::band_h`]) — a taller
-    /// logo spills upward as paint, never as layout.
-    pub const HERO_H_MIN: f32 = 120.0;
-    /// The tallest. = √[`HERO_AREA`], i.e. precisely where the area rule lands a 1:1 logo — so the
-    /// ceiling never touches a real wordmark and bites only on a taller-than-wide asset. This is the
-    /// ONE knob to pull down (to ~200) if a device capture says a square emblem shouts or crowds the
-    /// detail page's compact title mid-scroll; do not reach for the area, which is what keeps
-    /// wordmarks where they are.
-    pub const HERO_H_MAX: f32 = 268.0;
-    /// COMPACT rung — the pinned title the detail page scrolls up to. The hero rung scaled by
-    /// ([`COMPACT_H_MIN`]/[`HERO_H_MIN`])² = 0.45², so the two rungs cannot drift apart: a 5:1
-    /// wordmark lands on the floor at BOTH rungs, by construction.
-    pub const COMPACT_AREA: f32 = 14_580.0;
-    /// One line of [`super::size::TITLE`] text (40 × 1.32 ≈ 53) — the compact title's own text
-    /// fallback, which is what this rung stands in for. Unchanged from the literal 54 it replaces,
-    /// so a wordmark in the pinned strip is pixel-identical to today.
-    pub const COMPACT_H_MIN: f32 = 54.0;
-    /// Set by the BAND, not by the area rule (which would want 121 here): the pinned strip has to
-    /// clear the screen top and stop short of `detail::TOP_MARGIN`, where the first scrolled
-    /// section lifts to.
-    ///
-    /// Since 2026-08-23 the strip is solved from this number rather than fitted around it — "clear
-    /// the screen top" now means clear the OVERSCAN frame (`consts::MARGIN_Y` 54), so
-    /// `detail::COMPACT_TITLE_BOT` is `54 + this` and `TOP_MARGIN` is that plus 26px of air. Pulling
-    /// this down (still the one knob to pull if a device capture says a square emblem crowds the
-    /// pinned title) now lifts the whole strip with it instead of only shrinking the mark.
+    /// Comparable presence for ordinary wordmarks and emblems, before either axis limit binds.
+    pub const HERO_AREA: f32 = 60_000.0;
+    /// The title flow reserves this height independently of the painted logo.
+    pub const HERO_BAND_H: f32 = 120.0;
+    /// Wide wordmarks stop here instead of growing to the full reading column.
+    pub const HERO_W_MAX: f32 = 640.0;
+    /// Tall and square marks cannot dominate the artwork or reach the top navigation.
+    pub const HERO_H_MAX: f32 = 240.0;
+    /// The pinned compact title retains its existing layout band.
+    pub const COMPACT_BAND_H: f32 = 54.0;
+    /// Compact presence derives from the same scale, rather than a separate aspect rule.
+    pub const COMPACT_AREA: f32 = HERO_AREA * (COMPACT_BAND_H / HERO_BAND_H) * (COMPACT_BAND_H / HERO_BAND_H);
+    pub const COMPACT_W_MAX: f32 = HERO_W_MAX * COMPACT_BAND_H / HERO_BAND_H;
+    /// The compact strip's overscan and following content use this height limit too.
     pub const COMPACT_H_MAX: f32 = 72.0;
+    /// The Continue Watching deck card's logo (`card_art::compose`'s baked composite, 420x236). The
+    /// area is chosen so an ordinary wordmark lands where the covers Plex bakes put theirs (a 5.7:1
+    /// mark 232x41, a 6.7:1 one 253x38, a 3.7:1 one 189x51); tall marks clamp at [`CARD_H_MAX`].
+    pub const CARD_AREA: f32 = 9_600.0;
+    /// The card's logo slot is this tall, and no mark is taller.
+    pub const CARD_BAND_H: f32 = CARD_H_MAX;
+    /// Tall and square marks stop here instead of growing into the card's subject.
+    pub const CARD_H_MAX: f32 = 56.0;
+    /// Wide wordmarks stop here, well inside the 420 px card.
+    pub const CARD_W_MAX: f32 = 270.0;
+    /// The logo's BOTTOM edge sits this far above the card's bottom edge: 12 px clear of the 24 px
+    /// footer text line that rides 12 px above the card bottom.
+    pub const CARD_BOTTOM_INSET: f32 = 48.0;
 }
 
 // ── Accent / control ─────────────────────────────────────────────────────────
@@ -382,6 +491,14 @@ pub const CONTROL_RIM_FOCUS_UNKEYED_W: f32 = 1.25;
 /// depths are its blur radii read as how far the light reaches in, which is what an SDF falloff can
 /// express and a CSS spread cannot be transcribed into.
 pub const CONTROL_RIM_FOCUS_UNKEYED_GLOW: [f32; 4] = [5.0, 1.0, 2.5, 0.55];
+
+/// **The `ring` focus face** (`TransportButton::focus_face`): a white stroke standing just OUTSIDE
+/// the disc, which keeps its rest face (the accent fill is the other focus face). White for the
+/// reason [`CONTROL_RIM_FOCUS_UNKEYED`] is: it is the one colour the two polarities of an unknown
+/// frame agree on. `W` is the stroke, `GAP` the clear band between it and the disc's edge.
+pub const CONTROL_FOCUS_RING: [f32; 4] = WHITE;
+pub const CONTROL_FOCUS_RING_W: f32 = 2.5;
+pub const CONTROL_FOCUS_RING_GAP: f32 = 3.0;
 
 /// **THE FOCUS CAST** — what a control face casts once the remote is on it, as two stops of
 /// `(dy, blur, alpha)` over [`CARD_SHADOW`]'s black.
@@ -667,17 +784,9 @@ pub const SCRIM_BLACK_INK: [f32; 3] = [BLACK[0], BLACK[1], BLACK[2]];
 ///
 /// MEASURED, not chosen. The panel is plain 888 with no sRGB framebuffer anywhere in the tree, so a
 /// token value IS an sRGB code and GL's blend is a straight lerp in that space — which makes the
-/// whole derivation arithmetic. It lives on [`crate::widgets::hero_scrim`] and is asserted by
-/// that component's anchor table, so brightening a text token and re-deriving this stay one edit.
-/// The binding case is a `TEXT_SECONDARY` BODY line where the hero's bottom-up ramp supplies only
-/// ~0.29: it needs 0.655 total, so the wedge must carry ~0.51 there and rather more at the title.
-///
-/// The same weight the tab bar's own track capsule already uses for the same job over the same
-/// artwork ([`TAB_TRACK_A_TOP`]) — one value per role, arrived at independently twice. An alpha
-/// rather than a colour, like [`CARD_SHADOW_REST_A`]: the ink is [`SCRIM_INK`], only the weight is
-/// the decision. **This is the one knob** if the treatment reads heavy — 0.60 still clears 3:1
-/// everywhere.
-pub const SCRIM_TEXT_A: f32 = 0.72;
+/// whole derivation arithmetic. Home and Detail grade their continuous fields separately in
+/// `widgets_hero_shade_tests` and `widgets_hero_scrim_tests`.
+pub const SCRIM_TEXT_A: f32 = 0.84;
 
 /// **White overlay at alpha `a`** — the ramp every overlay on this palette rides.
 ///
@@ -809,7 +918,7 @@ pub const RAIL_FILL: [f32; 4] = with_a(WHITE, 0.95);
 /// "this bit is special", and the rail sits straight over moving video.
 // (RAIL_MARKER, white @ 0.42, was the intro/credits band on the scrubber. Removed 2026-08-04 with
 // the band itself — at twice the track's opacity it read as a rendering artifact rather than as
-// information. See the "the rail carries NO marks" note in appkit/player_hud.rs.)
+// information. See the "the rail carries NO marks" note in appkit/player_hud/classic.rs.)
 /// The **ambient wash's** resting tint — the faint warm cast a page carries when no artwork is
 /// keying it (the person page's header state, `Person Screen.dc.html`'s
 /// `rgba(233,230,224,.10)`). The palette's one warm stop, and the only survivor of the warm "Snow"
@@ -871,6 +980,24 @@ pub const ROW_VALUE_INK_ON_DIM: [f32; 4] = with_a(ACCENT_INK, 0.38);
 /// label; a read-out at the live row's ink made the row look half-available. That same ink
 /// quietened, as [`TEXT_SEPARATOR`] is, rather than a grey of its own.
 pub const ROW_VALUE_INK_DIM: [f32; 4] = with_a(TEXT_TERTIARY, 0.45);
+
+/// **The DISABLED control state, as one value** — what a table row that is present but cannot be
+/// used wears ([`crate::table::Row::disabled`]):
+///
+/// * `label` — the name off the pill: [`TEXT_TERTIARY`], the dim row's label rung.
+/// * `value` — the read-out beside it (a row's value): [`ROW_VALUE_INK_DIM`], the label's ink
+///   quietened one step.
+///
+/// A poster tile is not a control and never wears it (the Under posters picture dims by
+/// [`crate::follow_copy::DIM`] instead).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Disabled {
+    pub label: [f32; 4],
+    pub value: [f32; 4],
+}
+
+/// The one disabled state.
+pub const DISABLED: Disabled = Disabled { label: TEXT_TERTIARY, value: ROW_VALUE_INK_DIM };
 
 // ── The watched TICK on artwork (the tile's one state mark) ──────────────────
 /// The tick's ink: `COOL_0`, the same near-white a title is set in. **No disc, no plate** — the
@@ -1093,7 +1220,7 @@ pub const TAB_TRACK_BOT: [f32; 4] = scrim_black(TAB_TRACK_A_BOT);
 /// | .56 | 1.73 | | **.72** | **3.23** |
 ///
 /// The bar is **3:1** — the same one `widgets`' ground test holds an ambient wash to, and the same
-/// arithmetic that put [`SCRIM_TEXT_A`] and [`TAB_TRACK_A_TOP`] at .72 in the first place. Read as a
+/// arithmetic used to derive [`SCRIM_TEXT_A`] and [`TAB_TRACK_A_TOP`]. Read as a
 /// CONSTANT that table says the first legal density is the flat track's own, because **a blur
 /// removes DETAIL, not brightness**: a quarter-res Kawase of a white poster is still white. That was
 /// the verdict for a day, and it is the right verdict for a constant.
@@ -1218,7 +1345,7 @@ pub const TINT_WHITE: [f32; 4] = WHITE;
 // ── Review-score marks (detail hero ratings row) ─────────────────────────────
 // These used to be the ONE place the palette borrowed someone else's colour, justified by the
 // badge being a BRAND MARK. That justification is gone with the marks: Rotten Tomatoes' fruit,
-// seal and popcorn tub were removed 2026-08-02 (no licensing route exists, and a redraw is the
+// seal and popcorn tub were removed 2026-08-02 (no public licence, none held, and a redraw is the
 // infringement pattern, not a defence), and every provider is NAMED in text instead. So these are
 // now our own semantic colours for a VERDICT, and only two still sit near a brand's hue because a
 // ripe tomato that isn't red has stopped being a tomato.
@@ -1260,6 +1387,26 @@ pub const CARD_RING_RAD: f32 = 14.0;
 /// (1.07): on a 420×236 still that overlaps the neighbouring slot, and 1.04 reads as a lift rather
 /// than a zoom.
 pub const EP_CARD_FOCUS_SCALE: f32 = 1.04;
+
+/// Corner radius of the Continue Watching row's landscape tile (the handoff's `still-radius`); the
+/// tile's size and gap are the episode strip's own ([`crate::card_row::RowStyle::EPISODE`]).
+pub const STILL_RADIUS: f32 = 12.0;
+
+/// The gap between two Continue Watching stills (owner's board CW-13 v2: pitch 460 with the 420 tile).
+/// The Detail episode strip keeps [`crate::card_row::RowStyle::EPISODE`]'s 28.
+pub const STILL_GAP: f32 = 40.0;
+
+/// The Continue Watching footer line's top stands this far under the tile's foot (the board's 244 for
+/// a 236 tile): the line is OFF the art, which carries no scrim and keeps four rounded corners.
+pub const STILL_FOOTER_DROP: f32 = 8.0;
+
+/// Gap from the Continue Watching footer to the next shelf's heading. The two shelves can
+/// share the viewport with the first heading clear of the nav and the second caption in overscan.
+pub const STILL_FOOTER_AIR: f32 = space::LG * 0.5;
+
+/// Baseline rise for the stills heading. Leave room for the shared live focus lift to raise it
+/// farther when a nearby card grows.
+pub const STILL_HEADING_RISE: f32 = space::XS * 0.25;
 
 /// How far the focused episode still rises, in px, at full focus — with [`EP_CARD_FOCUS_SCALE`] it
 /// separates the focused card from the row instead of merely enlarging it in place.

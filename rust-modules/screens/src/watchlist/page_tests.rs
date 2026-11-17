@@ -349,7 +349,9 @@ fn the_open_menus_pill_is_lit_by_the_lift_and_left_out_of_the_page() {
     let plates: Vec<_> = prims.iter().filter(|(tag, _)| *tag == 2).map(|(_, r)| *r).collect();
     assert!(plates.len() == 1 && (plates[0].x - pill.x).abs() < 0.5 && (plates[0].w - pill.w).abs() < 0.5 && (plates[0].h - pill.h).abs() < 0.5,
         "the lift paints one accent pill at the focused extent {pill:?}: {plates:?}");
-    assert!(runs.iter().any(|run| run.text.contains("Sort") && inside(&run.at)), "and its label: {runs:?}");
+    let criterion = h.screen.options().summary();
+    assert!(runs.iter().any(|run| run.text == criterion && inside(&run.at)), "and its criterion: {runs:?}");
+    assert!(!runs.iter().any(|run| run.text.contains("Sort")), "the control's name is carried, never drawn: {runs:?}");
     assert!(runs.iter().all(|run| run.ink.iter().zip(plx_ui::ACCENT_INK).all(|(a, b)| (a - b).abs() < 0.01)),
         "every run of the face in the focused ink: {runs:?}");
     // a card is not the pill: the lift for a tile paints no accent pill
@@ -362,8 +364,15 @@ fn the_open_menus_pill_is_lit_by_the_lift_and_left_out_of_the_page() {
 /// **The menu's surface draws no pill of its own** (S12): its glass begins at the pill's rect and is
 /// never nothing once the morph is under way, and the pill above it is the lift's. Driven through
 /// the surface itself, as the dispatcher drives it: Mount, the open's frames, BACK, and the close
-/// run out and past. Red while the surface painted the pill's plate and label (the morph face), which
-/// is also what put a second copy of the label under the lift's on the first frames.
+/// run out and past. Red while the surface painted the control's face (the morph face), which is
+/// also what put a second copy of the face under the lift's on the first frames.
+///
+/// What the face draws is read off the primitives, not the words: the sort glyph (`Icon::Sort`,
+/// which no menu row wears), its quiet chevron inside the control's rect, and the accent plate at
+/// the pill's rect (a rounded fill, tag 2). The criterion's text cannot be the witness: the menu's
+/// Sort section draws the same label as a row. A premise first pins that the lift (the control's
+/// one paint) shows every one of those marks through the same readers, so a green surface is not
+/// a reader that sees nothing.
 #[test]
 fn the_menu_surface_is_glass_and_rows_and_draws_no_pill_of_its_own() {
     use super::cards_harness::{WatchHost, ENTRY};
@@ -371,11 +380,37 @@ fn the_menu_surface_is_glass_and_rows_and_draws_no_pill_of_its_own() {
     use plx_machine::machine::{
         Cx, Edge, Effects, EntryId, FocusKey, FocusRead, InputEvent, InputKind, InputOwner, Key, Machine, PressRead, Tick,
     };
-    use plx_ui::screen::{DrawFrame, Screen, ScreenEvent};
+    use plx_ui::draw_census::{capture, capture_icons};
+    use plx_ui::icons::Icon;
+    use plx_ui::screen::{By, DrawFrame, Screen, ScreenEvent};
+    use plx_ui::Rect;
     use std::{cell::RefCell, rc::Rc};
     let _g = plx_base::testlock::serial();
-    let h = Harness::new(tiles(3));
+    let mut h = Harness::new(tiles(3));
+    h.focus_elem(PILL_ELEM, By::Dir);
+    h.run(60); // the row's motion brings the focused pill up
     let pill = h.screen.pill_rect(&plx_ui::fixture::FixtureMeasure);
+    let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+    // the accent plate: a rounded fill (tag 2) at the pill's rect, as the lift paints it
+    let is_plate = |tag: u64, r: &Rect| tag == 2 && near(r.x, pill.x) && near(r.w, pill.w) && near(r.h, pill.h);
+    let in_control = |r: &Rect| r.cx() > pill.x && r.cx() < pill.x + pill.w && r.cy() > pill.y && r.cy() < pill.y + pill.h;
+    // the control's marks among one frame's primitives and glyphs: the plate, the sort glyph (anywhere:
+    // no row wears it) and the chevron inside the control's rect
+    let face_marks = |prims: &[(u64, Rect)], icons: &[(Icon, Rect)]| -> Vec<String> {
+        let mut found = Vec::new();
+        found.extend(prims.iter().filter(|(tag, r)| is_plate(*tag, r)).map(|(_, r)| format!("accent plate {r:?}")));
+        found.extend(icons.iter().filter(|(id, _)| *id == Icon::Sort).map(|(_, r)| format!("sort glyph {r:?}")));
+        found.extend(icons.iter().filter(|(id, r)| *id == Icon::ChevronDown && in_control(r)).map(|(_, r)| format!("chevron {r:?}")));
+        found
+    };
+
+    // premise: the lift is the control's paint, and the readers see all three of its marks
+    let key = FocusKey { entry: ENTRY, elem: PILL_ELEM };
+    let mut lift_prims = Vec::new();
+    let lift_icons = capture_icons(|| lift_prims = capture(|| h.redraw_lift(Some(key))));
+    let marks = face_marks(&lift_prims, &lift_icons);
+    assert!(marks.len() == 3, "premise: the lift paints the plate, the sort glyph and the chevron, readers see {marks:?}");
+
     let arg = crate::registry::WatchlistMenuArg {
         host: ENTRY,
         options: WatchlistOptionsState::default(),
@@ -392,29 +427,35 @@ fn the_menu_surface_is_glass_and_rows_and_draws_no_pill_of_its_own() {
             tick: Tick { ms, dt_us: 16_667 },
             measure: &plx_ui::fixture::FixtureMeasure,
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead::default(),
             owner: InputOwner::Entry(entry),
         };
         let mut fx = Effects::new(&mut out, plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(10)), &mut present);
         Machine::<WatchHost>::step(menu, &ev, &cx, &mut fx);
     };
-    let draw = |menu: &mut WatchlistMenuScreen| -> Vec<(String, plx_ui::Rect)> {
+    // one frame of the surface: its primitives and its glyphs
+    let draw = |menu: &mut WatchlistMenuScreen| -> (Vec<(u64, Rect)>, Vec<(Icon, Rect)>) {
         let sources = Rc::new(RefCell::new(plx_gfx::gfx::backdrop::Sources::default()));
         let cx = Cx {
             views: (),
             tick: Tick { ms: 0, dt_us: 16_667 },
             measure: &plx_ui::fixture::FixtureMeasure,
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead { current: Some(FocusKey { entry, elem: 0 }), ..Default::default() },
             owner: InputOwner::Entry(entry),
         };
-        plx_ui::draw_census::capture_text(|| {
-            let _discovery = plx_ui::frame::backdrop::discover(sources.clone());
-            let mut f = DrawFrame::new(&cx, plx_ui::Painter::recording());
-            Screen::<WatchHost>::draw(menu, &mut f);
-        })
+        let mut prims = Vec::new();
+        let icons = capture_icons(|| {
+            prims = capture(|| {
+                let _discovery = plx_ui::frame::backdrop::discover(sources.clone());
+                let mut f = DrawFrame::new(&cx, plx_ui::Painter::recording());
+                Screen::<WatchHost>::draw(menu, &mut f);
+            });
+        });
+        (prims, icons)
     };
-    let pill_label = plx_platform::i18n::msg::watchlist_page_sort_filter();
     step(&mut menu, ScreenEvent::Mount, ms);
     let back = InputEvent {
         kind: InputKind::Key { key: Key::Back, sym: 0, wcode: 0, edge: Edge::Down, at_edge: false },
@@ -425,8 +466,9 @@ fn the_menu_surface_is_glass_and_rows_and_draws_no_pill_of_its_own() {
         if frame == 40 { step(&mut menu, ScreenEvent::Input(back.clone()), ms); }
         ms += 16;
         step(&mut menu, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }), ms);
-        let words = draw(&mut menu);
-        assert!(!words.iter().any(|(text, _)| text == pill_label), "frame {frame}: the surface drew the pill's label: {words:?}");
+        let (prims, icons) = draw(&mut menu);
+        let drawn = face_marks(&prims, &icons);
+        assert!(drawn.is_empty(), "frame {frame}: the surface painted the control's face: {drawn:?}");
     }
 }
 
@@ -649,18 +691,18 @@ fn the_count_is_all_or_shown_of_total_and_absent_off_the_landed_list() {
 #[test]
 fn a_remove_lowers_the_count_when_the_landing_starts() {
     use plx_ui::cards::conformance::{CardHarness, Landing};
-    use plx_ui::containers::modal::{set_veil, CLOSING_GONE};
+    use plx_ui::containers::modal::CLOSING_GONE;
     let mut h = Harness::new(tiles(12));
     h.focus_index(2);
     assert_eq!(h.screen.count(), Some(Count::All(12)));
-    set_veil(1.0);
+    h.modal.veil = 1.0;
     h.landing(Landing::RemoveFocused).unwrap();
     assert_eq!(h.screen.tiles().len(), 11, "premise: committed");
     for frame in 0..30 {
         h.run(1);
         assert_eq!(h.screen.count(), Some(Count::All(12)), "frame {frame}: the menu is still up");
     }
-    set_veil(CLOSING_GONE * 0.5);
+    h.modal.veil = CLOSING_GONE * 0.5;
     let mut lowered_at_start = false;
     for frame in 0..40 {
         h.run(1);
@@ -673,7 +715,7 @@ fn a_remove_lowers_the_count_when_the_landing_starts() {
         }
     }
     assert!(lowered_at_start, "the landing began and the count followed");
-    set_veil(0.0);
+    h.modal.veil = 0.0;
 }
 
 /// **A Remove holds the colour wash until the grid's landing ends.** The wash eases one 8-bit step
@@ -683,8 +725,7 @@ fn a_remove_lowers_the_count_when_the_landing_starts() {
 #[test]
 fn a_remove_holds_the_wash_target_until_the_landing_ends() {
     use plx_ui::cards::conformance::{CardHarness, Landing};
-    use plx_ui::containers::modal::set_veil;
-    set_veil(0.0);
+    // This harness owns an explicit unveiled ModalRead from construction.
     let mut rows = tiles(12);
     for (i, t) in rows.iter_mut().enumerate() {
         let c = 20 + 15 * i as u8;
@@ -721,9 +762,7 @@ fn a_remove_holds_the_wash_target_until_the_landing_ends() {
 #[test]
 fn the_ease_after_a_remove_is_about_half_the_ordinary_one() {
     use plx_ui::cards::conformance::{CardHarness, Landing};
-    use plx_ui::containers::modal::set_veil;
     use plx_ui::widgets::PageGround;
-    set_veil(0.0);
     let mut rows = tiles(12);
     for (i, t) in rows.iter_mut().enumerate() {
         let c = if i % 2 == 0 { 10 } else { 245 };
@@ -787,8 +826,7 @@ fn the_ease_after_a_remove_is_about_half_the_ordinary_one() {
 #[test]
 fn an_unveiled_remove_lowers_the_count_with_its_first_step() {
     use plx_ui::cards::conformance::{CardHarness, Landing};
-    use plx_ui::containers::modal::set_veil;
-    set_veil(0.0);
+    // This harness owns an explicit unveiled ModalRead from construction.
     let mut h = Harness::new(tiles(12));
     h.focus_index(2);
     h.landing(Landing::RemoveFocused).unwrap();
@@ -812,7 +850,7 @@ fn the_shape_follows_the_write_order() {
 #[test]
 fn a_remove_changes_nothing_on_the_grid_until_the_landing_starts() {
     use plx_ui::cards::conformance::CardHarness;
-    use plx_ui::containers::modal::{set_veil, CLOSING_GONE};
+    use plx_ui::containers::modal::CLOSING_GONE;
     let mut h = Harness::new(tiles(14));
     h.focus_index(2);
     h.run(60);
@@ -822,7 +860,7 @@ fn a_remove_changes_nothing_on_the_grid_until_the_landing_starts() {
     // every word the frame draws and where: the focus caption (title and year line) among them
     let words_before = h.draw_texts();
     assert!(words_before.iter().any(|(w, _)| w == "2002"), "premise: the removed title's caption is drawn: {words_before:?}");
-    set_veil(1.0);
+    h.modal.veil = 1.0;
     let guid = h.screen.tiles()[h.screen.index_of(removed).unwrap()].row.guid.clone();
     h.screen.input(WatchlistIn::Removed(guid));
     for frame in 0..30 {
@@ -852,7 +890,7 @@ fn a_remove_changes_nothing_on_the_grid_until_the_landing_starts() {
             assert!((s - want).abs() < 1e-3, "frame {frame}: card {e} rescaled under the menu: {want} -> {s}");
         }
     }
-    set_veil(CLOSING_GONE * 0.5);
+    h.modal.veil = CLOSING_GONE * 0.5;
     let now = h.focused().unwrap();
     let mut last = 1.0f32;
     let mut rose = false;
@@ -867,7 +905,46 @@ fn a_remove_changes_nothing_on_the_grid_until_the_landing_starts() {
     }
     assert!(rose && (last - h.focus_scale()).abs() < 1e-3, "the new focus rose once to the pop and rests there");
     assert!(moved, "the landing's start moved the caption to the new focus");
-    set_veil(0.0);
+    h.modal.veil = 0.0;
+}
+
+/// **A mounted harness does not follow the process-wide Under posters cell.** The grid sizes the
+/// focused row's caption band from the setting every frame (80 px under one line, 112 under two),
+/// and the Settings tests write that cell (`restore_under_posters`) under `testlock::serial()`,
+/// which a harness does not take: a flip between two of its frames moved every row below the
+/// focused one by the 32 px between the bands, and failed
+/// `a_remove_changes_nothing_on_the_grid_until_the_landing_starts` about one run in three on a loaded
+/// machine. This holds the cell on a two-line value for the mount and while the page is stepped, as
+/// the Settings tests do, and grades that the band and a lower row's card stand where the default
+/// puts them.
+#[test]
+fn the_harness_sizes_its_band_from_its_own_pin_not_from_the_live_setting() {
+    use plx_plex::plex::session::{UnderPosters, UnderPostersLadder};
+    use plx_ui::cards::conformance::CardHarness;
+    /// Puts the live cell back on its default, a panic included.
+    struct Live;
+    impl Drop for Live {
+        fn drop(&mut self) {
+            plx_media::route::restore_under_posters(UnderPosters::DEFAULT);
+        }
+    }
+    let _serial = plx_base::testlock::serial();
+    let _live = Live;
+    let settled = |live: UnderPosters| {
+        plx_media::route::restore_under_posters(live);
+        let mut h = Harness::new(tiles(14));
+        h.focus_index(2);
+        h.run(60);
+        // the live cell moves again under the mounted page, as a Settings test's next write does
+        plx_media::route::restore_under_posters(live);
+        h.run(1);
+        let below = h.cards()[7];
+        (h.screen.band_h(), h.drawn_rect(below, 1.0).unwrap().y)
+    };
+    let default = settled(UnderPosters::DEFAULT);
+    let two_lines = settled(UnderPosters { title: true, details: UnderPostersLadder::Genre.movie_parts(), show_details: UnderPostersLadder::Genre.show_parts(), sort_value: false });
+    assert_eq!(default.0, Some(80.0), "premise: the default opens one line of band");
+    assert_eq!(two_lines, default, "the live cell held two lines (112 px) and the harness followed it: (band, y of a lower card)");
 }
 
 #[test]
@@ -915,8 +992,7 @@ fn coloured(n: usize, bare: &[usize]) -> Vec<super::page::WatchTile> {
 #[test]
 fn a_remove_never_passes_the_wash_through_neutral() {
     use plx_ui::cards::conformance::{CardHarness, Landing};
-    use plx_ui::containers::modal::set_veil;
-    set_veil(0.0);
+    // This harness owns an explicit unveiled ModalRead from construction.
     let flat = [theme::SURFACE_APP; 4];
     let mut h = Harness::new(coloured(12, &[3]));
     h.focus_index(2);
@@ -945,8 +1021,7 @@ fn a_remove_never_passes_the_wash_through_neutral() {
 #[test]
 fn a_filter_never_passes_the_wash_through_neutral_or_another_title() {
     use plx_machine::machine::{EntryId, FocusKey};
-    use plx_ui::containers::modal::set_veil;
-    set_veil(0.0);
+    // This harness owns an explicit unveiled ModalRead from construction.
     let flat = [theme::SURFACE_APP; 4];
     let mut h = Harness::new(coloured(9, &[]));
     h.focus_index(2);
@@ -1136,6 +1211,68 @@ fn the_returning_chrome_never_draws_over_the_header_row_still_arriving() {
     assert!(arriving >= 3, "and the title arrives over more than a pop ({arriving} partial frames)");
     assert!(h.screen.scroll().abs() < 0.5, "premise: the page is home");
     assert_eq!(h.screen.head_alpha(), 1.0, "and the header row is whole once it is there");
+}
+
+/// **A sort picked from the menu swaps the control's criterion; it never cuts.** The row is rebuilt
+/// where the options land (an `input`, before any tick), so the swap begins from the rebuild
+/// itself: the frame that changes the sort already draws the OLD criterion, and then the old falls
+/// as the new rises, both ending at the control's one right edge, in the page's own pass and in the
+/// opener lift (the only thing that draws the control while the menu that picked is still closing).
+/// Red while the Watchlist's row held no swap: the new sort showed whole on the first frame.
+#[test]
+fn a_picked_sort_swaps_the_criterion_in_the_page_pass_and_through_the_lift() {
+    use plx_machine::machine::FocusKey;
+    use plx_ui::draw_census::Run;
+    use plx_ui::screen::By;
+    let _g = plx_base::testlock::serial();
+    let _l = language_on_this_thread_for_test(Preference::En);
+    let mut h = Harness::new(tiles(3));
+    h.screen.input(WatchlistIn::List(ListState::Ready { total: 3 }));
+    h.focus_elem(PILL_ELEM, By::Dir);
+    h.run(60);
+    let key = FocusKey { entry: super::cards_harness::ENTRY, elem: PILL_ELEM };
+    let (old, new) = ("Date added", "Title");
+    let opacity = |runs: &[Run], text: &str| runs.iter().find(|run| run.text == text).map_or(0.0, |run| run.ink[3]);
+    let rest = opacity(&h.draw_runs(), old);
+    assert!(rest > 0.9, "premise: the control reads {old:?} at rest, drawn at {rest}");
+    assert!(!h.screen.probe_header_swap_active(), "premise: nothing is swapping at rest");
+
+    h.screen.input(WatchlistIn::Options(WatchlistOptionsState { sort: super::options::SortKey::Title, ..Default::default() }));
+    // `(old, new)` as the page's pass and the lift draw them this frame.
+    let drawn = |h: &mut Harness| {
+        let page = h.draw_runs();
+        let lift = h.lift_census(Some(key)).1;
+        ((opacity(&page, old), opacity(&page, new)), (opacity(&lift, old), opacity(&lift, new)), page)
+    };
+    let (page, lift, runs) = drawn(&mut h);
+    assert!(h.screen.probe_header_swap_active(), "the pick began a swap, before any tick");
+    for (what, (out, arriving)) in [("page", page), ("lift", lift)] {
+        assert!(out > 0.9 * rest && arriving < 0.1 * rest, "the first frame of the pick: the {what} draws the OLD criterion ({out}, {arriving})");
+    }
+    let edge = |runs: &[Run], text: &str| runs.iter().find(|run| run.text == text).map(|run| run.at.x + run.at.w);
+    let control_edge = edge(&runs, old).expect("the old criterion is drawn");
+
+    let mut last = (rest, 0.0);
+    let mut both = 0;
+    for frame in 0..240 {
+        h.run(1);
+        let (page, lift, runs) = drawn(&mut h);
+        if let (Some(a), Some(b)) = (edge(&runs, old), edge(&runs, new)) {
+            both += 1;
+            assert!((a - control_edge).abs() < 0.01 && (b - control_edge).abs() < 0.01, "frame {frame}: both criteria end at the control's one right edge ({a}, {b}, {control_edge})");
+        }
+        for (what, (out, arriving)) in [("page", page), ("lift", lift)] {
+            assert!((out + arriving - rest).abs() < 1.0e-3, "frame {frame}: the {what} draws {out} + {arriving}, which is not {rest}");
+        }
+        assert_eq!(page, lift, "frame {frame}: the page and the lift draw the swap alike");
+        assert!(page.0 <= last.0 + 1.0e-3 && page.1 >= last.1 - 1.0e-3, "frame {frame}: the cross-fade runs one way");
+        last = page;
+        if !h.screen.probe_header_swap_active() { break; }
+    }
+    assert!(!h.screen.probe_header_swap_active(), "the swap landed");
+    assert!(both > 3, "premise: the two criteria were on screen together for a while ({both} frames)");
+    let (page, lift, _) = drawn(&mut h);
+    assert_eq!((page, lift), ((0.0, rest), (0.0, rest)), "the settled control draws the new criterion alone");
 }
 
 /// **The header row is built once per key, not once per question.** The page asks for the row in its

@@ -78,7 +78,18 @@
 //! **What Style can reach depends on the active renderer** ([`SubRenderer`]): only the client's
 //! plain-text caption follows Size and Position, so under an image (PGS/VobSub) or native ASS/SSA
 //! subtitle those two rows are dim, focusable and inert, with a separate note each. Color stays
-//! live under every renderer: the subtitle ink tints bitmaps and ASS alike. Size and Position are
+//! pickable under every renderer: a gray tints any of them (the bitmap tint,
+//! `player_hud::subtitle_tint`); Yellow is the colour of a synthesized text header and of the
+//! client's own drawn text, and in an authored ASS/SSA script it replaces the pure-white primary of
+//! every style that has one (`plx_media::player::ass_ink`). Whether the pick's colours reach the
+//! active subtitle is ONE media fact, `plx_media::player::subtitle_takes_colour` (a picture: never;
+//! text: always; ASS/SSA: when the header that reaches libass has a white-primary style), a pure read of
+//! the session (the header's half is a value of its readout that the app delivers once a tick,
+//! `player::deliver_subtitle_ink`: the menu reads no subtitle registry), taken into
+//! [`SubSig`] and [`TrackMenuState::takes_colour`]. Where it is false the Color picker shows the Yellow
+//! rung DISABLED (the shared disabled row: dim, focusable, inert; the grays stay live), with the reason
+//! as the page's note and on the Style page ("gray only dims"), and a stored Yellow pick stays the
+//! checked rung and the saved preference: the menu never rewrites the pick. Size and Position are
 //! persisted by `route::select_subtitle_size` / `select_subtitle_position` and Color by
 //! `player::set_subtitle_tone`: all three are one call into the one write door (`route::choose`,
 //! `How::Optimistic`: live value first, the durable write second, never republished).
@@ -231,7 +242,7 @@ impl StyleField {
         match self {
             Self::Size => subtitle_size_label(SubtitleSize::from_index(i as u8)),
             Self::Position => subtitle_position_label(SubtitlePosition::from_index(i as u8)),
-            Self::Color => tone_label(SubtitleTone::from_index(i as u8)),
+            Self::Color => subtitle_tone_label(SubtitleTone::from_index(i as u8)),
         }
     }
 }
@@ -331,33 +342,54 @@ type EnhState = (
     plx_media::route::SubtitleEffect,
 );
 
-/// **A tab root's natural panel rect** — the layout of `table` as the panel would hug it. Each
-/// tab hugs its own rows (shared menu rule); the right edge is fixed, so switching tabs moves only
-/// the left edge.
-fn table_natural(table: &TableView, measure: &dyn plx_machine::machine::Measure) -> Rect {
+/// **The tallest page this menu shows with app-owned rows** — what decides which SIDE of its opener
+/// the panel opens on (`plx_ui::popover::anchor_panel`'s `need_h`), so the side is the same on
+/// every page and never flips under a viewer who pushes one. A server-length list (audio dubs,
+/// subtitle tracks) may be taller and scrolls inside the panel. Classic's room above its row is
+/// 710, which this stays under, so classic always opens upward. `pub(crate)` because the HUD lint
+/// places this menu with it (`hud_format::lint_menus`, M2), through [`place_panel`].
+pub(crate) const NEED_H: f32 = 600.0;
+
+/// **The one call of the shared placer for this menu**: a panel of `size` beside `anchor`, on the side
+/// [`NEED_H`] decides, `PLAYER_MENU_GAP` away, inside `SAFE`. The live panel ([`table_natural`]), the
+/// overscan audit ([`overscan_rects`]) and the HUD lint (`hud_format::lint_menus`) all place through
+/// it, so none can drift from another.
+pub(crate) fn place_panel(anchor: Rect, size: (f32, f32)) -> plx_ui::popover::Anchored {
+    plx_ui::popover::anchor_panel(
+        anchor,
+        size,
+        NEED_H,
+        theme::layout::PLAYER_MENU_GAP,
+        plx_ui::popover::Placement::PLAYER_MENU,
+    )
+}
+
+/// **A tab root's natural panel**, placed beside `anchor` — the layout of `table` as the panel would
+/// hug it. Each tab hugs its own rows (shared menu rule); the edge the opener's segment ends at is
+/// fixed, so switching tabs moves only the far edge.
+///
+/// The panel grows away from the opener and its height is capped at the room on that side, so a
+/// long list (an item with many audio dubs) SCROLLS inside the panel instead of the panel itself
+/// spilling over the opener or past the safe frame.
+fn table_natural(
+    table: &TableView,
+    anchor: Rect,
+    measure: &dyn plx_machine::machine::Measure,
+) -> plx_ui::popover::Anchored {
     let pw = table.menu_panel_width(measure);
-    // the transport control row's own right edge — one number for the discs and both panels
-    let px = crate::player_hud::CTRL_RIGHT - pw;
-    // Bottom-anchored just above the control-button row (buttons top at SCR_H-288) with a clear gap.
-    // The panel grows UPWARD from this fixed bottom edge, and its height is capped so the top never
-    // crosses `top_min` — so a long list (an item with many audio dubs) SCROLLS inside the panel
-    // instead of the panel itself spilling down over the buttons. Switching Audio↔Subtitles keeps
-    // the bottom edge steady.
-    let bottom = theme::layout::PLAYER_MENU_BOTTOM; // 764 — ~28px above the buttons
     // A note row wraps, so its line count depends on the width: it is resolved HERE, against the
     // same `measure` and `pw` the panel is sized with, so no caller (`update`, hit-testing,
     // `draw`) can read the count a rebuild left stale. Idempotent and a few short strings.
     table.fit_notes(pw, measure);
-    let top_min = 60.0;
-    let ph = table.measured_height().clamp(160.0, bottom - top_min);
-    let py = bottom - ph; // ≥ top_min by construction
-    Rect::new(px, py, pw, ph)
+    let ph = table.measured_height().max(160.0);
+    place_panel(anchor, (pw, ph))
 }
 
 /// The renderer the ACTIVE subtitle is drawn by — what decides whether the caption's Size and
 /// Position can reach it. Only the client's plain-text caption draw follows them
 /// (`appkit::player_hud::draw_subtitle_message`); an image subtitle keeps its own bitmap geometry and
 /// native ASS/SSA its authored layout. The subtitle INK tints all three, so Color is always live.
+/// (Whether the pick's COLOUR reaches a styled one is [`plx_media::player::ass_ink`]'s rule.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubRenderer {
     Text,
@@ -376,12 +408,16 @@ impl SubRenderer {
         }
     }
 
-    /// The note under the Style rows, when Size and Position cannot reach this renderer.
-    fn note(self) -> Option<&'static str> {
+    /// The note under the Style rows, when Size and Position cannot reach this renderer. A styled
+    /// subtitle says which of its colours the pick reaches: `takes_colour` is the media fact
+    /// (`plx_media::player::subtitle_takes_colour`), so its white text follows the pick or none of it does.
+    fn note(self, takes_colour: bool) -> Option<&'static str> {
+        use plx_platform::i18n::msg;
         match self {
             Self::Text => None,
-            Self::Image => Some(plx_platform::i18n::msg::widgets_tracks_style_image_note()),
-            Self::Styled => Some(plx_platform::i18n::msg::widgets_tracks_style_styled_note()),
+            Self::Image => Some(msg::widgets_tracks_style_image_note()),
+            Self::Styled if takes_colour => Some(msg::widgets_tracks_style_styled_note()),
+            Self::Styled => Some(msg::widgets_tracks_style_fixed_note()),
         }
     }
 }
@@ -397,6 +433,10 @@ struct SubSig {
     subs: Vec<(i64, bool)>,
     active: c_int,
     renderer: SubRenderer,
+    /// Whether the Color pick's colours reach the active subtitle
+    /// (`plx_media::player::subtitle_takes_colour`): read once here, so the Color picker's dimmed rungs
+    /// follow it on a live poll (an ASS sidecar's header arrives after the pick).
+    takes_colour: bool,
     transcoding: bool,
     /// who draws the subtitle: what Timing and Style are gated and explained by
     presenter: plx_media::route::SubtitlePresenter,
@@ -470,6 +510,10 @@ pub struct TrackMenuState {
     /// The renderer of the ACTIVE subtitle, captured when the root is (re)built — what the Style
     /// page's Size and Position lock reads.
     renderer: SubRenderer,
+    /// Whether the Color pick's colours reach the ACTIVE subtitle, captured with [`Self::renderer`]
+    /// (the media fact `plx_media::player::subtitle_takes_colour`): the Color picker dims the rungs
+    /// that would not.
+    takes_colour: bool,
     /// What the Subtitles root was last built from; a live poll rebuilds when it moves.
     sub_sig: Option<SubSig>,
     /// The Other languages page's model — one entry per language, as of the last root build or
@@ -541,6 +585,13 @@ pub struct TrackMenuState {
     /// without the item in hand. A copy, refreshed wherever the subs list is re-read, so a
     /// subtitle that lands (or is replaced) while the page is up marks its hit at once.
     item_sidecars: Vec<metadata::Stream>,
+    /// The opener's rect, handed in when the menu opened ([`Self::with_anchor`]) and never read
+    /// from anywhere again: a stand-in taking the HUD row, or a language change, cannot move an
+    /// open panel.
+    anchor: Rect,
+    /// The side of [`Self::anchor`] the panel took, as of the last placement: where its rise
+    /// comes from.
+    side: std::cell::Cell<plx_ui::popover::Side>,
 }
 
 /// **What the track menu DECIDED**, for the loop to perform (spec §2.2).
@@ -672,6 +723,19 @@ impl TrackMenuState {
         yours: Vec<String>,
         offer_search: bool,
     ) -> Self {
+        Self::new_with_preferences(ps, meta, tab, yours, offer_search,
+            plx_plex::plex::session::SubtitleSize::Medium, plx_plex::plex::session::SubtitlePosition::Low)
+    }
+
+    pub fn new_with_preferences(
+        ps: &plx_media::route::PlaybackSession,
+        meta: metadata::MetadataView<'_>,
+        tab: c_int,
+        yours: Vec<String>,
+        offer_search: bool,
+        size: plx_plex::plex::session::SubtitleSize,
+        position: plx_plex::plex::session::SubtitlePosition,
+    ) -> Self {
         let mut s = TrackMenuState {
             tab,
             active_audio: 0,
@@ -681,10 +745,11 @@ impl TrackMenuState {
             form: TrackTable::new(BAND_BASE),
             offset_ms: plx_media::player::subtitle_offset_ms(),
             tone: plx_media::player::subtitle_tone(),
-            size: plx_media::route::subtitle_size(),
-            position: plx_media::route::subtitle_position(),
+            size,
+            position,
             pages: PageStack::new(),
             renderer: SubRenderer::Text,
+            takes_colour: true,
             sub_sig: None,
             other: Vec::new(),
             root_tracks: Vec::new(),
@@ -699,11 +764,28 @@ impl TrackMenuState {
             search: offer_search.then(|| plx_data::subsearch::SubSearchSnapshot::idle(0)),
             search_watching: false,
             item_sidecars: Vec::new(),
+            anchor: crate::player_hud::classic::ctrl_row_hit_rect(),
+            side: std::cell::Cell::new(plx_ui::popover::Side::Above),
         };
         s.form.table.min_panel_w = theme::layout::PLAYER_MENU_MIN_W;
         s.sync_item(ps, meta);
         s.rebuild(ps, meta, tab, false);
         s
+    }
+
+    /// Open beside `anchor`, the rect of the control (widened to the end of its segment) that
+    /// opened the menu, as the player screen hands it over. Without it the menu opens where classic
+    /// does: the control row's rect, whose right edge is `CTRL_RIGHT`. Called once, on the
+    /// freshly built menu and before its first frame: the placement is cached against the table's
+    /// layout, and the anchor is latched for the menu's whole life.
+    pub fn with_anchor(mut self, anchor: Rect) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    /// The anchor the menu was opened with ([`Self::with_anchor`]).
+    pub fn anchor(&self) -> Rect {
+        self.anchor
     }
 
     /// The highlighted row, for the focus probe (`crate::focusprobe`) — a READ of the cursor the
@@ -967,7 +1049,10 @@ impl TrackMenuState {
             self.motion.cancel_slide();
         } else {
             // The page still holds: remember what the root is now built from (the pop back
-            // rebuilds it) and refresh this page in place, focus kept by id.
+            // rebuilds it) and refresh this page in place, focus kept by id. The media fact the Color
+            // rungs are dimmed by (an ASS header arriving after the page opened) moves without
+            // changing the page's availability, so it is taken here.
+            self.takes_colour = sig.takes_colour;
             self.sub_sig = Some(sig);
             if let Some(page) = self.pages.top() {
                 let form = self.page_form(page);
@@ -1009,14 +1094,15 @@ impl TrackMenuState {
         let subs = item
             .map(|t| t.subs.iter().enumerate().map(|(i, s)| (s.id, offered.contains(&i))).collect())
             .unwrap_or_default();
-        let renderer = item
-            .and_then(|t| t.subs.get(usize::try_from(active).ok()?))
-            .map_or(SubRenderer::Text, |s| SubRenderer::of_codec(&s.codec));
+        let active_sub = item.and_then(|t| t.subs.get(usize::try_from(active).ok()?));
+        let renderer = active_sub.map_or(SubRenderer::Text, |s| SubRenderer::of_codec(&s.codec));
+        let takes_colour = active_sub.map_or(true, |s| plx_media::player::subtitle_takes_colour(ps, &s.codec));
         let (_, enhancement, _, effect) = Self::enh_state(ps);
         SubSig {
             subs,
             active,
             renderer,
+            takes_colour,
             transcoding: plx_media::route::is_transcoding(ps),
             presenter: plx_media::route::subtitle_presenter(ps),
             enhancement,
@@ -1640,7 +1726,11 @@ impl TrackMenuState {
 
     /// The Style page: one drill-in per field, each reading out its current value. Under an image
     /// or styled subtitle Size and Position are disabled (dim, focusable, inert) and one note names
-    /// why; Color is live under every renderer — the subtitle ink tints bitmaps and ASS alike.
+    /// why. Color stays pickable under every renderer: a gray tints any of them
+    /// (`player_hud::subtitle_tint`); Yellow reaches a synthesized text track and the pure-white
+    /// primaries of an authored ASS/SSA script (`plx_media::player::ass_ink`), never a picture. Where the
+    /// media fact `takes_colour` says it cannot reach, [`Self::picker_form`] disables the Yellow rung and
+    /// the note on this page says why.
     fn style_form(&self) -> TrackForm {
         let field_row = |field: StyleField| {
             Row::new(field.label()).value(field.rung_label(self.current_rung(field)))
@@ -1667,18 +1757,35 @@ impl TrackMenuState {
                 (),
                 field_row(StyleField::Color),
             );
-        if let Some(note) = self.renderer.note() {
+        if let Some(note) = self.renderer.note(self.takes_colour) {
             sec = sec.note(note);
         }
         Form::new().section(sec)
     }
 
     /// A picker page: one choice per rung of `field`'s ladder, the current one checked.
+    ///
+    /// The Color picker under a subtitle the pick's colours cannot reach (`takes_colour` is false: a
+    /// picture, or an ASS/SSA script with no pure-white style) shows those rungs DISABLED (the shared
+    /// disabled-row state: dim, focusable, inert) with the reason as the page's note. The grays stay live
+    /// (they tint any renderer), and the stored pick stays the checked rung and the saved preference: the
+    /// page says the pick does not reach this subtitle, it never rewrites it.
     fn picker_form(&self, field: StyleField) -> TrackForm {
         let current = TrackRow::Choice(field, self.current_rung(field));
-        let sec = (0..field.rungs()).fold(FormSection::new(""), |sec, rung| {
+        let unreachable = |rung: usize| {
+            field == StyleField::Color
+                && !self.takes_colour
+                && SubtitleTone::from_index(rung as u8).text_rgb8().is_some()
+        };
+        let mut sec = (0..field.rungs()).fold(FormSection::new(""), |sec, rung| {
             sec.choice(TrackRow::Choice(field, rung), (), Row::new(field.rung_label(rung)), |id| *id == current)
+                .disabled(unreachable(rung))
         });
+        if field == StyleField::Color && !self.takes_colour {
+            if let Some(note) = self.renderer.note(false) {
+                sec = sec.note(note);
+            }
+        }
         Form::new().section(sec)
     }
 
@@ -1816,8 +1923,9 @@ impl TrackMenuState {
     /// idiom the Subtitles tab's Timing/Style pair uses, plus an optional non-selectable note (an
     /// inert slot: it takes a layout row and has no identity). Mirrors [`Self::layout`] for the
     /// Subtitles tab.
-    fn audio_form(&self, meta: metadata::MetadataView<'_>) -> TrackForm {
+    fn audio_form(&self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>) -> TrackForm {
         self.audio_form_for(
+            ps,
             meta,
             (self.enhance_shown, self.enhance_route, self.enhance_disabled, self.enhance_subtitle_effect),
         )
@@ -1825,7 +1933,7 @@ impl TrackMenuState {
 
     /// [`Self::audio_form`] against an explicit enhancement answer ([`Self::enh_state`]'s shape),
     /// so the Audio root can be built while the menu shows Subtitles and has not stored one.
-    fn audio_form_for(&self, meta: metadata::MetadataView<'_>, enh: EnhState) -> TrackForm {
+    fn audio_form_for(&self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>, enh: EnhState) -> TrackForm {
         let (enhance_shown, enhance_route, enhance_disabled, enhance_subtitle_effect) = enh;
         let mut sec = FormSection::new(plx_platform::i18n::msg::widgets_tracks_audio());
         let d = match tracks(meta) {
@@ -1858,7 +1966,7 @@ impl TrackMenuState {
             } else {
                 name
             };
-            let sub = audio_sub_line(sub, s);
+            let sub = audio_sub_line(ps, sub, s);
             if !sub.is_empty() {
                 row = row.detail(sub);
             }
@@ -1924,6 +2032,7 @@ impl TrackMenuState {
         let forced_readout = Self::forced_readout(ps, meta, self.active_sub, self.forced_only);
         let sig = self.sub_sig_for(ps, meta, self.active_sub, forced_readout);
         self.renderer = sig.renderer;
+        self.takes_colour = sig.takes_colour;
         self.sub_sig = Some(sig);
         let (form, model) = self.sub_root_form(
             ps, meta, self.sub_sig.as_ref().and_then(|sig| sig.forced_only.as_deref()),
@@ -2026,7 +2135,7 @@ impl TrackMenuState {
     fn rebuild(&mut self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>, tab: c_int, slide: bool) {
         if tab == 0 {
             let (shown, route, disabled, subtitle_effect) = Self::enh_state(ps);
-            self.rebuild_audio(shown, route, disabled, subtitle_effect, meta, slide);
+            self.rebuild_audio(ps, shown, route, disabled, subtitle_effect, meta, slide);
         } else {
             let form = self.layout(ps, meta);
             let keep = self.active_sub_id();
@@ -2064,6 +2173,7 @@ impl TrackMenuState {
     /// below — landing on the checked track — is exactly the existing open/switch behaviour.
     fn rebuild_audio(
         &mut self,
+        ps: &plx_media::route::PlaybackSession,
         enhance_shown: Option<plx_plex::plex::AudioEnhancements>,
         enhance_route: Option<plx_media::route::EnhancementRoute>,
         enhance_disabled: Option<plx_media::route::DisabledReason>,
@@ -2084,7 +2194,7 @@ impl TrackMenuState {
         self.enhance_route = enhance_route;
         self.enhance_disabled = enhance_disabled;
         self.enhance_subtitle_effect = enhance_subtitle_effect;
-        let form = self.audio_form(meta);
+        let form = self.audio_form(ps, meta);
         // The offer is back: prefer the banked identity over `prev_target` (which names whatever
         // row the cursor happened to sit on while the rows were gone) whenever it still exists.
         let restored = if enhance_shown.is_some() { self.sticky_audio_target.take() } else { None };
@@ -2104,7 +2214,11 @@ impl TrackMenuState {
     /// [`TableView::layout_rev`]: text is measured when the table changed, not once per caller per
     /// frame. What is on screen is [`Self::shown_rect`], which springs toward this.
     fn panel_rect(&self, measure: &dyn plx_machine::machine::Measure) -> Rect {
-        self.motion.natural(self.form.table.layout_rev(), || table_natural(&self.form.table, measure))
+        self.motion.natural(self.form.table.layout_rev(), || {
+            let placed = table_natural(&self.form.table, self.anchor, measure);
+            self.side.set(placed.side);
+            placed.rect
+        })
     }
 
     /// The card as it is drawn this frame: its top and left edges on their springs toward
@@ -2142,7 +2256,7 @@ impl TrackMenuState {
                 || disabled != self.enhance_disabled
                 || subtitle_effect != self.enhance_subtitle_effect
             {
-                self.rebuild_audio(shown, route, disabled, subtitle_effect, meta, false);
+                self.rebuild_audio(ps, shown, route, disabled, subtitle_effect, meta, false);
             }
         } else {
             self.poll_subtitle_state(ps, meta);
@@ -2198,12 +2312,12 @@ impl TrackMenuState {
                 let forced = Self::forced_readout(ps, meta, self.active_sub, self.forced_only);
                 self.sub_root_form(ps, meta, forced.as_deref()).0
             } else {
-                self.audio_form_for(meta, Self::enh_state(ps))
+                self.audio_form_for(ps, meta, Self::enh_state(ps))
             };
             let mut other = TrackTable::new(BAND_BASE);
             other.table.min_panel_w = theme::layout::PLAYER_MENU_MIN_W;
             other.set(form, None);
-            let natural = table_natural(&other.table, measure);
+            let natural = table_natural(&other.table, self.anchor, measure).rect;
             PanelMotion::prewarm_background_text(natural, &other.table, measure)
         });
         self.background_owner = Some(owner);
@@ -2213,13 +2327,14 @@ impl TrackMenuState {
         // The appear fade/rise — the container drives the phase and the appear spring. The dim
         // over the video plane is the container's too (`PlayerOverlayScreen::scrim`,
         // `theme::underlay::DIM_PLAYER`), painted at the end of the player's page pass.
-        let p = Painter::root()
-            .alpha(appear)
-            .translate(0.0, Popover::RISE * (1.0 - appear));
+        // The panel rises from the side its opener is on (placed first: that is where the side is read).
+        let natural = self.panel_rect(measure);
+        let (dx, dy) = Popover::rise_offset(self.side.get(), Popover::RISE, appear);
+        let p = Painter::root().alpha(appear).translate(dx, dy);
         // frosted panel card — near-opaque dark (no true backdrop blur on the GLES plane, so a solid
         // dark card approximates it); only a hint of video shows through. ONE background at the
         // animated rect, the page(s) under its clip (`PanelMotion::draw`).
-        self.motion.draw(p, self.panel_rect(measure), 28.0, &self.form.table, measure);
+        self.motion.draw(p, natural, 28.0, &self.form.table, measure);
     }
 }
 
@@ -2343,9 +2458,10 @@ fn visible_subs(ps: &plx_media::route::PlaybackSession, meta: metadata::Metadata
 }
 
 /// Resolve the typed tone at the UI boundary; persisted values and technical logs stay stable.
-fn tone_label(tone: SubtitleTone) -> &'static str {
+pub fn subtitle_tone_label(tone: SubtitleTone) -> &'static str {
     match tone {
         SubtitleTone::White => plx_platform::i18n::msg::widgets_tracks_tone_white(),
+        SubtitleTone::Yellow => plx_platform::i18n::msg::widgets_tracks_tone_yellow(),
         SubtitleTone::Silver => plx_platform::i18n::msg::widgets_tracks_tone_silver(),
         SubtitleTone::LightGrey => plx_platform::i18n::msg::widgets_tracks_tone_light_grey(),
         SubtitleTone::Grey => plx_platform::i18n::msg::widgets_tracks_tone_grey(),
@@ -2390,17 +2506,28 @@ use plx_data::metadata::track_label::Kind;
 /// The sub-line under an audio track, saying so when the server would convert it: a track the TV
 /// cannot decode ("AAC 7.1" here) plays through the server's remux with only its audio converted,
 /// and the menu names that on the track it concerns rather than leaving the viewer to learn it
-/// from a log. Whether a track is converted is the planner's capability answer
-/// (`route::audio_converted_by_server`). Always ONE line: the longest label is graded against the
-/// panel by `converted_audio_sub_lines_fit_the_panel_in_every_language`.
-fn audio_sub_line(sub: String, s: &metadata::Stream) -> String {
-    audio_sub_line_for(sub, plx_media::route::audio_converted_by_server(&s.codec, s.channels))
+/// from a log. Whether a track is converted is the planner's capability answer for THIS playback's
+/// attempt (`route::audio_converted_by_server`, which reads `ps`). A surround track the APP decodes
+/// (`route::audio_decoded_in_app`: a codec the recovery put in force as its very last rung, or the
+/// `appdecodelossy` debug trigger; never Force Direct Play, which refuses a surround track the set
+/// cannot decode instead of mixing it down) says it plays in stereo, since the descriptor ("DTS 5.1")
+/// would otherwise promise a layout the downmix does not keep; the server mark outranks it. Always ONE line: the
+/// longest label is graded against the panel by `converted_audio_sub_lines_fit_the_panel_in_every_language`.
+fn audio_sub_line(ps: &plx_media::route::PlaybackSession, sub: String, s: &metadata::Stream) -> String {
+    let converted = plx_media::route::audio_converted_by_server(ps, &s.codec, s.channels, s.sampling_rate);
+    let in_app = plx_platform::devcaps::app_decode_mixes_down(s.channels)
+        && plx_media::route::audio_decoded_in_app(ps, &s.codec, s.channels, s.sampling_rate);
+    audio_sub_line_for(sub, converted, in_app)
 }
 
-/// [`audio_sub_line`] with the conversion fact given — the pure choice, host-testable.
-fn audio_sub_line_for(sub: String, converted: bool) -> String {
-    if converted && !sub.is_empty() {
+/// [`audio_sub_line`] with the facts given — the pure choice, host-testable.
+fn audio_sub_line_for(sub: String, converted: bool, decoded_in_app: bool) -> String {
+    if sub.is_empty() {
+        sub
+    } else if converted {
         plx_platform::i18n::msg::widgets_tracks_converted_by_server(&sub)
+    } else if decoded_in_app {
+        plx_platform::i18n::msg::widgets_tracks_decoded_in_app_stereo(&sub)
     } else {
         sub
     }
@@ -2621,17 +2748,14 @@ fn table_form(
 }
 
 /// The panel at its WIDEST ([`plx_ui::table::MENU_MAX_W`], the shared cap — either tab may hug
-/// up to it) and TALLEST, for the overscan audit ([`plx_ui::consts::SAFE`]) — the full
-/// `top_min`→`bottom` span, since the measured height comes from a `TableView` no host test can
-/// measure.
+/// up to it) and TALLEST, for the overscan audit ([`plx_ui::consts::SAFE`]) — placed by the
+/// same placer as the live panel, beside the anchor of the compiled classic (`player_hud::audit_geometry`), with the height of the whole room (the
+/// measured height comes from a `TableView` no host test can measure).
 #[cfg(any(test, feature = "test-support"))]
 pub fn overscan_rects(out: &mut Vec<(&'static str, Rect)>) {
-    let (bottom, top_min) = (theme::layout::PLAYER_MENU_BOTTOM, 60.0);
     let pw = plx_ui::table::MENU_MAX_W;
-    out.push((
-        "track menu panel (widest)",
-        Rect::new(crate::player_hud::CTRL_RIGHT - pw, top_min, pw, bottom - top_min),
-    ));
+    let placed = place_panel(crate::player_hud::audit_geometry().row, (pw, plx_ui::consts::SCR_H));
+    out.push(("track menu panel (widest)", placed.rect));
 }
 
 #[cfg(test)]
@@ -3219,6 +3343,8 @@ mod tests {
                         channels: 8,
                         can_normalize_loudness: true,
                         immersive: true,
+                        sample_rate: 0,
+                        bit_depth: 0,
                     },
                     memo: Some(plx_plex::plex::session::prefs::AudioMemo {
                         codec: "eac3".into(),
@@ -4346,14 +4472,61 @@ mod enhancement_menu_tests {
     #[test]
     fn a_converted_track_names_the_server_on_its_sub_line_and_a_playable_one_does_not() {
         let _g = plx_base::testlock::serial();
-        assert_eq!(audio_sub_line_for("AAC 7.1".into(), true), "AAC 7.1 \u{b7} converted by your server");
-        assert_eq!(audio_sub_line_for("Dolby Digital 5.1".into(), false), "Dolby Digital 5.1");
-        assert_eq!(audio_sub_line_for(String::new(), true), "", "no descriptor, nothing to extend");
+        assert_eq!(audio_sub_line_for("AAC 7.1".into(), true, false), "AAC 7.1 \u{b7} converted by your server");
+        assert_eq!(audio_sub_line_for("Dolby Digital 5.1".into(), false, false), "Dolby Digital 5.1");
+        assert_eq!(audio_sub_line_for(String::new(), true, false), "", "no descriptor, nothing to extend");
+        assert_eq!(audio_sub_line_for(String::new(), false, true), "", "no descriptor, nothing to extend");
+        assert_eq!(
+            audio_sub_line_for("DTS 5.1".into(), true, true),
+            "DTS 5.1 \u{b7} converted by your server",
+            "the server mark outranks the app's"
+        );
         // the capability answer it is fed: TrueHD is outside the profile's audio list, AC-3 is not
         let truehd = metadata::Stream { codec: "truehd".into(), channels: 8, ..Default::default() };
         let ac3 = metadata::Stream { codec: "ac3".into(), channels: 6, ..Default::default() };
-        assert!(plx_media::route::audio_converted_by_server(&truehd.codec, truehd.channels));
-        assert!(!plx_media::route::audio_converted_by_server(&ac3.codec, ac3.channels));
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        assert!(plx_media::route::audio_converted_by_server(&ps, &truehd.codec, truehd.channels, truehd.sampling_rate));
+        assert!(!plx_media::route::audio_converted_by_server(&ps, &ac3.codec, ac3.channels, ac3.sampling_rate));
+    }
+
+    /// **A surround track the app decodes says it plays in stereo** (Auto's very last rung, which put DTS
+    /// in force on a set whose pipeline refused it): the descriptor alone ("DTS 5.1") would promise a
+    /// layout the downmix does not keep. Force Direct Play never takes a surround track down, so it says
+    /// nothing of the kind there. A stereo track, a track the set decodes itself and a codec nothing
+    /// enabled say nothing extra, and the server mark outranks it.
+    #[test]
+    fn an_app_decoded_surround_track_says_it_plays_in_stereo() {
+        let _g = plx_base::testlock::serial();
+        assert_eq!(audio_sub_line_for("DTS 7.1".into(), false, true), "DTS 7.1 \u{b7} played in stereo");
+        assert_eq!(audio_sub_line_for("DTS 7.1".into(), false, false), "DTS 7.1");
+        let dts = |channels| metadata::Stream { codec: "dca".into(), channels, sampling_rate: 48_000, ..Default::default() };
+        let measured = std::sync::Arc::new(plx_platform::devcaps::Caps {
+            app_lossy: plx_platform::devcaps::AppLossy::Measured,
+            ..plx_platform::devcaps::Caps::assumed()
+        });
+        let mut ps = plx_media::route::PlaybackSession::IDLE;
+        plx_media::route::begin_attempt_for_test(&mut ps, measured.clone());
+        assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1 \u{b7} converted by your server", "Auto: the server converts it");
+        // The recovery's last rung put DTS in force: the attempt now plays the 5.1 track as stereo.
+        let rung = std::sync::Arc::new((*measured).clone().with_app_lossy_for("dts"));
+        plx_media::route::begin_attempt_for_test(&mut ps, rung.clone());
+        assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1 \u{b7} played in stereo");
+        assert_eq!(audio_sub_line(&ps, "DTS 2.0".into(), &dts(2)), "DTS 2.0", "a stereo track is not a downmix");
+        // Force Direct Play refuses a surround track the set cannot decode instead of mixing it down, even
+        // with the codec in force: no mark, because nothing plays it.
+        plx_media::route::set_direct_play_mode_for_test(&mut ps, plx_media::route::DirectPlayMode::Forced);
+        assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1", "Forced: no downmix, so no mark");
+        plx_media::route::begin_attempt_for_test(&mut ps, measured.clone());
+        assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1", "Forced on a measured set: the refusal, no mark");
+        let truehd = metadata::Stream { codec: "truehd".into(), channels: 8, sampling_rate: 48_000, ..Default::default() };
+        assert_eq!(audio_sub_line(&ps, "Dolby TrueHD 7.1".into(), &truehd), "Dolby TrueHD 7.1", "unmeasured: not decoded here");
+        let native = std::sync::Arc::new(plx_platform::devcaps::Caps {
+            audio: "aac,ac3,eac3,dts".into(),
+            audio_channels: [("dts".into(), 6)].into(),
+            ..(*measured).clone()
+        });
+        plx_media::route::begin_attempt_for_test(&mut ps, native);
+        assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1", "the set decodes it itself");
     }
 
     /// **The longest converted sub-line fits the Audio panel in every shipped language** — graded
@@ -4366,13 +4539,26 @@ mod enhancement_menu_tests {
         for language in SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
-            let (ps, _sid) = enhancement_test_session(EnhTestFixture::default());
+            let (mut ps, _sid) = enhancement_test_session(EnhTestFixture::default());
             let mk = |id: i64, codec: &str| metadata::Stream {
                 id, index: id, lang: "English".into(), lang_code: "eng".into(),
                 codec: codec.into(), channels: 8, layout: "7.1".into(), default: id == 1, ..Default::default()
             };
             let store = super::tests::store_with_audio(vec![mk(1, "truehd"), mk(2, "eac3"), mk(3, "dts")]);
             let menu = TrackMenuState::new(&ps, store.view(), 0, Vec::new());
+            out.extend(menu.form.table.app_fit_failures(plx_ui::table::MENU_MAX_W, language.tag()));
+            // The same track menu once the recovery's last rung put DTS in force on a measured set: the DTS
+            // 7.1 track is decoded in the app, and its "played in stereo" line is graded the same way.
+            plx_media::route::begin_attempt_for_test(&mut ps, std::sync::Arc::new(
+                plx_platform::devcaps::Caps {
+                    app_lossy: plx_platform::devcaps::AppLossy::Measured,
+                    ..plx_platform::devcaps::Caps::assumed()
+                }
+                .with_app_lossy_for("dts"),
+            ));
+            let menu = TrackMenuState::new(&ps, store.view(), 0, Vec::new());
+            let line = audio_sub_line(&ps, "DTS 7.1".into(), &mk(3, "dts"));
+            assert_ne!(line, "DTS 7.1", "{}: the app-decoded track says so", language.tag());
             out.extend(menu.form.table.app_fit_failures(plx_ui::table::MENU_MAX_W, language.tag()));
             teardown(&ps);
         }
@@ -4414,8 +4600,8 @@ mod enhancement_menu_tests {
         let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing row present");
         let style_i = menu.form.index_of(&TrackRow::Style).expect("Style row present");
         let rows = flat_rows(&menu);
-        assert!(rows[timing_i].dim, "Timing is dim under a live burn");
-        assert!(rows[style_i].dim, "Style is dim under a live burn");
+        assert!(rows[timing_i].disabled, "Timing is disabled under a live burn");
+        assert!(rows[style_i].disabled, "Style is disabled under a live burn");
 
         let note_i = style_i + 1;
         assert_eq!(menu.form.id_at(note_i), None, "a note is an inert slot with no id");
@@ -4424,9 +4610,9 @@ mod enhancement_menu_tests {
 
         // The track rows themselves stay live: Off, and the embedded subtitle, neither dim.
         let off_i = menu.form.index_of(&TrackRow::SubOff).expect("Off row present");
-        assert!(!rows[off_i].dim);
+        assert!(!rows[off_i].disabled);
         let sub_i = menu.form.index_of(&TrackRow::Sub(0)).expect("Sub(0) row present");
-        assert!(!rows[sub_i].dim);
+        assert!(!rows[sub_i].disabled);
 
         teardown(&ps);
     }
@@ -4447,7 +4633,7 @@ mod enhancement_menu_tests {
         });
         assert!(!menu.server_burn_built());
         let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing row present");
-        assert!(!flat_rows(&menu)[timing_i].dim);
+        assert!(!flat_rows(&menu)[timing_i].disabled);
         assert!(!menu.form.table.sections.iter().flat_map(|s| s.rows.iter()).any(|r| r.is_note()));
         teardown(&ps);
     }
@@ -4477,7 +4663,7 @@ mod enhancement_menu_tests {
             let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing stays in the menu");
             let style_i = menu.form.index_of(&TrackRow::Style).expect("Style stays in the menu");
             let rows = flat_rows(&menu);
-            assert!(rows[timing_i].dim && rows[style_i].dim, "both dim");
+            assert!(rows[timing_i].disabled && rows[style_i].disabled, "both disabled");
             assert_eq!(menu.form.id_at(style_i + 1), None, "the reason is an inert slot");
             assert_eq!(rows[style_i + 1].label, reason);
             let store = super::tests::store_with(vec![super::tests::stream(999, 0, "English", "eng", "")]);
@@ -4508,7 +4694,7 @@ mod enhancement_menu_tests {
         let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing row present");
         let style_i = menu.form.index_of(&TrackRow::Style).expect("Style row present");
         let rows = flat_rows(&menu);
-        assert!(!rows[timing_i].dim && !rows[style_i].dim, "both live");
+        assert!(!rows[timing_i].disabled && !rows[style_i].disabled, "both live");
         assert!(!menu.form.table.sections.iter().flat_map(|s| s.rows.iter()).any(|r| r.is_note()), "no reason line");
         teardown(&ps);
     }
@@ -4532,7 +4718,7 @@ mod enhancement_menu_tests {
         let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing row present");
         let style_i = menu.form.index_of(&TrackRow::Style).expect("Style row present");
         let rows = flat_rows(&menu);
-        assert!(!rows[timing_i].dim && !rows[style_i].dim, "both live");
+        assert!(!rows[timing_i].disabled && !rows[style_i].disabled, "both live");
         assert!(!rows.iter().any(|r| r.is_note()), "no reason line");
         teardown(&ps);
     }
@@ -4549,7 +4735,7 @@ mod enhancement_menu_tests {
         let timing_i = menu.form.index_of(&TrackRow::Timing).expect("Timing");
         let style_i = menu.form.index_of(&TrackRow::Style).expect("Style");
         let rows = flat_rows(&menu);
-        assert!(!rows[timing_i].dim && !rows[style_i].dim);
+        assert!(!rows[timing_i].disabled && !rows[style_i].disabled);
         assert!(!rows.iter().any(|r| r.is_note()));
         teardown(&ps);
     }
@@ -4645,7 +4831,7 @@ mod enhancement_menu_tests {
         assert_eq!(menu.active_sub, 0, "the embedded track must read checked once the route shows it");
         assert!(menu.server_burn_built(), "Color/Timing must lock once the live route is really a Burn");
         let style_i = menu.form.index_of(&TrackRow::Style).expect("Style row present");
-        assert!(flat_rows(&menu)[style_i].dim, "Style must actually redraw dim, not just flag it internally");
+        assert!(flat_rows(&menu)[style_i].disabled, "Style must actually redraw disabled, not just flag it internally");
         let off_i = menu.form.index_of(&TrackRow::SubOff).expect("Off row present");
         assert!(!flat_rows(&menu)[off_i].checked, "Off must no longer read checked");
         let sub_i = menu.form.index_of(&TrackRow::Sub(0)).expect("Sub(0) row present");
@@ -5370,6 +5556,7 @@ mod focus_tests {
             focus: FocusRead::default(),
             press: PressRead::default(),
             owner: InputOwner::Entry(entry),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         })
     }
 
@@ -5395,6 +5582,7 @@ mod focus_tests {
             position: SubtitlePosition::Low,
             pages: PageStack::new(),
             renderer: SubRenderer::Text,
+            takes_colour: true,
             sub_sig: None,
             other: Vec::new(),
             root_tracks: Vec::new(),
@@ -5409,6 +5597,8 @@ mod focus_tests {
             search: None,
             search_watching: false,
             item_sidecars: Vec::new(),
+            anchor: crate::player_hud::classic::ctrl_row_hit_rect(),
+            side: std::cell::Cell::new(plx_ui::popover::Side::Above),
         }
     }
 
@@ -5566,6 +5756,7 @@ mod localized_offset_tests {
             (Preference::Fr, "fr-FR", "-0,1 s", "+1,3 s"),
             (Preference::De, "de-DE", "-0,1 s", "+1,3 s"),
             (Preference::Hu, "hu-HU", "-0,1 mp", "+1,3 mp"),
+            (Preference::Ru, "ru-RU", "-0,1 с", "+1,3 с"),
         ] {
             let locale = LocaleContext::resolve(preference, None, Some(region), None, None);
             assert_eq!(crate::timing_capsule::offset_seconds_in(-100, true, &locale), negative);
@@ -5730,11 +5921,22 @@ mod style_page_tests {
         codec: &str,
         effect: SubtitleEffect,
     ) -> (TrackMenuState, plx_media::route::PlaybackSession, plx_data::stores::metadata::MetadataStore) {
-        let (ps, _sid) = enhancement_test_session(EnhTestFixture {
+        open_with_ink(codec, effect, None)
+    }
+
+    /// [`open_with`] on a session whose readout already carries the media side's colour fact `ink`
+    /// (`player::deliver_subtitle_ink`'s value: `None` = the ASS header is not known yet).
+    fn open_with_ink(
+        codec: &str,
+        effect: SubtitleEffect,
+        ink: Option<bool>,
+    ) -> (TrackMenuState, plx_media::route::PlaybackSession, plx_data::stores::metadata::MetadataStore) {
+        let (mut ps, _sid) = enhancement_test_session(EnhTestFixture {
             remux: None,
             subtitle_effect: effect,
             ..Default::default()
         });
+        ps.step_readout(plx_media::player::readout::ReadoutEvent::SubtitleInk(ink));
         let mut s = stream(999, 0, "English", "eng", "");
         s.codec = codec.into();
         let store = store_with(vec![s]);
@@ -5889,9 +6091,9 @@ mod style_page_tests {
             assert_eq!(menu.on_ok(store.view()), TrackOk::Navigated, "{codec}: Style itself is live");
             let locked = renderer != SubRenderer::Text;
             for field in [StyleField::Size, StyleField::Position] {
-                assert_eq!(row_of(&menu, TrackRow::OpenField(field)).dim, locked, "{codec} {field:?}");
+                assert_eq!(row_of(&menu, TrackRow::OpenField(field)).disabled, locked, "{codec} {field:?}");
             }
-            assert!(!row_of(&menu, TrackRow::OpenField(StyleField::Color)).dim, "{codec}: Color stays live");
+            assert!(!row_of(&menu, TrackRow::OpenField(StyleField::Color)).disabled, "{codec}: Color stays live");
             let notes: Vec<_> = menu
                 .form
                 .table
@@ -5929,7 +6131,83 @@ mod style_page_tests {
         // direct play: both, live
         let (menu, ps, _store) = open_text();
         assert!(has(&menu, TrackRow::Timing) && has(&menu, TrackRow::Style));
-        assert!(!row_of(&menu, TrackRow::Style).dim);
+        assert!(!row_of(&menu, TrackRow::Style).disabled);
+        teardown(&ps);
+    }
+
+    /// **A Color rung the active subtitle cannot take is dimmed with its reason, never unchecked.**
+    /// The one media fact (`player::subtitle_takes_colour`, which reads the session: the readout holds the
+    /// header's half) decides: plain text and an ASS/SSA track with a
+    /// pure-white-primary style take Yellow; an ASS track with none and a picture subtitle do not. Then
+    /// the Yellow rung is a disabled row (focusable, inert), the grays stay live (they tint any
+    /// renderer), the Style page's note and the picker's own note say why, and a stored Yellow pick stays
+    /// the checked rung and the saved preference. No subtitle registry is touched: the fact is a value
+    /// of the session.
+    #[test]
+    fn a_color_the_active_subtitle_cannot_take_is_dimmed_with_its_reason_and_the_stored_pick_stays() {
+        use plx_platform::i18n::msg;
+        let _g = plx_base::testlock::serial();
+        let cases: [(&str, Option<bool>, bool, Option<&str>); 4] = [
+            ("srt", None, true, None),
+            ("ass", Some(true), true, Some(msg::widgets_tracks_style_styled_note())),
+            ("ass", Some(false), false, Some(msg::widgets_tracks_style_fixed_note())),
+            ("pgs", None, false, Some(msg::widgets_tracks_style_image_note())),
+        ];
+        for (codec, white_style, takes, note) in cases {
+            plx_media::player::restore_subtitle_tone(SubtitleTone::Yellow);
+            let (mut menu, ps, store) = open_with_ink(codec, SubtitleEffect::Sidecar, white_style);
+            let at = format!("{codec} white_style={white_style:?}");
+            assert_eq!(menu.takes_colour, takes, "{at}: the menu reads the media fact");
+            let notes = |menu: &TrackMenuState| -> Vec<String> {
+                menu.form.table.sections.iter().flat_map(|s| &s.rows).filter(|r| r.is_note()).map(|r| r.label.to_string()).collect()
+            };
+            focus_id(&mut menu, TrackRow::Style);
+            menu.on_ok(store.view());
+            assert_eq!(notes(&menu), note.map(str::to_string).into_iter().collect::<Vec<_>>(), "{at}: the Style page's note");
+            focus_id(&mut menu, TrackRow::OpenField(StyleField::Color));
+            menu.on_ok(store.view());
+            assert_eq!(menu.page_path(), [TrackPage::Style, TrackPage::Picker(StyleField::Color)], "{at}");
+            assert_eq!(notes(&menu), if takes { vec![] } else { note.map(str::to_string).into_iter().collect() }, "{at}: the picker says why");
+            for rung in 0..SubtitleTone::LADDER.len() {
+                let tone = SubtitleTone::from_index(rung as u8);
+                let row = row_of(&menu, TrackRow::Choice(StyleField::Color, rung));
+                let reaches = takes || tone.text_rgb8().is_none();
+                assert_eq!(row.disabled, !reaches, "{at}: {tone:?}");
+                assert_eq!(row.checked, tone == SubtitleTone::Yellow, "{at}: {tone:?} stays the checked rung when it is the pick");
+            }
+            if !takes {
+                focus_id(&mut menu, TrackRow::Choice(StyleField::Color, SubtitleTone::Yellow.index() as usize));
+                assert_eq!(menu.on_ok(store.view()), TrackOk::Inert, "{at}: the dimmed rung opens nothing");
+                assert_eq!(plx_media::player::subtitle_tone(), SubtitleTone::Yellow, "{at}: the saved pick is untouched");
+            }
+            focus_id(&mut menu, TrackRow::Choice(StyleField::Color, SubtitleTone::Silver.index() as usize));
+            assert_ne!(menu.on_ok(store.view()), TrackOk::Inert, "{at}: a gray tints every renderer and stays pickable");
+            plx_media::player::restore_subtitle_tone(SubtitleTone::White);
+            teardown(&ps);
+        }
+    }
+
+    /// **The dimmed rungs follow the fact live**: an ASS track's header is known only once the demuxer (or
+    /// the sidecar fetch) has delivered it, so the Color picker opened before that refreshes IN PLACE
+    /// (same page, same focused rung) when the fact arrives in the session's readout, rather than staying
+    /// optimistic.
+    #[test]
+    fn the_color_picker_dims_its_rungs_when_the_headers_fact_arrives_after_it_opened() {
+        let _g = plx_base::testlock::serial();
+        let (mut menu, mut ps, store) = open_with("ass", SubtitleEffect::Sidecar);
+        focus_id(&mut menu, TrackRow::Style);
+        menu.on_ok(store.view());
+        focus_id(&mut menu, TrackRow::OpenField(StyleField::Color));
+        menu.on_ok(store.view());
+        let yellow = TrackRow::Choice(StyleField::Color, SubtitleTone::Yellow.index() as usize);
+        assert!(!row_of(&menu, yellow).disabled, "no header yet: nothing is dimmed");
+        focus_id(&mut menu, yellow);
+        ps.step_readout(plx_media::player::readout::ReadoutEvent::SubtitleInk(Some(false)));
+        menu.update(0.016, &plx_ui::fixture::FixtureMeasure, &ps, store.view());
+        assert_eq!(menu.page_path(), [TrackPage::Style, TrackPage::Picker(StyleField::Color)], "refreshed in place");
+        assert!(!menu.takes_colour);
+        assert!(row_of(&menu, yellow).disabled, "the header has no white style: Yellow is dimmed");
+        assert_eq!(menu.selected_id(), Some(yellow), "on the row the viewer was on");
         teardown(&ps);
     }
 
@@ -6045,19 +6323,29 @@ mod style_page_tests {
         for language in plx_platform::i18n::SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
-            for codec in ["pgs", "ass"] {
-                let (mut menu, ps, _store) = open_with(codec, SubtitleEffect::Sidecar);
-                menu.push(TrackPage::Style);
-                let w = menu.form.table.menu_panel_width(&measure);
-                assert!(w >= theme::layout::PLAYER_MENU_MIN_W, "{language:?}: the page is not a sliver ({w})");
-                menu.form.table.fit_notes(w, &measure);
-                let lines = menu.form.table.sections.iter().flat_map(|s| &s.rows)
-                    .filter(|r| r.is_note()).map(|r| r.note_lines.get()).max().expect("a note row");
-                // Spanish's longer wording needs ~520px for two lines; at the 440 floor it takes three
-                // (measured), English and Belarusian take two
-                let allowed = if language == Preference::Es { 3 } else { 2 };
-                assert!(lines <= allowed, "{language:?} {codec}: the note takes {lines} lines at {w}px");
-                teardown(&ps);
+            // the picture note, the styled note (white follows the pick) and the styled-with-no-white note,
+            // each on the Style page and (the dimmed Yellow rung's reason) on the Color picker
+            for (codec, white_style) in [("pgs", None), ("ass", None), ("ass", Some(false))] {
+                for picker in [false, true] {
+                    let (mut menu, ps, _store) = open_with_ink(codec, SubtitleEffect::Sidecar, white_style);
+                    menu.push(TrackPage::Style);
+                    if picker {
+                        menu.push(TrackPage::Picker(StyleField::Color));
+                    }
+                    let w = menu.form.table.menu_panel_width(&measure);
+                    assert!(w >= theme::layout::PLAYER_MENU_MIN_W, "{language:?}: the page is not a sliver ({w})");
+                    menu.form.table.fit_notes(w, &measure);
+                    let lines = menu.form.table.sections.iter().flat_map(|s| &s.rows)
+                        .filter(|r| r.is_note()).map(|r| r.note_lines.get()).max();
+                    // the picker carries a note only when its rungs are dimmed
+                    assert_eq!(lines.is_some(), !picker || !menu.takes_colour, "{language:?} {codec} picker={picker}");
+                    let lines = lines.unwrap_or(0);
+                    // Spanish's longer wording needs ~520px for two lines; at the 440 floor it takes three
+                    // (measured), English and Belarusian take two
+                    let allowed = if language == Preference::Es { 3 } else { 2 };
+                    assert!(lines <= allowed, "{language:?} {codec} {white_style:?} picker={picker}: the note takes {lines} lines at {w}px");
+                    teardown(&ps);
+                }
             }
         }
     }
@@ -6656,9 +6944,9 @@ mod motion_tests {
     /// One loop frame, as the dispatcher runs it: forget last frame's motion, then update. Returns
     /// whether a spring moved (what keeps the present gate awake).
     fn frame(menu: &mut TrackMenuState, ps: &plx_media::route::PlaybackSession, store: &plx_data::stores::metadata::MetadataStore) -> bool {
-        plx_machine::idle::frame_begin(DT);
+        plx_machine::motion::report::frame_begin(DT);
         menu.update(DT, &ShippedMeasure, ps, store.view());
-        plx_machine::idle::present_moving()
+        plx_machine::motion::report::present_moving()
     }
 
     fn run(menu: &mut TrackMenuState, ps: &plx_media::route::PlaybackSession, store: &plx_data::stores::metadata::MetadataStore, n: usize) {
@@ -7198,5 +7486,180 @@ mod motion_tests {
         assert!(store.run(append(sidecar(11, "", "nld"))), "an empty title names nothing, so matches nothing");
         let ids: Vec<i64> = store.view().playing().unwrap().subs.iter().map(|s| s.id).collect();
         assert_eq!(ids, [5, 6, 9, 10, 11]);
+    }
+}
+
+/// **Classic's settled Tracks panel does not move** when its placement comes from an anchor: the
+/// right edge is the control row's (`CTRL_RIGHT`), the bottom edge 764, the width the hug, and the
+/// height the measured one up to the room above the row.
+#[cfg(test)]
+mod classic_placement_tests {
+    use super::tests::stream;
+    use super::*;
+    use plx_base::fontcov::advances::ShippedMeasure;
+
+    fn item(audio: usize) -> plx_data::stores::metadata::MetadataStore {
+        let mut store = plx_data::stores::metadata::MetadataStore::default();
+        let mut item = metadata::PlayingItem::with_subs(vec![stream(10, 0, "English", "eng", ""), stream(11, 1, "French", "fra", "SDH")]);
+        item.audio = (0..audio).map(|i| stream(100 + i as i64, i as i64, &format!("Dub {i}"), "eng", "")).collect();
+        assert!(store.run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(item))));
+        store
+    }
+
+    /// (name, right edge, bottom edge, width, height) of each settled page.
+    fn settled(audio: usize) -> Vec<(String, [f32; 4])> {
+        let _g = plx_base::testlock::serial();
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let store = item(audio);
+        let mut out = Vec::new();
+        for (tab, name) in [(0, "audio root"), (1, "subtitles root")] {
+            let mut menu = TrackMenuState::new(&ps, store.view(), tab, vec!["eng".into()]);
+            let r = menu.panel_rect(&ShippedMeasure);
+            out.push((format!("{name} ({audio} dubs)"), [r.x + r.w, r.y + r.h, r.w, r.h]));
+            if let Some(i) = menu.form.index_of(&TrackRow::Style) {
+                menu.focus_row(i as c_int);
+                assert_eq!(menu.on_ok(store.view()), TrackOk::Navigated);
+                let r = menu.panel_rect(&ShippedMeasure);
+                out.push((format!("style page ({audio} dubs)"), [r.x + r.w, r.y + r.h, r.w, r.h]));
+            }
+        }
+        plx_plex::plex::reset_servers_for_test();
+        out
+    }
+
+    /// Captured from the constants-placed panels (`CTRL_RIGHT - pw`, bottom 764) before the
+    /// placement came from an anchor: (right, bottom, width, height).
+    #[test]
+    fn classic_tracks_panels_settle_where_they_always_did() {
+        let got = settled(3);
+        assert_eq!(
+            got.iter().map(|(n, r)| (n.as_str(), *r)).collect::<Vec<_>>(),
+            [
+                ("audio root (3 dubs)", [1824.0, 764.0, 468.0, 356.0]),
+                ("subtitles root (3 dubs)", [1824.0, 764.0, 447.0, 488.0]),
+                ("style page (3 dubs)", [1824.0, 764.0, 440.0, 296.0]),
+            ],
+        );
+    }
+
+    /// A list taller than the room scrolls inside a panel that stops at the cap. The cap was 704
+    /// (`bottom - 60`) and is now the room above the row, 710: the one settled frame that differs,
+    /// and only for a list taller than the old cap.
+    #[test]
+    fn a_long_dub_list_stops_at_the_room_above_the_row() {
+        let got = settled(40);
+        let (name, [right, bottom, w, h]) = &got[0];
+        assert!(name.starts_with("audio root"));
+        assert_eq!((*right, *bottom, *w, *h), (1824.0, 764.0, 468.0, 710.0));
+        assert_eq!(*bottom - *h, plx_ui::consts::SAFE.y, "the room is what is left under SAFE's top");
+    }
+
+    /// Every opener of classic gets the same anchor from the player screen, and it is the control
+    /// row's, ending at the segment's edge: that is why the Audio, Subtitles and `…` discs all open
+    /// a panel at `CTRL_RIGHT - pw`, bottom 764.
+    #[test]
+    fn the_classic_anchor_is_the_row_ending_at_the_segment_edge_above_the_gap() {
+        let a = crate::player_hud::classic::ctrl_row_hit_rect();
+        assert_eq!(a.x + a.w, crate::player_hud::classic::CTRL_RIGHT, "the segment's outer edge");
+        assert_eq!(a.y - theme::layout::PLAYER_MENU_GAP, 764.0, "PLAYER_MENU_GAP above the row is classic's bottom edge");
+        assert_eq!((a.y, a.h), (crate::player_hud::classic::CTRL_Y, crate::player_hud::classic::CTRL_H), "the discs' own band");
+    }
+
+    fn menu_at(anchor: Rect, tab: c_int) -> (TrackMenuState, plx_data::stores::metadata::MetadataStore) {
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let store = item(3);
+        (TrackMenuState::new(&ps, store.view(), tab, vec!["eng".into()]).with_anchor(anchor), store)
+    }
+
+    /// The panel opens beside the anchor it was handed, whichever side that is.
+    #[test]
+    fn the_panel_opens_beside_the_anchor_it_was_handed() {
+        let _g = plx_base::testlock::serial();
+        use plx_ui::popover::Side;
+        let gap = theme::layout::PLAYER_MENU_GAP;
+        // an opener high on the screen: the panel hangs BELOW it, from its right edge
+        let high = Rect::new(1500.0, 120.0, 324.0, 64.0);
+        let (menu, _store) = menu_at(high, 1);
+        let r = menu.panel_rect(&ShippedMeasure);
+        assert_eq!(menu.side.get(), Side::Below);
+        assert_eq!((r.y, r.x + r.w), (high.y + high.h + gap, high.x + high.w));
+        // an opener in the middle of the right edge with no room above or below for NEED_H: to its left
+        let mid = Rect::new(1700.0, 560.0, 64.0, 64.0);
+        let (menu, _store) = menu_at(mid, 1);
+        let r = menu.panel_rect(&ShippedMeasure);
+        assert_eq!(menu.side.get(), Side::Start);
+        assert_eq!(r.x + r.w, mid.x - gap);
+        assert!(plx_ui::consts::SAFE.contains(r.x, r.y) && r.y + r.h <= plx_ui::consts::SAFE.y + plx_ui::consts::SAFE.h);
+        plx_plex::plex::reset_servers_for_test();
+    }
+
+    /// **The anchor is latched**: the panel's side and its edge by the opener stay put as the page
+    /// changes under it (a push, the other tab: both change the width and height), because nothing
+    /// re-reads where the opener is.
+    #[test]
+    fn the_panel_does_not_move_off_its_anchor_while_it_is_open() {
+        let _g = plx_base::testlock::serial();
+        let (mut menu, store) = menu_at(Rect::new(1500.0, 300.0, 324.0, 64.0), 1);
+        let first = menu.panel_rect(&ShippedMeasure);
+        let side = menu.side.get();
+        assert_eq!(side, plx_ui::popover::Side::Below, "the opener is high: the panel hangs under it");
+        let i = menu.form.index_of(&TrackRow::Style).expect("Style row");
+        menu.focus_row(i as c_int);
+        assert_eq!(menu.on_ok(store.view()), TrackOk::Navigated);
+        let pushed = menu.panel_rect(&ShippedMeasure);
+        assert_ne!((pushed.w, pushed.h), (first.w, first.h), "the page changed the panel's size");
+        assert_eq!(menu.side.get(), side);
+        assert_eq!(pushed.x + pushed.w, first.x + first.w, "the edge by the opener");
+        assert_eq!(pushed.y, first.y, "and the panel's start (below the opener: its top)");
+        plx_plex::plex::reset_servers_for_test();
+    }
+
+    /// `NEED_H` is what the side is decided on, so it has to cover the tallest page the menu shows
+    /// with app-owned rows, and has to fit classic's room above the row (710) or classic would flip.
+    #[test]
+    fn need_h_covers_the_app_owned_pages_and_fits_classics_room() {
+        let _g = plx_base::testlock::serial();
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let store = item(0);
+        let mut tallest = 0.0f32;
+        for tab in [0, 1] {
+            let mut menu = TrackMenuState::new_with(&ps, store.view(), tab, vec!["eng".into()], true);
+            tallest = tallest.max(menu.form.table.measured_height());
+            if let Some(i) = menu.form.index_of(&TrackRow::Style) {
+                menu.focus_row(i as c_int);
+                assert_eq!(menu.on_ok(store.view()), TrackOk::Navigated);
+                tallest = tallest.max(menu.form.table.measured_height());
+            }
+        }
+        assert!(tallest > 200.0, "something was measured: {tallest}");
+        assert!(tallest <= NEED_H, "a page of {tallest} px is taller than NEED_H {NEED_H}");
+        assert!(NEED_H <= 764.0 - plx_ui::consts::SAFE.y, "classic's room above the row holds NEED_H");
+        plx_plex::plex::reset_servers_for_test();
+    }
+
+    /// The overscan audit's rect is the placer's, and sits inside SAFE.
+    #[test]
+    fn captured_preference_tracks_keep_the_opening_size_and_position() {
+        use plx_plex::plex::session::{SubtitleSize, SubtitlePosition};
+        let _serial = plx_base::testlock::serial();
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let meta = plx_data::stores::metadata::MetadataStore::default();
+        let mut a = TrackMenuState::new_with_preferences(&ps, meta.view(), 0, Vec::new(), false,
+            SubtitleSize::Large, SubtitlePosition::Low);
+        let b = TrackMenuState::new_with_preferences(&ps, meta.view(), 0, Vec::new(), false,
+            SubtitleSize::Small, SubtitlePosition::Low);
+        a.update(0.016, &plx_ui::fixture::FixtureMeasure, &ps, meta.view());
+        assert_eq!(a.size, SubtitleSize::Large);
+        assert_eq!(b.size, SubtitleSize::Small);
+        assert_eq!(a.position, SubtitlePosition::Low);
+    }
+
+    #[test]
+    fn the_overscan_rect_comes_from_the_placer() {
+        let mut out = Vec::new();
+        overscan_rects(&mut out);
+        let r = out[0].1;
+        assert_eq!((r.x + r.w, r.y + r.h, r.w), (1824.0, 764.0, plx_ui::table::MENU_MAX_W));
+        assert_eq!(r.y, plx_ui::consts::SAFE.y, "the whole room");
     }
 }

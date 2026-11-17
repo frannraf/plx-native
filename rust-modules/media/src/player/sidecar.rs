@@ -27,8 +27,22 @@
 //! burned and a sidecar is drawn from here. The fact is PASSED IN rather than read: the playback session is
 //! the frame's publication, and the draw that calls this already holds it.
 //!
-//! The renderer is asked on the SUBTITLE clock (`player::subtitle_clock_ns`, the playhead less the
-//! viewer's timing offset). Because the whole file is here, a sidecar is the one kind of track
+//! Over a REMUX the playhead is not file time: PMS starts the remux on a Part keyframe EARLIER
+//! than or at the requested offset — not always the last one (a 917 s request started on 914.914 s
+//! while 916.916 s existed; see `ff_subside`'s `sidecar_clock_at_917…` test) — and the engine
+//! labels that frame with the requested offset (`disp_base`), so the playhead leads the content by
+//! the snap (0.6 s to 2.2 s measured). The side reader finds that keyframe clock-only
+//! (`SIDE_READER_CLOCK_ONLY`: no cue read, byte-exact anchor match only) and
+//! `player::sidecar_clock_ns` adds its delta to the position the sidecar is drawn at, for a
+//! sidecar over a live remux only. Without an exact match, or off the reader's local-link and
+//! bitrate gate, nothing is added and the sidecar keeps the remux's clock. Until the measurement
+//! lands (a moment after each remux start), nothing is added either: the sidecar is drawn exactly
+//! as before for that moment, and a cue already shown early can appear a second time once the
+//! position drops.
+//!
+//! The screen asks `player::subtitle_draw` for the source and that position, and subtracts the
+//! viewer's timing offset from the clock it samples there, so the offset composes with the
+//! correction. Because the whole file is here, a sidecar is the one kind of track
 //! that can be ADVANCED as well as delayed — [`selected`] is what `player::subtitle_offset_range_ms`
 //! reads to offer it the sidecar offset range (see `subtitle_offset_range_ms`), where an embedded track
 //! gets a delay only.
@@ -79,6 +93,22 @@ struct Content {
     font_generation: Option<u64>,
     /// Set for a converted SubRip/WebVTT file, whose header follows the viewer's picks.
     text: Option<TextHold>,
+    /// Set for an ASS/SSA file the author styled: the file's own bytes, kept beside the script the
+    /// renderer holds because that one has the viewer's colour taken into its white styles
+    /// (`ass_ink`) and a new pick is applied to the file, not to an earlier result.
+    ink: Option<AuthoredInk>,
+}
+
+/// The file an authored script was loaded from, and the pick its held script was built for.
+struct AuthoredInk {
+    file: Arc<[u8]>,
+    tone: plx_plex::plex::session::SubtitleTone,
+    /// The file has a style the colour pick recolours ([`super::ass_ink::takes_colour`]), read once from
+    /// the FILE's bytes.
+    takes_colour: bool,
+    /// A worker is already rebuilding the script for a newer pick (one at a time, like
+    /// [`TextHold::restyling`]); a pick that lands meanwhile is taken up once it has published.
+    restyling: bool,
 }
 
 /// What a converted file needs to be restyled: the script is the synthesized header followed by
@@ -223,17 +253,48 @@ pub fn selected() -> bool {
     state().want.is_some()
 }
 
+/// Can the viewer's colour pick reach the selected sidecar? `None` while its file has not arrived
+/// (nothing is known, so the caller must not dim anything); a converted text file always takes it, an
+/// authored script when it has a style the pick recolours ([`super::ass_ink::takes_colour`]).
+pub fn takes_colour() -> Option<bool> {
+    let st = state();
+    let want = st.want.as_ref()?;
+    let (selection, content) = st.loaded.as_ref()?;
+    (selection == want).then(|| content.ink.as_ref().map_or(true, |ink| ink.takes_colour))
+}
+
+/// Put the test-only sidecar state in place: `stream_id` selected with `codec`, and `script`
+/// installed as the loaded file when given. The one door into the private state for tests.
+#[cfg(any(test, feature = "test-support"))]
+fn select_for_test(stream_id: i64, codec: &str, script: Option<&[u8]>) {
+    let mut st = state();
+    st.generation = st.generation.wrapping_add(1);
+    st.pending = None;
+    st.failed = None;
+    let selection = Selection {
+        server: plx_plex::plex::ServerId::UNSET, stream_id, key: String::new(), codec: codec.to_owned(),
+    };
+    st.want = Some(selection.clone());
+    st.loaded = script.map(|s| {
+        let content = decode(s.to_vec(), codec).expect("fixture: an authored script");
+        (selection, content)
+    });
+}
+
 /// Mark `stream_id` as the selected sidecar without fetching anything — for tests of what the
 /// selection KIND decides (the timing offset's range), which never draw a cue.
 #[cfg(any(test, feature = "test-support"))]
 pub fn select_without_fetch_for_test(stream_id: i64) {
-    let mut st = state();
-    st.generation = st.generation.wrapping_add(1);
-    st.pending = None;
-    st.want = Some(Selection {
-        server: plx_plex::plex::ServerId::UNSET, stream_id, key: String::new(), codec: String::new(),
-    });
-    st.failed = None;
+    select_for_test(stream_id, "", None);
+}
+
+/// Select `stream_id` as a sidecar and install `script` as its loaded file, without fetching: for
+/// tests of what the DRAW is handed for a sidecar over a remux (`player::subtitle_draw`). The
+/// script must be an authored ASS/SSA one: a converted file would be restyled by a worker at once. (An
+/// authored script is rebuilt on a worker too, when the colour pick moves: [`start_recolour`].)
+#[cfg(any(test, feature = "test-support"))]
+pub fn select_loaded_for_test(stream_id: i64, script: &[u8]) {
+    select_for_test(stream_id, "ass", Some(script));
 }
 
 /// Select `stream_id` as a sidecar whose conversion FAILED `age` ago, without fetching anything: the
@@ -307,7 +368,8 @@ pub fn notice_shown() -> bool {
 /// and Off→On; render requests carry the current clock, so no cue is lost on a backward seek. A
 /// converted SubRip/WebVTT file whose header was synthesized for other picks than the viewer's now
 /// has its restyle started here, lazily, on a worker; the old look stays up until the worker
-/// publishes the restyled script (an unselected file is never restyled).
+/// publishes the restyled script (an unselected file is never restyled). An authored script whose
+/// white styles must take a new colour pick is rebuilt the same way ([`start_recolour`]).
 pub fn ass_source(burned: bool) -> Option<Arc<super::ass::Source>> {
     ass_source_styled(burned, TextStyle::current())
 }
@@ -332,6 +394,12 @@ fn ass_source_styled(burned: bool, style: TextStyle) -> Option<Arc<super::ass::S
         // The new script is built off this thread (it is the whole file again, megabytes for a long
         // one) and published under this lock when ready; until then the old look stays up.
         plx_base::diag::spans::span("restyle", || start_restyle(content, style));
+    }
+    // An authored script takes the pick in its white styles. The whole file is scanned and copied when
+    // the pick moves to or from a colour (a grey or a size changes nothing in it), so that is a worker's
+    // job too, and the old look stays up until it publishes.
+    if content.ink.as_ref().is_some_and(|ink| ink.tone != style.tone) {
+        plx_base::diag::spans::span("restyle", || start_recolour(content, style.tone));
     }
     if content.font_generation != Some(generation) {
         let super::ass::Content::Script { bytes, .. } = &content.source.content else { return None; };
@@ -391,6 +459,49 @@ fn publish_restyle(content: &mut Content, id: u64, base_generation: u32, style: 
     });
 }
 
+/// Begin building an authored `content`'s script for the pick `tone` on a worker, unless one is already
+/// running. FRAME THREAD, under the sidecar lock: it copies one `Arc` and starts a thread, whatever the
+/// size of the file (up to `SIDECAR_MAX_BYTES`); the scan and the copy of the recolour are the worker's.
+fn start_recolour(content: &mut Content, tone: plx_plex::plex::session::SubtitleTone) {
+    let Some(ink) = content.ink.as_mut().filter(|ink| !ink.restyling) else { return };
+    let (id, file) = (content.source.id, ink.file.clone());
+    ink.restyling = true;
+    let started = plx_base::task::spawn_small("sidecar recolour", move || {
+        let wanted: Arc<[u8]> = super::ass_ink::recolour(&file, tone).map_or_else(|| file.clone(), Arc::from);
+        drop(file);
+        let mut st = state();
+        if let Some((_, content)) = st.loaded.as_mut() {
+            publish_recolour(content, id, tone, wanted);
+        }
+        SETTLED.notify_all();
+        drop(st);
+        plx_machine::present::wake_from_worker();
+    });
+    if !started {
+        super::log("sidecar: recolour worker refused");
+        ink.restyling = false;
+        SETTLED.notify_all();
+    }
+}
+
+/// Publish the script built for `tone` if `content` is still the file it was built from. The fonts are
+/// the ones the content holds now, so a recolour never undoes a font publication. When the pick leaves
+/// the white styles unchanged `wanted` is the file's own `Arc` and, if that is what the renderer holds
+/// already, only the pick is recorded.
+fn publish_recolour(content: &mut Content, id: u64, tone: plx_plex::plex::session::SubtitleTone, wanted: Arc<[u8]>) {
+    let Some(ink) = content.ink.as_mut().filter(|_| content.source.id == id) else { return };
+    ink.restyling = false;
+    ink.tone = tone;
+    let super::ass::Content::Script { bytes, fonts } = &content.source.content else { return };
+    if Arc::ptr_eq(bytes, &wanted) {
+        return;
+    }
+    content.source = Arc::new(super::ass::Source {
+        id, revision: content.source.revision.wrapping_add(1),
+        origin: content.source.origin, content: super::ass::Content::Script { bytes: wanted, fonts: fonts.clone() },
+    });
+}
+
 /// `head` then `tail` as one shared buffer, allocated once at its exact size (the iterator is
 /// exact-sized, so no intermediate `Vec` is built and copied).
 fn joined(head: &[u8], tail: &[u8]) -> Arc<[u8]> {
@@ -420,13 +531,17 @@ fn decode(bytes: Vec<u8>, codec: &str) -> Result<Content, Failure> {
     if authored {
         // Validate only the presence of events. libass owns the script grammar, including
         // style/format declarations, overlapping dialogue and vector drawing events.
+        let file: Arc<[u8]> = bytes.into();
+        let tone = TextStyle::current().tone;
+        let held = super::ass_ink::recolour(&file, tone).map_or_else(|| file.clone(), Arc::from);
         return Ok(Content {
             source: Arc::new(super::ass::Source {
                 id: super::ass::next_source_id(), revision: 1, origin: super::ass::Origin::Authored,
-                content: super::ass::Content::Script { bytes: bytes.into(), fonts: Arc::from([]) },
+                content: super::ass::Content::Script { bytes: held, fonts: Arc::from([]) },
             }),
             font_generation: None,
             text: None,
+            ink: Some(AuthoredInk { takes_colour: super::ass_ink::takes_colour(&file), file, tone, restyling: false }),
         });
     }
     // A server conversion or error must not silently turn an ASS selection into plain text.
@@ -459,6 +574,7 @@ fn decode(bytes: Vec<u8>, codec: &str) -> Result<Content, Failure> {
             content: super::ass::Content::Script { bytes: script, fonts: Arc::from([]) },
         }),
         font_generation: None,
+        ink: None,
         text: Some(TextHold { header_len: header.len(), style_generation: style.generation(), cues: converted.cues, restyling: false }),
     })
 }
@@ -483,11 +599,13 @@ mod tests {
         assert!(!timeout.timed_out() && !st.running, "sidecar worker finished");
     }
 
-    /// Block until no restyle worker is building a script for the loaded file ([`SETTLED`]).
+    /// Block until no restyle or recolour worker is building a script for the loaded file ([`SETTLED`]).
     fn finish_restyle() {
         let (_st, timeout) = SETTLED
             .wait_timeout_while(state(), WORKER_HUNG, |st| {
-                st.loaded.as_ref().and_then(|(_, c)| c.text.as_ref()).is_some_and(|hold| hold.restyling)
+                st.loaded.as_ref().is_some_and(|(_, c)| {
+                    c.text.as_ref().is_some_and(|hold| hold.restyling) || c.ink.as_ref().is_some_and(|ink| ink.restyling)
+                })
             })
             .unwrap_or_else(|e| e.into_inner());
         assert!(!timeout.timed_out(), "sidecar restyle worker finished");
@@ -816,6 +934,51 @@ mod tests {
             "a converted response must not silently discard styling");
     }
 
+    /// **An ASS sidecar takes the viewer's colour in its white styles** (a server-converted SubRip file is
+    /// one): the script the renderer is given is the file's with `ass_ink::recolour` applied, rebuilt in
+    /// place when the pick moves (same id, one revision bump, the file's own bytes kept to apply the next
+    /// pick to), and the file's own bytes again once the pick is not a colour. The rebuild is a worker's
+    /// (the file is up to `SIDECAR_MAX_BYTES`): the call that notices the pick returns the held source
+    /// itself, which is the structural proof that the frame thread built nothing inline.
+    #[test]
+    fn an_authored_script_takes_the_colour_pick_in_its_white_styles_and_keeps_the_files_bytes() {
+        use plx_plex::plex::session::SubtitleTone;
+        let _guard = plx_base::testlock::serial();
+        reset();
+        finish_download();
+        let style = |name: &str, primary: &str| format!(
+            "Style: {name},Arial,48,{primary},&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1\n");
+        let file = format!(
+            "[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n{}{}[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello\n",
+            style("Default", "&H00FFFFFF"), style("Sign", "&H00FF0000")).into_bytes();
+        let body = file.clone();
+        select_with_fetch(plx_plex::plex::ServerId::from_raw(0), 9, "/library/streams/9".into(), "ass".into(),
+            move |_, _, _| Some(body.clone()));
+        finish_download();
+        let white = TextStyle { tone: SubtitleTone::White, ..TextStyle::current() };
+        let yellow = TextStyle { tone: SubtitleTone::Yellow, ..white };
+        let before = ass_source_styled(false, white).unwrap();
+        assert_eq!(before.origin, Origin::Authored);
+        let ass::Content::Script { bytes, .. } = &before.content else { panic!() };
+        assert_eq!(bytes.as_ref(), file.as_slice(), "white is the file's own ink");
+        let during = ass_source_styled(false, yellow).unwrap();
+        assert!(Arc::ptr_eq(&before, &during), "the old look is still up when the pick lands: nothing was built inline");
+        finish_restyle();
+        let after = ass_source_styled(false, yellow).unwrap();
+        assert_eq!((after.id, after.revision, after.origin), (before.id, before.revision.wrapping_add(1), Origin::Authored));
+        let ass::Content::Script { bytes, .. } = &after.content else { panic!() };
+        assert_eq!(bytes.as_ref(), super::super::ass_ink::recolour(&file, SubtitleTone::Yellow).unwrap().as_slice());
+        assert!(Arc::ptr_eq(&after, &ass_source_styled(false, yellow).unwrap()), "once only");
+        let grey = TextStyle { tone: SubtitleTone::Silver, ..white };
+        let during = ass_source_styled(false, grey).unwrap();
+        assert!(Arc::ptr_eq(&after, &during), "moving off the colour is a worker's too");
+        finish_restyle();
+        let back = ass_source_styled(false, grey).unwrap();
+        let ass::Content::Script { bytes, .. } = &back.content else { panic!() };
+        assert_eq!(bytes.as_ref(), file.as_slice(), "the pick moved off yellow: the file's own bytes return");
+        reset();
+    }
+
     /// #708's legacy charsets reach the script as the same UTF-8 text the embedded path gets.
     #[test]
     fn legacy_charsets_convert_to_the_expected_event_body() {
@@ -839,6 +1002,7 @@ mod tests {
         TextStyle {
             size: if current.size == SubtitleSize::Large { SubtitleSize::Small } else { SubtitleSize::Large },
             position: if current.position == SubtitlePosition::High { SubtitlePosition::Low } else { SubtitlePosition::High },
+            ..current
         }
     }
 

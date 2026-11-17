@@ -14,7 +14,7 @@
 #   present  — the present gate's worker door: ONE atomic static in machine/src/present.rs and ONE
 #              `wake_from_worker`.
 #   effect   — `Effect::` spelled nowhere (the enum is `Fx::`, the app's `AppFx::`).
-#   sink     — `tv::sink::installed` and `VideoSink` only under player/, tv/, tv.rs and port.rs
+#   sink     — `tv::sink::installed` and `VideoSink` only under player/, tv/, tv.rs, port.rs and app/adapters/backends.rs
 #              (step L15: the Starfish/ACB verbs are the player's alone).
 #
 # Phase 4 rule (D3 rewrite, phase 12):
@@ -51,6 +51,30 @@
 #
 #   blocking — every production `allow_blocking(` call site is a line of
 #              ci/allow/blocking.txt, held as an exact multiset: a new site or a stale line fails.
+#
+# The Sans-IO ledgers (docs/sans-io.md): logic never performs IO. Each rule freezes today's sites in
+# one file per area under ci/allow/<rule>/ (exact multisets that only shrink: a new site, a stale
+# line, a wrong `# count:`, or a line filed in the wrong area fails; a migration lands by deleting
+# lines). A MACHINE is the scope of the first two: rust-modules/data, session, screens, ui, appkit
+# and machine, plex's session.rs, and the player's lifecycle.rs, recovery.rs (the failed-open ladder
+# machine) and route planners.
+#   workers  — a production worker start in a machine: `task::spawn`, `spawn_small*`,
+#              `spawn_off_frame*`, `storage_worker::submit`, `submit_retained`, the command worker's
+#              `.submit_ticket`. A machine's work leaves as a typed effect the app runs.
+#   globals  — a production read of a process-global registry in a machine: `client_for`,
+#              `current_server`, `current_snapshot`, `keypin::revision`, `keypin::blocked_for`,
+#              `session::peek`, `grant::offers`, the player's pause readers
+#              `transport::viewer_paused` and `preview::paused` (each takes the session and still
+#              reads process-global state; `transport::paused` reads only the session's
+#              `PlayerReadout` and is no longer a spelling), and `player::TX`
+#              or the Feed owners `FEED_TX` / `FEED_SHARED` in the player's lifecycle (at zero: the
+#              machine takes the pause as a value on its event). The value arrives in an event or an
+#              argument instead.
+#   forks    — a production test/production fork (`#[cfg(not(test))]`, `not(any(test, feature =
+#              "test-support"))`, `cfg!(not(test))` and the like) anywhere in data/, plex/, media/ or
+#              session/: logic has no `cfg(test)` branch; tests deliver events through the same seam.
+#   fxlanes  — an `AppFx` arm of `Bridge::app_effect` that does not push `Fx::Deliver(..)`: a result
+#              returns on the one ordered FIFO, not on a side queue with its own timing.
 #
 # Phase 8 rule (§14, §6.2):
 #   nav      — a screen under rust-modules/screens/src/ never calls `plx_ui::nav::` (`crate::ui::nav::` before the ui split; any
@@ -121,11 +145,97 @@ SRC_TELEMETRY=rust-modules/telemetry/src
 SRC_DATA=rust-modules/data/src
 SRC_SESSION=rust-modules/session/src
 SRC_MEDIA=rust-modules/media/src
+SRC_PLAYBACK_CONTRACT=rust-modules/playback-contract/src
+SRC_PLAY_URI=rust-modules/play-uri/src
+SRC_PLAY_FEED=rust-modules/play-feed/src
+SRC_MEDIA_CODECS=rust-modules/media-codecs/src
 SRC_APPKIT=rust-modules/appkit/src
 SRC_SCREENS=rust-modules/screens/src
 fails=0
 fail() { echo "::error::check-deps: $*"; fails=$((fails+1)); }
 ok()   { echo "  ok — $*"; }
+
+# ---- selecting rules ---------------------------------------------------------------------------
+# `ci/check-deps.sh` with no argument runs EVERY rule: that is what `make check`, CI and
+# ci/check-python-steps.txt run, and nothing but an argument changes it (an environment variable left
+# exported in a shell would quietly shrink the gate; an argument cannot be inherited). The gate
+# self-tests of tests/test_harness.py prove each rule still catches a planted violation, and each
+# used to run the whole script for that, ~25 s of CPU a run and ~70 runs. So:
+#   ci/check-deps.sh --only blocking,workers   run just those rules, the code the full run runs for
+#                                              them: their verdict lines, a summary, exit 0 or 1
+#   ci/check-deps.sh --list-rules              the rule names (RULES below), one a line, no rule run
+# A name that is no rule, an empty list, a second --only or any other argument exits 2 before any
+# rule runs, so a misspelt selector is an error and never "ran nothing (or less than asked), green". A rule's NAME is what its verdict
+# line starts with (`ok — <name>` / `check-deps: <name>: ...`); `allowlist-counts` is the one rule that
+# prints nothing when green.
+#
+# A rule is a block `if want <name>; then ... fi # <name>` (or `want <name> && gate ...`) whose body
+# is left at the margin, not indented, so the diff and blame of the rules stay what they were. Inside
+# a block, use only what the block itself computes, a shared definition (a function, a constant, a
+# pattern) outside every block, or one of the three PRELUDES below, which are computed only when a
+# rule that reads them is selected (`any_wanted`; a rule that reads one is named in its list). Under
+# `set -u` an unset prelude read inside `$( ... )` kills just that subshell and the rule reads
+# green, so a rule that reads a prelude it was not named for is loud, not quiet: `is_wholly_test`
+# exits 2 and the others print `unbound variable` on stderr (tests/test_harness.py fails on both).
+# RULES must name the `want` calls in order; every run ends by checking that, whatever it selected.
+RULES=(browse-owner viewstate-owner person-owner search-owner hubs-owner metadata-owner libm ticks wall
+  fpflags present effect mutators mutators-visibility nav ui-owner-legacy ui-owner-files owned-damage
+  owned-wake cards layer sessionwrite screen-runtime-io uistorage legacypage sibling textmeasure dt ladder hittest frame
+  sink route fnlen testmod threads blocking workers globals forks fxlanes tmppath paging allowlist-counts)
+deps_usage() {
+  echo "check-deps: $*" >&2
+  echo "usage: ci/check-deps.sh [--only RULE[,RULE...] | --list-rules]" >&2
+  exit 2
+}
+known_rule() {
+  local r
+  for r in "${RULES[@]}"; do [ "$r" = "$1" ] && return 0; done
+  return 1
+}
+only=""       # ",rule,rule," once --only was given, else empty: every rule
+have_only=0
+only_arg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list-rules) printf '%s\n' "${RULES[@]}"; exit 0 ;;
+    --only|--only=*)
+      # one way to say it: a second --only would overwrite the first and run a smaller set, green
+      [ "$have_only" -eq 0 ] || deps_usage "--only is given once; join the rules with commas (--only a,b)"
+      have_only=1
+      if [ "$1" = "--only" ]; then
+        [ $# -ge 2 ] || deps_usage "--only needs a rule list"
+        only_arg="$2"; shift 2
+      else
+        only_arg="${1#--only=}"; shift
+      fi ;;
+    *) deps_usage "unknown argument '$1'" ;;
+  esac
+done
+if [ "$have_only" -eq 1 ]; then
+  [ -n "$only_arg" ] || deps_usage "--only needs at least one rule"
+  case "$only_arg" in ,*|*,|*,,*) deps_usage "--only '$only_arg' has an empty rule name" ;; esac
+  IFS=, read -r -a only_names <<< "$only_arg"
+  for only_rule in "${only_names[@]}"; do
+    known_rule "$only_rule" || deps_usage "--only names '$only_rule', which is no rule (--list-rules says which are)"
+  done
+  only=",$only_arg,"
+fi
+rules_seen=""
+# want <rule>: is this rule selected? The guard of every rule, always in the main shell.
+want() {
+  known_rule "$1" || { echo "check-deps: internal: want '$1' names no rule of RULES" >&2; exit 2; }
+  rules_seen="$rules_seen $1"
+  case "$only" in "") return 0 ;; *",$1,"*) return 0 ;; esac
+  return 1
+}
+# any_wanted <rule>...: is no selector given, or is one of these rules selected? Gates a prelude.
+any_wanted() {
+  local r
+  for r in "$@"; do known_rule "$r" || { echo "check-deps: internal: any_wanted '$r' names no rule" >&2; exit 2; }; done
+  [ -z "$only" ] && return 0
+  for r in "$@"; do case "$only" in *",$r,"*) return 0 ;; esac; done
+  return 1
+}
 
 # grep_code <pattern> <paths...>: matching lines, minus comment-only lines, as `path:line:text`.
 grep_code() {
@@ -144,7 +254,10 @@ grep_code() {
 # filters that list with its real pattern. The verdict and the output are unchanged, but the
 # prefix alternation must stay a NECESSARY part of every owner pattern, never a loose sample.
 OWNER_PREFIX='(crate|plx_data)::(browse|viewstate|person|search|pms|metadata)::|stores::(browse|viewstate|person|search|hubs|metadata)::'
+# PRELUDE 1 of 3 (see "selecting rules"): computed only when one of the six owner rules is selected.
+if any_wanted browse-owner viewstate-owner person-owner search-owner hubs-owner metadata-owner; then
 OWNER_LINES="$(grep -HrnE --include='*.rs' "$OWNER_PREFIX" "$SRC" "$SRC_DATA" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null || true)"
+fi
 grep_code_owner() {
   printf '%s\n' "$OWNER_LINES" | grep -E -- "$1" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true
 }
@@ -232,6 +345,10 @@ wholly_test_files() {
   python3 ci/rust_test_modules.py "$SRC_DATA"
   python3 ci/rust_test_modules.py "$SRC_SESSION"
   python3 ci/rust_test_modules.py "$SRC_MEDIA"
+  python3 ci/rust_test_modules.py "$SRC_PLAYBACK_CONTRACT"
+  python3 ci/rust_test_modules.py "$SRC_PLAY_URI"
+  python3 ci/rust_test_modules.py "$SRC_PLAY_FEED"
+  python3 ci/rust_test_modules.py "$SRC_MEDIA_CODECS"
   python3 ci/rust_test_modules.py "$SRC_APPKIT"
   python3 ci/rust_test_modules.py "$SRC_SCREENS"
 }
@@ -240,12 +357,19 @@ wholly_test_files() {
 # question once per candidate file or line with `echo "$wholly_test" | grep -qxF`, which is two
 # processes an answer.
 WHOLLY_TEST_INDEX=""
+WHOLLY_TEST_READY=0
 wholly_test_index_init() {
   WHOLLY_TEST_INDEX="
 $1
 "
+  WHOLLY_TEST_READY=1
 }
 is_wholly_test() {
+  # a rule asking before the prelude ran would read an empty index, i.e. "no file is a test file"
+  [ "$WHOLLY_TEST_READY" -eq 1 ] || {
+    echo "check-deps: internal: is_wholly_test before the wholly_test prelude (name the rule in its any_wanted list)" >&2
+    exit 2
+  }
   case "$WHOLLY_TEST_INDEX" in
     *"
 $1
@@ -267,8 +391,13 @@ gate() {
 }
 
 echo "== check-deps =="
+# PRELUDE 2 of 3: the test-module classification, 17 `rust_test_modules.py` runs (~3.7 s of CPU),
+# computed only when a rule that reads `$wholly_test` / `is_wholly_test` (directly, or through
+# `ledger_scan`) is selected. A run with no selector computes it first, as it always did.
+if any_wanted libm mutators cards sink threads blocking workers globals forks fxlanes paging; then
 wholly_test="$(wholly_test_files)" || { fail "Rust test-module classification failed"; exit 1; }
 wholly_test_index_init "$wholly_test"
+fi
 
 # browse-owner: Browse has one physical owner per `Stores`; the migration allowlist ended at zero
 # and is deliberately gone. Reject both the old storage/selector machinery and every free
@@ -440,6 +569,7 @@ owner_declarations() {
     ' "$file" || echo "$file:0:browse declaration scanner failed"
   done
 }
+if want browse-owner; then
 browse_owner_matches=$({
   owner_declarations "$browse_facades" 'ACTIVE|LEGACY_ADAPTER|BOOTSTRAP_AVAILABLE' \
     'BrowseState|BrowseAdapter|BrowseStore' "$SRC_DATA/browse/mod.rs"
@@ -457,12 +587,14 @@ else
   echo "$browse_owner_matches" | sed 's/^/    /'
   fail "browse-owner: retired Browse compatibility surface returned"
 fi
+fi # browse-owner
 
 # viewstate-owner: ViewState's physical state, Arc transport and notice live on ViewStateStore.
 # Zero tolerance, no allowlist: a free facade or storage/transport static can only select process
 # state, which would silently reconnect separate Bridges and let a retired worker cross reset.
 viewstate_facades='apply|run|run_with_browse|run_with_owners|pump|pump_with_owners|is_busy|take_landed_views|take_landed|request|request_with_browse|request_with_owners|reset|hold_inflight_for_test|owe_hubs_refresh_for_test|seed_ownership_fixture_for_test|ownership_fixture_for_test|late_completion_for_test|seed_post_reset_flight_for_test'
 viewstate_selectors='ACTIVE|OWNER|QUEUE|SENT|RETRY_CD|WANT_HUBS|LANDED|MAIL|VIEWSTATE|VIEW_STATE|LEGACY_ADAPTER'
+if want viewstate-owner; then
 viewstate_owner_matches=$({
   owner_declarations "$viewstate_facades" "$viewstate_selectors" \
     'ViewStateState|ViewStateAdapter|ViewStateStore|Req|Completion|Done' \
@@ -475,6 +607,7 @@ else
   echo "$viewstate_owner_matches" | sed 's/^/    /'
   fail "viewstate-owner: retired ViewState compatibility surface returned"
 fi
+fi # viewstate-owner
 
 # person-owner: Person's model/generation/retry/dev seed live in PersonState, its indexed fetch
 # claims/mailboxes live in the rotated Arc<PersonAdapter>, and both belong to one PersonStore per
@@ -482,6 +615,7 @@ fi
 # owners and lets an unaddressed reset, pump or optimistic edit cross the Bridge boundary.
 person_facades='current|loading|run|pump|apply|install_for_test|install_source_for_test|install_credits_for_test'
 person_selectors='ACTIVE|OWNER|CURRENT|GEN|RETRY_CD|FETCH|MAIL|PERSON|PERSON_STATE|LEGACY_ADAPTER|HELD'
+if want person-owner; then
 person_owner_matches=$({
   owner_declarations "$person_facades" "$person_selectors" \
     'PersonState|PersonAdapter|PersonStore|Person|Fetch|Mail|Landing' \
@@ -494,6 +628,7 @@ else
   echo "$person_owner_matches" | sed 's/^/    /'
   fail "person-owner: retired Person compatibility surface returned"
 fi
+fi # person-owner
 
 # search-owner: Search's query/generation/shelf model lives in SearchState, its per-source fetch
 # claims/mailboxes live in the rotated Arc<SearchAdapter>, and both belong to one SearchStore per
@@ -508,6 +643,7 @@ fi
 # rotates the adapter — only a bare, parameterless global `reset()` would be the retired shape.
 search_facades='apply|snapshot|snapshot_with_directory|run_with_directory|pump_with_directory|query|state|query_gen|publish_shelves_for_test|settling|debounce_elapsed_for_test'
 search_selectors='ACTIVE|OWNER|QUERY|GEN|STATE|SHELVES|SRC|ARMED|FAV_GEN|IN_FLIGHT|MAIL|SLOT|SEARCH|SEARCH_STATE|LEGACY_ADAPTER'
+if want search-owner; then
 search_owner_matches=$({
   owner_declarations "$search_facades" "$search_selectors" \
     'SearchState|SearchAdapter|SearchStore|Fetch|Projection|Shelf' \
@@ -520,20 +656,22 @@ else
   echo "$search_owner_matches" | sed 's/^/    /'
   fail "search-owner: retired Search compatibility surface returned"
 fi
+fi # search-owner
 
 # hubs-owner: Home's hub catalog model (`PmsState`) and its rotated worker mailbox/minter
 # (`Arc<PmsAdapter>`) belong to one `HubsStore` per Bridge (`app/bridge.rs`'s `hubs_run`/
-# `hubs_snapshot`, `app/bootstrap.rs`'s `HomeIo::hubs_with_directory`). Zero tolerance, no
+# `hubs_snapshot` and its controlled Home arms). Zero tolerance, no
 # allowlist: any free process-wide selector or module-level dispatcher reconnects those owners and
 # lets an unaddressed reset or landing cross the Bridge boundary — exactly the pre-port shape
 # `crate::stores::hubs::apply`/`apply_with_directory`/`controlled`/`controlled_with_directory` had,
 # each a free function reading/writing process-wide `pms.rs` statics instead of one owner's
 # `PmsState`/`Arc<PmsAdapter>` pair. `hubs_snapshot`/`run`/`run_with_directory`/
-# `land_with_directory`/`tick_with_directory`/`controlled_work`/`controlled_work_with_directory`
+# `land_with_directory`/`tick_with_directory`/`controlled_work`
 # are deliberately NOT listed: `pms.rs` keeps the current explicit-parameter architecture, taking
 # `state`/`adapter` in, exactly like search's own `reset(state, adapter)`.
 hubs_facades='apply|apply_with_directory|controlled|controlled_with_directory'
 hubs_selectors='RESULTS|NEXT_REQUEST|HUB_GEN|CATALOG_GEN|LAST_SECTIONS_GEN|ACTIVE|OWNER|LEGACY_ADAPTER'
+if want hubs-owner; then
 hubs_owner_matches=$({
   owner_declarations "$hubs_facades" "$hubs_selectors" \
     'PmsState|PmsAdapter|HubsStore|Landing|Src|SourceBuild' \
@@ -546,6 +684,7 @@ else
   echo "$hubs_owner_matches" | sed 's/^/    /'
   fail "hubs-owner: retired Hubs compatibility surface returned"
 fi
+fi # hubs-owner
 
 # metadata-owner: Detail's item/season/playing model (`MetadataState`) and its worker adapter
 # (`Arc<MetadataAdapter>`, D3's `record::Tracker` included) belong to one `MetadataStore` per
@@ -559,6 +698,7 @@ fi
 # hubs' and search's own owned stores.
 metadata_facades='apply'
 metadata_selectors='DETAIL_LANDING|SEASON_LANDING|ALT_LANDING|NOW|CURRENT|TRACKER|NOTICES'
+if want metadata-owner; then
 metadata_owner_matches=$({
   owner_declarations "$metadata_facades" "$metadata_selectors" \
     'MetadataState|MetadataAdapter|MetadataStore|Tracker' \
@@ -571,12 +711,14 @@ else
   echo "$metadata_owner_matches" | sed 's/^/    /'
   fail "metadata-owner: retired Metadata compatibility surface returned"
 fi
+fi # metadata-owner
 
 # libm: the method-call spelling, OUTSIDE machine/src/motion.rs (which owns the integrators and their
 # table test); `.log(&…`/`.log("…` is a logger, not a logarithm.
 # Wholly-test files (see `wholly_test_files`) are skipped like inline `#[cfg(test)]` blocks: a
 # test's reference colour maths is not logical state.
-libm_lines=$(grep_code '\.(exp|ln|log|powf|powi|cbrt|sin|cos|tan|atan2|hypot|mul_add|sin_cos)\(' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" \
+if want libm; then
+libm_lines=$(grep_code '\.(exp|ln|log|powf|powi|cbrt|sin|cos|tan|atan2|hypot|mul_add|sin_cos)\(' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" \
   | grep -vE '\.log\((&|")' | grep -v "^$SRC_MACHINE/motion.rs:")
 libm_bad=0
 while IFS= read -r line; do
@@ -586,22 +728,28 @@ while IFS= read -r line; do
   if ! allowed libm "$p"; then echo "    $line"; libm_bad=$((libm_bad+1)); fi
 done <<< "$libm_lines"
 if [ "$libm_bad" -eq 0 ]; then ok "libm"; else fail "libm: $libm_bad line(s) outside ci/allow/libm.txt"; fi
+fi # libm
 
-gate ticks 'SDL_GetTicks\(' "$SRC" "$SRC_BASE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS"
-#   wall (widened phase 12, D4): the scope grows from ui/+app/+route/plan.rs to also cover
-#              screens/ and stores/ (screens/player/ is a subdirectory of screens/ and so already
-#              included) — every screen migrated out of ui/ carries the same "instrument only"
-#              rule its old home had. Re-verified clean on 2026-09-10 with no new violation.
-gate wall '(Instant::now|SystemTime::now|\.elapsed\(\))' "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC/app" "$SRC_MEDIA/route/plan.rs" "$SRC_MEDIA/route/plan_memory.rs" "$SRC_SCREENS" "$SRC_DATA/stores"
+want ticks && gate ticks 'SDL_GetTicks\(' "$SRC" "$SRC_BASE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS"
+# Every data/session module is logic unless its exact reviewed IO/instrument file is in ports.ini.
+if want wall; then
+if python3 ci/check-ports.py; then ok "wall"; else fail "wall: outside exact ci/ports.ini files"; fi
+fi # wall
 
+if want fpflags; then
 if grep -rnE 'fp-contract|fast-math|\+fma' rust-modules/Cargo.toml rust-modules/build.rs rust-modules/net/Cargo.toml rust-modules/plex/Cargo.toml rust-modules/telemetry/Cargo.toml rust-modules/data/Cargo.toml rust-modules/session/Cargo.toml rust-modules/media/Cargo.toml rust-modules/appkit/Cargo.toml rust-modules/screens/Cargo.toml rust-modules/platform/Cargo.toml rust-modules/platform/build.rs rust-modules/gfx/Cargo.toml rust-modules/gfx/build.rs rust-modules/ui/Cargo.toml rust-modules/ui/build.rs rust-modules/appkit/build.rs rust-modules/screens/build.rs rust-modules/storage/Cargo.toml rust-modules/storage/build.rs rust-modules/.cargo Makefile 2>/dev/null | grep -v '^[[:space:]]*#'; then
   fail "fpflags: a floating-point contraction flag is set (spec §4.2 assumes none)"
 else ok "fpflags"; fi
+fi # fpflags
 
+if want present; then
 n=$(grep -cE '^static [A-Z_]+: Atomic' "$SRC_MACHINE/present.rs"); d=$(grep -c 'pub fn wake_from_worker' "$SRC_MACHINE/present.rs")
 if [ "$n" -eq 1 ] && [ "$d" -eq 1 ]; then ok "present: one worker door"; else fail "present: $n atomic statics, $d doors (one of each)"; fi
+fi # present
 
-if [ -n "$(grep_code '\bEffect::' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS")" ]; then fail "effect: \`Effect::\` is spelled (use Fx:: / AppFx::)"; else ok "effect"; fi
+if want effect; then
+if [ -n "$(grep_code '\bEffect::' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS")" ]; then fail "effect: \`Effect::\` is spelled (use Fx:: / AppFx::)"; else ok "effect"; fi
+fi # effect
 
 # mutators: production lines of ui/, screens/ and app/ (everything before the file's first
 # `#[cfg(test)]` + `mod` pair, which is where every screen keeps its tests) — PLUS, since D3, every
@@ -624,16 +772,17 @@ if [ -n "$(grep_code '\bEffect::' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFO
 # D3 (2026-09-11) regenerated this list against the real fn names — the previous one named
 # `save_view`/`toggle_unwatched`, neither of which the code has ever spelled that way (the real
 # names are `save_cursor`/`set_unwatched`), and `load_detail_now` for a function D1 deleted
-# outright — and added every real mutator the census found missing entirely: `alt_install`,
-# `alt_restamp_owners`, `alt_prune_inactive`, `alt_stand_in`, `record_pins`, `retry_source`,
+# outright — and added real mutators the census found missing entirely: `alt_install`,
+# `alt_restamp_owners`, `alt_prune_inactive`, `record_pins`, `retry_source`,
 # `apply_landing`, `take_landed_views`/`take_landed`.
-MUTATORS='\b(browse|pms|metadata|search|person|viewstate)::(set_cur|note_library_choice|kick_letters|kick_genres|want|save_cursor|set_sort_by_key|set_sort|set_unwatched|set_genre_by_id|set_genre|retry_cur_source|retry_source|recheck_shares|apply_pins|toggle_pin|record_pins|retry_discovery|reset|discover_pump|pump|pump_detail|pump_season|pump_alt_sources|request|open|close|set_query|request_detail|clear|load_season|set_now_playing|set_watched_local|install_playing|mark_skipped|retire_playing|retire_playing_item|alt_install|alt_restamp_owners|alt_prune_inactive|alt_stand_in|request_refetch_hubs|request_retry|edit_item|apply_landing|take_landed_views|take_landed)\(|\bsection_hubs::(kick|commit_staged|invalidate_all|invalidate|set_watched_local|left_the_deck)\('
+MUTATORS='\b(browse|pms|metadata|search|person|viewstate)::(set_cur|note_library_choice|kick_letters|kick_genres|want|save_cursor|set_sort_by_key|set_sort|set_unwatched|set_genre_by_id|set_genre|retry_cur_source|retry_source|recheck_shares|apply_pins|apply_pins_from|toggle_pin|record_pins|record_pins_from|retry_discovery|reset|discover_pump|pump|pump_detail|pump_season|pump_alt_sources|request|open|close|set_query|request_detail|clear|load_season|set_now_playing|set_watched_local|install_playing|mark_skipped|retire_playing|retire_playing_item|alt_install|alt_restamp_owners|alt_prune_inactive|request_refetch_hubs|request_retry|edit_item|apply_landing|take_landed_views|take_landed)\(|\bsection_hubs::(kick|commit_staged|invalidate_all|invalidate|set_watched_local|left_the_deck)\('
 # The spelling is matched WITHOUT a `crate::` prefix (a `use crate::metadata;` makes it
 # `metadata::load_season(`), and every `#[cfg(test)] mod … { … }` block is skipped by brace depth
 # wherever it sits in the file — the first version cut at the FIRST such block and let ~700
 # production lines of ui/detail.rs go unscanned. `stores::<store>::apply(` lines are the new
 # spelling and are excluded by name; a SCREEN's own `crate::ui::person::open(` is not a store
 # call and is masked before the match.
+if want mutators; then
 mut_bad=0
 while IFS= read -r f; do
   if is_wholly_test "$f"; then continue; fi
@@ -649,6 +798,7 @@ while IFS= read -r f; do
 # that can produce a hit.
 done < <(grep -rlE --include='*.rs' "$MUTATORS" "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC_SCREENS" "$SRC/app" "$SRC_MEDIA/route" "$SRC_MEDIA/player" "$SRC/dev" 2>/dev/null | sort)
 if [ "$mut_bad" -eq 0 ]; then ok "mutators"; else fail "mutators: $mut_bad line(s) call a store mutator directly (use the owner's run/step method, e.g. Bridge::<store>_run)"; fi
+fi # mutators
 
 # mutators-visibility (D3): the call-site rule above can only ever prove "nobody currently calls
 # this directly" — it says nothing about whether they COULD. This reads the DECLARATION line of
@@ -674,7 +824,7 @@ if [ "$mut_bad" -eq 0 ]; then ok "mutators"; else fail "mutators: $mut_bad line(
 # script's own shebang is `env bash` and the dev Mac's `/bin/bash` is 3.2 (Apple ships nothing
 # newer over the GPLv3 boundary), which has no associative arrays at all.
 MUT_FNS_TABLE=(
-  "browse/mod.rs|set_cur note_library_choice kick_letters kick_genres want save_cursor set_sort_by_key set_sort set_unwatched set_genre_by_id set_genre retry_cur_source retry_source recheck_shares apply_pins toggle_pin record_pins retry_discovery reset set_watched_local"
+  "browse/mod.rs|set_cur note_library_choice kick_letters kick_genres want save_cursor set_sort_by_key set_sort set_unwatched set_genre_by_id set_genre retry_cur_source retry_source recheck_shares apply_pins apply_pins_from toggle_pin record_pins record_pins_from retry_discovery reset set_watched_local"
   "browse/section_hubs.rs|kick commit_staged invalidate_all invalidate set_watched_local left_the_deck"
   "metadata.rs|request_detail clear load_season set_now_playing set_watched_local install_playing mark_skipped retire_playing retire_playing_item alt_install alt_restamp_owners alt_prune_inactive"
   "pms.rs|request_refetch_hubs request_retry edit_item apply_landing reset"
@@ -689,6 +839,7 @@ MUT_FNS_TABLE=(
 store_seamed() {
   grep -qE "^${1}::${2}(	|$)" ci/allow/store-seams.txt 2>/dev/null
 }
+if want mutators-visibility; then
 vis_bad=0
 for entry in "${MUT_FNS_TABLE[@]}"; do
   relf="${entry%%|*}"
@@ -703,8 +854,47 @@ for entry in "${MUT_FNS_TABLE[@]}"; do
   done
 done
 if [ "$vis_bad" -eq 0 ]; then ok "mutators-visibility"; else fail "mutators-visibility: $vis_bad fn(s) still crate-visible"; fi
+fi # mutators-visibility
 
-gate nav '(crate::ui|plx_ui)::nav::' "$SRC_SCREENS"
+want nav && gate nav '(crate::ui|plx_ui)::nav::' "$SRC" "$SRC_UI" "$SRC_APPKIT" "$SRC_SCREENS"
+
+# Completed ownership migration: legacy publications and the old gate cannot return.
+if want ui-owner-legacy; then
+ui_owner_hits=$(grep_code '(plx_ui|crate::ui)::press::|(plx_machine|crate)::idle::' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS")
+if [ -z "$ui_owner_hits" ]; then ok "ui-owner-legacy"; else
+  printf '%s\n' "$ui_owner_hits"
+  fail "ui-owner-legacy: retired global readers must not return"
+fi
+fi # ui-owner-legacy
+if want ui-owner-files; then
+legacy_owners=0
+for legacy in "$SRC_UI/nav.rs" "$SRC_UI/press.rs" "$SRC_MACHINE/idle.rs"; do
+  if [ -e "$legacy" ]; then
+    fail "ui-owner-files: retired module $legacy exists"
+    legacy_owners=$((legacy_owners+1))
+  fi
+done
+if [ "$legacy_owners" -eq 0 ]; then ok "ui-owner-files"; fi
+fi # ui-owner-files
+
+# Motion collectors may not own generic damage or a second process-global notification adapter.
+if want owned-damage; then
+owned_damage_hits=$(grep_code 'motion::report::(invalidate|take_damage|select_damage|take_page_damage|OwnScope)' "$SRC" "$SRC_UI" "$SRC_APPKIT" "$SRC_SCREENS" "$SRC_DATA" "$SRC_PLEX" "$SRC_MEDIA" "$SRC_PLATFORM")
+report_adapter=$(grep_code '\bAtomic[A-Za-z0-9_]*\b|pub fn (invalidate|take_damage|select_damage|take_page_damage|present_dirty|wake)\b' "$SRC_MACHINE/motion/report.rs")
+if [ -z "$owned_damage_hits$report_adapter" ]; then ok "owned-damage"; else
+  printf '%s\n%s\n' "$owned_damage_hits" "$report_adapter"
+  fail "owned-damage: presentation changes must reach the owned gate, never a global damage adapter"
+fi
+fi # owned-damage
+
+# Main-thread render/deferred work must address its owner; only actual IO workers use the atomic door.
+if want owned-wake; then
+main_wake_hits=$(grep_code 'motion::report::wake|wake_from_worker[[:space:]]*\(' "$SRC_UI" "$SRC/dev" "$SRC/app/run.rs")
+if [ -z "$main_wake_hits" ]; then ok "owned-wake"; else
+  printf '%s\n' "$main_wake_hits"
+  fail "owned-wake: main-thread work must request PresentEvent::Wake from its owner"
+fi
+fi # owned-wake
 
 # cards: a screen's card shelves and grids come from `plx_ui::cards::{Shelf, Grid}` (the
 # shared-card-sections plan, layer L1), which own the pop, press, stops, restore and paging a
@@ -722,6 +912,7 @@ gate nav '(crate::ui|plx_ui)::nav::' "$SRC_SCREENS"
 # allowlist (empty) is the screens that still assemble their own, one line per file, and only
 # SHRINKS.
 cards_pat='cards::(paint_visible|draw_tile|draw_focused)\b|use [^;]*cards::\{[^}]*\b(paint_visible|draw_tile|draw_focused)\b|\bCardRow\b|\bGridPop\b|\bGridBands\b|press::scale\(\)'
+if want cards; then
 cards_bad=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -736,6 +927,7 @@ while IFS= read -r line; do
   echo "    $line"; cards_bad=$((cards_bad+1))
 done < <(grep_code '\bAvatarRow\b' "$SRC_SCREENS")
 if [ "$cards_bad" -eq 0 ]; then ok "cards"; else fail "cards: $cards_bad line(s) outside ci/allow/cards.txt (or AvatarRow outside profiles.rs) — draw card sections with plx_ui::cards::Shelf / Grid"; fi
+fi # cards
 
 # layer: a SCREEN never names the application. §2.1's table says `screens/` may name `ui/`,
 # `stores/`, `plex/` and `player/` and never `app/`, and until phase 10 that half of the rule was
@@ -746,24 +938,34 @@ if [ "$cards_bad" -eq 0 ]; then ok "cards"; else fail "cards: $cards_bad line(s)
 # and nothing else) is only worth as much as the boundary underneath it. Count is zero, with no
 # allowlist: a screen that needs something of the loop's asks for it as an effect (`AppFx`,
 # `LoopReq`) — that is what the bundle in `registry.rs` is.
+if want layer; then
 if [ -n "$(grep_code '(crate|super)::app::' "$SRC_SCREENS")" ]; then
   grep_code '(crate|super)::app::' "$SRC_SCREENS" | sed 's/^/    /'
   fail "layer: a screen names the application (§2.1) — ask for it as an AppFx/LoopReq instead"
 else ok "layer"; fi
-gate sessionwrite 'session::load\(' "$SRC_SCREENS" "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT"
+fi # layer
+want sessionwrite && gate sessionwrite 'session::load\(' "$SRC_SCREENS" "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT"
+# Screen-local helpers/import aliases are scanned as production too; test ownership
+# comes from declarations, never filename suffixes. No IO-port-wide exemption.
+if want screen-runtime-io; then
+if python3 ci/ui_boundaries.py; then ok "screen-runtime-io"
+else fail "screen-runtime-io: use captured inputs or typed effects"; fi
+fi # screen-runtime-io
 # uistorage: the LIBRARY (`ui/`) never names the storage layer (§2.1: `ui/` may name only
 # `crate::{gfx,text,paths,task}`). A ui-owned sweep that needs the app's removal rule takes it as an
 # injected `fn` (`ui::rec::erase_owned_artifacts`). Zero, no allowlist. The wider table is not a
 # grep yet: ui/ still names other application modules, mostly from tests and dev instruments.
-gate uistorage '(crate|super|plx_platform)::storage::' "$SRC_UI" "$SRC_MACHINE"
+want uistorage && gate uistorage '(crate|super|plx_platform)::storage::' "$SRC_UI" "$SRC_MACHINE"
 
 # legacypage: the word itself, anywhere under src — a doc that still describes the type is as much
 # a hit as a declaration, which is the point (nothing compiles the prose either).
-legacy_hits=$(grep -rn --include='*.rs' 'LegacyPage' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null || true)
+if want legacypage; then
+legacy_hits=$(grep -rn --include='*.rs' 'LegacyPage' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null || true)
 if [ -z "$legacy_hits" ]; then ok "legacypage"; else
   echo "$legacy_hits" | sed 's/^/    /'
   fail "legacypage: $(echo "$legacy_hits" | wc -l | tr -d ' ') mention(s) — the type is retired (§15.2)"
 fi
+fi # legacypage
 
 # sibling: one screen family per directory; `<a>` is the first path component under screens/.
 #
@@ -773,6 +975,7 @@ fi
 # gate that forbade it would forbid the structure the spec asks for. It was an allowlist entry
 # until phase 10 moved the mounter into it; an entry would have had to say "this file names all of
 # them, permanently", which is a rule and not a migration.
+if want sibling; then
 sib_bad=0
 while IFS= read -r f; do
   [ "$f" = "$SRC_SCREENS/registry.rs" ] && continue
@@ -790,6 +993,7 @@ while IFS= read -r f; do
 done < <(grep -rlE --include='*.rs' 'crate::[a-z_]+' "$SRC_SCREENS" 2>/dev/null | sort)
 if [ "$sib_bad" -eq 0 ]; then ok "sibling"
 else fail "sibling: $sib_bad file(s) name a sibling screen (use crate::registry)"; fi
+fi # sibling
 
 # ============================================================================================
 # Phase 12 rules (spec §15.2, D4): the gates the earlier phases' own comments above never wrote,
@@ -819,6 +1023,7 @@ else fail "sibling: $sib_bad file(s) name a sibling screen (use crate::registry)
 # `impl Measure for` added later still only exempts ITS OWN body, and any other raw call anywhere
 # in the tree fails.
 tm_seams="$SRC_UI/text_view.rs $SRC_UI/text_buffer.rs $SRC_GFX/text.rs"
+if want textmeasure; then
 tm_bad=0
 while IFS= read -r f; do
   is_seam=0
@@ -836,6 +1041,7 @@ while IFS= read -r f; do
 # an `impl … Measure for …` block, so a file with no raw call has nothing for it to find.
 done < <(grep -rlE --include='*.rs' '(crate|plx_gfx)::text::(text_width|elide|cap_h)\(' "$SRC" "$SRC_GFX" "$SRC_UI" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | sort)
 if [ "$tm_bad" -eq 0 ]; then ok "textmeasure"; else fail "textmeasure: $tm_bad line(s) outside the Measure seam"; fi
+fi # textmeasure
 
 # dt (phase 12, D4 — ZERO now, was an allowlist): idle::dt() (deleted from machine/src/idle.rs entirely —
 # card_row.rs's focused-title marquee, its last caller, now reads the absolute idle::now_ms()
@@ -847,11 +1053,13 @@ if [ "$tm_bad" -eq 0 ]; then ok "textmeasure"; else fail "textmeasure: $tm_bad l
 # class this whole gate exists to catch. motion.rs currently has no hit either; the exclusion is
 # the documented intent (spec §4.2: the ONLY file licensed to touch a raw per-frame delta), not a
 # live carve-out.
-dt_hits=$(grep_code 'idle::dt\(\)|(\+=|-=)\s*dt\b' "$SRC" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" | grep -v "^$SRC_MACHINE/motion.rs:")
+if want dt; then
+dt_hits=$(grep_code 'idle::dt\(\)|(\+=|-=)\s*dt\b' "$SRC" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" | grep -v "^$SRC_MACHINE/motion.rs:")
 if [ -z "$dt_hits" ]; then ok "dt"; else
   echo "$dt_hits" | sed 's/^/    /'
   fail "dt: $(echo "$dt_hits" | wc -l | tr -d ' ') line(s) — see rule comment above"
 fi
+fi # dt
 
 # ladder: the old per-screen focus/hit ladder shape, zero across ui/ + screens/ once every Screen
 # answers FocusSource::Engine/HitSource::Engine (D2). No allowlist: every remaining hit is a
@@ -864,13 +1072,13 @@ gate_zero() {
     fail "$rule: $(echo "$hits" | wc -l | tr -d ' ') line(s) — see rule comment above"
   fi
 }
-gate_zero ladder 'fn move_focus|fn pointer_focus|fn top_focus|fn zones\b|fn key\(sym|fn focus_is_card|fn focus_is_ctl' "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC_SCREENS"
+want ladder && gate_zero ladder 'fn move_focus|fn pointer_focus|fn top_focus|fn zones\b|fn key\(sym|fn focus_is_card|fn focus_is_ctl' "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC_SCREENS"
 
 # hittest: the narrowed raw hit-tester call shape, zero in app/ once the player's HUD registers
 # its stops through DrawFrame::stop (D2) instead of app/run.rs testing raw coordinates against
 # player_hud's geometry by hand. Deliberately NOT a blanket `_at(` — that false-positives on
 # resume_at/memory_at/open_settings_at/write_at, which are unrelated lookups.
-gate_zero hittest 'pointer_focus\(|\b(failure_quality|icon|scrub)_hit\(' "$SRC/app"
+want hittest && gate_zero hittest 'pointer_focus\(|\b(failure_quality|icon|scrub)_hit\(' "$SRC/app"
 
 # frame: the three privileged OS-primitive calls, ZERO-TOLERANCE outside `app/run.rs` (D4) — no
 # allowlist file, because there is exactly one legitimate home once D1 lands: `app/run.rs` is the
@@ -887,6 +1095,7 @@ gate_zero hittest 'pointer_focus\(|\b(failure_quality|icon|scrub)_hit\(' "$SRC/a
 # actual call typed outside a string still fails this gate. `// `-prefixed comment lines (`app/run.rs` keeps one, describing where a call
 # used to live) are stripped the same way `grep_code` above does for every other rule.
 frame_pat='(crate|plx_platform)::tv::window::(pump_bus|opaque_route|clear_opaque_region)\('
+if want frame; then
 frame_bad=0
 while IFS= read -r f; do
   [ "$f" = "$SRC/app/run.rs" ] && continue
@@ -902,28 +1111,39 @@ while IFS= read -r f; do
 # REMOVES matches, so a file with no raw hit cannot fail this gate — and running its `awk` plus a
 # `grep` over all 420 files, to reach the two that mention the shape, was the single most expensive
 # rule in this script (4.8 s of its 17 s).
-done < <(grep -rlE --include='*.rs' "$frame_pat" "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | sort)
+done < <(grep -rlE --include='*.rs' "$frame_pat" "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | sort)
 if [ "$frame_bad" -eq 0 ]; then ok "frame"
 else fail "frame: $frame_bad line(s) of a privileged OS-primitive call outside app/run.rs"; fi
+fi # frame
 
 # sink: the Starfish/ACB verbs (`tv::sink::VideoSink`) are the player's alone (step L15). Only
-# `player/` (including `player/ffi*.rs`, which implement the trait), `port.rs` (which installs one)
-# and `tv.rs` with `tv/` (which hold it) name `tv::sink::installed` or `VideoSink`; every other module reaches
-# the television through the narrower `tv` interfaces. Wholly-test files are skipped like inline
+# `player/`, `play-uri/`, the native `webos/` port, and `port.rs` (which installs one)
+# and `tv.rs` with `tv/` (which hold it) name `tv::sink::installed` or `VideoSink`; so does
+# `app/adapters/backends.rs`, the boot composition that resolves the installed display once for the
+# ACB plane's boot and hands it on (it was `player/plane_boot.rs`; the composition root is where the
+# driver set is built). Every other module reaches the television through the narrower `tv` interfaces. Wholly-test files are skipped like inline
 # `#[cfg(test)]` blocks. Zero, no allowlist.
+if want sink; then
 sink_bad=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   p="${line%%:*}"
-  case "$p" in "$SRC_MEDIA"/player/*|"$SRC_PLATFORM"/tv/*|"$SRC_PLATFORM"/tv.rs|"$SRC"/port.rs) continue ;; esac
+  # A backend crate (Feed or URI) receives an injected sink; it may name the shared traits but never
+  # resolve the process-global installed sink. Composition remains in the common player/port runner.
+  case "$p" in "$SRC_PLAY_FEED"/*|"$SRC_PLAY_URI"/*)
+    case "$line" in *tv::sink::installed*|*tv::sink::display_installed*) ;; *) continue ;; esac ;;
+  esac
+  case "$p" in "$SRC_MEDIA"/player/*|"$SRC_PLATFORM"/tv/*|"$SRC_PLATFORM"/tv.rs|"$SRC_PLATFORM"/webos/*|"$SRC"/port.rs|"$SRC"/app/adapters/backends.rs) continue ;; esac
   if is_wholly_test "$p"; then continue; fi
   echo "    $line"; sink_bad=$((sink_bad+1))
-done < <(grep_code 'tv::sink::installed|\bVideoSink\b' "$SRC" "$SRC_PLATFORM" "$SRC_UI" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS")
+done < <(grep_code 'tv::sink::(installed|display_installed)|\b(VideoSink|DisplaySink)\b' "$SRC" "$SRC_PLATFORM" "$SRC_UI" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS")
 if [ "$sink_bad" -eq 0 ]; then ok "sink"
-else fail "sink: $sink_bad line(s) naming the video sink outside player/, port.rs, tv.rs and tv/"; fi
+else fail "sink: $sink_bad line(s) naming the video sink outside playback execution, port.rs, tv.rs and tv/"; fi
+fi # sink
 
 # route: `Route::` in app/ = 0, and `enum Route` gone from the whole tree (D1/D4). No allowlist:
 # the type is meant to be retired, not narrowed.
+if want route; then
 route_app=$(grep_code 'Route::' "$SRC/app")
 if [ -z "$route_app" ]; then ok "route: Route:: in app/"
 else fail "route: $(echo "$route_app" | wc -l | tr -d ' ') \`Route::\` use(s) in app/ — the page alphabet is \`AppArg\` (D1)"; fi
@@ -933,6 +1153,7 @@ else
   echo "$route_enum" | sed 's/^/    /'
   fail "route: enum Route re-declared — the page alphabet is \`AppArg\` (D1)"
 fi
+fi # route
 
 # fnlen: app/run.rs::run <= 200 lines, run_application (app/mod.rs, the D4 skeleton) <= 10 and
 # plex_run (port.rs: install, then hand over) <= 10 — counted by brace
@@ -948,6 +1169,7 @@ fn_body_lines() {
     }
   ' "$file"
 }
+if want fnlen; then
 run_len=$(fn_body_lines "$SRC/app/run.rs" 'run')
 if [ -n "$run_len" ] && [ "$run_len" -le 200 ]; then ok "fnlen: app/run.rs::run ($run_len lines)"
 else fail "fnlen: app/run.rs::run is ${run_len:-unknown} lines, budget 200 — a phase of the frame belongs in its own function (see run.rs's own doc)"; fi
@@ -957,14 +1179,17 @@ else fail "fnlen: run_application (app/mod.rs) is ${runapp_len:-unknown} lines, 
 plexrun_len=$(fn_body_lines "$SRC/port.rs" 'plex_run')
 if [ -n "$plexrun_len" ] && [ "$plexrun_len" -le 10 ]; then ok "fnlen: plex_run (port.rs) ($plexrun_len lines)"
 else fail "fnlen: plex_run (port.rs) is ${plexrun_len:-unknown} lines, budget 10"; fi
+fi # fnlen
 
 # testmod: `#[cfg(test)] mod` count in app/mod.rs = 0 (D4/D8) — every test module named in D8's
 # table is meant to have moved to its subject's own file by the time this gate is added.
+if want testmod; then
 testmod_n=$(grep -c '^#\[cfg(test)\]$' "$SRC/app/mod.rs" 2>/dev/null || echo 0)
 # only count ones immediately followed by `mod `, matching the mutators gate's own convention
 testmod_n=$(awk '/^#\[cfg\(test\)\]$/{p=1;next} p && /^mod /{c++} {p=0} END{print c+0}' "$SRC/app/mod.rs")
 if [ "$testmod_n" -eq 0 ]; then ok "testmod: app/mod.rs"
 else fail "testmod: $testmod_n \`#[cfg(test)] mod\` block(s) in app/mod.rs — a test lives beside its subject (D8)"; fi
+fi # testmod
 
 # threads: `thread::spawn(` outside task.rs, PRODUCTION lines only, EVERY spelling — a
 # `#[cfg(test)] mod` block is skipped by brace depth, the same convention the `mutators` gate
@@ -983,6 +1208,9 @@ else fail "testmod: $testmod_n \`#[cfg(test)] mod\` block(s) in app/mod.rs — a
 #     `use std::thread::{..spawn..}` lines outside task.rs itself), so this spelling adds nothing
 #     to the count yet — it exists so a FUTURE import cannot go unmatched the way the bare
 #     `thread::spawn(` spelling used to.
+if want threads; then
+# A flat all(test-or-test-support, feature...) conjunction remains wholly test-owned;
+# any(test, production-feature) does not and must still be scanned (harness controls).
 threads_bad=0
 while IFS= read -r f; do
   # a wholly-test file is test code exactly like an inline `#[cfg(test)] mod` block, which the
@@ -997,14 +1225,133 @@ while IFS= read -r f; do
     if ! allowed threads "$f"; then echo "    $f:$line"; threads_bad=$((threads_bad+1)); fi
   done < <(awk '
     skip>0 { n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth+=n-m; if (depth<=0) skip=0; prev=$0; next }
-    prev ~ /^[[:space:]]*#\[cfg\((test|any\(test, feature = "test-support"\))\)\][[:space:]]*$/ && /^[[:space:]]*mod / { skip=1; depth=gsub(/\{/,"{")-gsub(/\}/,"}"); if (depth<=0) skip=0; prev=$0; next }
+    prev ~ /^[[:space:]]*#\[cfg\((test|any\(test, feature = "test-support"\)|all\((test|any\(test, feature = "test-support"\)), [^()]*\))\)\][[:space:]]*$/ && /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]/ { skip=1; depth=gsub(/\{/,"{")-gsub(/\}/,"}"); if (depth<=0) skip=0; prev=$0; next }
     { print NR":"$0; prev=$0 }' "$f" | grep -E "$pat" | grep -vE '^[0-9]+:\s*//' || true)
 # ...over the files that spell `spawn(` at all — a superset of both matched spellings, and the `awk`
 # below only drops `#[cfg(test)] mod` blocks, so the count is unchanged.
-done < <(grep -rlE --include='*.rs' '\bspawn\(' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | grep -v "^$SRC_BASE/task.rs\$" | sort)
+done < <(grep -rlE --include='*.rs' '\bspawn\(' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | grep -v "^$SRC_BASE/task.rs\$" | sort)
 threads_declared=$(sed -n 's/^# count: *//p' ci/allow/threads.txt | head -1)
 if [ "$threads_bad" -eq "${threads_declared:-0}" ]; then ok "threads"
 else fail "threads: $threads_bad line(s) outside ci/allow/threads.txt (declared count is exactly ${threads_declared:-0}, not a ceiling)"; fi
+fi # threads
+
+# ---- the ledger rules: blocking, workers, globals, forks, fxlanes -------------------------------
+# A LEDGER is an exact multiset of production SITES, one line per site, held under ci/allow and only
+# ever shrinking:
+#   - a site NOT in the ledger fails — new work moves behind the seam the rule names instead of being
+#     excused;
+#   - a ledger line whose site is gone fails — so the list can only shrink, and a migration lands by
+#     DELETING its lines (and lowering that file's `# count:`, which must equal its entries);
+#   - a rename (`use ... as x`) is an alias the call-site scan cannot count and fails outright;
+#     `blocking` refuses any other bare mention of its identifier the same way (`let f = name;`), while
+#     workers and globals count a getter named without a call as a site of its own.
+# `ci/ledger.awk` finds the sites (comments, string literals and test code are never sites; its header
+# says exactly how), `ledger_scan` runs it over candidate files, `ledger_check` compares the multisets.
+# `blocking` keeps ONE file, ci/allow/blocking.txt. The four rules of docs/sans-io.md keep one file per
+# AREA — ci/allow/<rule>/<area>.txt — so two migrations that touch different areas never edit the same
+# `# count:` header: the area is the crate (`app` for rust-modules/src), except in data/, where it is
+# `data-<module>` for the top-level module under data/src, and `stores/<stem>.rs` joins the module of
+# its own name (`stores/watchlist.rs` and `watchlist.rs` are one area). A line filed in the wrong area
+# fails too, so the layout cannot drift.
+
+# ledger_area <path>: the area a site in <path> belongs to, in $LG_AREA
+ledger_area() {
+  local p="$1" s
+  case "$p" in
+    rust-modules/data/src/stores/*) s="${p#rust-modules/data/src/stores/}"; s="${s%%[/.]*}"
+      [ "$s" = mod ] && s=stores; LG_AREA="data-$s" ;;
+    rust-modules/data/src/*) s="${p#rust-modules/data/src/}"; LG_AREA="data-${s%%[/.]*}" ;;
+    rust-modules/src/*) LG_AREA=app ;;
+    rust-modules/*/src/*) s="${p#rust-modules/}"; LG_AREA="${s%%/*}" ;;
+    *) LG_AREA="?" ;;
+  esac
+}
+
+# ledger_scan: candidate files on stdin (a wholly-test file is skipped, like an inline test `mod`); the
+# sites of each, as ci/ledger.awk prints them, on stdout. LG_* in the environment configure the awk
+# (its header lists them, including the spellings that are sites only in a file that imports them).
+ledger_scan() {
+  local files
+  # the wholly-test files go in ONE pass: `is_wholly_test`'s case-match over the whole index costs
+  # ~20 ms a file, which is seconds over the few hundred candidates of a rule that reads every crate
+  files=$(sort -u | comm -23 - <(printf '%s\n' "$wholly_test" | sort))
+  [ -z "$files" ] && return 0
+  # ONE awk for all of them: an awk start costs more than lexing a typical file (paths hold no spaces)
+  # shellcheck disable=SC2086
+  awk -f ci/ledger.awk $files
+}
+
+# ledger_check <rule> <scan output>: compares it with the ledger files in $LG_LEDGERS and reports.
+# Messages come from LG_MSG_NEW / LG_MSG_REF / LG_MSG_STALE (line prefixes), LG_NOUN and LG_TAIL;
+# LG_COUNT_FILE (one file) also checks its declared count here, LG_AREA_CHECK=1 files by area.
+ledger_check() {
+  local rule="$1" blob="$2" f key file stem line shown
+  local refs sites pairs declared new stale misfiled count count_declared n_new n_stale n_ref
+  refs=$(printf '%s\n' "$blob" | awk -F'\t' '$1 == "REF" {print $2}')
+  sites=$(printf '%s\n' "$blob" | awk -F'\t' '$1 != "REF"')
+  pairs=""
+  for f in $LG_LEDGERS; do
+    [ -f "$f" ] || continue
+    pairs="$pairs
+$(awk -F'\t' '/^[[:space:]]*(#|$)/ {next} {print $1 "\t" FILENAME}' "$f")"
+  done
+  pairs=$(printf '%s\n' "$pairs" | sed '/^$/d')
+  declared=$(printf '%s\n' "$pairs" | cut -f1 | sort)
+  new=$(comm -23 <(printf '%s\n' "$sites" | sed '/^$/d') <(printf '%s\n' "$declared" | sed '/^$/d'))
+  stale=$(comm -13 <(printf '%s\n' "$sites" | sed '/^$/d') <(printf '%s\n' "$declared" | sed '/^$/d'))
+  misfiled=""
+  if [ -n "${LG_AREA_CHECK:-}" ]; then
+    while IFS=$'\t' read -r key file; do
+      [ -z "$key" ] && continue
+      ledger_area "${key%%::*}"
+      stem="${file##*/}"; stem="${stem%.txt}"
+      if [ "$LG_AREA" != "$stem" ]; then
+        misfiled="$misfiled${misfiled:+
+}$key  (in $file, belongs in ci/allow/$rule/$LG_AREA.txt)"
+      fi
+    done <<EOF_PAIRS
+$pairs
+EOF_PAIRS
+  fi
+  count=$(printf '%s\n' "$declared" | sed '/^$/d' | wc -l | tr -d ' ')
+  count_declared=""
+  [ -n "${LG_COUNT_FILE:-}" ] && count_declared=$(sed -n 's/^# count: *//p' "$LG_COUNT_FILE" | head -1)
+  n_new=$(printf '%s\n' "$new" | sed '/^$/d' | wc -l | tr -d ' ')
+  n_stale=$(printf '%s\n' "$stale" | sed '/^$/d' | wc -l | tr -d ' ')
+  n_ref=$(printf '%s\n' "$refs" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ -z "$new" ] && [ -z "$stale" ] && [ -z "$refs" ] && [ -z "$misfiled" ] \
+     && { [ -z "${LG_COUNT_FILE:-}" ] || [ "$count" -eq "${count_declared:-0}" ]; }; then
+    ok "$rule ($count sites)"
+  else
+    if [ -n "$new" ]; then
+      while IFS= read -r key; do
+        shown="$key"
+        if [ -n "${LG_AREA_CHECK:-}" ]; then ledger_area "${key%%::*}"; shown="$key  (ledger: ci/allow/$rule/$LG_AREA.txt)"; fi
+        echo "    $LG_MSG_NEW$shown"
+      done <<EOF_NEW
+$new
+EOF_NEW
+    fi
+    [ -n "$refs" ] && printf '%s\n' "$refs" | sed "s|^|    $LG_MSG_REF|"
+    if [ -n "$stale" ]; then
+      while IFS= read -r key; do
+        shown="$key"
+        if [ -n "${LG_AREA_CHECK:-}" ]; then
+          file=$(printf '%s\n' "$pairs" | awk -F'\t' -v k="$key" '$1 == k {print $2; exit}')
+          shown="$key  (in $file)"
+        fi
+        echo "    $LG_MSG_STALE$shown"
+      done <<EOF_STALE
+$stale
+EOF_STALE
+    fi
+    [ -n "$misfiled" ] && printf '%s\n' "$misfiled" | sed 's|^|    misfiled ledger line: |'
+    line="new: $n_new, stale: $n_stale, aliased: $n_ref"
+    [ -n "$misfiled" ] && line="$line, misfiled: $(printf '%s\n' "$misfiled" | wc -l | tr -d ' ')"
+    [ -n "${LG_COUNT_FILE:-}" ] && line="$line, declared count ${count_declared:-0} vs $count entries"
+    fail "$rule: $LG_NOUN is not exact ($line) — $LG_TAIL"
+  fi
+}
 
 # blocking: the frame thread's blocking exceptions, as a ledger that only shrinks. Every
 # production `allow_blocking(` CALL SITE is listed in
@@ -1014,57 +1361,245 @@ else fail "threads: $threads_bad line(s) outside ci/allow/threads.txt (declared 
 #     (`task::spawn_off_frame`, whose token a PMS half takes) instead of being excused;
 #   - an entry whose site no longer exists fails — so the list can only shrink, and a migration
 #     lands by deleting its line. The declared `# count:` must also equal the entry count.
-# Test code is skipped exactly as in `threads` (a wholly-test file, a `#[cfg(test)] mod` block).
+# Test code is skipped as `ci/ledger.awk` skips it, which is more than `threads` does: a wholly-test file,
+# and any item, statement or field under a `#[cfg(..)]` production can never satisfy (a `mod` with other
+# attributes in front of it, a `fn`, `feature = "test-support"`, `all(test, ..)`); strings and block comments
+# are blanked first, so a call after a `"http://"` string is seen. The same sites as before are listed.
 # The definition itself (`task/blocking.rs`), `fn` declarations and comment-only lines are not
 # call sites. Any OTHER non-test mention of the bare identifier — `use ...::allow_blocking as x`,
-# `let f = allow_blocking;` — is an alias the call-site grep cannot see, so it fails outright
-# (`blocking_refs`); the one tolerated mention is the exact re-export line in `base/src/task.rs`.
+# `let f = allow_blocking;` — is an alias the call-site scan cannot see, so it fails outright
+# (a REF line of the scan); the one tolerated mention is the exact re-export line in `base/src/task.rs`.
 # The enclosing fn is the innermost `fn <name>` whose body holds the call, tracked by
-# brace depth; a call in a closure belongs to the fn around the closure.
+# brace depth; a call in a closure belongs to the fn around the closure. The scan is the shared
+# `ci/ledger.awk` (the ledger machinery above).
+if want blocking; then
 blocking_sites=$(
-  while IFS= read -r f; do
-    if is_wholly_test "$f"; then continue; fi
-    awk -v file="$f" -v reexport_file="$SRC_BASE/task.rs" '
-      function pop_to(d) { while (top > 0 && sdepth[top] > d) top-- }
-      skip>0 { n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth+=n-m; if (depth<=0) skip=0; prev=$0; next }
-      prev ~ /^[[:space:]]*#\[cfg\((test|any\(test, feature = "test-support"\))\)\][[:space:]]*$/ && /^[[:space:]]*mod / { skip=1; depth=gsub(/\{/,"{")-gsub(/\}/,"}"); if (depth<=0) skip=0; prev=$0; next }
-      {
-        line=$0; prev=$0
-        code=line; sub(/\/\/.*/, "", code)
-        # a mention that is neither a call, the `fn` definition nor the listed re-export: an alias
-        if (code ~ /(^|[^A-Za-z0-9_])allow_blocking([^A-Za-z0-9_(]|$)/ && code !~ /fn[[:space:]]+allow_blocking\(/ \
-            && !(file == reexport_file && code ~ /^[[:space:]]*pub use blocking::\{allow_blocking, AllowBlocking\};[[:space:]]*$/))
-          print "REF\t" file ":" NR
-        if (match(code, /(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z0-9_]+/)) {
-          name=substr(code, RSTART, RLENGTH); sub(/.*fn[[:space:]]+/, "", name); pending=name
-        }
-        if (code ~ /(^|[^A-Za-z0-9_])allow_blocking\(/ && code !~ /fn[[:space:]]+allow_blocking\(/) {
-          hit=(top>0 ? stack[top] : (pending != "" ? pending : "?"))
-          # a call on the same line as the `fn` it sits in, before that fn pushes its body
-          if (pending != "" && code ~ /fn[[:space:]]/ && code ~ /\{/) hit=pending
-          print file "::" hit
-        }
-        n=gsub(/\{/,"{",code); m=gsub(/\}/,"}",code)
-        for (i=0; i<n; i++) { depth++; if (pending != "") { top++; stack[top]=pending; sdepth[top]=depth; pending="" } }
-        for (i=0; i<m; i++) { depth--; pop_to(depth) }
-        if (pending != "" && code ~ /;[[:space:]]*$/) pending=""
-      }' "$f"
-  done < <(grep -rlE --include='*.rs' 'allow_blocking' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null | grep -v "^$SRC_BASE/task/blocking.rs\$" | sort) | sort
+  grep -rlE --include='*.rs' 'allow_blocking' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" 2>/dev/null \
+    | grep -v "^$SRC_BASE/task/blocking.rs\$" | sort \
+    | LG_MODE=call LG_SITE='(^|[^A-Za-z0-9_])allow_blocking\(' LG_DEF='fn[[:space:]]+allow_blocking\(' \
+      LG_REF='(^|[^A-Za-z0-9_])allow_blocking([^A-Za-z0-9_(]|$)' LG_REEXPORT_FILE="$SRC_BASE/task.rs" \
+      LG_REEXPORT_RE='^[[:space:]]*pub use blocking::\{allow_blocking, AllowBlocking\};[[:space:]]*$' \
+      ledger_scan | sort
 )
-blocking_refs=$(printf '%s\n' "$blocking_sites" | awk -F'\t' '$1 == "REF" {print $2}')
-blocking_sites=$(printf '%s\n' "$blocking_sites" | awk -F'\t' '$1 != "REF"')
-blocking_declared=$(awk -F'\t' '/^[[:space:]]*(#|$)/ {next} {print $1}' ci/allow/blocking.txt | sort)
-blocking_new=$(comm -23 <(printf '%s\n' "$blocking_sites" | sed '/^$/d') <(printf '%s\n' "$blocking_declared" | sed '/^$/d'))
-blocking_stale=$(comm -13 <(printf '%s\n' "$blocking_sites" | sed '/^$/d') <(printf '%s\n' "$blocking_declared" | sed '/^$/d'))
-blocking_count=$(printf '%s\n' "$blocking_declared" | sed '/^$/d' | wc -l | tr -d ' ')
-blocking_count_declared=$(sed -n 's/^# count: *//p' ci/allow/blocking.txt | head -1)
-if [ -z "$blocking_new" ] && [ -z "$blocking_stale" ] && [ -z "$blocking_refs" ] && [ "$blocking_count" -eq "${blocking_count_declared:-0}" ]; then ok "blocking ($blocking_count sites)"
-else
-  [ -n "$blocking_new" ] && printf '%s\n' "$blocking_new" | sed 's/^/    new frame-thread blocking exception: /'
-  [ -n "$blocking_refs" ] && printf '%s\n' "$blocking_refs" | sed 's/^/    allow_blocking named without a call (an alias the ledger cannot count): /'
-  [ -n "$blocking_stale" ] && printf '%s\n' "$blocking_stale" | sed 's/^/    stale ci\/allow\/blocking.txt entry (site is gone — delete the line): /'
-  fail "blocking: the frame-thread exception ledger is not exact (new: $(printf '%s\n' "$blocking_new" | sed '/^$/d' | wc -l | tr -d ' '), stale: $(printf '%s\n' "$blocking_stale" | sed '/^$/d' | wc -l | tr -d ' '), aliased: $(printf '%s\n' "$blocking_refs" | sed '/^$/d' | wc -l | tr -d ' '), declared count ${blocking_count_declared:-0} vs $blocking_count entries) — a new allow_blocking site moves its work to a worker instead; the list only shrinks"
+LG_LEDGERS=ci/allow/blocking.txt LG_COUNT_FILE=ci/allow/blocking.txt \
+  LG_MSG_NEW='new frame-thread blocking exception: ' \
+  LG_MSG_REF='allow_blocking named without a call (an alias the ledger cannot count): ' \
+  LG_MSG_STALE='stale ci/allow/blocking.txt entry (site is gone — delete the line): ' \
+  LG_NOUN='the frame-thread exception ledger' \
+  LG_TAIL='a new allow_blocking site moves its work to a worker instead; the list only shrinks' \
+  ledger_check blocking "$blocking_sites"
+fi # blocking
+
+# ---- the Sans-IO ledgers (docs/sans-io.md): workers, globals, forks, fxlanes ------------------------
+# The rule they prepare: logic never performs IO. A MACHINE (a screen, a data/ store, the session
+# owner, the player's foreground lifecycle, a route planner) starts no worker, reads no
+# process-global registry and has no test/production fork; its work leaves as a typed effect the
+# app's runners execute. Today's sites are frozen here, each rule a ledger that only shrinks (the
+# layout and the exactness rules are the ledger machinery's, above); a migration PR deletes the
+# lines of the machine it made pure. MACHINES is the scope of workers and globals; FORK_SCOPE is the
+# scope of forks: the whole of every crate that holds a machine (a fork anywhere in them is a test that
+# does not run the product's code), which is each crate MACHINES names a directory or file of, plus all
+# of the Plex client and the player. The one exception is `platform/src/tv/plane.rs` (the ACB plane's
+# pure `Plane`, in the file of its runner `PlaneOwner`): platform holds forks of its own (i18n,
+# keymanager, storage, toast, webos, ...) that no ledger lists, so that one file is scanned for workers
+# and globals and the crate is not in FORK_SCOPE:
+MACHINES=("$SRC_DATA" "$SRC_SESSION" rust-modules/plex/src/plex/session.rs "$SRC_MEDIA/player/lifecycle.rs"
+  "$SRC_MEDIA/player/attempt_metrics.rs" "$SRC_MEDIA/player/attempt_view.rs" "$SRC_MEDIA/player/readout.rs" "$SRC_MEDIA/player/backend_startup.rs" "$SRC_MEDIA/player/backend_metrics.rs" "$SRC_MEDIA/player/recovery.rs" "$SRC_MEDIA/player/release.rs" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI/uriprobe.rs" "$SRC_PLAY_URI/uri_protocol.rs" "$SRC_PLAY_URI/uri_lifecycle.rs" "$SRC_PLAY_URI/register_ladder.rs" "$SRC_PLAY_URI/acb_bind.rs" "$SRC_PLAY_URI/picture_gate.rs" "$SRC_PLATFORM/tv/plane.rs" "$SRC_MEDIA/route/backend_policy.rs" "$SRC_MEDIA/route/plan.rs" "$SRC_MEDIA/route/plan_memory.rs" "$SRC_SCREENS" "$SRC_UI" "$SRC_APPKIT" "$SRC_MACHINE")
+FORK_SCOPE=("$SRC_DATA" "$SRC_PLEX" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_SESSION" "$SRC_SCREENS" "$SRC_UI" "$SRC_APPKIT" "$SRC_MACHINE")
+
+# scope_re <path>...: an ERE over repo-relative file paths that matches those paths (a `.rs` file
+# exactly, anything else as a directory prefix)
+scope_re() {
+  local re="" p
+  for p in "$@"; do
+    p=$(printf '%s' "$p" | sed 's/\./\\./g')
+    case "$p" in *.rs) re="$re|^$p\$" ;; *) re="$re|^$p/" ;; esac
+  done
+  printf '(%s)' "${re#|}"
+}
+machines_re=$(scope_re "${MACHINES[@]}")
+fork_scope_re=$(scope_re "${FORK_SCOPE[@]}")
+
+# ONE awk pass serves the three rules that scan files (this platform's grep costs 0.8-1.1 s a pass for
+# a long alternation over these crates, and each rule used to take its own; one awk pass over the same
+# files costs ~0.5 s for all of them). It prints `<W|G|F><TAB><file>` for every file of a rule's scope that
+# has a line that could hold a site of that rule, and ci/ledger.awk then decides what is really one; a
+# file the pattern misses cannot hold one. W and G read the machines, F the fork scope.
+workers_pat='spawn_small|spawn_off_frame|submit_retained|submit_ticket|task::(spawn|\{|\*)|storage_worker::(submit|\{|\*)|(task|storage_worker)[[:space:]]+as[[:space:]]'
+globals_pat='client_for|current_server|current_snapshot|keypin::(revision|blocked_for|\{|\*)|session::(peek|current_gen|screen_input_revision|\{|\*)|grant::(offers|\{|\*)|(^|[^A-Za-z0-9_])transport::(viewer_paused|\{|\*)|(^|[^A-Za-z0-9_])preview::(paused|\{|\*)|player::TX|devcaps::(caps|\{|\*)|is_dp_audio|(^|[^A-Za-z0-9_])tape::(active|\{|\*)|(^|[^A-Za-z0-9_])(sidecar|ass_source)::(takes_colour|selected|\{|\*)|server_ids|server_roster_gen|server_facts_gen|server_probe_result|peek_settled|screen_input_revision|(session|keypin|grant|player|transport|preview|devcaps|tape|sidecar|ass_source|caps|is_dp_audio|is_dp_audio_track|peek|peek_settled|current_gen|screen_input_revision|revision|blocked_for|offers|paused|viewer_paused|TX|server_ids|server_roster_gen|server_facts_gen|server_probe_result)[[:space:]]+as[[:space:]]'
+# a cfg line: one with `test` on it, or an attribute / `cfg!` that opens on one line and closes on a later
+# one, where `test` may sit on the second. A line that is a test-only attribute outright — `#[cfg(test)]`,
+# `#[cfg(any(test, feature = "test-support"))]`, or an `all(<either>, <flat atoms>)` of them — is no
+# candidate: an item under it is skipped whole.
+forks_pat='cfg.*test|test.*cfg|#!?\[cfg\([^]]*$|cfg!\([^)]*$'
+forks_plain_re='^[[:space:]]*#\[cfg\((test|any\(test, feature = "test-support"\)|all\((test|any\(test, feature = "test-support"\)), [^()]*\))\)\][[:space:]]*$'
+# PRELUDE 3 of 3: computed only when workers, globals or forks is selected.
+if any_wanted workers globals forks; then
+ledger_hits=$(
+  find "$SRC_DATA" "$SRC_SESSION" "$SRC_PLEX" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_SCREENS" "$SRC_UI" "$SRC_APPKIT" "$SRC_MACHINE" "$SRC_PLATFORM/tv/plane.rs" \
+      -name '*.rs' -type f 2>/dev/null \
+    | W_PAT="$workers_pat" G_PAT="$globals_pat" F_PAT="$forks_pat" F_PLAIN="$forks_plain_re" \
+      M_RE="$machines_re" K_RE="$fork_scope_re" \
+      xargs awk '
+        BEGIN { w = ENVIRON["W_PAT"]; g = ENVIRON["G_PAT"]; f = ENVIRON["F_PAT"]
+                p = ENVIRON["F_PLAIN"]; m = ENVIRON["M_RE"]; k = ENVIRON["K_RE"] }
+        FNR == 1 { dw = dg = df = 1; if (FILENAME ~ m) dw = dg = 0; if (FILENAME ~ k) df = 0 }
+        dw && dg && df { next }
+        !dw && $0 ~ w { print "W\t" FILENAME; dw = 1 }
+        !dg && $0 ~ g { print "G\t" FILENAME; dg = 1 }
+        !df && $0 ~ f && $0 !~ p { print "F\t" FILENAME; df = 1 }
+      '
+)
 fi
+# ledger_candidates <W|G|F>: the files of that rule's scope the prefilter kept
+ledger_candidates() {
+  printf '%s\n' "$ledger_hits" | awk -F'\t' -v r="$1" '$1 == r { print $2 }' | sort -u
+}
+
+# workers: a production call that starts a worker — `task::spawn(`, `spawn_small(`,
+# `spawn_small_keeping(`, `spawn_small_or_inline(`, `spawn_off_frame(`, `spawn_off_frame_keeping(` (base/src/task.rs),
+# `storage_worker::submit(`, `submit_retained(` (base/src/storage_worker.rs) and the typed command
+# worker's `.submit_ticket(`, keyed `<path>::<enclosing fn>::<spelling>`. A BARE `spawn(` / `submit(` is a
+# site only in a file that imports it from `task` / `storage_worker` (no other `spawn(` is a worker start:
+# `Builder::spawn`, a local fn). A local launcher (`launch_browse_discovery`) is not itself a site —
+# the real call inside it is. The command worker's `.submit(` is not covered: it is `cfg(any(test,
+# feature = "test-support"))` in base, so no production line can call it; `.submit_ticket(` is covered
+# although no machine calls it today, because a machine that did would be starting a worker. A worker
+# named without a call (`.map(spawn_small)`) is a site too; only a rename (`use ... as`) is refused,
+# because the renamed calls are invisible.
+if want workers; then
+workers_sites=$(
+  ledger_candidates W \
+    | LG_MODE=call LG_KEYSPELL=1 LG_USE_OK=1 LG_REF_USE_ONLY=1 \
+      LG_SITE='(^|[^A-Za-z0-9_])(spawn_small|spawn_small_keeping|spawn_small_or_inline|spawn_off_frame|spawn_off_frame_keeping|submit_retained|submit_ticket|task::spawn|storage_worker::submit)([^A-Za-z0-9_]|$)' \
+      LG_DEF='fn[[:space:]]+(spawn|spawn_small|spawn_small_keeping|spawn_small_or_inline|spawn_off_frame|spawn_off_frame_keeping|submit|submit_retained|submit_ticket)[[:space:]]*[(<]' \
+      LG_REF='(^|[^A-Za-z0-9_])(spawn|spawn_small|spawn_small_keeping|spawn_small_or_inline|spawn_off_frame|spawn_off_frame_keeping|submit|submit_retained|submit_ticket|task|storage_worker)[[:space:]]+as[[:space:]]' \
+      LG_BARE='task::(spawn([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?spawn([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])spawn([^A-Za-z0-9_]|$);;storage_worker::(submit([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?submit([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])submit([^A-Za-z0-9_]|$)' \
+      ledger_scan | sort
+)
+LG_LEDGERS="$(echo ci/allow/workers/*.txt)" LG_AREA_CHECK=1 \
+  LG_MSG_NEW='new production worker start in a machine: ' \
+  LG_MSG_REF='a worker start renamed by `use ... as` (an alias the ledger cannot count): ' \
+  LG_MSG_STALE='stale worker ledger entry (site is gone — delete the line): ' \
+  LG_NOUN='the worker-start ledger' \
+  LG_TAIL='a machine starts no worker: its work leaves as a typed effect the app runs (docs/sans-io.md); the ledgers only shrink' \
+  ledger_check workers "$workers_sites"
+fi # workers
+
+# globals: a production read of a process-global registry in a MACHINE — `client_for(`, `current_server(`,
+# `current_snapshot(`, `keypin::revision(`, `keypin::blocked_for(`, `session::peek(`, `grant::offers(`, the
+# player's pause readers `transport::viewer_paused(` and `preview::paused(`. Both take the session,
+# yet neither is a pure readout read: `viewer_paused` also reads the claim hold's process-global slot and serial
+# (`claim_hold::owns_pause`), and `preview::paused` the preview machine's process-global phase
+# (`preview::occupies`). `transport::paused(ps)` is no longer a spelling: since W3e L3b-2c moved the Pause into
+# the readout it reads `ps.readout().paused()` and nothing process-wide (it read `FEED_TX.paused` before); the
+# lifecycle PR B move had put all three in player/transport.rs and widened this rule to them, seeding the
+# machines' existing reads as a coverage expansion. The rule also guards `player::TX`
+# in the player's lifecycle (the machine, at zero: it takes the pause as a value on its event, and the
+# spelling stays pinned there as a guard; the HUD's direct reads are not machines). The pause moved with the
+# Feed backend's state to `plx_play_feed::shared::FEED_TX` (and the callback mailbox to `FEED_SHARED`), so the
+# guard names those spellings too (`shared::FEED_TX`, a bare `FEED_TX`, ...): moving the atomic must not move it
+# out of the guard's reach. The server registry's roster
+# readers (`server_ids(`, `server_roster_gen(`, `server_facts_gen(`, `server_probe_result(`: the `plex/src/plex/mod.rs`
+# re-exports of `servers::ids`, `roster_gen`, `facts_gen`, `probe_result`), the session cache's two readers
+# (`session::peek_settled(`, `session::current_gen(`) and the controlled-run switch `tape::active(` (a thread-local
+# the tape arms) read process-wide state behind a free function too, and the widening that closed the rule's list is a
+# coverage expansion that recorded the reads already there. So do the subtitle registries' colour-pick readers
+# `sidecar::takes_colour(` / `sidecar::selected(` / `ass_source::takes_colour(` / `ass_source::selected(`: the
+# Subtitles menu read them through a media free function before the fact became a readout value the app
+# delivers (`player::deliver_subtitle_ink`); no machine holds a site, so the names seeded no ledger line. The settings getters (`route::*`) and `i18n::current` are
+# deliberately NOT spellings: the owner's architecture board kept settings getters out of this gate, and
+# `i18n::current` is a display read. The device's
+# capability answer is read behind a function too: `devcaps::caps(`, and the zero-argument audio gates
+# `is_dp_audio(` / `is_dp_audio_track(` that used to read it (the `_with` forms take the value and do not
+# match). The attempt-caps PR widened the rule to them as a coverage expansion, not a shrink: the route's
+# planner took its `&Caps` as an argument and reads none, so they seeded no line. A bare
+# `peek(` / `revision(` / `blocked_for(` / `offers(` / `paused(` / `viewer_paused(` / `caps(` /
+# `is_dp_audio(` / `is_dp_audio_track(` / `current_gen(` / `active(` is a site in a file that
+# imports it from `session` / `keypin` / `grant` / `transport` / `preview` / `devcaps` / `sidecar` / `ass_source` /
+# `plex` / `transcoder` / `tape` (alone, last in a braced group, or
+# by glob; `transport`, `preview`, `devcaps` and `tape` count only as a whole path segment, because `scrub_preview::*` and
+# `hud_transport::*` are common module names that import neither) and, for `peek` and `current_gen(`, in
+# plex/src/plex/session.rs, the module that defines them (`data/src/stores/tape.rs` defines `active()` but is the
+# registry the stores call through, not a machine, so its own bare calls are no sites). `current_gen` and `active` are
+# generic names (a field, a method, another module's `active()`), so their bare form counts only as a call and only
+# where that import or module says it is the registry's; `peek_settled` and the four `server_*` names are as
+# distinctive as `client_for` and count bare anywhere (a method call, `x.server_ids()`, never does). A getter named without
+# a call (`.and_then(client_for)`) reads the registry as surely as a call does, so it is a site too; only a
+# rename (`use ... as`) is refused, because the renamed calls are invisible. Each getter's own definition is
+# not a site.
+if want globals; then
+globals_sites=$(
+  { ledger_candidates G
+    printf '%s\n' rust-modules/plex/src/plex/session.rs "$SRC_MEDIA/player/lifecycle.rs"; } \
+    | LG_MODE=call LG_KEYSPELL=1 LG_USE_OK=1 LG_REF_USE_ONLY=1 \
+      LG_SITE='(^|[^A-Za-z0-9_.])(client_for|current_server|current_snapshot|keypin::revision|keypin::blocked_for|session::peek|session::peek_settled|session::current_gen|session::screen_input_revision|grant::offers|transport::viewer_paused|preview::paused|devcaps::caps|is_dp_audio_track|is_dp_audio|tape::active|sidecar::takes_colour|sidecar::selected|ass_source::takes_colour|ass_source::selected|server_ids|server_roster_gen|server_facts_gen|server_probe_result|peek_settled|screen_input_revision)([^A-Za-z0-9_]|$)' \
+      LG_DEF='fn[[:space:]]+(client_for|current_server|current_snapshot|peek|peek_settled|current_gen|screen_input_revision|revision|blocked_for|offers|paused|viewer_paused|caps|is_dp_audio|is_dp_audio_track|active|server_ids|server_roster_gen|server_facts_gen|server_probe_result)[[:space:]]*[(<]' \
+      LG_REF='(^|[^A-Za-z0-9_])(client_for|current_server|current_snapshot|peek|peek_settled|current_gen|screen_input_revision|revision|blocked_for|offers|paused|viewer_paused|caps|is_dp_audio|is_dp_audio_track|server_ids|server_roster_gen|server_facts_gen|server_probe_result|tape::active|TX|session|keypin|grant|player|transport|preview|devcaps|tape|sidecar|ass_source)[[:space:]]+as[[:space:]]|(^|[^A-Za-z0-9_])tape::\{([^}]*[^A-Za-z0-9_])?active[[:space:]]+as[[:space:]]|(^|[^A-Za-z0-9_])(sidecar|ass_source)::\{([^}]*[^A-Za-z0-9_])?(takes_colour|selected)[[:space:]]+as[[:space:]]' \
+      LG_BARE='session::(peek([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?peek([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])peek([^A-Za-z0-9_]|$);;keypin::(revision([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?revision([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])revision([^A-Za-z0-9_]|$);;keypin::(blocked_for([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?blocked_for([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])blocked_for([^A-Za-z0-9_]|$);;grant::(offers([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?offers([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])offers([^A-Za-z0-9_]|$);;(^|[^A-Za-z0-9_])transport::(viewer_paused([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?viewer_paused([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])viewer_paused([^A-Za-z0-9_]|$);;(^|[^A-Za-z0-9_])preview::(paused([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?paused([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])paused([^A-Za-z0-9_]|$);;(^|[^A-Za-z0-9_])devcaps::(caps([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?caps([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])caps[[:space:]]*\(;;(^|[^A-Za-z0-9_])(plex|transcoder)::(is_dp_audio([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?is_dp_audio([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])is_dp_audio([^A-Za-z0-9_]|$);;(^|[^A-Za-z0-9_])(plex|transcoder)::(is_dp_audio_track([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?is_dp_audio_track([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])is_dp_audio_track([^A-Za-z0-9_]|$);;(^|[^A-Za-z0-9_])session::(current_gen([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?current_gen([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])current_gen[[:space:]]*\(;;(^|[^A-Za-z0-9_])tape::(active([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?active([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])active[[:space:]]*\(;;(^|[^A-Za-z0-9_])(sidecar|ass_source)::(selected([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?selected([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])selected[[:space:]]*\(;;(^|[^A-Za-z0-9_])(sidecar|ass_source)::(takes_colour([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?takes_colour([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])takes_colour[[:space:]]*\(;;(^|[^A-Za-z0-9_])session::(screen_input_revision([^A-Za-z0-9_]|$)|\*|\{([^}]*[^A-Za-z0-9_])?screen_input_revision([^A-Za-z0-9_}][^}]*)?\})@@(^|[^A-Za-z0-9_.:])screen_input_revision[[:space:]]*\(' \
+      LG_FILE_SITE='rust-modules/plex/src/plex/session.rs@@(^|[^A-Za-z0-9_.:])peek([^A-Za-z0-9_]|$);;rust-modules/plex/src/plex/session.rs@@(^|[^A-Za-z0-9_.:])current_gen[[:space:]]*\(;;rust-modules/media/src/player/lifecycle.rs@@(^|[^A-Za-z0-9_.])(player::TX|super::TX|shared::FEED_TX|shared::FEED_SHARED)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_.:])(TX|FEED_TX|FEED_SHARED)([^A-Za-z0-9_]|$)' \
+      ledger_scan | sort
+)
+LG_LEDGERS="$(echo ci/allow/globals/*.txt)" LG_AREA_CHECK=1 \
+  LG_MSG_NEW='new production read of a process-global registry in a machine: ' \
+  LG_MSG_REF='a registry getter renamed by `use ... as` (an alias the ledger cannot count): ' \
+  LG_MSG_STALE='stale globals ledger entry (site is gone — delete the line): ' \
+  LG_NOUN='the process-global read ledger' \
+  LG_TAIL='a machine reads no registry: the value arrives in an event or an argument (docs/sans-io.md); the ledgers only shrink' \
+  ledger_check globals "$globals_sites"
+fi # globals
+
+# forks: a production test/production fork across every machine crate (FORK_SCOPE: all of data/, plex/, media/,
+# session/, screens/, ui/, appkit/ and machine/) — a `#[cfg(..)]`
+# attribute that production CAN satisfy (`not(test)`, `not(any(test, feature = "test-support"))`,
+# `not(feature = "test-support")`, `all(target_os = .., not(test))`), or an inline `cfg!(..)` of any value,
+# whose predicate reads `test` or `feature = "test-support"`: code that is one thing in a test and another in
+# the product has a test the product never ran. An item that only a test can see (`#[cfg(test)]`,
+# `any(test, ..)`) is no fork, but `cfg!(test)` is: `if cfg!(test) {..} else {..}` compiles an arm production runs.
+# Keyed `<path>::<item name>` for an attribute on an item (a fn, a const, a mod, an impl, or a macro
+# invocation at module level, named for its macro: `latched_flag!`), or
+# `<path>::<enclosing fn>` for a statement or an inline `cfg!`, or `<path>::<struct>` for a field (it has no fn around
+# it) — never a line number. A file can
+# hold a fork only if it has a cfg line that is not a plain test-only attribute (an item under one is
+# skipped whole), which is what the candidates are.
+if want forks; then
+forks_sites=$(
+  ledger_candidates F \
+    | LG_MODE=fork ledger_scan | sort
+)
+LG_LEDGERS="$(echo ci/allow/forks/*.txt)" LG_AREA_CHECK=1 \
+  LG_MSG_NEW='new production test/production fork: ' \
+  LG_MSG_REF='' \
+  LG_MSG_STALE='stale fork ledger entry (site is gone — delete the line): ' \
+  LG_NOUN='the test/production fork ledger' \
+  LG_TAIL='logic has no cfg(test) fork: the seam is a typed effect tests and replay deliver events through (docs/sans-io.md); the ledgers only shrink' \
+  ledger_check forks "$forks_sites"
+fi # forks
+
+# fxlanes: in `Bridge::app_effect` every `AppFx::<Variant>` arm either pushes `Fx::Deliver(` — the ordered
+# FIFO, where a result returns as one addressed event in the same drain — or is a ledger line: an arm that
+# parks its request on a side queue of the bridge (`reqs`, `content_reqs`, ...) is a second lane with its
+# own timing. A NEW variant with a side queue fails; so does a new arm that is not on the FIFO. Keyed
+# `<path>::AppFx::<Variant>`, one line for EACH variant on an arm's head (`AppFx::A(r) | AppFx::B(r) => ..`
+# is two), and `<path>::AppFx::_` for an arm whose head names none (`other => ..`, `_ => ..`).
+if want fxlanes; then
+# Unreachable arms are allowed only after proving the explicit external classification
+# and the corresponding taken-head runner arm. A side queue plus unreachable still fails.
+if python3 ci/check-app-command-routing.py; then :
+else fail "fxlanes: external FIFO proof failed"; fi
+fxlanes_sites=$(
+  grep -rlE --include='*.rs' 'fn app_effect' "$SRC" 2>/dev/null | sort \
+    | LG_MODE=arm LG_ARM_FN=app_effect LG_ARM_MATCH='(^|[^A-Za-z0-9_])match[[:space:]]+fx[[:space:]]*\{' LG_ARM_OK='Fx::Deliver\(|unreachable!\(' \
+      ledger_scan | sort
+)
+LG_LEDGERS="$(echo ci/allow/fxlanes/*.txt)" LG_AREA_CHECK=1 \
+  LG_MSG_NEW='new AppFx arm outside the ordered Deliver lane: ' \
+  LG_MSG_REF='' \
+  LG_MSG_STALE='stale fxlanes ledger entry (arm is gone or now delivers — delete the line): ' \
+  LG_NOUN='the Bridge::app_effect lane ledger' \
+  LG_TAIL='an AppFx arm pushes Fx::Deliver(..) onto the one ordered FIFO instead of a side queue (docs/sans-io.md); the ledgers only shrink' \
+  ledger_check fxlanes "$fxlanes_sites"
+fi # fxlanes
 
 # tmppath: a literal `/tmp/plxnative-` string outside dev.rs and the log sinks, = 0 (D4). The
 # earlier version matched only a literal and a filesystem-open VERB co-occurring on the SAME
@@ -1090,7 +1625,8 @@ fi
 # path through `paths::in_runtime_dir("plxnative-…")`, a bare filename with no `/tmp/` prefix, so
 # neither one is a `/tmp/plxnative-` literal in the first place and there is no second file to
 # name here (re-verify this if a log sink is ever given a hardcoded `/tmp/` path).
-tmp_hits=$(python3 - "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" <<'PY'
+if want tmppath; then
+tmp_hits=$(python3 - "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" <<'PY'
 import os, sys
 
 src = sys.argv[1]
@@ -1181,6 +1717,7 @@ else
   echo "$tmp_hits" | sed 's/^/    /'
   fail "tmppath: $(echo "$tmp_hits" | grep -c . ) line(s) of a literal /tmp/plxnative- path outside dev.rs, not comment or log-message text"
 fi
+fi # tmppath
 
 
 # paging: the two Plex paging parameter names are spelled in ONE non-test file, the `paged_path`
@@ -1189,7 +1726,8 @@ fi
 # not counted (they cannot build a request), and test code is: whole test files (the `wholly_test`
 # classification above) and `#[cfg(test)]` items, found from tokens so a literal inside a string is
 # never mistaken for a comment. Zero, no allowlist. Scans every crate root, not only plex's.
-paging_hits=$(WHOLLY_TEST="$wholly_test" python3 - "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" <<'PY'
+if want paging; then
+paging_hits=$(WHOLLY_TEST="$wholly_test" python3 - "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" <<'PY'
 import os, sys
 sys.path.insert(0, "ci")
 from rust_test_modules import close, lex
@@ -1254,13 +1792,23 @@ else
   echo "$paging_hits" | sed 's/^/    /'
   fail "paging: $(echo "$paging_hits" | grep -c . ) production literal(s) spell X-Plex-Container- outside rust-modules/plex/src/plex/paging.rs (use paged_path)"
 fi
+fi # paging
 
-# every allowlist's declared count equals its entries
-for f in ci/allow/*.txt; do
+# every allowlist's declared count equals its entries — the flat lists, and the per-area ledger files
+# under ci/allow/<rule>/ (workers, globals, forks, fxlanes)
+if want allowlist-counts; then
+for f in ci/allow/*.txt ci/allow/*/*.txt; do
+  [ -f "$f" ] || continue
   declared=$(sed -n 's/^# count: *//p' "$f" | head -1)
   entries=$(grep -cvE '^[[:space:]]*(#|$)' "$f")
   [ "$declared" = "$entries" ] || fail "$f declares count $declared but has $entries entries"
 done
+fi # allowlist-counts
 
+# RULES and the `want` calls above must name the same rules in the same order, whatever was selected
+# (every guard is visited whether or not its rule runs): a rule outside RULES cannot be selected by
+# name, and a name without a guard would be "selected" and run nothing.
+[ "$rules_seen" = " ${RULES[*]}" ] || fail "RULES and the want guards disagree: RULES is [${RULES[*]}], the guards are [${rules_seen# }]"
+if [ -n "$only" ] && [ "$fails" -eq 0 ]; then echo "check-deps: the selected gates are green (--only $only_arg)"; exit 0; fi
 [ "$fails" -eq 0 ] && { echo "check-deps: all gates green"; exit 0; }
 echo "check-deps: $fails gate(s) failed"; exit 1

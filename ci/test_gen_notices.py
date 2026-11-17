@@ -5,9 +5,12 @@ merged in), a lock package that is neither a row nor `not_shipped` is refused, s
 `not_shipped` entry or a row in no lock, a moved toolchain pin is refused, the `compiler_builtins` version in
 the prose follows the std snapshot, rendering is idempotent, and the REAL repository's data file and
 notices pass the gate (so a hand edit of a generated table, or a bump without `make notices`, fails here
-as well as in the gate). Nothing here runs cargo or touches the network."""
+as well as in the gate), and `--verify-graph` resolves the ARM graph with the Makefile's shipping feature set
+(`make RELEASE=1`: the playback backends included) rather than a bare `--no-default-features`. Nothing here
+runs cargo or touches the network (the Makefile query `print-playback-config` is the one process it starts)."""
 import importlib.util
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -79,6 +82,16 @@ class Render(unittest.TestCase):
     def test_a_missing_region_is_an_error(self):
         with self.assertRaises(SystemExit):
             gen.render('no regions\n**compiler_builtins 1**\n', data(), self.project)
+
+    def test_an_explicit_dev_only_version_is_omitted_but_cannot_hide_a_runtime_version(self):
+        classified = data()
+        classified['not_shipped_versions'] = {'serde': ['0.9.0']}
+        project = {**self.project, 'serde': ['0.9.0', '1.0.1']}
+        self.assertEqual(gen.crate_versions('serde', project, classified), ['1.0.1'])
+        tree = {'serde': {'1.0.1'}, 'libc': {'0.2.9'}, 'icu_x': {'2.0.0'}}
+        self.assertEqual(gen.graph_problems(tree, classified, project), [])
+        tree['serde'].add('0.9.0')
+        self.assertTrue(any('0.9.0' in problem for problem in gen.graph_problems(tree, classified, project)))
 
 
 class Classification(unittest.TestCase):
@@ -156,6 +169,43 @@ class Graph(unittest.TestCase):
         self.assertEqual(self.check(self.TREE, *self.BASE), [])
 
 
+class GraphCommand(unittest.TestCase):
+    """The `cargo tree` that --verify-graph runs, without running it."""
+
+    def run_verify(self, featflags):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout='serde v1.0.0\n', stderr='')
+
+        originals = gen.shipping_featflags, gen.subprocess.run
+        gen.shipping_featflags, gen.subprocess.run = (lambda root: featflags), fake_run
+        try:
+            gen.verify_graph(data(), gen.parse_lock(lock(('serde', '1.0.0', True))))
+        finally:
+            gen.shipping_featflags, gen.subprocess.run = originals
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_the_graph_is_resolved_with_the_makefiles_shipping_features(self):
+        cmd = self.run_verify(['--no-default-features', '--features', 'backend-a,backend-b'])
+        self.assertIn('--features', cmd)
+        self.assertEqual(cmd[cmd.index('--features') + 1], 'backend-a,backend-b')
+        self.assertEqual(cmd.count('--no-default-features'), 1)
+        self.assertIn('armv7-unknown-linux-gnueabi', cmd)
+
+    def test_a_makefile_that_cannot_answer_is_a_problem_not_a_guess(self):
+        def refuse(root):
+            raise ValueError('make failed')
+        original = gen.shipping_featflags
+        gen.shipping_featflags = refuse
+        try:
+            self.assertEqual(gen.verify_graph(data(), {}), ['make failed'])
+        finally:
+            gen.shipping_featflags = original
+
+
 class Modes(unittest.TestCase):
     """The exit codes `.github/workflows/dependabot-notices.yml` branches on, on a throwaway checkout."""
 
@@ -222,7 +272,7 @@ class Toolchain(unittest.TestCase):
         self.real = gen.read_std
         self.addCleanup(setattr, gen, 'read_std', self.real)
 
-    def fake(self, std, rustc='rustc 1.100.0 (abc 2026-11-01)', backtrace='0.3.77'):
+    def fake(self, std, rustc='rustc 1.101.0 (abc 2026-11-01)', backtrace='0.3.77'):
         gen.read_std = lambda pin: (std, rustc, backtrace, [])
 
     def test_the_layout_round_trips_so_a_derive_changes_only_what_moved(self):
@@ -233,28 +283,28 @@ class Toolchain(unittest.TestCase):
     def test_a_moved_release_rewrites_the_snapshot(self):
         std = {**self.std, 'libc': ['0.2.999'], 'compiler_builtins': ['0.1.999']}
         self.fake(std)
-        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.100.0')
+        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.101.0')
         self.assertEqual((problems, added), ([], []))
         new = json.loads(out)
-        self.assertEqual(new['toolchain'], {'pin': '1.100.0', 'rustc': 'rustc 1.100.0 (abc 2026-11-01)', 'backtrace': '0.3.77'})
+        self.assertEqual(new['toolchain'], {'pin': '1.101.0', 'rustc': 'rustc 1.101.0 (abc 2026-11-01)', 'backtrace': '0.3.77'})
         self.assertEqual(new['std_lock']['libc'], '0.2.999')
         self.assertEqual(new['groups'], self.data['groups'])
         self.assertEqual(new['not_shipped'], self.data['not_shipped'])
 
     def test_a_crate_new_to_std_needs_a_person_and_nothing_is_rewritten(self):
         self.fake({**self.std, 'brandnew': ['0.1.0']})
-        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.100.0')
+        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.101.0')
         self.assertEqual(added, ['brandnew'])
         self.assertEqual(out, self.text)
 
     def test_a_crate_that_left_std_lock_is_dropped_from_std_not_shipped_but_a_linked_one_needs_a_person(self):
         gone = {k: v for k, v in self.std.items() if k != 'dlmalloc'}
         self.fake(gone)
-        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.100.0')
+        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.101.0')
         self.assertEqual((problems, added), ([], []))
         self.assertNotIn('dlmalloc', json.loads(out)['std_not_shipped'])
         self.fake({k: v for k, v in self.std.items() if k != 'libc'})
-        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.100.0')
+        out, problems, added = gen.derive_toolchain(self.data, self.text, '1.101.0')
         self.assertTrue(any('libc' in p for p in problems))
         self.assertEqual(out, self.text)
 
@@ -263,8 +313,8 @@ class Toolchain(unittest.TestCase):
         self.addCleanup(setattr, gen, 'workflow_pins', saved)
         gen.workflow_pins = lambda: {self.data['toolchain']['pin']}
         self.assertIsNone(gen.stale_pin(self.data))
-        gen.workflow_pins = lambda: {'1.100.0'}
-        self.assertEqual(gen.stale_pin(self.data), '1.100.0')
+        gen.workflow_pins = lambda: {'1.101.0'}
+        self.assertEqual(gen.stale_pin(self.data), '1.101.0')
         for bad in ('nightly', '1.100', '1.1.1; rm -rf /', '1.2.3-beta'):
             gen.workflow_pins = lambda bad=bad: {bad}
             with self.assertRaises(SystemExit):
@@ -278,6 +328,14 @@ class Toolchain(unittest.TestCase):
 
 
 class Repository(unittest.TestCase):
+    def test_the_shipping_features_name_the_playback_backends(self):
+        # A bare `--no-default-features` is a build with no playback backend: no plx_play_feed, so no
+        # dolby_vision and the rest of its tree, which the release links and the notices carry rows for.
+        flags = gen.shipping_featflags(gen.ROOT)
+        self.assertIn('--no-default-features', flags)
+        named = flags[flags.index('--features') + 1].split(',') if '--features' in flags else []
+        self.assertTrue({'play-uri', 'play-feed'} & set(named), flags)
+
     def test_the_real_notices_match_the_real_lock(self):
         d, project = gen.load()
         self.assertEqual(gen.problems_in(d, project, gen.workflow_pins()), [])

@@ -67,7 +67,7 @@ pub struct LiveRoute {
     pub subtitle_stream_id: i64,
     pub info: LiveInfo,
     /// A cloud provider's stream (Plex's own channels): no server session to keep alive or
-    /// release, and its HLS is read in the provider's shape (`ff::PROVIDER_STREAM`).
+    /// release, and its HLS is read in the provider's shape (`plx_playback_contract::live_stream`).
     pub provider: bool,
     /// The tuner's capture window the tune answered (pause and rewind play from it).
     pub capture: Option<CaptureWindow>,
@@ -125,8 +125,9 @@ impl LiveLease {
         forget_shift(&self.encoder_session);
         // Whatever drops a lease (a stop, a reset, a plan assigned over the session), the next
         // stream the demuxer opens is not this channel's: never a library stream read as live.
-        crate::ff::set_live_stream(false);
-        crate::ff::set_provider_stream(false);
+        plx_playback_contract::live_stream::set_live_stream(false);
+        plx_playback_contract::live_stream::set_provider_stream(false);
+        plx_net::range_io::set_resolve_unpinned(false);
         RECORD_ASKED.store(0, Ordering::Relaxed);
         if self.provider {
             crate::player::log("livetv: a provider's channel ends (nothing to release)");
@@ -449,8 +450,9 @@ pub fn install_live(ps: &mut PlaybackSession, route: LiveRoute) -> bool {
     super::decision::install_live_lease(ps, lease, route.info.clone(), &route.url);
     // the caption stream burned in is the subtitle "on": the menu checks its row
     super::decision::set_subtitle(ps, route.subtitle_stream_id.max(0));
-    crate::ff::set_live_stream(true);
-    crate::ff::set_provider_stream(route.provider);
+    plx_playback_contract::live_stream::set_live_stream(true);
+    plx_playback_contract::live_stream::set_provider_stream(route.provider);
+    plx_net::range_io::set_resolve_unpinned(route.provider);
     // pause and rewind: the tuner's capture as the tune answered it, the picture at its edge (a
     // Plex channel has none: nothing of an earlier playback stays)
     *shift_lock() = (!route.provider).then(|| {

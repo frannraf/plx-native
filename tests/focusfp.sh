@@ -28,6 +28,8 @@
 #   tests/focusfp.sh --pms 10.0.0.5:32400   # against a real server (fingerprints then carry
 #                                            #   real ratingKeys: NOT committable)
 #
+# FOCUS_STEP / FOCUS_SETTLE / FOCUS_BOOT_SETTLE override the default timing when recording on
+# high-refresh hosts; the route/focus assertions still have to pass before importing a fixture.
 # Needs `make sim` (the binary) and nothing else. Every flow gets a fresh instance root.
 set -euo pipefail
 
@@ -42,9 +44,11 @@ REC=""
 REPLAY=""
 MODE=""
 MIN_LINES=2
+MOCK_WAIT="${FOCUS_MOCK_WAIT:-90}" # cold mock startup may include font/image work
 BOOT_WAIT=25     # seconds to wait for the boot marker before giving up on a flow
-STEP=0.9         # seconds between tokens — a human D-pad cadence, and past every settle spring
-SETTLE=3         # seconds after the last token before the run is read
+STEP="${FOCUS_STEP:-0.9}" # seconds between tokens; shorter recordings on high-refresh hosts
+SETTLE="${FOCUS_SETTLE:-3}" # seconds after the last token before the run is read
+BOOT_SETTLE="${FOCUS_BOOT_SETTLE:-2}" # posters and asynchronous initial landings
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,7 +75,7 @@ if [ -n "$REPLAY" ]; then
 elif [ -z "$PMS" ]; then
   python3 "$ROOT/tests/mock_pms.py" --port "$PORT" --seed "$SEED" > "$OUT/mock_pms.log" 2>&1 &
   MOCK_PID=$!
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 $((MOCK_WAIT * 5))); do
     grep -q 'serving' "$OUT/mock_pms.log" 2>/dev/null && break
     sleep 0.2
   done
@@ -181,7 +185,7 @@ PY
       echo "  [FAIL] $n $name: $verdict"; return 1
     fi
   fi
-  sleep 2   # posters and the async landings the first keys must not race
+  sleep "$BOOT_SETTLE"
   if [ -n "$tokens" ]; then
     # `<>`: a FIFO opened write-only blocks in open(2) with no reader (ui-sim skill, trap 1).
     exec 3<> "$d/plxnative-remote"
@@ -260,10 +264,10 @@ record_flow 4 search-shelf-detail-back "search=s0" "sleep:2 down down ok sleep:2
 # 5 Detail -> Person -> Detail -> BACK -> Person -> BACK -> Detail
 record_flow 5 detail-person-detail "detail=$RK_MOVIE detailsec=1 detailok" "sleep:2 down ok sleep:2 back sleep:1 back sleep:1 down ok sleep:2 back" 'route=person'
 # 6 chip -> Account -> Settings -> Privacy -> Legal -> document -> BACK x4
-# The synthetic token boot has no signed-in account: Favourites is absent, so the root is Playback,
-# Language, Privacy, Legal, About and Privacy is row 2. Step down twice, visit it and toggle its
-# first choice, then return to row 2 and step down once to Legal.
-record_flow 6 settings-family "settings=root" "sleep:1 down down ok sleep:1 ok sleep:1 back sleep:1 down ok sleep:1 ok sleep:1 back back back" 'overlay=settings'
+# The synthetic token boot has no signed-in account: Favourites is absent, so the Settings v2 root is
+# Playback, Language, Privacy, Diagnostics, Legal, About and Privacy is row 2. Step down twice, visit
+# it and toggle its first choice, then return to row 2 and step down twice (past Diagnostics) to Legal.
+record_flow 6 settings-family "settings=root" "sleep:1 down down ok sleep:1 ok sleep:0.3 back sleep:1 down down ok sleep:1 ok sleep:0.3 back back sleep:1 back" 'overlay=settings'
 # 7 first-run consent -> onboard -> Home
 record_flow 7 firstrun-consent-onboard "firstrun" "sleep:1 ok sleep:1 ok sleep:1 down ok sleep:2" 'route='
 # 8 Detail -> hold on Related -> ItemMenu -> BACK. detailsec is a DOWN count, not a section id:

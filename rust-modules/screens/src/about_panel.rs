@@ -4,7 +4,8 @@
 //! one, the card, opens THIS panel. That is the design's rule and it is stated as a rule rather
 //! than as a layout accident: *"a block earns an alert only when the page truncates something
 //! worth reading in full."* The card truncates — its synopsis is capped at five `CAPTION` lines
-//! with a right-pinned MORE. The other three do not, and each is settled by name:
+//! with a MORE pinned where its last line ends (right, or left for an Arabic or Hebrew synopsis).
+//! The other three do not, and each is settled by name:
 //!
 //! * **Accessibility** is three fixed definitions of CC/SDH/AD that never change and are already
 //!   printed in full on the page — no alert.
@@ -943,6 +944,9 @@ mod tests {
         TEST_METADATA.with(|cell| unsafe { &mut *cell.get() })
     }
 
+    impl crate::registry::ScreenInputsLike for TestHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+    }
     impl crate::registry::CollectionLike for TestHost {
         fn collection<'a>(_cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a> {
             plx_data::collection::CollectionView::default()
@@ -963,6 +967,7 @@ mod tests {
             tick: Tick::default(),
             measure,
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead::default(),
             owner: InputOwner::Entry(ENTRY),
         }

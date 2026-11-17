@@ -1,5 +1,10 @@
 //! The physically owned Person model and fetch transport (`docs/stores-as-machines.md`). Each
 //! production `Bridge` owns one [`PersonStore`]; no free selector can connect two Bridges.
+//!
+//! The store starts no worker. Its pump emits each request as a [`StoreJob`](super::StoreJob) that
+//! its owner takes and owes to a runner (`Stores::person_pump`'s caller, `Bridge::person_pump`),
+//! and the part of the registry it decides from, which client each server holds, arrives as
+//! [`plx_plex::plex::ClientKeys`] within PersonInput, filled by the host right before the call.
 
 use plx_plex::plex::ServerId;
 use plx_machine::machine::{Cx, Effects, Handled, Host, Machine};
@@ -10,7 +15,7 @@ use super::StoreEv;
 
 #[derive(Clone, Debug)]
 pub enum PersonCmd {
-    /// Mount a person from the header a cast row handed in; the fetches spawn on the next pump.
+    /// Mount a person from the header a cast row handed in; the next pump emits the fetches as jobs.
     Open {
         sid: ServerId,
         key: String,
@@ -99,14 +104,44 @@ impl PersonStore {
         }
         changed
     }
-
-    /// Route-unconditional landing/spawn pass for this owner's adapter.
-    pub fn pump(&mut self, gate: &plx_machine::landgate::Gate) -> bool {
-        let changed = self.state.pump_with_gate(&self.adapter, gate);
-        if changed {
-            self.bump();
-        }
+    /// Open uses the exact captured roster/session; independent commands remain usable without it.
+    pub fn run_with_input(&mut self, cmd: PersonCmd, input: &crate::person::PersonInput<'_>) -> bool {
+        if !matches!(&cmd, PersonCmd::Open { .. }) { return self.run(cmd); }
+        let changed = self.state.run_with_input(&self.adapter, cmd, input);
+        if changed { self.bump(); }
         changed
+    }
+
+    /// Route-unconditional landing pass for this owner's adapter, and the requests the open page
+    /// wants now. `keys` is the registry's answer as of this call. It does NOT start the requests
+    /// it emitted: the caller takes them with [`PersonStore::take_jobs`] and hands them to a runner
+    /// in the same turn (the one production caller is `Bridge::person_pump`; the application's test
+    /// rigs fail a frame that ends with a job still here,
+    /// `Bridge::assert_no_store_jobs_left_for_test`).
+pub fn pump(&mut self, gate: &plx_machine::landgate::Gate, input: &crate::person::PersonInput<'_>) -> bool {
+        let changed = self.state.pump_with_gate(&self.adapter, gate, input);
+        if changed { self.bump(); }
+        changed
+    }
+
+    /// Same-drain terminal pass after the runner attempted these requests. No admission is emitted.
+    pub fn land_launch_refusals(&mut self) -> bool {
+        let changed = self.state.land_launch_refusals(&self.adapter);
+        if changed { self.bump(); }
+        changed
+    }
+
+    /// Take the jobs the pump has emitted since the last take, in the order they were emitted. The
+    /// caller OWES each one to a runner: a job dropped here is a request whose claim is never
+    /// released.
+    #[must_use]
+    pub fn take_jobs(&mut self) -> Vec<super::StoreJob> {
+        std::mem::take(&mut self.state.jobs)
+    }
+
+    /// Does the outbox hold a job nobody has taken yet?
+    pub fn has_jobs(&self) -> bool {
+        !self.state.jobs.is_empty()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -172,13 +207,12 @@ impl PersonStore {
 
 impl<H: Host> Machine<H> for PersonStore {
     type Ev = StoreEv<PersonCmd>;
-    fn step(&mut self, ev: &Self::Ev, _cx: &Cx<'_, H>, _fx: &mut Effects<'_, H>) -> Handled {
+fn step(&mut self, ev: &Self::Ev, _cx: &Cx<'_, H>, _fx: &mut Effects<'_, H>) -> Handled {
         match ev {
-            StoreEv::Cmd(command) => {
-                self.run(command.clone());
-            }
+            StoreEv::Cmd(command) => { self.run(command.clone()); }
             StoreEv::Pump { .. } => {
-                self.pump(&plx_machine::landgate::Gate::default());
+                plx_base::eventlog::log("person: pump requires captured inputs — refused");
+                debug_assert!(false, "Person pump requires captured inputs");
             }
         }
         Handled::Yes

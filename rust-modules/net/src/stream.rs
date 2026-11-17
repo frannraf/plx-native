@@ -7,7 +7,7 @@
 //! four decimal octets parsed by hand into a `sockaddr_in`, which made a hostname and every IPv6
 //! server not "degraded" but impossible — the shape of the gap LG's checklist #43 CASE2 asks about.
 //! What is still missing here is TLS: this arm stays cleartext. [`crate::http`] sends an `https://`
-//! control-plane origin through [`crate::net`], while MEDIA bytes use [`crate::curlio`], a
+//! control-plane origin through [`crate::net`], while MEDIA bytes use [`crate::range_io`], a
 //! libcurl-multi pull source under the same `ff.rs` AVIO that this module serves for `http`.
 //!
 //! Failures the legacy `0`/`-1` return cannot carry are reported to the event log instead: a
@@ -1816,6 +1816,12 @@ pub fn http_read_until(
     unsafe {
         let hs = &mut *hs;
         let n = n as usize;
+        // A finished body is the clean end, answered before any framing is parsed. The drain may
+        // have consumed the last chunk already, and a keep-alive connection stays open after it:
+        // reading chunk framing off it would wait for bytes that never come.
+        if hs.body_done != 0 {
+            return 0;
+        }
         if hs.chunked != 0 {
             if hs.chunk_left < 0 {
                 match hs_skip_chunked_trailers(hs, deadline, pacer) {

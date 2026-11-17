@@ -267,13 +267,10 @@ fn recording_painters_do_not_declare_live_glass_or_underlay_damage() {
 }
 
 #[test]
-fn content_at_or_above_the_surfaces_band_is_never_recorded() {
-    // The `nav.modals.surfaces` draw loop (Settings/AccountMenu/ItemMenu/About's own content,
-    // `dispatch.rs::draw_with`) is not gated by `host_render`/`PagePlan`, so it walks fully on
-    // every discovered frame — but nothing reads a `Paint` recorded at or above `Z::surface(0)`
-    // (the one glass there, a menu's own, reads the prefix BELOW it), so recording what it
-    // declares was pure cost for data nothing reads. This is the modal-100 /
-    // push-100 stress-bench regression's second cause (see docs/backdrop-blur-profiling.md).
+fn the_cheap_discovery_walk_does_not_record_unrequested_surface_content() {
+    // The initial traversal skips modal primitive arguments. `discover_with` repeats only
+    // when current-frame live glass actually needs a surface prefix; ordinary Settings and
+    // frozen menus keep this fast path (the modal stress-bench regression's constraint).
     let _guard = plx_base::testlock::serial();
     let sources = Rc::new(RefCell::new(Sources::default()));
     sources.borrow_mut().begin(vec![]);
@@ -445,6 +442,38 @@ fn shared_chrome_splits_when_its_glasses_overlap() {
         2,
         "the second band uses a visible prefix; the independent third stays above it"
     );
+}
+
+/// The top bar's chip (the profile circle) and its centred track: `BAND_AIR`-clear of each other
+/// at every strip width, so they never overlap, but a track of 1432 px or more starts inside the
+/// chip's sampling footprint (its rect grown by `BLUR_REACH`). Footprint contact alone must not
+/// split the shared band: that is a second source job and a second page pass for glass that
+/// samples the page, not each other.
+#[test]
+fn shared_chrome_neighbours_whose_footprints_touch_but_rects_do_not_keep_one_source() {
+    let _guard = plx_base::testlock::serial();
+    let chip = Rect::new(96.0, 54.0, 76.0, 76.0);
+    let track = Rect::new(188.0, 54.0, 1544.0, 76.0);
+    for (name, order) in [("chip then track", [chip, track]), ("track then chip", [track, chip])] {
+        let sources = Rc::new(RefCell::new(Sources::default()));
+        sources.borrow_mut().begin(vec![]);
+        {
+            let _walk = discover(sources.clone());
+            let _band = layer(Z::CHROME, true);
+            for r in order {
+                declare_glass(crate::Painter::root(), r);
+            }
+        }
+        sources.borrow_mut().resolve();
+        assert_eq!(
+            sources.borrow().entries.keys().copied().collect::<Vec<_>>(),
+            vec![Z::CHROME],
+            "{name}: one source in the shared band"
+        );
+        let jobs = sources.borrow().jobs();
+        assert_eq!(jobs.len(), 1, "{name}: one capture");
+        assert!(covers(jobs[0].1, chip) && covers(jobs[0].1, track), "{name}: it covers both");
+    }
 }
 
 #[test]
@@ -765,9 +794,9 @@ fn wash_frame_with(
     moving: bool,
     glass: impl Fn(crate::Painter),
 ) -> bool {
-    plx_machine::idle::frame_begin(1.0 / 60.0);
+    plx_machine::motion::report::frame_begin(1.0 / 60.0);
     if moving {
-        plx_machine::idle::note_motion();
+        plx_machine::motion::report::note_motion();
     }
     sources.borrow_mut().begin(vec![]);
     {
@@ -1004,6 +1033,7 @@ fn the_wash_term_follows_the_ink_ramp_laid_over_the_wash() {
         rect: [0.0, 100.0, 1920.0, 400.0],
         ink: [0.0, 0.0, 0.0],
         ink_a,
+        scrim: plx_gfx::gfx::scrim::GroundShade::NONE,
     };
     assert!(g(0.0, [0.0; 2]).delta(&g(0.0, [0.0; 2])).is_none(), "same wash, no term");
     assert!(g(3.0, [0.25; 2]).delta(&g(0.0, [0.0; 2])).is_none(), "another ink is another source");
@@ -1038,8 +1068,8 @@ fn an_inked_wash_strip_is_deferred_and_its_ramp_keys_the_source() {
     let strips = |step: f32, foot: f32| {
         move |p: crate::Painter| {
             let ink = [0.02, 0.02, 0.03, 1.0];
-            p.ambient_inked(Rect::new(0.0, 0.0, 1920.0, 400.0), wash_at(step), (ink, [0.0, foot]), false);
-            p.ambient_inked(Rect::new(0.0, 400.0, 1920.0, 680.0), wash_at(step), (ink, [foot, 0.6]), false);
+            p.ambient_inked(Rect::new(0.0, 0.0, 1920.0, 400.0), wash_at(step), crate::GroundInk::ramp(ink, [0.0, foot]), false);
+            p.ambient_inked(Rect::new(0.0, 400.0, 1920.0, 680.0), wash_at(step), crate::GroundInk::ramp(ink, [foot, 0.6]), false);
         }
     };
     let sources = Rc::new(RefCell::new(Sources::default()));
@@ -1089,7 +1119,7 @@ fn an_art_ground_under_the_chrome_is_never_deferred() {
                 Rect::new(0.0, 0.0, 1920.0, 800.0),
                 plx_gfx::gfx::UV_FULL,
                 [1.0; 4],
-                ([0.0; 4], [0.0; 2]),
+                crate::GroundInk::NONE,
             )
         }
     };

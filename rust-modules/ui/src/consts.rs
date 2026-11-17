@@ -98,27 +98,30 @@ pub const SAFE: crate::Rect = crate::Rect::new(
     SCR_H - 2.0 * MARGIN_Y,
 );
 
+/// **The tolerance of an edge test, in px.** A layout derived through f32 sums lands a hair either side of an
+/// exact edge, so two edges closer than this are the same edge and rects that overlap by less than it only
+/// touch. [`inside_safe`] reads it; the HUD lint's overlap, `SAFE` and menu checks share it rather than each
+/// keeping a copy.
+pub const EDGE_TOL: f32 = 0.01;
+
 /// Is `r` wholly inside [`SAFE`]? The one test the audit's table asks, per rect.
 ///
-/// A hair of tolerance (`EPS`) because several of the rects handed here are the result of an f32
+/// A hair of tolerance ([`EDGE_TOL`]) because several of the rects handed here are the result of an f32
 /// derivation that lands on the boundary exactly — `SCR_W - MARGIN_X - w` then `+ w` is not bit-for-
 /// bit `SCR_W - MARGIN_X` — and a control flush against the frame is compliant, not a violation.
 #[inline]
 pub fn inside_safe(r: crate::Rect) -> bool {
-    const EPS: f32 = 0.01;
-    r.x >= SAFE.x - EPS
-        && r.y >= SAFE.y - EPS
-        && r.x + r.w <= SAFE.x + SAFE.w + EPS
-        && r.y + r.h <= SAFE.y + SAFE.h + EPS
+    r.x >= SAFE.x - EDGE_TOL
+        && r.y >= SAFE.y - EDGE_TOL
+        && r.x + r.w <= SAFE.x + SAFE.w + EDGE_TOL
+        && r.y + r.h <= SAFE.y + SAFE.h + EDGE_TOL
 }
 
 // hero <-> grid continuum
-/// Shelf top in hero view. Re-derived once the peek row stopped magnifying its focused cell: the
-/// peek used to be judged off that popped tile, whose 1.09 scale about its centre lifted its top
-/// edge `CARD_H * 0.09 / 2 ≈ 17px` above every other card in the row. Un-popping the row dropped
-/// the whole shelf by that much, so the peek is 17px shallower here to keep the composition the
-/// hero view was tuned to (828 → 811; card top = `PEEK_Y + CARD_DY` = 837, as the popped one was).
-pub const PEEK_Y: f32 = 811.0;
+/// Shelf origin in hero view: the card's 26 px inset places its top at 768, which stands 40 px under
+/// the hero's action row (top 668, 60 tall: `theme::hero::HOME_ACTIONS_Y`; owner's board CW-13 v2).
+/// The dive from here to [`GRID_TOP_Y`] is 548 px: the board's grid scroll.
+pub const PEEK_Y: f32 = 742.0;
 // shelf top in grid view, and the rest of the FOCUSED shelf on every scroll (`ui_cards::grid_rest_scroll`
 // pins it here whatever the Under posters band): leaves the hub title (row_y − TITLE_DY, lifted up to
 // ~17 more when its leftmost card magnifies) a clear space::MD under the profile chip (bottom edge 126).
@@ -448,7 +451,7 @@ pub fn page_dir(sym: c_uint, wcode: c_uint) -> Option<c_int> {
 
 /// **Is this press one the app binds ANYWHERE — the whole key map, as one predicate.**
 ///
-/// It exists for a single caller and a single rule: `app.rs`'s `begin_fresh_press` runs for EVERY
+/// The app's `begin_fresh_press` runs for EVERY
 /// fresh press, *before* the ladder has decided whether anything takes it, and two of the things it
 /// does are global — it un-dismisses the player HUD and it aborts an armed tvOS click. So an
 /// unsupported key (LG checklist item 40: the colour buttons, GUIDE, INFO, the number pad on a
@@ -487,13 +490,12 @@ pub fn page_dir(sym: c_uint, wcode: c_uint) -> Option<c_int> {
 /// order — the exact duplication [`page_dir`] was written to end. A number key is also, unlike a
 /// colour button, a key this app really does bind, so calling it bound is honest.
 pub fn is_bound(sym: c_uint, wcode: c_uint) -> bool {
+    is_remote_bound(sym, wcode) || plx_platform::labcfg::is_trigger_key(sym, wcode)
+}
+
+/// The fixed key map, independent of a lab build's runtime diagnostics configuration.
+pub fn is_remote_bound(sym: c_uint, wcode: c_uint) -> bool {
     classify(sym, wcode) != Key::Other
-        // A LAB build binds one more key — the diagnostics trigger, which is configuration rather
-        // than a constant (`plx_platform::labcfg::config`). It has to be here or pressing it would also wake
-        // the player HUD and abort an armed click, which is precisely the effect this predicate
-        // exists to withhold from keys the app does not act on. Always `false` in every other
-        // build, at compile time.
-        || plx_platform::labcfg::is_trigger_key(sym, wcode)
         || page_dir(sym, wcode).is_some()
         || sym == SDLK_BACKSPACE
         || sym == SDLK_CLEAR
@@ -665,8 +667,8 @@ mod tests {
 
     /// The two horizontal tests the ladder asks, copied here as the `matches!` patterns `app.rs`
     /// spells at those arms — so the asymmetry between them is asserted rather than described.
-    /// `nav4` is the non-player four-way nav dispatch; `lr` is the player's scrub arm (and the
-    /// Chapters strip, and the scrub's key-up/auto-repeat companions).
+    /// `nav4` is the non-player four-way nav dispatch; `lr` is the player's scrub arm (and
+    /// the scrub's key-up/auto-repeat companions).
     fn nav4(k: Key) -> bool {
         matches!(
             k,
