@@ -905,10 +905,8 @@ pub(crate) fn player_requests(
             PlayerReq::ChannelStep(step) => step_live_channel(&mut player.session, bridge, step, now, pages),
             PlayerReq::LiveSkip(delta) => {
                 live_skip(&mut player.session, pa, delta);
-                if let Some(player) = super::bridge::player_mut(pages) {
-                    player.hud.extend(now, HUD_LINGER_MS);
-                    player.publish();
-                }
+                super::bridge::send_player_message(pages,
+                    plx_screens::registry::AppMsg::PlayerExtendHud { now, duration_ms: HUD_LINGER_MS });
             }
         }
     }
@@ -963,10 +961,8 @@ fn step_live_channel(
         let line = plx_platform::i18n::msg::live_tv_tuning(&words);
         plx_media::route::set_live_context(ps, Some(&line));
     }
-    if let Some(player) = super::bridge::player_mut(pages) {
-        player.hud.extend(now, HUD_LINGER_MS);
-        player.publish();
-    }
+    super::bridge::send_player_message(pages,
+        plx_screens::registry::AppMsg::PlayerExtendHud { now, duration_ms: HUD_LINGER_MS });
 }
 
 /// A subtitle pick on a live channel is the broadcast's closed captions on or off. The server burns
