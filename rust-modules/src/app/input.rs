@@ -67,24 +67,11 @@ impl Pointer {
     /// alike. Each caller keeps its own decision to call `hide_cursor()`; this is the state
     /// half: the cursor reads hidden, Back no longer owns it, motion is counted afresh against
     /// `DPAD_MOTION_GATE` and the edge glide stops.
-    /// Distance from the first motion after a keypad press, not summed hand jitter: a Magic
-    /// Remote held still drifts a few pixels for ever, and a sum of that drift woke the cursor.
-    pub(crate) fn note_motion(&mut self, x: f32, y: f32) {
-        if self.prev_mx < 0.0 {
-            self.prev_mx = x;
-            self.prev_my = y;
-        }
-        self.mot_accum = (x - self.prev_mx).abs().max((y - self.prev_my).abs());
-    }
-
     pub(crate) fn enter_dpad(&mut self) {
         self.dpad_mode = true;
         self.cur_hidden = true;
         self.back_cursor = None;
         self.mot_accum = 0.0;
-        // the next motion is the anchor `note_motion` measures from
-        self.prev_mx = -1.0;
-        self.prev_my = -1.0;
         self.edge.stop();
     }
 
@@ -350,9 +337,9 @@ pub(crate) fn click_is_ok(dpad_mode: bool, motion_since_dpad: f32, on_control: b
     dpad_mode && transparent_cursor && (motion_since_dpad < DPAD_MOTION_GATE || !on_control)
 }
 
-/// Pointer displacement, in logical px from the post-keypad anchor, that hands focus back to
+/// Pointer travel, in logical px accumulated since the last D-pad press, that hands focus back to
 /// the pointer: below it, motion is the hand holding the remote, not a deliberate move.
-pub(crate) const DPAD_MOTION_GATE: f32 = 600.0;
+pub(crate) const DPAD_MOTION_GATE: f32 = 120.0;
 
 // `home_activate` (the OK/pointer activation ladder for the legacy Home grid) was retired with
 // the legacy `ui::home` module when phase 8 made Home an owned `Screen` — its job (trail reset,
@@ -1878,22 +1865,6 @@ mod mark_scope_tests {
 mod click_is_ok_tests {
     use super::click_is_ok;
 
-    #[test]
-    fn pointer_requires_a_large_displacement_not_accumulated_jitter() {
-        let mut pointer = super::Pointer::IDLE;
-        pointer.note_motion(100.0, 100.0);
-        for _ in 0..1000 {
-            pointer.note_motion(120.0, 110.0);
-            pointer.note_motion(100.0, 100.0);
-        }
-        assert!(pointer.mot_accum < super::DPAD_MOTION_GATE);
-        pointer.note_motion(500.0, 100.0);
-        assert!(pointer.mot_accum < super::DPAD_MOTION_GATE);
-        pointer.note_motion(800.0, 100.0);
-        assert!(pointer.mot_accum >= super::DPAD_MOTION_GATE);
-    }
-
-
     /// Issue #642's set: arrows hid the pointer by the transparent cursor, so OK arrives as a
     /// click — it is the OK key, including after the jiggle a press itself causes. Anywhere else a
     /// click is a click: the pointer was moved on purpose (past the gate, or out of D-pad mode),
@@ -1905,7 +1876,7 @@ mod click_is_ok_tests {
         assert!(click_is_ok(true, 600.0, false, true), "drift onto bare video is still OK");
         for (dpad, motion, on_control, transparent) in [
             (true, super::DPAD_MOTION_GATE, true, true),
-            (true, super::DPAD_MOTION_GATE + 100.0, true, true),
+            (true, 500.0, true, true),
             (false, 0.0, false, true),
             (true, 0.0, false, false),
         ] {
