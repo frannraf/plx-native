@@ -10906,7 +10906,7 @@ static mut MUTABLE: u8 = 0;
         # Metadata M4: alt sources leave as MetaAltSources (-1 worker, -8 globals, -3 forks).
         # Notify retirement: -1 worker, -8 globals, -3 forks.
         # W2 retires Watchlist resolve: -1 worker and -7 globals.
-        "workers": 4,  # production worker starts inside machines (`ci/allow/workers/`)
+        "workers": 4 + 1,  # FORK-ONLY +1: Live TV store (ci/allow/workers/data-live_tv.txt). production worker starts inside machines (`ci/allow/workers/`)
         # Sans-IO lifecycle PR B moved the pin by nothing: -3 (the three `lifecycle.rs` `player::TX` lines left with the
         # transport contract, `player/transport.rs`, the IO layer) and +3 (a relocation lowers no pin by itself, so the same
         # diff widened the spellings to the transport readers `transport::paused`, `transport::viewer_paused` and
@@ -10923,11 +10923,11 @@ static mut MUTABLE: u8 = 0;
         # screens/, ui/, appkit/ and machine/ (it read only data/, plex/, media/, session/), +17 (58 -> 75).
         # S4 Browse explicit roster inputs remove its 14 registry reads (103 -> 89).
         # Retained screen inputs remove the screen family's remaining registry reads.
-        "globals": 19,  # Person -11, then Search -14 / Metadata -5 / PMS -3 / ViewState -2.
+        "globals": 19 + 3,  # FORK-ONLY +3: Live TV store/cloud identity (ci/allow/globals/data-live_tv.txt). Person -11, then Search -14 / Metadata -5 / PMS -3 / ViewState -2.
         # Dolby Vision setting (#1156): -1 on forks (`build_stream` takes the DV probe from `ResolveEnv`, captured
         # at the request, so its test/production read of `devcaps::dv::capability` is gone).
         # Actual pre-M4 entries were 68 (the previous pin 71 was a loose ceiling).
-        "forks": 58,  # production test/production forks in every machine crate: data/, plex/, media/, session/, screens/, ui/, appkit/, machine/ (`ci/allow/forks/`)
+        "forks": 58 + 4,  # FORK-ONLY +4: Live TV store runner, Library landing (ci/allow/forks/data-live_tv.txt, screens.txt). production test/production forks in every machine crate: data/, plex/, media/, session/, screens/, ui/, appkit/, machine/ (`ci/allow/forks/`)
         "fxlanes": 0,  # all app families yield to the same FIFO runner (`ci/allow/fxlanes/`)
     }
 
