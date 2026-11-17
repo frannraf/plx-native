@@ -85,7 +85,9 @@ const REPEAT_GRACE_MS: u32 = 300;
 /// The hero's logo rung: the heroes' area and floor, the height fixed at [`LOGO_H`], the text
 /// fallback at [`TITLE_TEXT_SZ`].
 fn logo_rung() -> LogoRung {
-    LogoRung::Custom { area: theme::logo::HERO_AREA, band_h: LOGO_H, w_max: theme::logo::HERO_W_MAX, h_max: LOGO_H,
+    // upstream's heroes size a mark by AREA; this page draws every mark at one height (the column
+    // binding a very wide one), so the area never binds and the width cap is the column
+    LogoRung::Custom { area: f32::MAX, band_h: LOGO_H, w_max: COL_W, h_max: LOGO_H,
         fallback_sz: TITLE_TEXT_SZ, descent_share: 1.0 }
 }
 

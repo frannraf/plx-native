@@ -2231,7 +2231,7 @@ pub fn every_page_arg() -> Vec<AppArg> {
         }),
         AppArg::Content(ContentArg::Collection(plx_plex::plex::collections::CollectionRef::by_tag(sid, 0, 1, ""))),
         AppArg::Content(ContentArg::Catalog { hex: [0; 12] }),
-        AppArg::Search, AppArg::Watchlist, AppArg::LiveTv, AppArg::Player,
+        AppArg::Search, AppArg::Watchlist, AppArg::Player, AppArg::LiveTv,
     ]
 }
 
