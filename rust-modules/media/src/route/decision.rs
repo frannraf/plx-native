@@ -624,6 +624,41 @@ struct CarriedLink {
 pub use super::plan::SourceSelection as UriSelection;
 
 #[cfg(test)]
+mod live_reset_tests {
+    use super::*;
+
+    /// **A live channel is a playback of its own, but not a new process**: what boot installed on the
+    /// session (the backend composition) and what every plan carries over survive the reset, so the
+    /// library film played after a channel still has the URI engine. Before the fix the reset
+    /// assigned `IDLE` whole and left `BackendSet::FEED` (the default) for the rest of the run.
+    #[test]
+    fn a_live_reset_keeps_the_composed_backends_and_the_clock() {
+        let mut session = PlaybackSession::IDLE;
+        session.install_backends(plx_playback_contract::BackendSet::BOTH);
+        session.now_ms = 4_321;
+        session.url = "https://example.invalid/library.m3u8".into();
+        session.cur_rk = "1".into();
+        reset_for_live(&mut session);
+        assert_eq!(session.backends(), plx_playback_contract::BackendSet::BOTH);
+        assert_eq!(session.now_ms, 4_321);
+        assert!(session.url.is_empty() && session.cur_rk.is_empty(), "the last item is gone");
+    }
+
+    /// The Feed start admits only a planned offer: a channel's stream is published as the explicit
+    /// source it is, so `backend_planned_feed_allowed` holds for it.
+    #[test]
+    fn a_live_source_is_a_planned_feed_offer() {
+        let mut session = PlaybackSession::IDLE;
+        session.install_backends(plx_playback_contract::BackendSet::BOTH);
+        reset_for_live(&mut session);
+        session.url = "https://example.invalid/live.m3u8".into();
+        assert!(!session.backend_planned_feed_allowed(), "premise: nothing planned yet");
+        assert!(session.qualify_explicit_feed_source());
+        assert!(session.backend_planned_feed_allowed());
+    }
+}
+
+#[cfg(test)]
 mod source_selection_tests {
     use super::*;
 
@@ -2106,9 +2141,24 @@ pub(crate) fn retire_stopped_playback(ps: &mut PlaybackSession) {
 /// A live playback is a playback of its own: nothing of the last one (its item, tracks, queue,
 /// resume point, an earlier channel's lease) carries over. The clock reading stays.
 pub(super) fn reset_for_live(ps: &mut PlaybackSession) {
-    let now_ms = ps.now_ms;
-    *ps = PlaybackSession::IDLE;
-    ps.now_ms = now_ms;
+    // What `apply_plan` carries over every new plan: the boot's backend composition and URI
+    // preflight port (installed once), the readout's long-lived members, the clock, the delivery
+    // estimate, the rate and the metric/attempt bookkeeping. Dropping them turned the URI engine
+    // off for the rest of the process after a channel was watched.
+    let kept = PlaybackSession {
+        now_ms: ps.now_ms,
+        backends: ps.backends,
+        uri_preflight_port: ps.uri_preflight_port.clone(),
+        readout: ps.readout.clone(),
+        carried_link: ps.carried_link,
+        requested_rate_permille: ps.requested_rate_permille,
+        attempt_origin: ps.attempt_origin,
+        metric_request: ps.metric_request,
+        pending_metric_lifecycle: std::mem::take(&mut ps.pending_metric_lifecycle),
+        reconfigure_pause_goal: ps.reconfigure_pause_goal,
+        ..PlaybackSession::IDLE
+    };
+    *ps = kept;
 }
 
 /// Install a live channel's lease and stream (`route::live::install_live` is the caller). The URL
@@ -2120,6 +2170,9 @@ pub(super) fn install_live_lease(ps: &mut PlaybackSession, lease: super::live::L
     set_live_lines(ps, &info);
     ps.live = Some(lease);
     ps.live_info = Some(info);
+    // The Feed start admits only a planned offer: a channel is an explicit source (no plan), its
+    // one recipe the stream as the server sends it, as a dev trigger's URL is.
+    let _ = ps.qualify_explicit_feed_source();
 }
 
 /// The HUD's two lines of a live channel: the program, and the channel it is on. An airing whose

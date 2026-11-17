@@ -1012,7 +1012,8 @@ impl LiveTvScreen {
         self.last_tick = Some(ms);
         let target = self.wash_target();
         // decorative: the wash dissolving between programs moves no layout
-        self.wash.step(target, AmbientWash::K, dt);
+        // decorative: the wash dissolving between programs moves no layout
+        plx_machine::motion::report::decorative(|| self.wash.step(target, AmbientWash::K, dt));
         let mut moving = !self.wash.at_rest();
         let tabs = model::tab_sources(&self.view.snap).len();
         self.tab_grow.resize(tabs, plx_ui::Spring::at(0.0));

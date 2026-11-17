@@ -900,7 +900,9 @@ pub(crate) fn player_requests(
                 exit_player(player, pa, repause_at, refresh_hubs, pages);
             }
             PlayerReq::Minimize => {
-                performed.exiting = !minimize_player(player, pa, repause_at, refresh_hubs, pages);
+                // either way the player page leaves (to the guide's corner, or out)
+                performed.exiting = true;
+                let _ = minimize_player(player, pa, repause_at, refresh_hubs, pages);
             }
             PlayerReq::ChannelStep(step) => step_live_channel(&mut player.session, bridge, step, now, pages),
             PlayerReq::LiveSkip(delta) => {

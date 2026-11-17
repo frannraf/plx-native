@@ -212,12 +212,15 @@ impl FocusHero {
     /// is no longer resident and there is nothing left to hold.
     /// Answers whether a dissolve is still under way (the page then reports Motion).
     pub(super) fn step(&mut self, dt: f32) -> bool {
-        if self.tex.0 != 0 {
-            self.art.step(1.0, AmbientWash::K, dt);
-        }
-        if self.outgoing_tex.0 != 0 {
-            self.outgoing_art.step(1.0, AmbientWash::K, dt);
-        }
+        // decorative: the dissolve must not count as the page's layout moving
+        plx_machine::motion::report::decorative(|| {
+            if self.tex.0 != 0 {
+                self.art.step(1.0, AmbientWash::K, dt);
+            }
+            if self.outgoing_tex.0 != 0 {
+                self.outgoing_art.step(1.0, AmbientWash::K, dt);
+            }
+        });
         let moving = (self.tex.0 != 0 && plx_machine::motion::moving(self.art.pos, 1.0, self.art.vel, dt))
             || (self.outgoing_tex.0 != 0 && plx_machine::motion::moving(self.outgoing_art.pos, 1.0, self.outgoing_art.vel, dt));
         if self.held.is_some() && (reveal(self.tex, &self.art) > 0.999 || self.outgoing_tex.0 == 0) {

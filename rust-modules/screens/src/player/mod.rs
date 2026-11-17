@@ -1499,7 +1499,8 @@ impl PlayerScreen {
         if self.hud.sections.any() && self.modal() && matches!(key, Key::Left { alt: true } | Key::Right { alt: true }) {
             return Handled::Yes;
         }
-        if self.jump_key(ps, key, edge, now, fx, instant_dpad_seeking, interval) {
+        // a live channel's LEFT/RIGHT/FF/REW are its own skips (the arm below): there is no duration to jump in
+        if !plx_media::route::live_can_shift(ps) && self.jump_key(ps, key, edge, now, fx, instant_dpad_seeking, interval) {
             return Handled::Yes;
         }
         if self.hud.visible_at_press && matches!(self.hud.nav.focus, GROUP_ROW | GROUP_STRIP)
@@ -1566,7 +1567,8 @@ impl PlayerScreen {
                 Handled::Yes
             }
             Key::Back if edge == Edge::Down && self.hud.back_leaves_at_press => {
-                Self::ask(fx, PlayerReq::Exit);
+                // a live channel's BACK keeps it playing in the guide's corner
+                Self::ask(fx, if plx_media::route::is_live(ps) { PlayerReq::Minimize } else { PlayerReq::Exit });
                 Handled::Yes
             }
             // **BACK over an offered stand-in dismisses the OFFER, not the transport.** A Skip
@@ -2414,7 +2416,14 @@ impl PlayerScreen {
     /// ([`Self::record_stops`]) ask once and read it through [`Self::groups_in`] and [`Self::place_in`];
     /// a pointer event and the caption draw ask for their own.
     fn geometry_for(&self, chapters: bool) -> HudGeometry {
-        player_hud::geometry::geometry_content(&self.compiled, self.hud.sections.bits(), self.eff_slot(), chapters, self.model.is_episode, self.model.paused)
+        let mut geo = player_hud::geometry::geometry_content(&self.compiled, self.hud.sections.bits(), self.eff_slot(),
+            chapters && !self.model.live, self.model.is_episode, self.model.paused);
+        // a live channel has no tabs (no library item for an Info card, no chapters): none drawn,
+        // so none is a stop or a hit (`groups_in`, `place_in`)
+        if self.model.live {
+            geo.tabs.iter_mut().for_each(|tab| *tab = None);
+        }
+        geo
     }
 
     /// [`Self::geometry_for`] for the content the `Cx` holds.

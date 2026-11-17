@@ -2041,7 +2041,8 @@ pub mod page_id {
     pub const WATCHLIST: ScreenId = ScreenId(25);
     pub const LIBRARY_COLLECTIONS: ScreenId = ScreenId(28);
     pub const LIBRARY_RECOMMENDED: ScreenId = ScreenId(29);
-    pub const LIVE_TV: ScreenId = ScreenId(30);
+    /// 31: upstream's Versions panel took 30.
+    pub const LIVE_TV: ScreenId = ScreenId(31);
 }
 
 /// **A screen argument: everything the container needs to mount one screen, and nothing else.**
